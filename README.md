@@ -28,7 +28,7 @@ use seekquarry\atto\Website;
 
 $test = new WebSite();
 
-$test->get('/', function() use ($test) {
+$test->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>

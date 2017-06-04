@@ -1,17 +1,18 @@
 Atto Web Server
 ===============
+Atto is a single file, low dependency, pure PHP web server and web routing engine
 
- * This software can be used to route requests, and hence, serve as a micro
+ * Atto can be used to route requests, and hence, serve as a micro
  framework for use under a traditional web server such as Apache, nginx,
  or lighttpd. 
  
- * This software can also be used to serve web apps as a stand alone 
- web server for apps created using its routing facility. 
+ * Atto can be used as a stand alone web server for apps 
+ created using its routing facility. 
  
- * This software is web request event-driven, supporting
+ * Atto is web request event-driven, supporting
  asynchronous I/O for web traffic. 
  
- * This software supports timers for background events.
+ * Atto supports timers for background events.
  
  * Unlike similar PHP software, as a Web Server it instantiates traditional
  PHP superglobals like $_GET, $_POST, $_REQUEST, $_COOKIE, $_SESSION,

@@ -1,0 +1,25 @@
+{
+    "name": "seekquarry/yioop",
+    "description": "Single file, pure PHP web server and web routing engine",
+    "homepage": "https://www.seekquarry.com/",
+    "license": "GPLv3",
+    "authors": [
+        {
+            "name": "Chris Pollett",
+            "email": "chris@pollett.org"
+        }
+    ],
+    "minimum-stability": "stable",
+    "require": {
+        "php": ">=5.5.0",
+        "ext-pcre": "*",
+        "ext-SPL":"*",
+        "ext-zip": "*",
+        "lib-pcre": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "seekquarry\\atto\\": ["src/"]
+        }
+    }
+}

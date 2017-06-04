@@ -358,7 +358,9 @@ class WebSite
         }
         $this->routes[$method][$route] = $callback;
     }
+    /*
         HTTP/HTTPS Processing Methods
+     */
     /**
      * Adds a middle ware callback that should be called before any processing
      * on the request is done.
@@ -370,7 +372,6 @@ class WebSite
     {
         $this->middle_wares[] = $callback;
     }
-     */
     /**
      * Cause all the current HTTP request to be processed according to the
      * middleware callbacks and routes currently set on this WebSite object.

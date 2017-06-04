@@ -54,7 +54,7 @@ $test->get('/', function() {
 $test->get('/images/{file_name}', function () use ($test) {
         $file_name = __DIR__ . "/images/" . urldecode($_REQUEST['file_name']);
         if (file_exists($file_name)) {
-            $test->header("Content-Type: ".mime_content_type($file_name));
+            $test->header("Content-Type: " . $test->mimeType($file_name));
             echo $test->fileGetContents($file_name);
         } else {
             $test->trigger("ERROR", "/404");

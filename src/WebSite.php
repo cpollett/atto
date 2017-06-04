@@ -640,6 +640,70 @@ class WebSite
         return move_uploaded_file($filename, $destination);
     }
     /**
+     * Returns the mime type of the provided file name if it can be determined.
+     * (This function is from the seekquarry/yioop project)
+     *
+     * @param string $file_name (name of file including path to figure out
+     *      mime type for)
+     * @param bool $use_extension whether to just try to guess from the file
+     *      extension rather than looking at the file
+     * @return string mime type or unknown if can't be determined
+     */
+    function mimeType($file_name, $use_extension = false)
+    {
+        $mime_type = "unknown";
+        $last_chars = "-1";
+        if (!$use_extension && !file_exists($file_name)) {
+            return $mime_type;
+        }
+        if (!$use_extension && class_exists("\finfo")) {
+            $finfo = new \finfo(FILEINFO_MIME);
+            $mime_type = $finfo->file($file_name);
+        } else {
+            $last_chars = strtolower(substr($file_name,
+                strrpos($file_name, ".")));
+            $mime_types = [
+                ".aac" => "audio/aac",
+                ".aif" => "audio/aiff",
+                ".aiff" => "audio/aiff",
+                ".aifc" => "audio/aiff",
+                ".avi" => "video/x-msvideo",
+                ".bmp" => "image/bmp",
+                ".bz" => "application/bzip",
+                ".ico" => "image/x-icon",
+                ".css" => "text/css",
+                ".csv" => "text/csv",
+                ".epub" => "application/epub+zip",
+                ".gif" => "image/gif",
+                ".gz" => "application/gzip",
+                ".html" => 'text/html',
+                ".jpeg" => "image/jpeg",
+                ".jpg" => "image/jpeg",
+                ".oga" => "audio/ogg",
+                ".ogg" => "audio/ogg",
+                ".opus" => "audio/opus",
+                ".mov" => "video/quicktime",
+                ".mp3" => "audio/mpeg",
+                ".mp4" => "video/mp4",
+                ".m4a" => "audio/mp4",
+                ".m4v" => "video/mp4",
+                ".pdf" => "application/pdf",
+                ".png" => "image/png",
+                ".tex" => "text/plain",
+                ".txt" => "text/plain",
+                ".wav" => "audio/vnd.wave",
+                ".webm" => "video/webm",
+                ".zip" => "application/zip",
+                ".Z" => "application/x-compress",
+            ];
+            if (isset($mime_types[$last_chars])) {
+                $mime_type = $mime_types[$last_chars];
+            }
+        }
+        $mime_type = str_replace('application/ogg', 'video/ogg', $mime_type);
+        return $mime_type;
+    }
+    /**
      * @param float $time
      * @param callable $callback
      * @param bool $repeating
@@ -679,8 +743,9 @@ class WebSite
             "CULL_OLD_SESSION_NUM" => 5
         ];
         if (is_int($address) && $address >= 0 && $address < 65535) {
+            $localhost = strstr(PHP_OS, "WIN") ? "localhost" : "0.0.0.0";
             // 0 binds to any incoming ipv4 address
-            $address = "tcp://0:$address";
+            $address = "tcp://$localhost:$address";
             $server_globals = ["SERVER_NAME" => "localhost"];
         } else {
             $server_globals = ['SERVER_NAME' => substr($address, 0,

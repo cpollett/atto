@@ -119,7 +119,7 @@ Atto Server to be autoloaded as needed by your code.
 More Examples
 -------------
 
-The examples folder of this project has a sequence of examples illustration 
+The examples folder of this project has a sequence of examples illustrating 
 the main features of the Atto Server.
 
 Out of paranoia, each of these files has a call to exit(); at the start of it,

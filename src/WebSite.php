@@ -76,7 +76,7 @@ class WebSite
     protected $http_methods;
     protected $header_data;
     protected $content_type;
-    protected $file_cache = ['MARKED' => [], 'UNKMARKED' => []];
+    protected $file_cache = ['MARKED' => [], 'UNMARKED' => []];
     protected $is_cli;
     protected $is_secure = false;
     /**

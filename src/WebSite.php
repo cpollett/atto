@@ -668,8 +668,10 @@ class WebSite
      */
     public function listen($address, $config_array_or_ini_filename = false)
     {
+        $path = (!empty($_SERVER['PATH'])) ? $_SERVER['PATH'] :
+            ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
         $default_server_globals = [ "DOCUMENT_ROOT" => getcwd(),
-            "GATEWAY_INTERFACE" => "CGI/1.1", "PATH" => $_SERVER['PATH'],
+            "GATEWAY_INTERFACE" => "CGI/1.1", "PATH" => $path,
             "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
             "MAX_REQUEST_LEN" => 10000000, "MAX_CACHE_FILESIZE" => 1000000,

@@ -1,6 +1,6 @@
 Atto Web Server
 ===============
-Atto is a single file, low dependency, pure PHP web server and web routing engine
+Atto is a single file, low dependency, pure PHP web server and web routing engine.
 
  * Atto can be used to route requests, and hence, serve as a micro
  framework for use under a traditional web server such as Apache, nginx,

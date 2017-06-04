@@ -388,9 +388,10 @@ class WebSite
             $_SERVER['REQUEST_METHOD'];
         if (empty($_SERVER['QUERY_STRING'])) {
             $this->request_script = rtrim(
-                substr($_SERVER['REQUEST_URI'], strlen($this->base_path)), "?");
+                substr(urldecode($_SERVER['REQUEST_URI']),
+                strlen($this->base_path)), "?");
         } else {
-            $this->request_script = substr($_SERVER['REQUEST_URI'],
+            $this->request_script = substr(urldecode($_SERVER['REQUEST_URI']),
                 strlen($this->base_path),
                 -strlen($_SERVER['QUERY_STRING']) -  1);
         }

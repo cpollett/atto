@@ -6,23 +6,28 @@ Atto is a single file, low dependency, pure PHP web server and web routing engin
  framework for use under a traditional web server such as Apache, nginx,
  or lighttpd. 
  
- * Atto can be used as a stand alone web server for apps 
+ * Atto can be used as a standalone web server for apps 
  created using its routing facility. 
  
  * Atto is web request event-driven, supporting
- asynchronous I/O for web traffic. 
+ asynchronous I/O for web traffic.
  
- * Atto supports timers for background events.
- 
- * Unlike similar PHP software, as a Web Server it instantiates traditional
+ * Unlike similar PHP software, as a Web Server, it instantiates traditional
  PHP superglobals like $_GET, $_POST, $_REQUEST, $_COOKIE, $_SESSION,
  $_FILES, etc and endeavors to make it easy to code apps in a rapid PHP style.
  
+As a standalone Web Server:
+
+ * Atto supports timers for background events.
+ * Atto handles sessions in RAM.
+ * Atto has File I/O methods fileGetContents and filePutContents which cache
+   files using the Marker algorithm.
+ 
 Usage
 -----------
-```
+```php
 <?php
-require 'path_to_atto_server_code/src/Website.php'; //this would line would need to be adjusted
+require 'path_to_atto_server_code/src/Website.php'; //this line would need to be adjusted
 
 use seekquarry\atto\Website;
 
@@ -53,7 +58,7 @@ $test->get('/', function() {
 $test->get('/images/{file_name}', function () use ($test) {
         $file_name = __DIR__ . "/images/" . urldecode($_REQUEST['file_name']);
         if (file_exists($file_name)) {
-            $test->header("Content-Type: ".mime_content_type($file_name));
+            $test->header("Content-Type: " . $this->mimeType($file_name));
             echo $test->fileGetContents($file_name);
         } else {
             $test->trigger("ERROR", "/404");
@@ -83,6 +88,39 @@ if ($test->isCli()) {
  
 Installation
 ------------
- 
+
+Atto Server has been tested on PHP 5.5, PHP 7, and HHVM. HTTPS support does 
+not currently work under HHVM.
+
+To install the software one should have PHP installed. One can then git clone 
+the project or download the ZIP file off of GitHub.
+
+To use Atto Server in your project, add the lines:
+```php
+require 'path_to_atto_server_code/src/Website.php'; //this line would need to be adjusted
+
+use seekquarry\atto\Website;
+```
+to the top of your project file. If you don't have the ``use`` line, then to
+refer to the Website class you would need to add the whole namespace path.
+For example,
+```php
+$test = new seekquarry\atto\Website();
+```
+
+If you use composer, you can require Atto Server using the command:
+```
+composer require seekquarry/atto
+```
+You should then do ``composer install`` or ``composer update``.
+Requiring ``"vendor/autoload.php"`` should then suffice to allow 
+Atto Server to be autoloaded as needed by your code.
+
 More Examples
 -------------
+
+The examples folder of this project has a sequence of examples illustrating 
+the main features of the Atto Server.
+
+Out of paranoia, at the start of each of these examples there is an ``exit();`` call. 
+This line should be removed or commented to try the example.

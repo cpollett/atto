@@ -76,7 +76,7 @@ class WebSite
     protected $http_methods;
     protected $header_data;
     protected $content_type;
-    protected $file_cache;
+    protected $file_cache = ['MARKED' => [], 'UNKMARKED' => []];
     protected $is_cli;
     protected $is_secure = false;
     /**
@@ -743,6 +743,10 @@ class WebSite
             "CULL_OLD_SESSION_NUM" => 5
         ];
         if (is_int($address) && $address >= 0 && $address < 65535) {
+            /*
+             both work on windows, but localhost doesn't give windows defender
+             warning
+            */
             $localhost = strstr(PHP_OS, "WIN") ? "localhost" : "0.0.0.0";
             // 0 binds to any incoming ipv4 address
             $address = "tcp://$localhost:$address";

@@ -20,7 +20,7 @@ Atto is a single file, low dependency, pure PHP web server and web routing engin
  
 Usage
 -----------
-<code>
+```
 <?php
 require 'path_to_atto_server_code/src/Website.php'; //this would line would need to be adjusted
 
@@ -79,7 +79,7 @@ if ($test->isCli()) {
 } else {
     $test->process();
 }
-</code>
+```
  
 Installation
 ------------

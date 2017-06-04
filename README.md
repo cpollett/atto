@@ -20,9 +20,9 @@ Atto is a single file, low dependency, pure PHP web server and web routing engin
  
 Usage
 -----------
-```
+```php
 <?php
-require 'path_to_atto_server_code/src/Website.php'; //this would line would need to be adjusted
+require 'path_to_atto_server_code/src/Website.php'; //this line would need to be adjusted
 
 use seekquarry\atto\Website;
 
@@ -53,7 +53,7 @@ $test->get('/', function() {
 $test->get('/images/{file_name}', function () use ($test) {
         $file_name = __DIR__ . "/images/" . urldecode($_REQUEST['file_name']);
         if (file_exists($file_name)) {
-            $test->header("Content-Type: ".mime_content_type($file_name));
+            $test->header("Content-Type: " . $this->mimeType($file_name));
             echo $test->fileGetContents($file_name);
         } else {
             $test->trigger("ERROR", "/404");
@@ -83,6 +83,39 @@ if ($test->isCli()) {
  
 Installation
 ------------
- 
+
+Atto Server has been tested on PHP 5.5, PHP 7, and HHVM. HTTPS support does 
+not currently work under HHVM.
+
+To install the software one should have PHP installed. One can then git clone 
+the project or download the ZIP file off of GitHub.
+
+To use Atto Server in your project, add the lines:
+```php
+require 'path_to_atto_server_code/src/Website.php'; //this line would need to be adjusted
+
+use seekquarry\atto\Website;
+```
+to the top of your project file. If you don't have the ``use`` line, then to
+refer to the Website class you would need to add the whole namespace path.
+For example,
+```php
+$test = new seekquarry\atto\Website();
+```
+
+If you use composer, you can require Atto Server using the command:
+```
+composer require seekquarry/atto
+```
+You should then do ``composer install`` or ``composer update``.
+Requiring "vendor/autoload.php" should then suffice to allow 
+Atto Server to be autoloaded as needed by your code.
+
 More Examples
 -------------
+
+The examples folder of this project has a sequence of examples illustration 
+the main features of the Atto Server.
+
+Out of paranoia, each of these files has a call to exit(); at the start of it,
+so won't run unless you comment this line out.

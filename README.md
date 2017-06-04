@@ -113,7 +113,7 @@ If you use composer, you can require Atto Server using the command:
 composer require seekquarry/atto
 ```
 You should then do ``composer install`` or ``composer update``.
-Requiring "vendor/autoload.php" should then suffice to allow 
+Requiring ``"vendor/autoload.php"`` should then suffice to allow 
 Atto Server to be autoloaded as needed by your code.
 
 More Examples

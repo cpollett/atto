@@ -14,7 +14,7 @@ $test = new WebSite();
        php index.php
     and pointing a browser to http://localhost:8080/
  */
-$test->get('/', function() use ($test) {
+$test->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>

@@ -668,7 +668,7 @@ class WebSite
      */
     public function listen($address, $config_array_or_ini_filename = false)
     {
-        $default_server_globals = [ "DOCUMENT_ROOT" => $_SERVER['PWD'],
+        $default_server_globals = [ "DOCUMENT_ROOT" => getcwd(),
             "GATEWAY_INTERFACE" => "CGI/1.1", "PATH" => $_SERVER['PATH'],
             "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",

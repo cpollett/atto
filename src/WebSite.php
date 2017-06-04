@@ -29,7 +29,7 @@
  * @filesource
  */
 
-namespace seekquarry\atto;
+namespace cpollett\atto;
 
 /**
  * A single file, low dependency, pure PHP web server and web routing engine

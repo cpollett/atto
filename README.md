@@ -65,7 +65,7 @@ if($test->isCli()) {
     /* This line is for when site is run under a web server like
        Apache, nginx, lighttpd, etc. The enclosing folder should contain an
        .htaccess file to redirect traffic through this index.php file. So
-       redirects need to be on to use this example under a different web server.
+       redirects need to be on to use this example under a Apache, etc.
      */
     $test->process();
 }
@@ -77,8 +77,8 @@ Installation
 Atto Server has been tested on PHP 5.5, PHP 7, and HHVM. HTTPS support does 
 not currently work under HHVM.
 
-To install the software one should have PHP installed. One can then git clone 
-the project or download the ZIP file off of GitHub.
+To install the software one should have PHP installed. One can then 
+``git clone`` the project or download the ZIP file off of GitHub.
 
 To use Atto Server in your project, add the lines:
 ```php
@@ -107,5 +107,5 @@ More Examples
 The examples folder of this project has a sequence of examples illustrating 
 the main features of the Atto Server.
 
-Out of paranoia, at the start of each of these examples there is an ``exit();``
+Out of paranoia, at the start of each of these examples, there is an ``exit();``
 call. This line should be removed or commented to try the example.

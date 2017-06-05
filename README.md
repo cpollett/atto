@@ -1,6 +1,7 @@
 Atto Web Server
 ===============
-Atto is a single file, low dependency, pure PHP web server and web routing engine.
+Atto is a single file, low dependency, pure PHP web server and web routing
+engine.
 
  * Atto can be used to route requests, and hence, serve as a micro
  framework for use under a traditional web server such as Apache, nginx,
@@ -27,61 +28,45 @@ Usage
 -----------
 ```php
 <?php
-require 'path_to_atto_server_code/src/Website.php'; //this line would need to be adjusted
+require 'atto_server_path/src/Website.php'; //this line need to be changed
 
 use seekquarry\atto\Website;
 
 $test = new WebSite();
-
+/*
+    A Simple Atto WebSite used to display a Hello World landing page.
+    After changing the require line above, you can run the example
+    by typing:
+       php index.php
+    and pointing a browser to http://localhost:8080/
+ */
 $test->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>
-    <head><title>Serve Static Files Example - Atto Server</title></head>
+    <head><title>Hello World - Atto Server</title></head>
     <body>
-    <h1>Serve Static Files - Atto Server</h1>
-    <div>Here is an image which will be served by using a different
-    route within this application:<br />
-    <img src="images/me1.jpg" alt="a photo of me" />
-    </div>
-    <div>Below are a list of links to files in an images subfolder.
-    The last file list does not exists.</div>
-    <ul>
-    <li><a href="images/me1.jpg">Photo 1</a></li>
-    <li><a href="images/me2.jpg">Photo 2</a></li>
-    <li><a href="images/me3.jpg">Photo 3</a></li>
-    </ul>
+    <h1>Hello World!</h1>
+    <div>My first atto server route!</div>
     </body>
     </html>
-    <?php
-});
-$test->get('/images/{file_name}', function () use ($test) {
-        $file_name = __DIR__ . "/images/" . urldecode($_REQUEST['file_name']);
-        if (file_exists($file_name)) {
-            $test->header("Content-Type: " . $this->mimeType($file_name));
-            echo $test->fileGetContents($file_name);
-        } else {
-            $test->trigger("ERROR", "/404");
-        }
-    }
-);
-$test->error('/404', function () {
-    ?>
-    <!DOCTYPE html>
-    <html>
-    <head><title>File Not Found - Atto Server</title></head>
-    <body>
-    <h1>File Not Found - Atto Server</h1>
-    <p>The requested file could not be found :(
-    </p>
-    </body>
-    </html>
-    <?php
+<?php
 });
 
-if ($test->isCli()) {
+if($test->isCli()) {
+    /*
+       This line is used if the app is run from the command line
+       with a line like:
+       php index.php
+       It causes the server to run on port 8080
+     */
     $test->listen(8080);
 } else {
+    /* This line is for when site is run under a web server like
+       Apache, nginx, lighttpd, etc. The enclosing folder should contain an
+       .htaccess file to redirect traffic through this index.php file. So
+       redirects need to be on to use this example under a different web server.
+     */
     $test->process();
 }
 ```
@@ -97,7 +82,7 @@ the project or download the ZIP file off of GitHub.
 
 To use Atto Server in your project, add the lines:
 ```php
-require 'path_to_atto_server_code/src/Website.php'; //this line would need to be adjusted
+require 'atto_server_path/src/Website.php';  //this line need to be changed
 
 use seekquarry\atto\Website;
 ```
@@ -122,5 +107,5 @@ More Examples
 The examples folder of this project has a sequence of examples illustrating 
 the main features of the Atto Server.
 
-Out of paranoia, at the start of each of these examples there is an ``exit();`` call. 
-This line should be removed or commented to try the example.
+Out of paranoia, at the start of each of these examples there is an ``exit();``
+call. This line should be removed or commented to try the example.

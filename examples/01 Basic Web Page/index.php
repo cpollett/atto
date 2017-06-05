@@ -3,7 +3,7 @@ require '../../src/Website.php';
 
 use seekquarry\atto\Website;
 
-//exit(); // comment this line to be able to run this example.
+exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();
 /*
     A Simple Atto WebSite used to display a Hello World landing page.

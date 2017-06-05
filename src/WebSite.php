@@ -412,9 +412,11 @@ class WebSite
         }
     }
     /**
+     * Calls any callbacks associated with a given $method and $route provided
+     * that recursion in method route call is not detected.
      *
-     * @param string $method
-     * @param string $route
+     * @param string $method the name of a web request method for example, "GET"
+     * @param string $route  request pattern to match
      */
     public function trigger($method, $route)
     {
@@ -443,7 +445,15 @@ class WebSite
         return $handled;
     }
     /**
-     * @param string $header
+     * Adds a new HTTP header to the list of header that will be sent with
+     * HTTP response. If the value of $header begins with HTTP/ then it
+     * is assumed that $header is the response message not a header. In this
+     * case, the value of $header will become the response message, replacing
+     * any existing messages if present. This function defaults to PHP's
+     * built-in header() function when this script is run from a non-CLI
+     * context.
+     *
+     * @param string $header HTTP header or message to send with HTTP response
      */
     public function header($header)
     {
@@ -468,13 +478,22 @@ class WebSite
         }
     }
     /**
-     * @param string $name
-     * @param string $value
-     * @param int $expire
-     * @param string $path
-     * @param string $domain
-     * @param string $secure
-     * @param bool $httponly
+     * Sends an HTTP cookie header as part of the HTTP response. If this method
+     * is run from a non-CLI context then this function defaults to PHP's
+     * built-in function setcookie();
+     *
+     * Cookies returned from a parituclar client will appear in the $_COOKIE
+     * superglobal.
+     *
+     * @param string $name name of cookie
+     * @param string $value value associated with cookie
+     * @param int $expire Unix timestamp for when the cookie expires
+     * @param string $path request path associated with the cookie
+     * @param string $domain request domain associated with the cookie
+     * @param string $secure whether the cookie should only be sent if HTTPS in
+     *      use
+     * @param bool $httponly whether or not the cookie is available only over
+     *      HTTP, and not available to client-side Javascript
      */
     public function setCookie($name, $value = "", $expire = 0, $path = "",
         $domain = "", $secure = false, $httponly = false)
@@ -504,9 +523,18 @@ class WebSite
         }
     }
     /**
-     * @param array $options
+     * Starts a web session. This involves sending a HTTP cookie header
+     * with a unique value to identify the client. When this client returns
+     * the cookie, session data is looked up. When run in CLI mode session
+     * data is stored in RAM. When run under a different web server, this
+     * method defaults to PHP's built-in function session_start().
+     *
+     * @param array $options field that can be set are mainly related to the
+     *  session cookie: 'name' (for cookie name), 'cookie_path',
+     * 'cookie_lifetime' (in seconds from now), 'cookie_domain',
+     * 'cookie_secure', 'cookie_httponly'
      */
-    public function sessionStart(array $options = [])
+    public function sessionStart($options = [])
     {
         if ($this->isCli()) {
             foreach ($this->session_configs as $key => $value) {
@@ -564,9 +592,15 @@ class WebSite
         }
     }
     /**
+     * Reads in the file $filename and returns its contents as a string.
+     * In non-CLI mode this method maps directly to PHP's built-in function
+     * file_get_contents(). In CLI mode, it checks if the file exists in
+     * its Marker Algorithm based RAM cache (Fiat et al 1991). If so, it
+     * directly returns it. Otherwise, it reads it in usingthe blocking I/O
+     * file_get_contents() and caches it before return its string contents.
      *
-     * @param string $filename
-     * @param callable $callback 
+     * @param string $filename name of file to get contents of
+     * @return string contents of the file given by $filename
      */
     public function fileGetContents($filename)
     {
@@ -605,9 +639,11 @@ class WebSite
         return file_get_contents($filename);
     }
     /**
+     * Writes $data to the persistent file with name $filename. Saves a copy
+     * in the RAM cache if there is a copy already there.
      *
-     * @param string $filename
-     * @param string $data 
+     * @param string $filename name of file to write to persistent storages
+     * @param string $data string of data to store in file
      */
     public function filePutContents($filename, $data)
     {
@@ -622,9 +658,12 @@ class WebSite
         return file_put_contents($filename, $data);
     }
     /**
+     * Used to move a file that was uploaded from a form on the client to the
+     * desired location on the server. In non-CLI mode this calls PHP's built-in
+     * move_uploaded_file() function
      *
-     * @param string $filename
-     * @param string $destination 
+     * @param string $filename tmp_name in $_FILES of the uploaded file
+     * @param string $destination where on server the file should be moved to
      */
     public function moveUploadedFile($filename , $destination)
     {
@@ -704,9 +743,17 @@ class WebSite
         return $mime_type;
     }
     /**
-     * @param float $time
-     * @param callable $callback
-     * @param bool $repeating
+     * Sets up a repeating or one-time timer that calls $callback every or after
+     * $time seconds
+     *
+     * @param float $time time in seconds (fractional seconds okay) after which
+     *      $callback should be called. Or interval between calls if this is
+     *      a repeating timer.
+     * @param callable $callback a function to be called after now + $time
+     * @param bool $repeating whether $callback should be called every $time
+     *      seconds or just once.
+     * @return int an id for the timer that can be used to turn it off (@see
+     *      clearTimer())
      */
     public function setTimer($time, callable $callback, $repeating = true)
     {
@@ -719,7 +766,9 @@ class WebSite
         return $next_time;
     }
     /**
-     * @param int $timer_id
+     * Deletes a timer for the list of active timers. (@see setTimer)
+     *
+     * @param int $timer_id the id of the timer to remove
      */
     public function clearTimer($timer_id)
     {
@@ -812,10 +861,10 @@ class WebSite
     }
     /**
      *
-     * @param string $request_string
+     * @param string $request_path
      * @param string $route 
      */
-    protected function checkMatch($request_script, $route)
+    protected function checkMatch($request_path, $route)
     {
         $add_vars = [];
         $matches = false;
@@ -826,7 +875,7 @@ class WebSite
                 $magic_string, $route);
             $route_regex = preg_quote($route_regex, "/");
             $route_regex = str_replace($magic_string, "(.*)", $route_regex);
-            if (preg_match_all("/$route_regex/", $request_script,
+            if (preg_match_all("/$route_regex/", $request_path,
                 $request_matches) > 0) {
                 $num_matches = count($matches[0]);
                 array_shift($request_matches);
@@ -838,7 +887,7 @@ class WebSite
                 }
                 return $add_vars;
             }
-        } else if ($request_script == $route) {
+        } else if ($request_path == $route) {
             return $add_vars;
         }
         return false;

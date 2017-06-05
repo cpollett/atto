@@ -775,9 +775,25 @@ class WebSite
         unset($this->timers[$timer_id]);
     }
     /**
+     * Starts an Atto Web Server listening at $address using the configuration
+     * values provided. It also has this server's event loo. As web requests
+     * come in $this->process is called to handle them. This input and output
+     * tcp streams used by this method are non-blocking. Detecting traffic is
+     * done using stream_select().  This maps to Unix-select calls, which
+     * seemed to be the most cross-platform compatible way to do things.
+     * Streaming methods could be easily re-written to support libevent 
+     * (doesn't work yet PHP7) or more modern event library
      *
-     * @param int $address
-     * @param mixed $config_array_or_ini_filename
+     * @param int $address address and port to listen for web requests on
+     * @param mixed $config_array_or_ini_filename either an associative
+     *      array of configuration parameters or the filename of a .ini
+     *      with such parameters. Things that can be set are mainly fields
+     *      that might typically show up in the $_SERVER superglobal.
+     *      See the $default_server_globals variable below for some of them.
+     *      The SERVER_CONTENT field can be set to an array of stream
+     *      context field values and these can be used to configure
+     *      the server to handle SSL/TLS (one of the examples in the examples
+     *      folder.)
      */
     public function listen($address, $config_array_or_ini_filename = false)
     {
@@ -853,16 +869,18 @@ class WebSite
                 $out_streams_with_data, $excepts, $timeout, $micro_timeout);
             $this->processTimers();
             if ($num_selected > 0) {
-                $this->readStreams($server, $in_streams_with_data);
-                $this->writeStreams($out_streams_with_data);
+                $this->processRequestStreams($server, $in_streams_with_data);
+                $this->processResponseStreams($out_streams_with_data);
             }
             $this->cullDeadStreams();
         }
     }
     /**
+     * Checks if a portion of a request uri path matches a Atto server route.
      *
-     * @param string $request_path
-     * @param string $route 
+     * @param string $request_path part of a path portion of a request uri
+     * @param string $route a route that might be handled by Atto Server
+     * @return bool whether the requested path matches the given route.
      */
     protected function checkMatch($request_path, $route)
     {
@@ -893,7 +911,9 @@ class WebSite
         return false;
     }
     /**
-     *
+     * Handles processing timers on this Atto Web Site. This method is called
+     * from the event loop in @see listen and checks to see if any callbacks
+     * associated with timers need to be called.
      */
     protected function processTimers()
     {
@@ -916,10 +936,19 @@ class WebSite
         }
     }
     /**
-     * @param resource $server
-     * @param array $out_streams_with_data
+     * Processes incoming streams with data. If the server has detected a
+     * new connection, then a stream is set-up. For other streams,
+     * request data is processed as it comes in. Once the request is complete,
+     * superglobals are set up and process() is used route the request which
+     * is output buffered. When this is complete, an output stream is 
+     * instantiated to send this data asynchronously back to the browser.
+     *
+     * @param resource $server socket server used to listen for incoming
+     *  connections
+     * @param array $in_streams_with_data streams with request data to be
+     *  processed.
      */
-    protected function readStreams($server, $in_streams_with_data)
+    protected function processRequestStreams($server, $in_streams_with_data)
     {
         foreach ($in_streams_with_data as $in_stream) {
             if ($in_stream == $server) {
@@ -946,7 +975,7 @@ class WebSite
                     }
                     $key = (int)$connection;
                     $this->in_streams[self::CONNECTION][$key] = $connection;
-                    $this->initReadStream($key);
+                    $this->initRequestStream($key);
                 }
             } else {
                 $meta = stream_get_meta_data($in_stream);
@@ -982,7 +1011,7 @@ class WebSite
                     $out_data = $this->header_data .
                             "Content-Length: ". strlen($out_data) .
                             "\x0D\x0A\x0D\x0A" .  $out_data;
-                    $this->initReadStream($key);
+                    $this->initRequestStream($key);
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
                         $this->out_streams[self::CONNECTION][$key] =
                             $in_stream;
@@ -997,9 +1026,13 @@ class WebSite
         }
     }
     /**
-     * @param int key
+     * Gets info about an incoming request stream and uses this to set up
+     * an initial stream context. This context is used to populate the $_SERVER
+     * variable when the request is later processed.
+     *
+     * @param int key id of request stream to initialize context for 
      */
-    protected function initReadStream($key)
+    protected function initRequestStream($key)
     {
         $connection = $this->in_streams[self::CONNECTION][$key];
         $remote_name = stream_socket_get_name($connection, true);
@@ -1021,9 +1054,13 @@ class WebSite
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
     }
     /**
-     * @param array $out_streams_with_data
+     * Used to send response data to out stream for which responses have not
+     * been written.
+     *
+     * @param array $out_streams_with_data rout streams that are ready
+     *      to send more response data
      */
-    protected function writeStreams($out_streams_with_data)
+    protected function processResponseStreams($out_streams_with_data)
     {
         foreach ($out_streams_with_data as $out_stream) {
             $meta = stream_get_meta_data($out_stream);
@@ -1054,8 +1091,13 @@ class WebSite
         }
     }
     /**
-     * @param int $key
-     * @param string $data
+     * Takes the string $data recently read from the request stream with
+     * id $key, tacks that on to the previous received data. If this completes
+     * an HTTP request then the request headers and request are parsed
+     *
+     * @param int $key id of request stream to process data for
+     * @param string $data from request stream
+     * @return bool whether the request is complete
      */
     protected function parseRequest($key, $data)
     {
@@ -1149,8 +1191,22 @@ class WebSite
         return true;
     }
     /**
+     * Used to initialize the superglobals before process() is called when
+     * WebSite is run in CLI-mode. The values for the globals come from the
+     * request streams context which has request headers. If the request
+     * had CONTENT, for example, from posted form data, this is parsed and
+     * $_POST, and $_FILES superglobals set up.
      *
-     * @param array $context
+     * @param array $context associative array of information parsed from
+     *      a web request. Tthe content portion of the request is not yet
+     *      parsed but headers are, each with a prefix field HTTP_ followed
+     *      by name of the header. For example the value of a header with name
+     *      Cookie should be in $context['HTTP_COOKIE']. The Content-Type
+     *      and Content-Length header do no get the prefix, so should be as
+     *      $context['CONTENT_TYPE'] and $context['CONTENT_LENGTH']. 
+     *      The request method, query_string, also appear with the HTTP_ prefix.
+     *      Finally, the content of the request should be in 
+     *      $context['CONTENT'].
      */
     protected function setGlobals($context)
     {
@@ -1227,8 +1283,12 @@ class WebSite
         $_REQUEST = array_merge($_GET, $_POST, $_COOKIE);
     }
     /**
+     * Outputs HTTP error response message in the case that no specific error
+     * handler was set
      *
-     * @param string $route
+     * @param string $route the route of the error. Internally, when an HTTP
+     *      error occurs it is usually given a route of the form /response code.
+     *      For example, /404 for a NOT FOUND error.
      */
     protected function defaultErrorHandler($route = "")
     {
@@ -1241,8 +1301,10 @@ class WebSite
         echo $message;
     }
     /**
+     * Used to set up PHP superglobals, $_GET, $_POST, etc in the case that
+     * a 400 BAD REQUEST response occurs.
      *
-     * @param int $key
+     * @param int $key id of stream that bad request came from
      */
     protected function initializeBadRequestResponse($key)
     {
@@ -1258,7 +1320,10 @@ class WebSite
              'SERVER_PROTOCOL' => 'HTTP/1.0']);
     }
     /**
-     *
+     * Used to close connections and remove from stream arrays streams that
+     * have not had traffic in the last CONNECTION_TIMEOUT seconds. The
+     * stream socket server is exempt from being culled, as are any streams
+     * whose ids are in $this->immortal_stream_keys.
      */
     protected function cullDeadStreams()
     {
@@ -1280,8 +1345,10 @@ class WebSite
         }
     }
     /**
+     * Closes stream with id $key and removes it from in_streams and
+     * outstreams arrays.
      *
-     * @param int $key
+     * @param int $key id of stream to delete
      */
     protected function shutdownHttpStream($key)
     {
@@ -1300,8 +1367,12 @@ class WebSite
         );
     }
     /**
+     * Removes a stream from outstream arrays. Since an HTTP connection can
+     * handle several requests from a single client, this method does not close
+     * the connection. It might be run after a request response pair, while 
+     * waiting for the next request.
      *
-     * @param int $key
+     * @param int $key id of stream to remove from outstream arrays.
      */
     protected function shutdownHttpWriteStream($key)
     {

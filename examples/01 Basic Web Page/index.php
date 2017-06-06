@@ -24,7 +24,6 @@ $test->get('/', function() {
     </html>
 <?php
 });
-
 if($test->isCli()) {
     /*
        This line is used if the app is run from the command line

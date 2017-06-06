@@ -44,7 +44,7 @@ $test->get('/results', function ()
     <?= print_r($_REQUEST); ?>
     </pre>
     </body>
-    </html>s
+    </html>
     <?php
 });
 if ($test->isCli()) {

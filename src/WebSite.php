@@ -504,8 +504,8 @@ class WebSite
             }
             $out_cookie = "Set-Cookie: $name=$value";
             if ($expire != 0) {
-                $out_cookie .= "; Expires=" . gmdate("D, d M Y H:i:s", $expire) .
-                    " GMT";
+                $out_cookie .= "; Expires=" . gmdate("D, d M Y H:i:s", 
+                    intval($expire)) . " GMT";
             }
             if ($path != "") {
                 $out_cookie .= "; Path=$path";

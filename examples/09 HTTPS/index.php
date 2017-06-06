@@ -8,7 +8,10 @@ $test = new WebSite();
 
 /*
     A Simple Atto WebSite used to display a Hello World landing page using
-    HTTPS. After commenting the exit() line above, you can run the example
+    HTTPS. 
+    Make sure php is configured with openssl and ssl is enabled in the php.ini
+    file.
+    After commenting the exit() line above, you can run this example
     by typing:
        php index.php
     and pointing a browser to http://localhost:8080/

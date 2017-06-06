@@ -21,6 +21,7 @@ $test->get('/', function() {
     <html>
     <head><title>Post Example - Atto Server</title></head>
     <body>
+    <h1>Post Example - Atto Server</h1>
     <form method="post" action="/results">
         <label for="name-field">Enter Name:</label>
        <input id="name-field" type="text" name="name" />
@@ -37,7 +38,7 @@ $test->post('/results', function ()
     <html>
     <head><title>Results of Form Post - Atto Server</title></head>
     <body>
-    <h1>Results of Form Post</h1>
+    <h1>Results of Form Post - Atto Server</h1>
     <pre>$_POST variable array:
     <?= print_r($_POST); ?>
     $_REQUEST variable array:

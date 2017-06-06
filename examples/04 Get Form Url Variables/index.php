@@ -21,7 +21,7 @@ $test->get('/', function() {
     <html>
     <head><title>Get Form Example - Atto Server</title></head>
     <body>
-    <form method="get" action="/results">
+    <form method="get" action="results" >
        <label for="name-field">Enter Name:</label>
        <input id="name-field" type="text" name="name" />
        <input type="submit" value="Submit" />
@@ -30,7 +30,33 @@ $test->get('/', function() {
     </html>
     <?php
 });
+/*
+    This page shows the values that came from the / route's form.
+ */
 $test->get('/results', function ()
+{
+    ?>
+    <!DOCTYPE html>
+    <html>
+    <head><title>Results of Get Form - Atto Server</title></head>
+    <body>
+    <h1>Results of Get Form</h1>
+    <pre>$_GET variable array:
+    <?= print_r($_GET); ?>
+    $_REQUEST variable array:
+    <?= print_r($_REQUEST); ?>
+    </pre>
+    <p><a href="results/some_value">This link shows how variables can
+    be computed from match with the url</a>.</p>
+    </body>
+    </html>
+    <?php
+});
+/*
+    This route is followed when a user clicks on the link on the results
+    page and shows how matches against the url are turned into $_GET values.
+*/
+$test->get('/results/{from_the_url}', function ()
 {
     ?>
     <!DOCTYPE html>

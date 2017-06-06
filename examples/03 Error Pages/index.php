@@ -3,7 +3,7 @@ require '../../src/Website.php';
 
 use seekquarry\atto\Website;
 
-//exit(); // you need to comment this line to be able to run this example.
+exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();
 /*
     A Simple Atto WebSite used to demonstrate some eror pages
@@ -22,7 +22,6 @@ $test->get('/', function() {
     <ul>
     <li><a href="dkjgakldsfg">A link to a non-existent page</a>.</li>
     <li><a href="local">Allowed on 127.0.0.1 but not on localhost</a>.</li>
-    <li><a href="/auth">A Page Requiring Authentication</a>.</li>
     </ul>
     </body>
     </html>

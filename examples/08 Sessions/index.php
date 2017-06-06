@@ -7,7 +7,7 @@ exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();
 
 /*
-    A Simple Atto WebSite used to implement a simple counter with sessions
+    An Atto WebSite used to implement a simple counter with sessions
     After commenting the exit() line above, you can run the example
     by typing:
        php index.php

@@ -8,9 +8,9 @@ $test = new WebSite();
 
 /*
     An Atto WebSite consisting of a form with a text field. Submitting the
-    form posts it to a /results page where the submitted data is printed out
-    After commenting the exit() line above, you can run the example
-    by typing:
+    form sends it via GET method to a /results page where the submitted data
+    is printed out. After commenting the exit() line above, you can run the
+    example by typing:
        php index.php
     and pointing a browser to http://localhost:8080/. Click reload several
     times to see the count go up.
@@ -19,10 +19,10 @@ $test->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>
-    <head><title>Post Example - Atto Server</title></head>
+    <head><title>Get Form Example - Atto Server</title></head>
     <body>
-    <form method="post" action="/results">
-        <label for="name-field">Enter Name:</label>
+    <form method="get" action="/results">
+       <label for="name-field">Enter Name:</label>
        <input id="name-field" type="text" name="name" />
        <input type="submit" value="Submit" />
     </form>
@@ -30,21 +30,21 @@ $test->get('/', function() {
     </html>
     <?php
 });
-$test->post('/results', function ()
+$test->get('/results', function ()
 {
     ?>
     <!DOCTYPE html>
     <html>
-    <head><title>Results of Form Post - Atto Server</title></head>
+    <head><title>Results of Get Form - Atto Server</title></head>
     <body>
-    <h1>Results of Form Post</h1>
-    <pre>$_POST variable array:
-    <?= print_r($_POST); ?>
+    <h1>Results of Get Form</h1>
+    <pre>$_GET variable array:
+    <?= print_r($_GET); ?>
     $_REQUEST variable array:
     <?= print_r($_REQUEST); ?>
     </pre>
     </body>
-    </html>
+    </html>s
     <?php
 });
 if ($test->isCli()) {

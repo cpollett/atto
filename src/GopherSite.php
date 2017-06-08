@@ -567,7 +567,7 @@ class GopherSite
         $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+',
             'g','I','T', 'h', 'i', 's'];
         foreach ($lines as $line) {
-            $first = $line[0];
+            $first = (empty($line)) ? "\0" : $line[0];
             if (!in_array($first, $line_starts) ||
                 strpos($line, "\x09") === false) {
                 $out .= "i" . $line .

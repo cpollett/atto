@@ -32,7 +32,7 @@ Usage
 
 ```php
 <?php
-require 'atto_server_path/src/Website.php'; //this line need to be changed
+require 'atto_server_path/src/Website.php'; //this line needs to be changed
 
 use seekquarry\atto\Website;
 

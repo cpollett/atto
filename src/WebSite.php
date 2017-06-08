@@ -326,9 +326,9 @@ class WebSite
      * current WebSite object under paths matching $route.
      *
      * @param string $route request pattern to match
-     * @param Website $subsite Website object to add sub routes from
+     * @param WebSite $subsite WebSite object to add sub routes from
      */
-    public function subsite($route, Website $subsite)
+    public function subsite($route, WebSite $subsite)
     {
         foreach ($this->http_methods as $method) {
             foreach ($subsite->routes[$method] as $sub_route => $callback) {
@@ -596,21 +596,36 @@ class WebSite
      * In non-CLI mode this method maps directly to PHP's built-in function
      * file_get_contents(). In CLI mode, it checks if the file exists in
      * its Marker Algorithm based RAM cache (Fiat et al 1991). If so, it
-     * directly returns it. Otherwise, it reads it in usingthe blocking I/O
+     * directly returns it. Otherwise, it reads it in using blocking I/O
      * file_get_contents() and caches it before return its string contents.
+     * Note this function assumes that only the web server is performing I/O
+     * with this file. filemtime() can be used to see if a file on disk has been
+     * changed and then you can use $force_read = true below to force re-
+     * reading the file into the cache
      *
      * @param string $filename name of file to get contents of
+     * @param bool $force_read whether to force the file to be read from
+     *      presistent storage rather than the cache
      * @return string contents of the file given by $filename
      */
-    public function fileGetContents($filename)
+    public function fileGetContents($filename, $force_read = false)
     {
         if ($this->isCli()) {
             $path = realpath($filename);
             if (isset($this->file_cache['MARKED'][$path])) {
+                if ($force_read) {
+                    $this->file_cache['MARKED'][$path] =
+                        file_get_contents($path);
+                }
                 return $this->file_cache['MARKED'][$path];
             } else if (isset($this->file_cache['UNMARKED'][$path])) {
-                $this->file_cache['MARKED'][$path] =
-                    $this->file_cache['UNMARKED'][$path];
+                if ($force_read) {
+                    $this->file_cache['MARKED'][$path] =
+                        file_get_contents($path);
+                } else {
+                    $this->file_cache['MARKED'][$path] =
+                        $this->file_cache['UNMARKED'][$path];
+                }
                 unset($this->file_cache['UNMARKED'][$path]);
                 return $this->file_cache['MARKED'][$path];
             }
@@ -758,7 +773,7 @@ class WebSite
     public function setTimer($time, callable $callback, $repeating = true)
     {
         if (!$this->isCli()) {
-            throw new \Exception("Atto Website Timers require CLI execution");
+            throw new \Exception("Atto WebSite Timers require CLI execution");
         }
         $next_time = microtime(true) + $time;
         $this->timers[$next_time] = [$repeating, $time, $callback];
@@ -776,7 +791,7 @@ class WebSite
     }
     /**
      * Starts an Atto Web Server listening at $address using the configuration
-     * values provided. It also has this server's event loo. As web requests
+     * values provided. It also has this server's event loop. As web requests
      * come in $this->process is called to handle them. This input and output
      * tcp streams used by this method are non-blocking. Detecting traffic is
      * done using stream_select().  This maps to Unix-select calls, which
@@ -1198,7 +1213,7 @@ class WebSite
      * $_POST, and $_FILES superglobals set up.
      *
      * @param array $context associative array of information parsed from
-     *      a web request. Tthe content portion of the request is not yet
+     *      a web request. The content portion of the request is not yet
      *      parsed but headers are, each with a prefix field HTTP_ followed
      *      by name of the header. For example the value of a header with name
      *      Cookie should be in $context['HTTP_COOKIE']. The Content-Type

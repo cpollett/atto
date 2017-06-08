@@ -1,0 +1,4 @@
+I am Chris Pollett, a professor at San Jose University. 
+I created the GopherSite to make it easier
+for people to create Gopher based sites using PHP.
+

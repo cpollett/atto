@@ -1,7 +1,7 @@
 <?php
-require '../../src/Website.php';
+require '../../src/WebSite.php';
 
-use seekquarry\atto\Website;
+use seekquarry\atto\WebSite;
 
 exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();

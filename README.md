@@ -1,23 +1,26 @@
-Atto Web Server
+Atto Servers
 ===============
-Atto is a single file, low dependency, pure PHP web server and web routing
-engine.
+Atto is a collection of single file, low dependency, pure PHP servers and
+routing engines. Currently, Atto has two server classes: WebSite, a pure PHP
+web server and web routing engine and GopherSite, a pure PHP [gopher](
+https://en.wikipedia.org/wiki/Gopher_%28protocol%29) server 
+and gopher routing engine.
 
- * Atto can be used to route requests, and hence, serve as a micro
- framework for use under a traditional web server such as Apache, nginx,
+ * Atto Servers can be used to route requests, and hence, serve as a micro
+ framework for use under a traditional servers such as Apache, nginx,
  or lighttpd. 
  
- * Atto can be used as a standalone web server for apps 
+ * Atto can be used as a standalone server for apps 
  created using its routing facility. 
  
- * Atto is web request event-driven, supporting
+ * Atto is request event-driven, supporting
  asynchronous I/O for web traffic.
  
- * Unlike similar PHP software, as a Web Server, it instantiates traditional
- PHP superglobals like $_GET, $_POST, $_REQUEST, $_COOKIE, $_SESSION,
+ * Unlike similar PHP software, as a Web or Gopher Server, it instantiates
+traditional PHP superglobals like $_GET, $_POST, $_REQUEST, $_COOKIE, $_SESSION,
  $_FILES, etc and endeavors to make it easy to code apps in a rapid PHP style.
  
-As a standalone Web Server:
+As a standalone Server:
 
  * Atto supports timers for background events.
  * Atto handles sessions in RAM.
@@ -87,26 +90,28 @@ require 'atto_server_path/src/Website.php';  //this line need to be changed
 
 use seekquarry\atto\Website;
 ```
-to the top of your project file. If you don't have the ``use`` line, then to
+to the top of your project file. (GopherSite should be used if you want a
+[gopher](https://en.wikipedia.org/wiki/Gopher_%28protocol%29) server) If you 
+don't have the ``use`` line, then to
 refer to the Website class you would need to add the whole namespace path.
 For example,
 ```php
 $test = new seekquarry\atto\Website();
 ```
 
-If you use composer, you can require Atto Server using the command:
+If you use composer, you can require Atto Servers using the command:
 ```
 composer require seekquarry/atto
 ```
 You should then do ``composer install`` or ``composer update``.
 Requiring ``"vendor/autoload.php"`` should then suffice to allow 
-Atto Server to be autoloaded as needed by your code.
+Atto Servers to be autoloaded as needed by your code.
 
 More Examples
 -------------
 
 The examples folder of this project has a sequence of examples illustrating 
-the main features of the Atto Server.
+the main features of the Atto Servers.
 
 Out of paranoia, at the start of each of these examples, there is an ``exit();``
 call. This line should be removed or commented to try the example.

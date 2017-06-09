@@ -688,9 +688,20 @@ class GopherSite
                     continue;
                 }
                 $len = strlen($this->in_streams[self::DATA][$key]);
-                $data = stream_get_contents($in_stream,
-                   $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
-                if ($this->parseRequest($key, $data)) {
+                $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
+                $too_long = $len >= $max_len;
+                if (!$too_long) {
+                    $data = stream_get_contents($in_stream,
+                       $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
+                } else {
+                    $data = "";
+                    $this->in_streams[self::CONTEXT][$key]["REQUEST_METHOD"] =
+                        "ERROR";
+                    $this->in_streams[self::CONTEXT][$key]["REQUEST_URI"] =
+                        "/request_too_long";
+                    $this->setGlobals($this->in_streams[self::CONTEXT][$key]);
+                }
+                if ($too_long || $this->parseRequest($key, $data)) {
                     ob_start();
                     $this->process();
                     $out_data = ob_get_clean();
@@ -713,7 +724,7 @@ class GopherSite
      * an initial stream context. This context is used to populate the $_SERVER
      * variable when the request is later processed.
      *
-     * @param int key id of request stream to initialize context for 
+     * @param int key id of request stream to initialize context for
      */
     protected function initRequestStream($key)
     {

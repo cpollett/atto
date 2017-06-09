@@ -1000,9 +1000,22 @@ class WebSite
                     continue;
                 }
                 $len = strlen($this->in_streams[self::DATA][$key]);
-                $data = stream_get_contents($in_stream,
-                   $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
-                if ($this->parseRequest($key, $data)) {
+                $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
+                $too_long = $len >= $max_len;
+                if (!$too_long) {
+                    $data = stream_get_contents($in_stream,
+                       $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
+                } else {
+                    $data = "";
+                    $this->in_streams[self::CONTEXT][$key]["REQUEST_METHOD"] =
+                        "ERROR";
+                    $this->in_streams[self::CONTEXT][$key]["REQUEST_URI"] =
+                        "/400";
+                    $this->in_streams[self::CONTEXT][$key]['SERVER_PROTOCOL'] =
+                        'HTTP/1.0';
+                    $this->setGlobals($this->in_streams[self::CONTEXT][$key]);
+                }
+                if ($too_long || $this->parseRequest($key, $data)) {
                     $this->header_data = "";
                     $this->current_session = "";
                     $_SESSION = [];
@@ -1045,7 +1058,7 @@ class WebSite
      * an initial stream context. This context is used to populate the $_SERVER
      * variable when the request is later processed.
      *
-     * @param int key id of request stream to initialize context for 
+     * @param int key id of request stream to initialize context for
      */
     protected function initRequestStream($key)
     {
@@ -1228,7 +1241,8 @@ class WebSite
         $_SERVER = array_merge($this->default_server_globals, $context);
         parse_str($context['QUERY_STRING'], $_GET);
         $_POST = [];
-        if (!empty($context['CONTENT_TYPE']) && 
+        if (!empty($context['CONTENT']) &&
+            !empty($context['CONTENT_TYPE']) &&
             strpos($context['CONTENT_TYPE'], "multipart/form-data") !== false) {
             preg_match('/boundary=(.*)/', $context['CONTENT_TYPE'], $matches);
             $boundary = $matches[1];

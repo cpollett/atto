@@ -695,17 +695,22 @@ class GopherSite
                        $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
                 } else {
                     $data = "";
-                    $this->in_streams[self::CONTEXT][$key]["REQUEST_METHOD"] =
-                        "ERROR";
-                    $this->in_streams[self::CONTEXT][$key]["REQUEST_URI"] =
-                        "/request_too_long";
-                    $this->setGlobals($this->in_streams[self::CONTEXT][$key]);
+                    $this->initializeBadRequestResponse($key);
                 }
                 if ($too_long || $this->parseRequest($key, $data)) {
+                    if (!empty($this->in_streams[self::CONTEXT][$key][
+                        'PRE_BAD_RESPONSE'])) {
+                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
+                            true;
+                        $_SERVER['BAD_RESPONSE'] = true;
+                    }
                     ob_start();
                     $this->process();
                     $out_data = ob_get_clean();
-                    $this->initRequestStream($key);
+                    if (empty($this->in_streams[self::CONTEXT][$key][
+                        'BAD_RESPONSE'])) {
+                        $this->initRequestStream($key);
+                    }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
                         $this->out_streams[self::CONNECTION][$key] =
                             $in_stream;
@@ -771,7 +776,9 @@ class GopherSite
             }
             if ($remaining_bytes == 0) {
                 $context = $this->out_streams[self::CONTEXT][$key];
-                $this->shutdownGopherStream($key);
+                if (empty($context["PRE_BAD_RESPONSE"])) {
+                    $this->shutdownGopherStream($key);
+                }
             }
         }
     }
@@ -871,7 +878,8 @@ class GopherSite
         $_REQUEST = [];
         $_SERVER = array_merge($this->default_server_globals,
             $this->in_streams[self::CONTEXT][$key],
-            ['REQUEST_METHOD' => 'ERROR', 'REQUEST_URI' => '/400']);
+            ['REQUEST_METHOD' => 'ERROR', 'REQUEST_URI' => '/400',
+             'PRE_BAD_RESPONSE' => true]);
     }
     /**
      * Used to close connections and remove from stream arrays streams that

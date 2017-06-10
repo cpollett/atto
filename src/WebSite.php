@@ -818,7 +818,8 @@ class WebSite
             "GATEWAY_INTERFACE" => "CGI/1.1", "PATH" => $path,
             "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
-            "MAX_REQUEST_LEN" => 10000000, "MAX_CACHE_FILESIZE" => 1000000,
+            "MAX_IO_LEN" => 128 * 1024, "MAX_REQUEST_LEN" => 10000000,
+            "MAX_CACHE_FILESIZE" => 1000000,
             "MAX_CACHE_FILES" => 100, "CONNECTION_TIMEOUT" => 20,
             "CULL_OLD_SESSION_NUM" => 5
         ];
@@ -984,7 +985,7 @@ class WebSite
                 if ($connection) {
                     if ($this->is_secure) {
                         stream_set_blocking($connection, 1);
-                        stream_socket_enable_crypto($connection, true, 
+                        stream_socket_enable_crypto($connection, true,
                             STREAM_CRYPTO_METHOD_TLS_SERVER);
                         stream_set_blocking($connection, 0);
                     }
@@ -1002,20 +1003,25 @@ class WebSite
                 $len = strlen($this->in_streams[self::DATA][$key]);
                 $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
                 $too_long = $len >= $max_len;
+                if (!empty($this->in_streams[self::CONTEXT][$key][
+                    'BAD_RESPONSE'])) {
+                    continue;
+                }
                 if (!$too_long) {
-                    $data = stream_get_contents($in_stream,
-                       $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
+                    $data = stream_get_contents($in_stream, min(
+                       $this->default_server_globals['MAX_IO_LEN'],
+                       $this->default_server_globals['MAX_REQUEST_LEN'] - $len
+                        ));
                 } else {
                     $data = "";
-                    $this->in_streams[self::CONTEXT][$key]["REQUEST_METHOD"] =
-                        "ERROR";
-                    $this->in_streams[self::CONTEXT][$key]["REQUEST_URI"] =
-                        "/400";
-                    $this->in_streams[self::CONTEXT][$key]['SERVER_PROTOCOL'] =
-                        'HTTP/1.0';
-                    $this->setGlobals($this->in_streams[self::CONTEXT][$key]);
+                    $this->initializeBadRequestResponse($key);
                 }
                 if ($too_long || $this->parseRequest($key, $data)) {
+                    if (!empty($this->in_streams[self::CONTEXT][$key][
+                        'PRE_BAD_RESPONSE'])) {
+                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
+                            true;
+                    }
                     $this->header_data = "";
                     $this->current_session = "";
                     $_SESSION = [];
@@ -1039,7 +1045,10 @@ class WebSite
                     $out_data = $this->header_data .
                             "Content-Length: ". strlen($out_data) .
                             "\x0D\x0A\x0D\x0A" .  $out_data;
-                    $this->initRequestStream($key);
+                    if (empty($this->in_streams[self::CONTEXT][$key][
+                        'BAD_RESPONSE'])) {
+                        $this->initRequestStream($key);
+                    }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
                         $this->out_streams[self::CONNECTION][$key] =
                             $in_stream;
@@ -1111,7 +1120,9 @@ class WebSite
                     strtolower($context['HTTP_CONNECTION']) == 'close') ||
                     empty($context['SERVER_PROTOCOL']) ||
                     $context['SERVER_PROTOCOL'] == 'HTTP/1.0') {
-                    $this->shutdownHttpStream($key);
+                    if (empty($context["PRE_BAD_RESPONSE"])) {
+                        $this->shutdownHttpStream($key);
+                    }
                 } else {
                     $this->shutdownHttpWriteStream($key);
                 }
@@ -1206,6 +1217,11 @@ class WebSite
             if (empty($context['CONTENT_LENGTH'])) {
                 $context['CONTENT'] = "";
                 $this->setGlobals($context);
+                return true;
+            } else if ($context['CONTENT_LENGTH'] >
+                $this->default_server_globals['MAX_REQUEST_LEN'] -
+                $end_head_pos) {
+                $this->initializeBadRequestResponse($key);
                 return true;
             }
         }
@@ -1346,7 +1362,8 @@ class WebSite
         $_SERVER = array_merge($this->default_server_globals,
             $this->in_streams[self::CONTEXT][$key],
             ['REQUEST_METHOD' => 'ERROR', 'REQUEST_URI' => '/400',
-             'SERVER_PROTOCOL' => 'HTTP/1.0']);
+             'SERVER_PROTOCOL' => 'HTTP/1.0',
+             'PRE_BAD_RESPONSE' => true]);
     }
     /**
      * Used to close connections and remove from stream arrays streams that

@@ -95,7 +95,7 @@ class GopherSite
      * Sets up a callback function to be called when a ERROR command is
      * made for $route is made to this gopher app.
      *
-     * ERROR commands is a pseudo-HTTP method event which can be generated
+     * ERROR commands is a pseudo-gopher event which can be generated
      * whenever a server or request error is detected. For example, if a file
      * wasn't found under some path, the handler for that path might
      * call $this->trigger('ERROR', /404); to call the handler for 404 NOT
@@ -113,7 +113,8 @@ class GopherSite
      *
      * @param callable $callback function to call if ERROR request for $route
      *      made.
-     * @param bool $raw
+     * @param bool $raw whether to gopherize the callback's output before
+     *      sending it to the client
      */
     public function error($route, callable $callback, $raw = false)
     {
@@ -135,7 +136,8 @@ class GopherSite
      *
      * @param callable $callback function to call if REQUEST for $route
      *      made.
-     * @param bool $raw
+     * @param bool $raw whether to gopherize the callback's output before
+     *      sending it to the client
      */
     public function request($route, callable $callback, $raw = false)
     {
@@ -162,12 +164,14 @@ class GopherSite
      * when a Gopher request using $method method and with a uri matching
      * $route occurs.
      *
-     * @param string $method the name of a gopher request method: either
-     *  REQUEST or ERRORGopherSite.
+     * @param string $method the kind of a gopher request: either
+     *  REQUEST (when a selector is requested) or ERROR (any error in
+     *  client request).
      * @param string $route request pattern to match
      * @param callable $callback function to be called if the incoming request
      *      matches with $method and $route
-     * @param bool $raw
+     * @param bool $raw whether to gopherize the callback's output before
+     *      sending it to the client
      */
     public function addRoute($method, $route, callable $callback, $raw = false)
     {
@@ -196,7 +200,7 @@ class GopherSite
         $this->middle_wares[] = $callback;
     }
     /**
-     * Cause all the current HTTP request to be processed according to the
+     * Cause all the current Gopher request to be processed according to the
      * middleware callbacks and routes currently set on this GopherSite object.
      */
     public function process()
@@ -239,6 +243,7 @@ class GopherSite
      *
      * @param string $method the name of a gopher method, REQUEST or ERROR
      * @param string $route  request pattern to match
+     * @return bool whether the $route was handled by any callback
      */
     public function trigger($method, $route)
     {
@@ -280,15 +285,13 @@ class GopherSite
     }
     /**
      * Reads in the file $filename and returns its contents as a string.
-     * In non-CLI mode this method maps directly to PHP's built-in function
-     * file_get_contents(). In CLI mode, it checks if the file exists in
-     * its Marker Algorithm based RAM cache (Fiat et al 1991). If so, it
-     * directly returns it. Otherwise, it reads it in using blocking I/O
-     * file_get_contents() and caches it before return its string contents.
-     * Note this function assumes that only the gopher server is performing I/O
-     * with this file. filemtime() can be used to see if a file on disk has been
-     * changed and then you can use $force_read = true below to force re-
-     * reading the file into the cache
+     * It checks if the file exists in its Marker Algorithm based RAM cache
+     * (Fiat et al 1991). If so, it directly returns it. Otherwise, it reads
+     * it in using blocking I/O file_get_contents() and caches it before return
+     * its string contents. Note this function assumes that only the gopher
+     * server is performing I/O with this file. filemtime() can be used to see
+     * if a file on disk has been changed and then you can use
+     * $force_read = true below to force re-reading the file into the cache
      *
      * @param string $filename name of file to get contents of
      * @param bool $force_read whether to force the file to be read from
@@ -472,13 +475,13 @@ class GopherSite
     {
         $path = (!empty($_SERVER['PATH'])) ? $_SERVER['PATH'] :
             ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
-        $default_server_globals = [ "DOCUMENT_ROOT" => getcwd(),
-            "PATH" => $path,
-            "INFORMATION_EOL" => "\tfake\tnull\t0\x0A\x0D",
+        $default_server_globals = [ "CONNECTION_TIMEOUT" => 20,
+            "DOCUMENT_ROOT" => getcwd(),
+            "INFORMATION_EOL" => "\tfake\tnull\t0\x0D\x0A",
+            "MAX_REQUEST_LEN" => 1000, "MAX_CACHE_FILESIZE" => 1000000,
+            "MAX_CACHE_FILES" => 100, "PATH" => $path,
             "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO GOPHER SERVER",
-            "MAX_REQUEST_LEN" => 10000000, "MAX_CACHE_FILESIZE" => 1000000,
-            "MAX_CACHE_FILES" => 100, "CONNECTION_TIMEOUT" => 20
         ];
         if (is_int($address) && $address >= 0 && $address < 65535) {
             /*
@@ -576,7 +579,7 @@ class GopherSite
                 $out .= rtrim($line, "\x0A") . "\xA\x0D";
             }
         }
-        return $out . ".\x0A\x0D";
+        return $out . ".\x0D\x0A";
     }
     /**
      * Checks if a portion of a request uri path matches a Atto server route.
@@ -655,73 +658,82 @@ class GopherSite
     {
         foreach ($in_streams_with_data as $in_stream) {
             if ($in_stream == $server) {
-                if ($this->is_secure) {
-                    stream_set_blocking($server, 1);
+                $this->processServerRequest($server);
+                return;
+            }
+            $meta = stream_get_meta_data($in_stream);
+            $key = (int)$in_stream;
+            if ($meta['eof']) {
+                $this->shutdownGopherStream($key);
+                continue;
+            }
+            $len = strlen($this->in_streams[self::DATA][$key]);
+            $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
+            $too_long = $len >= $max_len;
+            if (!$too_long) {
+                $data = stream_get_contents($in_stream, $max_len - $len);
+            } else {
+                $data = "";
+                $this->initializeBadRequestResponse($key);
+            }
+            if ($too_long || $this->parseRequest($key, $data)) {
+                if (!empty($this->in_streams[self::CONTEXT][$key][
+                    'PRE_BAD_RESPONSE'])) {
+                    $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
+                        true;
+                    $_SERVER['BAD_RESPONSE'] = true;
                 }
-                if ($this->timer_alarms->isEmpty()) {
-                    $timeout = ini_get("default_socket_timeout");
-                } else {
-                    $next_alarm = $this->timer_alarms->top();
-                    $timeout = max(min( $next_alarm[0] - microtime(true),
-                        ini_get("default_socket_timeout")), 0);
-                }
-                $connection = stream_socket_accept($server, $timeout);
-                if ($this->is_secure) {
-                    stream_set_blocking($server, 0);
-                }
-                if ($connection) {
-                    if ($this->is_secure) {
-                        stream_set_blocking($connection, 1);
-                        stream_socket_enable_crypto($connection, true, 
-                            STREAM_CRYPTO_METHOD_TLS_SERVER);
-                        stream_set_blocking($connection, 0);
-                    }
-                    $key = (int)$connection;
-                    $this->in_streams[self::CONNECTION][$key] = $connection;
+                ob_start();
+                $this->process();
+                $out_data = ob_get_clean();
+                if (empty($this->in_streams[self::CONTEXT][$key][
+                    'BAD_RESPONSE'])) {
                     $this->initRequestStream($key);
                 }
-            } else {
-                $meta = stream_get_meta_data($in_stream);
-                $key = (int)$in_stream;
-                if ($meta['eof']) {
-                    $this->shutdownGopherStream($key);
-                    continue;
+                if (empty($this->out_streams[self::CONNECTION][$key])) {
+                    $this->out_streams[self::CONNECTION][$key] = $in_stream;
+                    $this->out_streams[self::DATA][$key] = $out_data;
+                    $this->out_streams[self::CONTEXT][$key] = $_SERVER;
+                    $this->out_streams[self::MODIFIED_TIME][$key] = time();
                 }
-                $len = strlen($this->in_streams[self::DATA][$key]);
-                $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
-                $too_long = $len >= $max_len;
-                if (!$too_long) {
-                    $data = stream_get_contents($in_stream,
-                       $this->default_server_globals['MAX_REQUEST_LEN'] - $len);
-                } else {
-                    $data = "";
-                    $this->initializeBadRequestResponse($key);
-                }
-                if ($too_long || $this->parseRequest($key, $data)) {
-                    if (!empty($this->in_streams[self::CONTEXT][$key][
-                        'PRE_BAD_RESPONSE'])) {
-                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
-                            true;
-                        $_SERVER['BAD_RESPONSE'] = true;
-                    }
-                    ob_start();
-                    $this->process();
-                    $out_data = ob_get_clean();
-                    if (empty($this->in_streams[self::CONTEXT][$key][
-                        'BAD_RESPONSE'])) {
-                        $this->initRequestStream($key);
-                    }
-                    if (empty($this->out_streams[self::CONNECTION][$key])) {
-                        $this->out_streams[self::CONNECTION][$key] =
-                            $in_stream;
-                        $this->out_streams[self::DATA][$key] = $out_data;
-                        $this->out_streams[self::CONTEXT][$key] =
-                            $_SERVER;
-                        $this->out_streams[self::MODIFIED_TIME][$key] = time();
-                    }
-                }
-                $this->in_streams[self::MODIFIED_TIME][$key] = time();
             }
+            $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        }
+    }
+    /**
+     * Used to process any timers for GopherSite and
+     * used to check if the server has detected a
+     * new connection. In which case, a read stream is set-up.
+     *
+     * @param resource $server socket server used to listen for incoming
+     *  connections
+     */
+    protected function processServerRequest($server)
+    {
+        if ($this->timer_alarms->isEmpty()) {
+            $timeout = ini_get("default_socket_timeout");
+        } else {
+            $next_alarm = $this->timer_alarms->top();
+            $timeout = max(min( $next_alarm[0] - microtime(true),
+                ini_get("default_socket_timeout")), 0);
+        }
+        if ($this->is_secure) {
+            stream_set_blocking($server, 1);
+        }
+        $connection = stream_socket_accept($server, $timeout);
+        if ($this->is_secure) {
+            stream_set_blocking($server, 0);
+        }
+        if ($connection) {
+            if ($this->is_secure) {
+                stream_set_blocking($connection, 1);
+                stream_socket_enable_crypto($connection, true,
+                    STREAM_CRYPTO_METHOD_TLS_SERVER);
+                stream_set_blocking($connection, 0);
+            }
+            $key = (int)$connection;
+            $this->in_streams[self::CONNECTION][$key] = $connection;
+            $this->initRequestStream($key);
         }
     }
     /**
@@ -785,7 +797,7 @@ class GopherSite
     /**
      * Takes the string $data recently read from the request stream with
      * id $key, tacks that on to the previous received data. If this completes
-     * an HTTP request then the request headers and request are parsed
+     * an Gopher request then the request headers and request are parsed
      *
      * @param int $key id of request stream to process data for
      * @param string $data from request stream
@@ -796,10 +808,6 @@ class GopherSite
         $this->in_streams[self::DATA][$key] .= $data;
         $context = $this->in_streams[self::CONTEXT][$key];
         $data = $this->in_streams[self::DATA][$key];
-        if (strlen($data) > 1000) {
-            $this->initializeBadRequestResponse($key);
-            return true;
-        }
         $eol = "\x0D\x0A"; /*
             spec says use CRLF, but hard to type as human on Mac or Linux
             so relax spec for inputs. (Follow spec exactly for output)
@@ -810,7 +818,7 @@ class GopherSite
         if (($request_pos = strpos($data, "$eol")) === false) {
             $eol = \PHP_EOL;
             $request_pos = strpos($data, "$eol");
-            if ($request_pos_pos === false) {
+            if ($request_pos === false) {
                 $this->initializeBadRequestResponse($key);
                 return true;
             }
@@ -853,10 +861,10 @@ class GopherSite
         $_REQUEST = $_GET;
     }
     /**
-     * Outputs HTTP error response message in the case that no specific error
+     * Outputs Gopher error response message in the case that no specific error
      * handler was set
      *
-     * @param string $route the route of the error. Internally, when an HTTP
+     * @param string $route the route of the error. Internally, when an Gopher
      *      error occurs it is usually given a route of the form /response code.
      *      For example, /404 for a NOT FOUND error.
      */
@@ -929,7 +937,7 @@ class GopherSite
         );
     }
     /**
-     * Removes a stream from outstream arrays. Since an HTTP connection can
+     * Removes a stream from outstream arrays. Since an Gopher connection can
      * handle several requests from a single client, this method does not close
      * the connection. It might be run after a request response pair, while 
      * waiting for the next request.

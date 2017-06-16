@@ -86,7 +86,7 @@ To install the software one should have PHP installed. One can then
 
 To use Atto Server in your project, add the lines:
 ```php
-require 'atto_server_path/src/Website.php';  //this line need to be changed
+require 'atto_server_path/src/Website.php';  //this line needs to be changed
 
 use seekquarry\atto\Website;
 ```

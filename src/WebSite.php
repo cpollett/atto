@@ -417,6 +417,7 @@ class WebSite
      *
      * @param string $method the name of a web request method for example, "GET"
      * @param string $route  request pattern to match
+     * @return bool whether the $route was handled by any callback
      */
     public function trigger($method, $route)
     {
@@ -814,14 +815,13 @@ class WebSite
     {
         $path = (!empty($_SERVER['PATH'])) ? $_SERVER['PATH'] :
             ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
-        $default_server_globals = [ "DOCUMENT_ROOT" => getcwd(),
-            "GATEWAY_INTERFACE" => "CGI/1.1", "PATH" => $path,
+        $default_server_globals = ["CONNECTION_TIMEOUT" => 20,
+            "CULL_OLD_SESSION_NUM" => 5, "DOCUMENT_ROOT" => getcwd(),
+            "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 1000000,
+            "MAX_CACHE_FILES" => 100,  "MAX_IO_LEN" => 128 * 1024,
+            "MAX_REQUEST_LEN" => 10000000, "PATH" => $path,
             "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
-            "MAX_IO_LEN" => 128 * 1024, "MAX_REQUEST_LEN" => 10000000,
-            "MAX_CACHE_FILESIZE" => 1000000,
-            "MAX_CACHE_FILES" => 100, "CONNECTION_TIMEOUT" => 20,
-            "CULL_OLD_SESSION_NUM" => 5
         ];
         if (is_int($address) && $address >= 0 && $address < 65535) {
             /*
@@ -968,98 +968,106 @@ class WebSite
     {
         foreach ($in_streams_with_data as $in_stream) {
             if ($in_stream == $server) {
-                if ($this->is_secure) {
-                    stream_set_blocking($server, 1);
+                $this->processServerRequest($server);
+                return;
+            }
+            $meta = stream_get_meta_data($in_stream);
+            $key = (int)$in_stream;
+            if ($meta['eof']) {
+                $this->shutdownHttpStream($key);
+                continue;
+            }
+            $len = strlen($this->in_streams[self::DATA][$key]);
+            $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
+            $too_long = $len >= $max_len;
+            if (!empty($this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])){
+                continue;
+            }
+            if (!$too_long) {
+                $data = stream_get_contents($in_stream, min(
+                    $this->default_server_globals['MAX_IO_LEN'],
+                    $max_len - $len));
+            } else {
+                $data = "";
+                $this->initializeBadRequestResponse($key);
+            }
+            if ($too_long || $this->parseRequest($key, $data)) {
+                if (!empty($this->in_streams[self::CONTEXT][$key][
+                    'PRE_BAD_RESPONSE'])) {
+                    $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
+                        true;
                 }
-                if ($this->timer_alarms->isEmpty()) {
-                    $timeout = ini_get("default_socket_timeout");
-                } else {
-                    $next_alarm = $this->timer_alarms->top();
-                    $timeout = max(min( $next_alarm[0] - microtime(true),
-                        ini_get("default_socket_timeout")), 0);
+                $this->header_data = "";
+                $this->current_session = "";
+                $_SESSION = [];
+                $this->content_type = false;
+                ob_start();
+                $this->process();
+                $out_data = ob_get_contents();
+                ob_end_clean();
+                if ($this->current_session != "" &&
+                    !empty($_COOKIE[$this->current_session])) {
+                    $session_id = $_COOKIE[$this->current_session];
+                    $this->sessions[$session_id]['DATA'] = $_SESSION;
                 }
-                $connection = stream_socket_accept($server, $timeout);
-                if ($this->is_secure) {
-                    stream_set_blocking($server, 0);
+                if (substr($this->header_data, 0, 5) != "HTTP/") {
+                    $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                        " 200 OK\x0D\x0A". $this->header_data;
                 }
-                if ($connection) {
-                    if ($this->is_secure) {
-                        stream_set_blocking($connection, 1);
-                        stream_socket_enable_crypto($connection, true,
-                            STREAM_CRYPTO_METHOD_TLS_SERVER);
-                        stream_set_blocking($connection, 0);
-                    }
-                    $key = (int)$connection;
-                    $this->in_streams[self::CONNECTION][$key] = $connection;
+                if (!$this->content_type) {
+                    $this->header_data .= "Content-Type: text/html\x0D\x0A";
+                }
+                $out_data = $this->header_data .
+                        "Content-Length: ". strlen($out_data) .
+                        "\x0D\x0A\x0D\x0A" .  $out_data;
+                if (empty($this->in_streams[self::CONTEXT][$key][
+                    'BAD_RESPONSE'])) {
                     $this->initRequestStream($key);
                 }
-            } else {
-                $meta = stream_get_meta_data($in_stream);
-                $key = (int)$in_stream;
-                if ($meta['eof']) {
-                    $this->shutdownHttpStream($key);
-                    continue;
+                if (empty($this->out_streams[self::CONNECTION][$key])) {
+                    $this->out_streams[self::CONNECTION][$key] = $in_stream;
+                    $this->out_streams[self::DATA][$key] = $out_data;
+                    $this->out_streams[self::CONTEXT][$key] = $_SERVER;
+                    $this->out_streams[self::MODIFIED_TIME][$key] = time();
                 }
-                $len = strlen($this->in_streams[self::DATA][$key]);
-                $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
-                $too_long = $len >= $max_len;
-                if (!empty($this->in_streams[self::CONTEXT][$key][
-                    'BAD_RESPONSE'])) {
-                    continue;
-                }
-                if (!$too_long) {
-                    $data = stream_get_contents($in_stream, min(
-                       $this->default_server_globals['MAX_IO_LEN'],
-                       $this->default_server_globals['MAX_REQUEST_LEN'] - $len
-                        ));
-                } else {
-                    $data = "";
-                    $this->initializeBadRequestResponse($key);
-                }
-                if ($too_long || $this->parseRequest($key, $data)) {
-                    if (!empty($this->in_streams[self::CONTEXT][$key][
-                        'PRE_BAD_RESPONSE'])) {
-                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
-                            true;
-                    }
-                    $this->header_data = "";
-                    $this->current_session = "";
-                    $_SESSION = [];
-                    $this->content_type = false;
-                    ob_start();
-                    $this->process();
-                    $out_data = ob_get_contents();
-                    ob_end_clean();
-                    if ($this->current_session != "" &&
-                        !empty($_COOKIE[$this->current_session])) {
-                        $session_id = $_COOKIE[$this->current_session];
-                        $this->sessions[$session_id]['DATA'] = $_SESSION;
-                    }
-                    if (substr($this->header_data, 0, 5) != "HTTP/") {
-                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                            " 200 OK\x0D\x0A". $this->header_data;
-                    }
-                    if (!$this->content_type) {
-                        $this->header_data .= "Content-Type: text/html\x0D\x0A";
-                    }
-                    $out_data = $this->header_data .
-                            "Content-Length: ". strlen($out_data) .
-                            "\x0D\x0A\x0D\x0A" .  $out_data;
-                    if (empty($this->in_streams[self::CONTEXT][$key][
-                        'BAD_RESPONSE'])) {
-                        $this->initRequestStream($key);
-                    }
-                    if (empty($this->out_streams[self::CONNECTION][$key])) {
-                        $this->out_streams[self::CONNECTION][$key] =
-                            $in_stream;
-                        $this->out_streams[self::DATA][$key] = $out_data;
-                        $this->out_streams[self::CONTEXT][$key] =
-                            $_SERVER;
-                        $this->out_streams[self::MODIFIED_TIME][$key] = time();
-                    }
-                }
-                $this->in_streams[self::MODIFIED_TIME][$key] = time();
             }
+            $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        }
+    }
+    /**
+     * Used to process any timers for WebSite and
+     * used to check if the server has detected a
+     * new connection. In which case, a read stream is set-up.
+     *
+     * @param resource $server socket server used to listen for incoming
+     *  connections
+     */
+    protected function processServerRequest($server)
+    {
+        if ($this->timer_alarms->isEmpty()) {
+            $timeout = ini_get("default_socket_timeout");
+        } else {
+            $next_alarm = $this->timer_alarms->top();
+            $timeout = max(min( $next_alarm[0] - microtime(true),
+                ini_get("default_socket_timeout")), 0);
+        }
+        if ($this->is_secure) {
+            stream_set_blocking($server, 1);
+        }
+        $connection = stream_socket_accept($server, $timeout);
+        if ($this->is_secure) {
+            stream_set_blocking($server, 0);
+        }
+        if ($connection) {
+            if ($this->is_secure) {
+                stream_set_blocking($connection, 1);
+                stream_socket_enable_crypto($connection, true,
+                    STREAM_CRYPTO_METHOD_TLS_SERVER);
+                stream_set_blocking($connection, 0);
+            }
+            $key = (int)$connection;
+            $this->in_streams[self::CONNECTION][$key] = $connection;
+            $this->initRequestStream($key);
         }
     }
     /**

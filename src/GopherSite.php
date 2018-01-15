@@ -1,7 +1,7 @@
 <?php
 /**
  * seekquarry\atto\GopherSite -- a small gopher server and routing engine
- * 
+ *
  *
  * Copyright (C) 2017  Chris Pollett chris@pollett.org
  *
@@ -35,10 +35,10 @@ namespace seekquarry\atto;
  * A single file, low dependency, pure PHP gopher server and routing engine
  * class.
  *
- * This software can be used to serve gopher apps. It is request 
- * event-driven, supporting asynchronous I/O for gopher traffic. It also 
+ * This software can be used to serve gopher apps. It is request
+ * event-driven, supporting asynchronous I/O for gopher traffic. It also
  * supports timers for background events. It automatically sets up
- * subperglobals such as $_REQUEST and $_SERVER which cna be useful in
+ * subperglobals such as $_REQUEST and $_SERVER which can be useful in
  * processing requests.
  */
 class GopherSite
@@ -453,11 +453,11 @@ class GopherSite
     /**
      * Starts an Atto Gopher Server listening at $address using the
      * configuration values provided. It also has this server's event loop. As
-     * requests come in $this->process is called to handle them. This input 
+     * requests come in $this->process is called to handle them. This input
      * and output tcp streams used by this method are non-blocking. Detecting
      * traffic is done using stream_select().  This maps to Unix-select calls,
      * which seemed to be the most cross-platform compatible way to do things.
-     * Streaming methods could be easily re-written to support libevent 
+     * Streaming methods could be easily re-written to support libevent
      * (doesn't work yet PHP7) or more modern event library
      *
      * @param int $address address and port to listen for requests on
@@ -519,6 +519,10 @@ class GopherSite
         $server_context = stream_context_create($context);
         $server = stream_socket_server($address, $errno, $errstr,
             STREAM_SERVER_BIND|STREAM_SERVER_LISTEN, $server_context);
+        if (!$server) {
+            echo "Failed to bind address $address\nServer Stopping\n";
+            exit();
+        }
         stream_set_blocking($server, 0);
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $server_globals);
@@ -538,7 +542,7 @@ class GopherSite
                 $next_alarm = $this->timer_alarms->top();
                 $pre_timeout = max(0, microtime(true) - $next_alarm[0]);
                 $timeout = floor($pre_timeout);
-                $micro_timeout = intval(($timeout - floor($pre_timeout)) 
+                $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
             }
             $num_selected = stream_select($in_streams_with_data,
@@ -552,7 +556,7 @@ class GopherSite
         }
     }
     /**
-     * Converts a string with some lines involving gopher links, but all 
+     * Converts a string with some lines involving gopher links, but all
      * other lines not in gopher format. Adds an i at the start of non-gopher
      * lines and adds necessary fake data and tabs as end. Line endings
      * for all lines are stripped and replaced with CRLF.
@@ -646,7 +650,7 @@ class GopherSite
      * new connection, then a stream is set-up. For other streams,
      * request data is processed as it comes in. Once the request is complete,
      * superglobals are set up and process() is used route the request which
-     * is output buffered. When this is complete, an output stream is 
+     * is output buffered. When this is complete, an output stream is
      * instantiated to send this data asynchronously back to the browser.
      *
      * @param resource $server socket server used to listen for incoming
@@ -846,12 +850,12 @@ class GopherSite
         return true;
     }
     /**
-     * Used to initialize the superglobals before process() is called. 
+     * Used to initialize the superglobals before process() is called.
      * The values for the globals come from the
      * request streams context which has request headers.
      *
      * @param array $context associative array of information parsed from
-     *      a gopher request. 
+     *      a gopher request.
      */
     protected function setGlobals($context)
     {
@@ -939,7 +943,7 @@ class GopherSite
     /**
      * Removes a stream from outstream arrays. Since an Gopher connection can
      * handle several requests from a single client, this method does not close
-     * the connection. It might be run after a request response pair, while 
+     * the connection. It might be run after a request response pair, while
      * waiting for the next request.
      *
      * @param int $key id of stream to remove from outstream arrays.
@@ -983,7 +987,7 @@ function link($uri, $link_text)
         $_SERVER['SERVER_PORT'] : 70;
     $port = empty($uri_parts['port']) ? $default_port :
         $uri_parts['port'];
-    if (!empty($uri_parts['scheme']) &&in_array($uri_parts['scheme'], 
+    if (!empty($uri_parts['scheme']) &&in_array($uri_parts['scheme'],
         ['http', 'https'])) {
         $link_type = "h";
         $path = "URL:$uri";
@@ -994,4 +998,24 @@ function link($uri, $link_text)
         "\t" . $port . PHP_EOL;
 }
 
-
+/**
+ * Function to call instead of exit() to indicate that the script
+ * processing the current gopher page is done processing. Use this rather
+ * that exit(), as exit() will also terminate GopherSite.
+ *
+ * @param string $err_msg error message to send on exiting
+ * @throws GopherException
+ */
+function gopherExit($err_msg = "")
+{
+    if (php_sapi_name() == 'cli') {
+        throw new GopherException($err_msg);
+    } else {
+        exit($err_msg);
+    }
+}
+/**
+ * Exception generated when a running WebSite script calls webExit()
+ */
+class GopherException extends \Exception {
+}

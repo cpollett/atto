@@ -1,7 +1,7 @@
 <?php
 /**
  * seekquarry\atto\Website -- a small web server and web routing engine
- * 
+ *
  *
  * Copyright (C) 2017  Chris Pollett chris@pollett.org
  *
@@ -95,17 +95,18 @@ class WebSite
         $this->http_methods = array_keys($this->routes);
         if (empty($base_path)) {
             $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
-            $base_path = $pathinfo['dirname'];
             $base_path = $pathinfo["dirname"];
-            if ($base_path == ".") {
-                $base_path = "";
-            }
+        }
+        if ($base_path == ".") {
+            $base_path = "";
         }
         $this->is_cli = (php_sapi_name() == 'cli');
         if(!empty($_SERVER['HTTPS'])) {
             $this->is_secure = true;
         }
         $this->base_path = $base_path;
+        $this->stop = false;
+        $this->restart = false;
         ini_set('precision', 16);
         $this->timer_alarms = new \SplMinHeap();
     }
@@ -119,16 +120,16 @@ class WebSite
     {
         return $this->is_cli;
     }
-    /*
-
-        HTTP/HTTPS Routing Methods
-
-     */
     /**
-     * Sets up a callback function to be called when a HTTP CONNECT command is
-     * made for $route is made to this web app.
+     * Magic method __call is called whenever an unknown method is called
+     * for this class. In this case, we check if the method name corresponds
+     * to a lower case HTTP command. In which case, we check that the arguments
+     * are a two element array with a route and a callback function and add
+     * the appropriate route to a routing table.
      *
-     * @param string $route request pattern to match CONNECT command against
+     * @param array $route_callback a two element array consisting of a routing
+     *      pattern and a callback function.
+     *      In the route pattern
      *      * acts as a wildcare. {var_name} in a path can be used to set up
      *      a $_GET field for the match.
      *      Example $routes:
@@ -137,189 +138,22 @@ class WebSite
      *      /thread/{thread_num} would match /thread/5 and would set up
      *          a variable $_GET['thread_num'] = 5 as well as
      *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if CONNECT request for $route
-     *      made.
+     *      The second element of the $route_callback should be a callable
+     *      function to be called in the event that the route pattern is matched
      */
-    public function connect($route, callable $callback)
+    public function __call($method, $route_callback)
     {
-        $this->addRoute("CONNECT", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP DELETE command is
-     * made for $route is made to this web app.
-     *
-     * @param string $route request pattern to match DELETE command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if DELETE request for $route
-     *      made.
-     */
-    public function delete($route, callable $callback)
-    {
-        $this->addRoute("DELETE", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a ERROR command is
-     * made for $route is made to this web app.
-     *
-     * ERROR commands is a pseudo-HTTP method event which can be generated
-     * whenever a server or request error is detected. For example, if a file
-     * wasn't found under some path, the handler for that path might
-     * call $this->trigger('ERROR', /404); to call the handler for 404 NOT
-     * FOUND events.
-     *
-     * @param string $route request pattern to match ERROR command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if ERROR request for $route
-     *      made.
-     */
-    public function error($route, callable $callback)
-    {
-        $this->addRoute("ERROR", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP GET command is
-     * made for $route is made to this web app.
-     *
-     * @param string $route request pattern to match GET command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if GET request for $route
-     *      made.
-     */
-    public function get($route, callable $callback)
-    {
-        $this->addRoute("GET", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP HEAD command is
-     * made for $route is made to this web app.
-     *
-     * @param string $route request pattern to match HEAD command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if HEAD request for $route
-     *      made.
-     */
-    public function head($route, callable $callback)
-    {
-        $this->addRoute("HEAD", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP OPTIONS command is
-     * made for $route is made to this web app.
-     *
-     * @param string $route request pattern to match OPTIONS command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if OPTIONS request for $route
-     *      made.
-     */
-    public function options($route, callable $callback)
-    {
-        $this->addRoute("OPTIONS", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP POST command is
-     * made for $route is made to this web app. post'd variables appear in
-     * $_POST superglobal. If a file upload was being done then files uploaded
-     * in the $_FILES superglobal.
-     *
-     * @param string $route request pattern to match OPTIONS command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if POST request for $route
-     *      made.
-     */
-    public function post($route, callable $callback)
-    {
-        $this->addRoute("POST", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP PUT command is
-     * made for $route is made to this web app.
-     *
-     * @param string $route request pattern to match PUT command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if PUT request for $route
-     *      made.
-     */
-    public function put($route, callable $callback)
-    {
-        $this->addRoute("PUT", $route, $callback);
-    }
-    /**
-     * Sets up a callback function to be called when a HTTP TRACE command is
-     * made for $route is made to this web app.
-     *
-     * @param string $route request pattern to match TRACE command against
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *
-     * @param callable $callback function to call if PUT request for $route
-     *      made.
-     */
-    public function trace($route, callable $callback)
-    {
-        $this->addRoute("TRACE", $route, $callback);
+        $num_args = count($route_callback);
+        $route_name = strtoupper($method);
+        if ($num_args < 1 || $num_args > 2 ||
+            !in_array($route_name, $this->http_methods) ||
+            $method != strtolower($method)) {
+            throw new \Error("Call to undefined method \"$method.\"");
+        } else if ($num_args == 1) {
+            array_unshift($route_callback, $route_name);
+        }
+        list($route, $callback) = $route_callback;
+        $this->addRoute($route_name, $route, $callback);
     }
     /**
      * Used to add all the routes and callbacks of a WebSite object to the
@@ -349,9 +183,9 @@ class WebSite
     public function addRoute($method, $route, callable $callback)
     {
         if (!isset($this->routes[$method])) {
-            throw new \Exception("Unknown Router Method");
+            throw new \Error("Unknown Router Method");
         } else if (!is_callable($callback)) {
-            throw new \Exception("Callback not callable");
+            throw new \Error("Callback not callable");
         }
         if (!isset($this->routes[$method])) {
             $this->routes[$method] = [];
@@ -395,12 +229,16 @@ class WebSite
                 strlen($this->base_path),
                 -strlen($_SERVER['QUERY_STRING']) -  1);
         }
+        if ($this->request_script == "") {
+            $this->request_script = "/";
+        }
         if (empty($this->routes[$method])) {
             $method = "ERROR";
             $route = "/404";
         }
         $route = $this->request_script;
-        if (!$this->trigger($method, $route)) {
+        $handled = $this->trigger($method, $route);
+        if (!$handled) {
             $handled =  false;
             if ($method != 'ERROR') {
                 $route = "/404";
@@ -439,8 +277,10 @@ class WebSite
                 $_GET = array_merge($_GET, $add_vars);
                 $_REQUEST = array_merge($_REQUEST, $add_vars);
                 $_SERVER['RECURSION'][] = $method . " ". $check_route;
-                $callback();
                 $handled = true;
+                if ($callback()) {
+                    return true;
+                }
             }
         }
         return $handled;
@@ -463,7 +303,7 @@ class WebSite
                 if (strtolower(substr($this->header_data, 0, 5)) == 'http/') {
                     $header_parts = explode("\x0D\x0A", $this->header_data, 2);
                     $this->header_data = $header . "\x0D\x0A" .
-                        (empty(header_parts[1])? "" : $header_parts[1]);
+                        (empty($header_parts[1])? "" : $header_parts[1]);
                 } else {
                     $this->header_data = $header . "\x0D\x0A" .
                         $this->header_data;
@@ -572,14 +412,14 @@ class WebSite
             $first_time = max(0, $last_time - $this->default_server_globals[
                 'CULL_OLD_SESSION_NUM']);
             for ($i = $last_time; $i >= $first_time; $i--) {
-                $session_id = $this->session_queue[$i];
-                if (!isset($this->sessions[$session_id])) {
+                $delete_id = $this->session_queue[$i];
+                if (!isset($this->sessions[$delete_id])) {
                     unset($this->session_queue[$i]);
                 } else {
-                    $item_time = $this->sessions[$session_id]['TIME'];
+                    $item_time = $this->sessions[$delete_id]['TIME'];
                     if ($item_time + $lifetime < $time) {
                         unset($this->session_queue[$i]);
-                        unset($this->sessions[$session_id]);
+                        unset($this->sessions[$delete_id]);
                     }
                 }
             }
@@ -797,7 +637,7 @@ class WebSite
      * tcp streams used by this method are non-blocking. Detecting traffic is
      * done using stream_select().  This maps to Unix-select calls, which
      * seemed to be the most cross-platform compatible way to do things.
-     * Streaming methods could be easily re-written to support libevent 
+     * Streaming methods could be easily re-written to support libevent
      * (doesn't work yet PHP7) or more modern event library
      *
      * @param int $address address and port to listen for web requests on
@@ -838,6 +678,13 @@ class WebSite
         }
         $context = [];
         if (is_array($config_array_or_ini_filename)) {
+            if (!empty($config_array_or_ini_filename['SESSION_INFO'])) {
+                $this->sessions =
+                    $config_array_or_ini_filename['SESSION_INFO']['SESSIONS'];
+                $this->sessions = $config_array_or_ini_filename['SESSION_INFO'][
+                    'SESSION_QUEUE'];
+                unset($config_array_or_ini_filename['SESSION_INFO']);
+            }
             if (!empty($config_array_or_ini_filename['SERVER_CONTEXT'])) {
                 $context = $config_array_or_ini_filename['SERVER_CONTEXT'];
                 unset($config_array_or_ini_filename['SERVER_CONTEXT']);
@@ -859,6 +706,10 @@ class WebSite
         $server_context = stream_context_create($context);
         $server = stream_socket_server($address, $errno, $errstr,
             STREAM_SERVER_BIND|STREAM_SERVER_LISTEN, $server_context);
+        if (!$server) {
+            echo "Failed to bind address $address\nServer Stopping\n";
+            exit();
+        }
         stream_set_blocking($server, 0);
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $server_globals);
@@ -868,8 +719,17 @@ class WebSite
         $this->out_streams = [self::CONNECTION => [], self::DATA => []];
         $excepts = null;
         echo "SERVER listening at $address\n";
-        while (true) {
-            $in_streams_with_data = $this->in_streams[self::CONNECTION];
+        $num_selected = 1;
+        while (!$this->stop || $num_selected > 0) {
+            if ($this->stop) {
+                $in_streams_with_data = $this->in_streams[self::CONNECTION];
+                unset($in_streams_with_data[(int)$server]);
+                if (count($in_streams_with_data) == 0) {
+                    break;
+                }
+            } else {
+                $in_streams_with_data = $this->in_streams[self::CONNECTION];
+            }
             $out_streams_with_data = $this->out_streams[self::CONNECTION];
             if ($this->timer_alarms->isEmpty()) {
                 $timeout = null;
@@ -878,7 +738,7 @@ class WebSite
                 $next_alarm = $this->timer_alarms->top();
                 $pre_timeout = max(0, microtime(true) - $next_alarm[0]);
                 $timeout = floor($pre_timeout);
-                $micro_timeout = intval(($timeout - floor($pre_timeout)) 
+                $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
             }
             $num_selected = stream_select($in_streams_with_data,
@@ -890,6 +750,156 @@ class WebSite
             }
             $this->cullDeadStreams();
         }
+        if ($this->restart) {
+            $session_path = substr($this->restart, strlen('restart') + 1);
+            $php = "php";
+            $script = "$php " .
+                "index.php " . $_SERVER['SERVER_PORT'] . " 2 \"$session_path\"";
+            if (strstr(PHP_OS, "WIN")) {
+                $script = str_replace("/", "\\", $script);
+            }
+            foreach ($this->in_streams[self::CONNECTION] as $key => $stream) {
+                if (!empty($stream)) {
+                    stream_socket_shutdown($stream, STREAM_SHUT_RDWR);
+                }
+            }
+            fclose($server);
+            if (strstr(PHP_OS, "WIN")) {
+                $job = "start /B $script ";
+            } else {
+                $job = "$script < /dev/null > /dev/null &";
+            }
+            pclose(popen($job, "r"));
+        }
+    }
+    /**
+     * Used to handle local web page/HTTP requests made from a running
+     * WebSite script  back to itself. For example, if while processing a
+     * Website ROUTE, one wanted to do curl request for another local page.
+     * Since WebSite is is single-threaded, such a request would block until the
+     * current page was done processing, but as the current page depends on the
+     * blocked request, this would cause a deadlock. To avoid this WebSite's
+     * should check if a request is local, and if so, call
+     * processInternalRequest in lieu of making a real web request, using
+     * curl, sockets, etc.
+     *
+     * @param string $url local page url requested
+     * @param bool $include_headers whether to include HTTP response headers
+     *      in the returned results as if it had be a real web request
+     * @param array $post_data variables (if any) to be used in an internal
+     *      HTTP POST request.
+     * @return string web page that WebSite would have reqsponded with if
+     *      the request had been made as a usual web request.
+     */
+    public function processInternalRequest($url, $include_headers = false,
+        $post_data = null)
+    {
+        static $request_context = [];
+        if (count($request_context) > 5) {
+            return "INTERNAL REQUEST FAILED DUE TO RECURSION";
+        }
+        $url_parts = parse_url($url);
+        $uri = '';
+        if (!empty($url_parts['path'])) {
+            $uri .= $url_parts['path'];
+        }
+        $context = [];
+        $context['QUERY_STRING'] = "";
+        $context['REMOTE_ADDR'] = "0.0.0.0";
+        if (!empty($url_parts['query'])) {
+            $uri .= '?' . $url_parts['query'];
+            $context['QUERY_STRING'] = $url_parts['query'];
+        }
+        if (!empty($url_parts['fragment'])) {
+            $uri .= '#' . $url_parts['fragment'];
+        }
+        $context['REQUEST_METHOD'] = ($post_data) ? 'POST' : 'GET';
+        $context['SERVER_PROTOCOL'] = 'HTTP/1.1';
+        $context['REQUEST_URI'] = $uri;
+        $context['PHP_SELF'] = $uri;
+        if (!empty($_SERVER['HTTP_COOKIE'])) {
+            $context['HTTP_COOKIE'] = $_SERVER['HTTP_COOKIE'];
+        }
+        $context['SCRIPT_FILENAME'] =
+            $this->default_server_globals['DOCUMENT_ROOT'] .
+            $context['PHP_SELF'];
+        $context['CONTENT'] = "";
+        $request_context[] = ["SERVER" => $_SERVER, "GET" => $_GET,
+            "POST" => $_POST, "REQUEST" => $_REQUEST, "COOKIE" => $_COOKIE,
+            "SESSION" => $_SESSION,
+            "HEADER" => empty($this->header_data) ? "" : $this->header_data,
+            "CONTENT_TYPE" => empty($this->content_type) ? false :
+                $this->content_type,
+            "CURRENT_SESSION" => empty($this->current_session) ? "" :
+                $this->current_session];
+        $this->setGlobals($context);
+        $_POST = (empty($post_data)) ? [] : $post_data;
+        $this->header_data = "";
+        $this->current_session = "";
+        $_SESSION = [];
+        $this->content_type = false;
+        ob_start();
+        try {
+            $this->process();
+        } catch (WebException $we) {
+            $msg = $we->getMessage();
+            $cmd = substr($msg, 0, strlen('restart'));
+            if (in_array($cmd, ["restart", "stop"])) {
+                if ($cmd == 'restart') {
+                    $session_path = substr($msg, strlen('restart') + 1);
+                    if (!empty($session_path)) {
+                        $session_info['SESSIONS'] = $this->sessions;
+                        $session_info['SESSION_QUEUE'] = $this->session_queue;
+                        file_put_contents($session_path,
+                            serialize($session_info));
+                    }
+                    $this->restart = $msg;
+                }
+                $this->stop = true;
+            }
+        }
+        $out_data = ob_get_contents();
+        ob_end_clean();
+        if ($this->current_session != "" &&
+            !empty($_COOKIE[$this->current_session])) {
+            $session_id = $_COOKIE[$this->current_session];
+            $this->sessions[$session_id]['DATA'] = $_SESSION;
+        }
+        $redirect = false;
+        if (substr($this->header_data, 0, 5) != "HTTP/") {
+            if (stristr($this->header_data, "Location") != false) {
+                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                    " 301 Moved Permanently\x0D\x0A" .
+                $this->header_data;
+            } else if (
+                stristr($this->header_data, "Refresh") != false) {
+                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                    " 302 Found\x0D\x0A" .
+                $this->header_data;
+            } else {
+                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                    " 200 OK\x0D\x0A". $this->header_data;
+            }
+        }
+        if (!$this->content_type && !$redirect) {
+            $this->header_data .= "Content-Type: text/html\x0D\x0A";
+        }
+        if ($include_headers) {
+            $out_data = $this->header_data .
+                    "Content-Length: ". strlen($out_data) .
+                    "\x0D\x0A\x0D\x0A" .  $out_data;
+        }
+        $r = array_pop($request_context);
+        $_SERVER = $r["SERVER"];
+        $_GET = $r["GET"];
+        $_POST = $r["POST"];
+        $_REQUEST = $r["REQUEST"];
+        $_COOKIE = $r["COOKIE"];
+        $_SESSION = $r["SESSION"];
+        $this->header_data = $r["HEADER"];
+        $this->content_type = $r["CONTENT_TYPE"];
+        $this->current_session = $r["CURRENT_SESSION"];
+        return $out_data;
     }
     /**
      * Checks if a portion of a request uri path matches a Atto server route.
@@ -956,7 +966,7 @@ class WebSite
      * new connection, then a stream is set-up. For other streams,
      * request data is processed as it comes in. Once the request is complete,
      * superglobals are set up and process() is used route the request which
-     * is output buffered. When this is complete, an output stream is 
+     * is output buffered. When this is complete, an output stream is
      * instantiated to send this data asynchronously back to the browser.
      *
      * @param resource $server socket server used to listen for incoming
@@ -1002,7 +1012,26 @@ class WebSite
                 $_SESSION = [];
                 $this->content_type = false;
                 ob_start();
-                $this->process();
+                try {
+                    $this->process();
+                } catch (WebException $we) {
+                    $msg = $we->getMessage();
+                    $cmd = substr($msg, 0, strlen('restart'));
+                    if (in_array($cmd, ["restart", "stop"])) {
+                        if ($cmd == 'restart') {
+                            $session_path = substr($msg, strlen('restart') + 1);
+                            if (!empty($session_path)) {
+                                $session_info['SESSIONS'] = $this->sessions;
+                                $session_info['SESSION_QUEUE'] =
+                                    $this->session_queue;
+                                file_put_contents($session_path,
+                                    serialize($session_info));
+                            }
+                            $this->restart = $msg;
+                        }
+                        $this->stop = true;
+                    }
+                }
                 $out_data = ob_get_contents();
                 ob_end_clean();
                 if ($this->current_session != "" &&
@@ -1010,11 +1039,23 @@ class WebSite
                     $session_id = $_COOKIE[$this->current_session];
                     $this->sessions[$session_id]['DATA'] = $_SESSION;
                 }
+                $redirect = false;
                 if (substr($this->header_data, 0, 5) != "HTTP/") {
-                    $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                        " 200 OK\x0D\x0A". $this->header_data;
+                    if (stristr($this->header_data, "Location") != false) {
+                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                            " 301 Moved Permanently\x0D\x0A" .
+                        $this->header_data;
+                    } else if (
+                        stristr($this->header_data, "Refresh") != false) {
+                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                            " 302 Found\x0D\x0A" .
+                        $this->header_data;
+                    } else {
+                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                            " 200 OK\x0D\x0A". $this->header_data;
+                    }
                 }
-                if (!$this->content_type) {
+                if (!$this->content_type && !$redirect) {
                     $this->header_data .= "Content-Type: text/html\x0D\x0A";
                 }
                 $out_data = $this->header_data .
@@ -1255,9 +1296,9 @@ class WebSite
      *      by name of the header. For example the value of a header with name
      *      Cookie should be in $context['HTTP_COOKIE']. The Content-Type
      *      and Content-Length header do no get the prefix, so should be as
-     *      $context['CONTENT_TYPE'] and $context['CONTENT_LENGTH']. 
+     *      $context['CONTENT_TYPE'] and $context['CONTENT_LENGTH'].
      *      The request method, query_string, also appear with the HTTP_ prefix.
-     *      Finally, the content of the request should be in 
+     *      Finally, the content of the request should be in
      *      $context['CONTENT'].
      */
     protected function setGlobals($context)
@@ -1294,17 +1335,17 @@ class WebSite
                     }
                     if (preg_match( "/\s*Content-Type\:\s*([^\s]+)/i",
                         $head_part, $matches)) {
-                        $content_type = $matches[1];
+                        $content_type = trim($matches[1]);
                     }
                 }
                 if (empty($name)) {
                     continue;
                 }
                 if (empty($file_name)) {
-                    $_POST[$name] = $content;
+                    $_POST[$name] = rtrim($content, "\x0D\x0A");
                     continue;
                 }
-                $file_array = ['name' => $file_name, 'tmp_name' => $file_name, 
+                $file_array = ['name' => $file_name, 'tmp_name' => $file_name,
                     'type' => $content_type, 'error' => 0, 'data' => $content,
                     'size' => strlen($content)];
                 if (empty($_FILES[$name])) {
@@ -1423,7 +1464,7 @@ class WebSite
     /**
      * Removes a stream from outstream arrays. Since an HTTP connection can
      * handle several requests from a single client, this method does not close
-     * the connection. It might be run after a request response pair, while 
+     * the connection. It might be run after a request response pair, while
      * waiting for the next request.
      *
      * @param int $key id of stream to remove from outstream arrays.
@@ -1437,4 +1478,24 @@ class WebSite
         );
     }
 }
-
+/**
+ * Function to call instead of exit() to indicate that the script
+ * processing the current web page is done processing. Use this rather
+ * that exit(), as exit() will also terminate WebSite.
+ *
+ * @param string $err_msg error message to send on exiting
+ * @throws WebException
+ */
+function webExit($err_msg = "")
+{
+    if (php_sapi_name() == 'cli') {
+        throw new WebException($err_msg);
+    } else {
+        exit($err_msg);
+    }
+}
+/**
+ * Exception generated when a running WebSite script calls webExit()
+ */
+class WebException extends \Exception {
+}

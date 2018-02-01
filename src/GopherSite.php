@@ -23,7 +23,7 @@
  * END LICENSE
  *
  * @author Chris Pollett chris@pollett.org
- * @license http://www.gnu.org/licenses/ GPL3
+ * @license http://www.gnu.org/licenses/ GPL-3.0-or-later
  * @link http://www.seekquarry.com/
  * @copyright 2017
  * @filesource

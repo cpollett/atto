@@ -3,7 +3,7 @@
  * seekquarry\atto\Website -- a small web server and web routing engine
  *
  *
- * Copyright (C) 2017  Chris Pollett chris@pollett.org
+ * Copyright (C) 2018  Chris Pollett chris@pollett.org
  *
  * LICENSE:
  *
@@ -23,7 +23,7 @@
  * END LICENSE
  *
  * @author Chris Pollett chris@pollett.org
- * @license http://www.gnu.org/licenses/ GPL3
+ * @license http://www.gnu.org/licenses/ GPL-3.0-or-later
  * @link http://www.seekquarry.com/
  * @copyright 2017
  * @filesource

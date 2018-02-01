@@ -2,7 +2,7 @@
     "name": "seekquarry/atto",
     "description": "Single file, pure PHP web server and web routing engine",
     "homepage": "https://www.seekquarry.com/",
-    "license": "GPLv3",
+    "license": "GPL-3.0-or-later",
     "authors": [
         {
             "name": "Chris Pollett",

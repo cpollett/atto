@@ -25,7 +25,7 @@
  * @author Chris Pollett chris@pollett.org
  * @license http://www.gnu.org/licenses/ GPL-3.0-or-later
  * @link http://www.seekquarry.com/
- * @copyright 2017
+ * @copyright 2018
  * @filesource
  */
 
@@ -663,25 +663,30 @@ class WebSite
             "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
         ];
-        if (is_int($address) && $address >= 0 && $address < 65535) {
+        $original_address = $address;
+        if ($address >= 0 && $address < 65535) {
             /*
              both work on windows, but localhost doesn't give windows defender
              warning
             */
             $localhost = strstr(PHP_OS, "WIN") ? "localhost" : "0.0.0.0";
             // 0 binds to any incoming ipv4 address
+            $port = $address;
             $address = "tcp://$localhost:$address";
-            $server_globals = ["SERVER_NAME" => "localhost"];
+            $server_globals = ["SERVER_NAME" => "localhost",
+                "SERVER_PORT" => $port];
         } else {
             $server_globals = ['SERVER_NAME' => substr($address, 0,
-                strrpos($address, ":"))];
+                strrpos($address, ":")),
+                'SERVER_PORT' => substr($address, strrpos($address, ":"))];
         }
         $context = [];
         if (is_array($config_array_or_ini_filename)) {
             if (!empty($config_array_or_ini_filename['SESSION_INFO'])) {
                 $this->sessions =
                     $config_array_or_ini_filename['SESSION_INFO']['SESSIONS'];
-                $this->sessions = $config_array_or_ini_filename['SESSION_INFO'][
+                $this->session_queue =
+                    $config_array_or_ini_filename['SESSION_INFO'][
                     'SESSION_QUEUE'];
                 unset($config_array_or_ini_filename['SESSION_INFO']);
             }
@@ -750,17 +755,17 @@ class WebSite
             }
             $this->cullDeadStreams();
         }
-        if ($this->restart) {
+        if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
             $session_path = substr($this->restart, strlen('restart') + 1);
-            $php = "php";
-            $script = "$php " .
-                "index.php " . $_SERVER['SERVER_PORT'] . " 2 \"$session_path\"";
+            $php = (!empty($_ENV['HHVM'])) ? "hhvm" : "php";
+            $script = "$php " . $_SERVER['SCRIPT_NAME'] .
+                " " . $original_address . " 2 \"$session_path\"";
             if (strstr(PHP_OS, "WIN")) {
                 $script = str_replace("/", "\\", $script);
             }
             foreach ($this->in_streams[self::CONNECTION] as $key => $stream) {
                 if (!empty($stream)) {
-                    stream_socket_shutdown($stream, STREAM_SHUT_RDWR);
+                    @stream_socket_shutdown($stream, STREAM_SHUT_RDWR);
                 }
             }
             fclose($server);
@@ -834,6 +839,24 @@ class WebSite
                 $this->current_session];
         $this->setGlobals($context);
         $_POST = (empty($post_data)) ? [] : $post_data;
+        $out_data = $this->getResponseData($include_headers);
+        $r = array_pop($request_context);
+        $_SERVER = $r["SERVER"];
+        $_GET = $r["GET"];
+        $_POST = $r["POST"];
+        $_REQUEST = $r["REQUEST"];
+        $_COOKIE = $r["COOKIE"];
+        $_SESSION = $r["SESSION"];
+        $this->header_data = $r["HEADER"];
+        $this->content_type = $r["CONTENT_TYPE"];
+        $this->current_session = $r["CURRENT_SESSION"];
+        return $out_data;
+    }
+    /**
+     *
+     */
+    protected function getResponseData($include_headers = true)
+    {
         $this->header_data = "";
         $this->current_session = "";
         $_SESSION = [];
@@ -889,16 +912,6 @@ class WebSite
                     "Content-Length: ". strlen($out_data) .
                     "\x0D\x0A\x0D\x0A" .  $out_data;
         }
-        $r = array_pop($request_context);
-        $_SERVER = $r["SERVER"];
-        $_GET = $r["GET"];
-        $_POST = $r["POST"];
-        $_REQUEST = $r["REQUEST"];
-        $_COOKIE = $r["COOKIE"];
-        $_SESSION = $r["SESSION"];
-        $this->header_data = $r["HEADER"];
-        $this->content_type = $r["CONTENT_TYPE"];
-        $this->current_session = $r["CURRENT_SESSION"];
         return $out_data;
     }
     /**
@@ -994,6 +1007,7 @@ class WebSite
                 continue;
             }
             if (!$too_long) {
+                stream_set_blocking($in_stream, 0);
                 $data = stream_get_contents($in_stream, min(
                     $this->default_server_globals['MAX_IO_LEN'],
                     $max_len - $len));
@@ -1007,60 +1021,7 @@ class WebSite
                     $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
                         true;
                 }
-                $this->header_data = "";
-                $this->current_session = "";
-                $_SESSION = [];
-                $this->content_type = false;
-                ob_start();
-                try {
-                    $this->process();
-                } catch (WebException $we) {
-                    $msg = $we->getMessage();
-                    $cmd = substr($msg, 0, strlen('restart'));
-                    if (in_array($cmd, ["restart", "stop"])) {
-                        if ($cmd == 'restart') {
-                            $session_path = substr($msg, strlen('restart') + 1);
-                            if (!empty($session_path)) {
-                                $session_info['SESSIONS'] = $this->sessions;
-                                $session_info['SESSION_QUEUE'] =
-                                    $this->session_queue;
-                                file_put_contents($session_path,
-                                    serialize($session_info));
-                            }
-                            $this->restart = $msg;
-                        }
-                        $this->stop = true;
-                    }
-                }
-                $out_data = ob_get_contents();
-                ob_end_clean();
-                if ($this->current_session != "" &&
-                    !empty($_COOKIE[$this->current_session])) {
-                    $session_id = $_COOKIE[$this->current_session];
-                    $this->sessions[$session_id]['DATA'] = $_SESSION;
-                }
-                $redirect = false;
-                if (substr($this->header_data, 0, 5) != "HTTP/") {
-                    if (stristr($this->header_data, "Location") != false) {
-                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                            " 301 Moved Permanently\x0D\x0A" .
-                        $this->header_data;
-                    } else if (
-                        stristr($this->header_data, "Refresh") != false) {
-                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                            " 302 Found\x0D\x0A" .
-                        $this->header_data;
-                    } else {
-                        $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                            " 200 OK\x0D\x0A". $this->header_data;
-                    }
-                }
-                if (!$this->content_type && !$redirect) {
-                    $this->header_data .= "Content-Type: text/html\x0D\x0A";
-                }
-                $out_data = $this->header_data .
-                        "Content-Length: ". strlen($out_data) .
-                        "\x0D\x0A\x0D\x0A" .  $out_data;
+                $out_data = $this->getResponseData();
                 if (empty($this->in_streams[self::CONTEXT][$key][
                     'BAD_RESPONSE'])) {
                     $this->initRequestStream($key);
@@ -1448,7 +1409,7 @@ class WebSite
     protected function shutdownHttpStream($key)
     {
         if (!empty($this->in_streams[self::CONNECTION][$key])) {
-            stream_socket_shutdown($this->in_streams[self::CONNECTION][$key],
+            @stream_socket_shutdown($this->in_streams[self::CONNECTION][$key],
                 STREAM_SHUT_RDWR);
         }
         unset($this->in_streams[self::CONNECTION][$key],

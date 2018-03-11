@@ -25,7 +25,7 @@
  * @author Chris Pollett chris@pollett.org
  * @license http://www.gnu.org/licenses/ GPL-3.0-or-later
  * @link http://www.seekquarry.com/
- * @copyright 2017
+ * @copyright 2018
  * @filesource
  */
 
@@ -675,6 +675,7 @@ class GopherSite
             $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
             $too_long = $len >= $max_len;
             if (!$too_long) {
+                stream_set_blocking($in_stream, 0);
                 $data = stream_get_contents($in_stream, $max_len - $len);
             } else {
                 $data = "";

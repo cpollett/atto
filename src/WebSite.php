@@ -76,7 +76,7 @@ class WebSite
     protected $http_methods;
     protected $header_data;
     protected $content_type;
-    protected $file_cache = ['MARKED' => [], 'UNMARKED' => []];
+    protected $file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
     protected $is_cli;
     protected $is_secure = false;
     /**
@@ -452,7 +452,17 @@ class WebSite
     public function fileGetContents($filename, $force_read = false)
     {
         if ($this->isCli()) {
-            $path = realpath($filename);
+            if (isset($this->file_cache['PATH'][$filename])) {
+                /*
+                    we are caching realpath which already has its own cache
+                    realpath's cache is based on time, ours is based on
+                    the marking algorithm.
+                 */
+                $path = $this->file_cache['PATH'][$filename];
+            } else {
+                $path = realpath($filename);
+                $this->file_cache['PATH'][$filename] = $path;
+            }
             if (isset($this->file_cache['MARKED'][$path])) {
                 if ($force_read) {
                     $this->file_cache['MARKED'][$path] =
@@ -473,13 +483,6 @@ class WebSite
             $data = file_get_contents($path);
             if (strlen($data) < $this->default_server_globals[
                 'MAX_CACHE_FILESIZE']) {
-                if (count($this->file_cache['MARKED']) >=
-                    $this->default_server_globals['MAX_CACHE_FILES']) {
-                    foreach($this->file_cache['MARKED'] as $path => $data) {
-                        $this->file_cache['UNMARKED'][$path] = $data;
-                        unset($this->file_cache['MARKED'][$path]);
-                    }
-                }
                 if (count($this->file_cache['MARKED']) +
                     ($num_unmarked = count($this->file_cache['UNMARKED'])) >=
                     $this->default_server_globals['MAX_CACHE_FILES']) {
@@ -488,7 +491,19 @@ class WebSite
                     unset(
                         $this->file_cache['UNMARKED'][$unmarked_paths[$eject]]);
                 }
-                $this->file_cache['UNMARKED'][$path] = $data;
+                $this->file_cache['MARKED'][$path] = $data;
+                if (count($this->file_cache['MARKED']) >=
+                    $this->default_server_globals['MAX_CACHE_FILES']) {
+                    foreach ($this->file_cache['PATH'] as $name => $path) {
+                        if (empty($this->file_cache['MARKED'][$path])) {
+                            unset($this->file_cache['PATH'][$name]);
+                        }
+                    }
+                    foreach($this->file_cache['MARKED'] as $path => $data) {
+                        $this->file_cache['UNMARKED'][$path] = $data;
+                        unset($this->file_cache['MARKED'][$path]);
+                    }
+                }
             }
             return $data;
         }
@@ -503,7 +518,17 @@ class WebSite
      */
     public function filePutContents($filename, $data)
     {
-        $path = realpath($filename);
+        if (isset($this->file_cache['PATH'][$filename])) {
+            /*
+                we are caching realpath which already has its own cache
+                realpath's cache is based on time, ours is based on
+                the marking algorithm.
+             */
+            $path = $this->file_cache['PATH'][$filename];
+        } else {
+            $path = realpath($filename);
+            $this->file_cache['PATH'][$filename] = $path;
+        }
         if ($this->isCli()) {
             if (isset($this->file_cache['MARKED'][$path])) {
                 $this->file_cache['MARKED'][$path] = $data;

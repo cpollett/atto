@@ -48,36 +48,131 @@ namespace seekquarry\atto;
  */
 class WebSite
 {
+    /*
+        Field component name constants used in input or output stream array
+     */
     const CONNECTION = 0;
     const DATA = 1;
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
-    const IS_FILE = 4;
-    const REQUEST_HEAD = 5;
+    const REQUEST_HEAD = 4;
+    /*
+      CONNECT OPTIONS and the longest named HTTP method. It has length 7
+     */
     const LEN_LONGEST_HTTP_METHOD = 7;
+    /**
+     * Keys of stream that won't disappear (for example the server socket)
+     * @var array
+     */
     public $immortal_stream_keys = [];
+    /**
+     * Used to determine portion of path to ignore
+     * when checking if a route matches against the current request.
+     * @var string
+     */
     public $base_path;
+    /**
+     * Default values to write into $_SERVER before processing a connection
+     * request (in CLI mode)
+     * @var array
+     */
     protected $default_server_globals;
+    /**
+     * Associative array http_method => array of how to handle paths for
+     *  that method
+     * @var array
+     */
     protected $routes = ["CONNECT" => [], "DELETE"  => [], "ERROR"  => [],
         "GET" => [], "HEAD" => [], "OPTIONS"  => [], "POST"  => [],
         "PUT" => [], "TRACE" => []];
+    /**
+     * Default values used to set up session variables
+     * @var array
+     */
     protected $session_configs = [ 'cookie_lifetime' => '0',
         'cookie_path' => '/', 'cookie_domain' => '', 'cookie_secure' => '',
         'cookie_httponly' => '', 'name' => 'PHPSESSID', 'save_path' => ''];
+    /**
+     * Array of all connection streams for which we are receiving data from
+     * client together with associated stream info
+     * @var array
+     */
     protected $in_streams = [];
+    /**
+     * Array of all connection streams for which we are writing data to a
+     * client together with associated stream info
+     * @var array
+     */
     protected $out_streams = [];
+    /**
+     * Middle ware callbacks to run when processing a request
+     * @var array
+     */
     protected $middle_wares = [];
+    /**
+     * Filename of currently requested script
+     * @var array
+     */
     protected $request_script;
+    /**
+     * Used to store session data in ram for all currently active sessions
+     * @var array
+     */
     protected $sessions = [];
+    /**
+     * Keeps an ordering of currently actively sessions so if run out of
+     * memory know who to evict
+     * @var array
+     */
     protected $session_queue = [];
+    /**
+     * Timer function callbacks that have been declared
+     * @var array
+     */
     protected $timers = [];
+    /**
+     * Priority queue of which timers are about to go off
+     * @var \SplMinHeap
+     */
     protected $timer_alarms;
+    /**
+     * Cookie name value of the currently active request's session
+     * @var string
+     */
     protected $current_session = "";
+    /**
+     * List of HTTP methods for which routes have been declared
+     * @var array
+     */
     protected $http_methods;
+    /**
+     * Holds the header portion so far of the HTTP response
+     * @var string
+     */
     protected $header_data;
+    /**
+     * Whether the current response already has declared a Content-Type.
+     * If not, WebSite will default to adding a text/html header
+     * @var bool
+     */
     protected $content_type;
+    /**
+     * Used to cache in RAM files which have been read or written by the
+     * fileGetContents or filePutContents
+     * @var array
+     */
     protected $file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
+    /**
+     * Whether this object is being run from teh command line with a listen()
+     * call or if it is being run under a web server and so only used for
+     * routing
+     * @var bool
+     */
     protected $is_cli;
+    /**
+     * Whether https is being used
+     * @var bool
+     */
     protected $is_secure = false;
     /**
      * Sets the base path used for determining request routes. Sets
@@ -91,7 +186,7 @@ class WebSite
      */
     public function __construct($base_path = "")
     {
-        $this->default_server_globals = [];
+        $this->default_server_globals = ["MAX_CACHE_FILESIZE" => 2000000];
         $this->http_methods = array_keys($this->routes);
         if (empty($base_path)) {
             $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
@@ -127,6 +222,8 @@ class WebSite
      * are a two element array with a route and a callback function and add
      * the appropriate route to a routing table.
      *
+     * @param string $method HTTP command to add $route_Callack for in routing
+     *      table
      * @param array $route_callback a two element array consisting of a routing
      *      pattern and a callback function.
      *      In the route pattern
@@ -202,7 +299,7 @@ class WebSite
      * @param callable $callback function to be called before processing of
      *      request
      */
-    public function use(callable $callback)
+    public function middleware(callable $callback)
     {
         $this->middle_wares[] = $callback;
     }
@@ -452,10 +549,10 @@ class WebSite
     public function fileGetContents($filename, $force_read = false)
     {
         if ($this->isCli()) {
-            if (isset($this->file_cache['PATH'][$filename])) {
+            if (!empty($this->file_cache['PATH'][$filename])) {
                 /*
-                    we are caching realpath which already has its own cache
-                    realpath's cache is based on time, ours is based on
+                    We are caching realpath which already has its own cache.
+                    realpath's cache though is based on time, ours is based on
                     the marking algorithm.
                  */
                 $path = $this->file_cache['PATH'][$filename];
@@ -515,28 +612,49 @@ class WebSite
      *
      * @param string $filename name of file to write to persistent storages
      * @param string $data string of data to store in file
+     * @return int number of bytes written
      */
     public function filePutContents($filename, $data)
     {
-        if (isset($this->file_cache['PATH'][$filename])) {
-            /*
-                we are caching realpath which already has its own cache
-                realpath's cache is based on time, ours is based on
-                the marking algorithm.
-             */
-            $path = $this->file_cache['PATH'][$filename];
-        } else {
-            $path = realpath($filename);
-            $this->file_cache['PATH'][$filename] = $path;
-        }
-        if ($this->isCli()) {
-            if (isset($this->file_cache['MARKED'][$path])) {
-                $this->file_cache['MARKED'][$path] = $data;
-            } else if (isset($this->file_cache['UNMARKED'][$path])) {
-                $this->file_cache['UNMARKED'][$path] = $data;
+        $num_bytes = strlen($data);
+        $fits_in_cache =
+            $num_bytes < $this->default_server_globals['MAX_CACHE_FILESIZE'];
+        if ($fits_in_cache) {
+            if (isset($this->file_cache['PATH'][$filename])) {
+                /*
+                    we are caching realpath which already has its own cache
+                    realpath's cache is based on time, ours is based on
+                    the marking algorithm.
+                 */
+                $path = $this->file_cache['PATH'][$filename];
+            } else {
+                $path = realpath($filename);
+                $this->file_cache['PATH'][$filename] = $path;
             }
         }
-        return file_put_contents($filename, $data);
+        if ($this->isCli()) {
+            if ($fits_in_cache)  {
+                if (isset($this->file_cache['MARKED'][$path])) {
+                    $this->file_cache['MARKED'][$path] = $data;
+                } else if (isset($this->file_cache['UNMARKED'][$path])) {
+                    $this->file_cache['UNMARKED'][$path] = $data;
+                }
+            } else if (!empty($this->file_cache['PATH'][$filename])) {
+                $path = $this->file_cache['PATH'][$filename];
+                unset($this->file_cache['MARKED'][$path],
+                    $this->file_cache['UNMARKED'][$path],
+                    $this->file_cache['PATH'][$filename]);
+            }
+        }
+        $num_bytes = file_put_contents($filename, $data);
+        return $num_bytes;
+    }
+    /**
+     * Deletes the files stored in the RAM FileCache
+     */
+    public function clearFileCache()
+    {
+        $this->file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
     }
     /**
      * Used to move a file that was uploaded from a form on the client to the
@@ -682,10 +800,11 @@ class WebSite
             ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
         $default_server_globals = ["CONNECTION_TIMEOUT" => 20,
             "CULL_OLD_SESSION_NUM" => 5, "DOCUMENT_ROOT" => getcwd(),
-            "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 1000000,
-            "MAX_CACHE_FILES" => 100,  "MAX_IO_LEN" => 128 * 1024,
+            "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
+            "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
             "MAX_REQUEST_LEN" => 10000000, "PATH" => $path,
-            "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
+            "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
+            "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
         ];
         $original_address = $address;
@@ -730,6 +849,14 @@ class WebSite
             }
             $server_globals = array_merge($server_globals, $ini_data);
         }
+        foreach ($default_server_globals as $server_global =>
+            $server_value) {
+            if (!empty($context[$server_global])) {
+                $server_globals[$server_global] =
+                    $context[$server_global];
+                unset($context[$server_global]);
+            }
+        }
         if (!empty($context['ssl'])) {
             $this->is_secure = true;
         }
@@ -766,7 +893,7 @@ class WebSite
                 $micro_timeout = 0;
             } else {
                 $next_alarm = $this->timer_alarms->top();
-                $pre_timeout = max(0, microtime(true) - $next_alarm[0]);
+                $pre_timeout = max(0, $next_alarm[0] - microtime(true));
                 $timeout = floor($pre_timeout);
                 $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
@@ -795,7 +922,7 @@ class WebSite
             }
             fclose($server);
             if (strstr(PHP_OS, "WIN")) {
-                $job = "start /B $script ";
+                $job = "start $script ";
             } else {
                 $job = "$script < /dev/null > /dev/null &";
             }
@@ -878,7 +1005,14 @@ class WebSite
         return $out_data;
     }
     /**
+     * Used  by usual and internal requests to compute response  string of the
+     * web server to the web client's request. In the case of internal requests,
+     * it is sometimes usesful to return just the body of the response without
+     * HTTP headers
      *
+     * @param bool $include_headers whether to include HTTP headers at beginning
+     *      of reponse
+     * @return string HTTP response to web client request
      */
     protected function getResponseData($include_headers = true)
     {
@@ -1088,7 +1222,7 @@ class WebSite
         if ($connection) {
             if ($this->is_secure) {
                 stream_set_blocking($connection, 1);
-                stream_socket_enable_crypto($connection, true,
+                @stream_socket_enable_crypto($connection, true,
                     STREAM_CRYPTO_METHOD_TLS_SERVER);
                 stream_set_blocking($connection, 0);
             }
@@ -1337,7 +1471,7 @@ class WebSite
                 if (empty($_FILES[$name])) {
                     $_FILES[$name] = $file_array;
                 } else {
-                    foreach(['name', 'tmp_name', 'type', 'error', 'data',
+                    foreach (['name', 'tmp_name', 'type', 'error', 'data',
                         'size'] as $field) {
                         if (!is_array($_FILES[$name][$field])) {
                             $_FILES[$name][$field] = [$_FILES[$name][$field]];

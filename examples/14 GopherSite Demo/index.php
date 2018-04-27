@@ -23,7 +23,7 @@ $test = new G\GopherSite();
     the time, remote address, and requested selector
  */
 openlog("PHP", LOG_PERROR, LOG_USER);
-$test->use(function () use ($test)
+$test->middleware(function () use ($test)
 {
     $log_msg = $_SERVER['REMOTE_ADDR'] . " " .$_SERVER['REQUEST_URI'];
     syslog(LOG_INFO, $log_msg);
@@ -120,7 +120,7 @@ $test->request('/magic-eight-ball', function() {
 =====================================
 = MAGIC EIGHT BALL                  =
 =====================================
-    <?php 
+    <?php
     if ($query) { ?>
 You asked: <?=$query ?>
 

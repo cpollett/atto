@@ -9,13 +9,13 @@ $test = new WebSite();
 openlog("PHP", LOG_PERROR, LOG_USER);
 /*
     In this example, a log message is written each time a web request is made.
-    To do this we make use of the use() function to register a callback
-    that is called before the request is handled. 
+    To do this we make use of the middleware() function to register a callback
+    that is called before the request is handled.
     To run this example, comment the exit line above and type:
     php index.php
     and pointing a browser to http://localhost:8080/.
  */
-$test->use(function () use ($test)
+$test->middleware(function () use ($test)
 {
     $log_msg = $_SERVER['REMOTE_ADDR'] . " " .
         $_SERVER['REQUEST_METHOD'] ." ". $_SERVER['REQUEST_URI'];

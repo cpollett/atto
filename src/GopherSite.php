@@ -43,22 +43,83 @@ namespace seekquarry\atto;
  */
 class GopherSite
 {
+    /*
+        Field component name constants used in input or output stream array
+     */
     const CONNECTION = 0;
     const DATA = 1;
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
+    /**
+     * Keys of stream that won't disappear (for example the server socket)
+     * @var array
+     */
     public $immortal_stream_keys = [];
+    /**
+     * Used to determine portion of path to ignore
+     * when checking if a route matches against the current request.
+     * @var string
+     */
     public $base_path;
+    /**
+     * Default values to write into $_SERVER before processing a connection
+     * request (in CLI mode)
+     * @var array
+     */
     protected $default_server_globals;
+    /**
+     * Associative array http_method => array of how to handle paths for
+     *  that method
+     * @var array
+     */
     protected $routes = ["ERROR"  => [], "REQUEST" => []];
+    /**
+     * List of Gopher methods for which routes have been declared
+     * @var array
+     */
     protected $gopher_methods;
+    /**
+     * Array of all connection streams for which we are receiving data from
+     * client together with associated stream info
+     * @var array
+     */
     protected $in_streams = [];
+    /**
+     * Array of all connection streams for which we are writing data to a
+     * client together with associated stream info
+     * @var array
+     */
     protected $out_streams = [];
+    /**
+     * Middle ware callbacks to run when processing a request
+     * @var array
+     */
     protected $middle_wares = [];
+    /**
+     * Filename of currently requested script
+     * @var array
+     */
     protected $request_script;
+    /**
+     * Timer function callbacks that have been declared
+     * @var array
+     */
     protected $timers = [];
+    /**
+     * Priority queue of which timers are about to go off
+     * @var \SplMinHeap
+     */
     protected $timer_alarms;
-    protected $file_cache = ['MARKED' => [], 'UNMARKED' => []];
+    /**
+     * Used to cache in RAM files which have been read or written by the
+     * fileGetContents or filePutContents
+     * @var array
+     */
+    protected $file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
+    /**
+     * Whether SSL is being used
+     * @var bool
+     */
     protected $is_secure = false;
     /**
      * Sets the base path used for determining request routes. Sets
@@ -195,7 +256,7 @@ class GopherSite
      * @param callable $callback function to be called before processing of
      *      request
      */
-    public function use(callable $callback)
+    public function middleware(callable $callback)
     {
         $this->middle_wares[] = $callback;
     }
@@ -285,13 +346,15 @@ class GopherSite
     }
     /**
      * Reads in the file $filename and returns its contents as a string.
-     * It checks if the file exists in its Marker Algorithm based RAM cache
-     * (Fiat et al 1991). If so, it directly returns it. Otherwise, it reads
-     * it in using blocking I/O file_get_contents() and caches it before return
-     * its string contents. Note this function assumes that only the gopher
-     * server is performing I/O with this file. filemtime() can be used to see
-     * if a file on disk has been changed and then you can use
-     * $force_read = true below to force re-reading the file into the cache
+     * In non-CLI mode this method maps directly to PHP's built-in function
+     * file_get_contents(). In CLI mode, it checks if the file exists in
+     * its Marker Algorithm based RAM cache (Fiat et al 1991). If so, it
+     * directly returns it. Otherwise, it reads it in using blocking I/O
+     * file_get_contents() and caches it before return its string contents.
+     * Note this function assumes that only the web server is performing I/O
+     * with this file. filemtime() can be used to see if a file on disk has been
+     * changed and then you can use $force_read = true below to force re-
+     * reading the file into the cache
      *
      * @param string $filename name of file to get contents of
      * @param bool $force_read whether to force the file to be read from
@@ -300,7 +363,17 @@ class GopherSite
      */
     public function fileGetContents($filename, $force_read = false)
     {
-        $path = realpath($filename);
+        if (!empty($this->file_cache['PATH'][$filename])) {
+            /*
+                we are caching realpath which already has its own cache
+                realpath's cache is based on time, ours is based on
+                the marking algorithm.
+             */
+            $path = $this->file_cache['PATH'][$filename];
+        } else {
+            $path = realpath($filename);
+            $this->file_cache['PATH'][$filename] = $path;
+        }
         if (isset($this->file_cache['MARKED'][$path])) {
             if ($force_read) {
                 $this->file_cache['MARKED'][$path] =
@@ -321,13 +394,6 @@ class GopherSite
         $data = file_get_contents($path);
         if (strlen($data) < $this->default_server_globals[
             'MAX_CACHE_FILESIZE']) {
-            if (count($this->file_cache['MARKED']) >=
-                $this->default_server_globals['MAX_CACHE_FILES']) {
-                foreach($this->file_cache['MARKED'] as $path => $data) {
-                    $this->file_cache['UNMARKED'][$path] = $data;
-                    unset($this->file_cache['MARKED'][$path]);
-                }
-            }
             if (count($this->file_cache['MARKED']) +
                 ($num_unmarked = count($this->file_cache['UNMARKED'])) >=
                 $this->default_server_globals['MAX_CACHE_FILES']) {
@@ -336,7 +402,19 @@ class GopherSite
                 unset(
                     $this->file_cache['UNMARKED'][$unmarked_paths[$eject]]);
             }
-            $this->file_cache['UNMARKED'][$path] = $data;
+            $this->file_cache['MARKED'][$path] = $data;
+            if (count($this->file_cache['MARKED']) >=
+                $this->default_server_globals['MAX_CACHE_FILES']) {
+                foreach ($this->file_cache['PATH'] as $name => $path) {
+                    if (empty($this->file_cache['MARKED'][$path])) {
+                        unset($this->file_cache['PATH'][$name]);
+                    }
+                }
+                foreach($this->file_cache['MARKED'] as $path => $data) {
+                    $this->file_cache['UNMARKED'][$path] = $data;
+                    unset($this->file_cache['MARKED'][$path]);
+                }
+            }
         }
         return $data;
     }
@@ -346,16 +424,46 @@ class GopherSite
      *
      * @param string $filename name of file to write to persistent storages
      * @param string $data string of data to store in file
+     * @return int number of bytes written
      */
     public function filePutContents($filename, $data)
     {
-        $path = realpath($filename);
-        if (isset($this->file_cache['MARKED'][$path])) {
-            $this->file_cache['MARKED'][$path] = $data;
-        } else if (isset($this->file_cache['UNMARKED'][$path])) {
-            $this->file_cache['UNMARKED'][$path] = $data;
+        $num_bytes = strlen($data);
+        $fits_in_cache =
+            $num_bytes < $this->default_server_globals['MAX_CACHE_FILESIZE'];
+        if ($fits_in_cache) {
+            if (isset($this->file_cache['PATH'][$filename])) {
+                /*
+                    we are caching realpath which already has its own cache
+                    realpath's cache is based on time, ours is based on
+                    the marking algorithm.
+                 */
+                $path = $this->file_cache['PATH'][$filename];
+                if (isset($this->file_cache['MARKED'][$path])) {
+                    $this->file_cache['MARKED'][$path] = $data;
+                } else if (isset($this->file_cache['UNMARKED'][$path])) {
+                    $this->file_cache['UNMARKED'][$path] = $data;
+                }
+            } else if (!empty($this->file_cache['PATH'][$filename])) {
+                $path = $this->file_cache['PATH'][$filename];
+                unset($this->file_cache['MARKED'][$path],
+                    $this->file_cache['UNMARKED'][$path],
+                    $this->file_cache['PATH'][$filename]);
+            } else {
+                $path = realpath($filename);
+                $this->file_cache['PATH'][$filename] = $path;
+            }
         }
-        return file_put_contents($filename, $data);
+        $num_bytes = file_put_contents($filename, $data);
+        chmod($filename, 0777);
+        return $num_bytes;
+    }
+    /**
+     * Deletes the files stored in the RAM FileCache
+     */
+    public function clearFileCache()
+    {
+        $this->file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
     }
     /**
      * Returns the mime type of the provided file name if it can be determined.
@@ -478,9 +586,10 @@ class GopherSite
         $default_server_globals = [ "CONNECTION_TIMEOUT" => 20,
             "DOCUMENT_ROOT" => getcwd(),
             "INFORMATION_EOL" => "\tfake\tnull\t0\x0D\x0A",
-            "MAX_REQUEST_LEN" => 1000, "MAX_CACHE_FILESIZE" => 1000000,
-            "MAX_CACHE_FILES" => 100, "PATH" => $path,
-            "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
+            "MAX_REQUEST_LEN" => 1000, "MAX_CACHE_FILESIZE" => 2000000,
+            "MAX_CACHE_FILES" => 250, "PATH" => $path,
+            "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
+            "SERVER_SIGNATURE" => "",
             "SERVER_SOFTWARE" => "ATTO GOPHER SERVER",
         ];
         if (is_int($address) && $address >= 0 && $address < 65535) {
@@ -512,6 +621,14 @@ class GopherSite
                 unset($ini_data['SERVER_CONTEXT']);
             }
             $server_globals = array_merge($server_globals, $ini_data);
+        }
+        foreach ($default_server_globals as $server_global =>
+            $server_value) {
+            if (!empty($context[$server_global])) {
+                $server_globals[$server_global] =
+                    $context[$server_global];
+                unset($context[$server_global]);
+            }
         }
         if (!empty($context['ssl'])) {
             $this->is_secure = true;
@@ -732,7 +849,7 @@ class GopherSite
         if ($connection) {
             if ($this->is_secure) {
                 stream_set_blocking($connection, 1);
-                stream_socket_enable_crypto($connection, true,
+                @stream_socket_enable_crypto($connection, true,
                     STREAM_CRYPTO_METHOD_TLS_SERVER);
                 stream_set_blocking($connection, 0);
             }

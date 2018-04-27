@@ -10,7 +10,7 @@ $test = new WebSite();
     The middleware below is used to determine which host a user came in on.
     Then three subsites have been added to the $test website, one for each
     host to handle traffic to that host. To run this example, use ifconfig
-    or ipconfig to dtermine your ip address on your LAN and edi the
+    or ipconfig to dtermine your ip address on your LAN and edit the
     $host_list value for the thrid entry appropriately. In the real world
     you could use different hostnames you had paid for $host_list
     After commenting the exit() line above, you can run the example
@@ -19,7 +19,7 @@ $test = new WebSite();
     and pointing a browser to http://localhost:8080/ or
     http://127.0.0.1:8080/ or http://your_lan_ip_address:8080/.
  */
-$test->use(function() use ($test) {
+$test->middleware(function() use ($test) {
     $host_list = ["localhost" => "/host1", "127.0.0.1" => "/host2",
         "10.1.10.33" => "/host3"];
     $host_parts = explode(":", $_SERVER['HTTP_HOST']); //get rid of port number
@@ -30,7 +30,7 @@ $test->use(function() use ($test) {
     $_SERVER['REQUEST_URI'] = urldecode($test->base_path . $host . $active_uri);
 });
 $host1site = new Website();
-$host1site->get('/', function() { 
+$host1site->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>
@@ -45,7 +45,7 @@ $host1site->get('/', function() {
 $test->subsite('/host1', $host1site);
 
 $host2site = new Website();
-$host2site->get('/', function() { 
+$host2site->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>
@@ -60,7 +60,7 @@ $host2site->get('/', function() {
 $test->subsite('/host2', $host2site);
 
 $host3site = new Website();
-$host3site->get('/', function() { 
+$host3site->get('/', function() {
     ?>
     <!DOCTYPE html>
     <html>

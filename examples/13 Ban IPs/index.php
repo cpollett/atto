@@ -11,7 +11,7 @@ $test = new WebSite();
     banned IP address, if so, the reequest method and uri is changed so as
     to generate a 403 FORBIDDEN response.
  */
-$test->use(function () use ($test)
+$test->middleware(function () use ($test)
 {
     if (empty($test->bad_ips)) {
         $test->bad_ips = [];

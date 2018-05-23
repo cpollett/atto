@@ -704,7 +704,7 @@ class GopherSite
      */
     protected function gopherize($data)
     {
-        $lines = explode(PHP_EOL, $data);
+        $lines = explode(\PHP_EOL, $data);
         if (count($lines) > 0 && $lines[count($lines) - 1] == "") {
             array_pop($lines);
         }
@@ -1133,8 +1133,8 @@ function link($uri, $link_text)
         $host = $_SERVER['SERVER_NAME'];
         $port = $default_port;
     }
-    return "PHP_EOL" . $link_type . $link_text . "\t" . $path . "\t" . $host .
-        "\t" . $port . PHP_EOL;
+    return \PHP_EOL . $link_type . $link_text . "\t" . $path . "\t" . $host .
+        "\t" . $port . \PHP_EOL;
 }
 
 /**

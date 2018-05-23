@@ -643,6 +643,27 @@ class GopherSite
         stream_set_blocking($server, 0);
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $server_globals);
+        $as_user = "";
+        if (function_exists("posix_getuid") &&
+            function_exists("posix_getpwuid") &&
+            function_exists("posix_getpwnam") &&
+            !empty($this->default_server_globals['USER'])) {
+            $uid = posix_getuid();
+            $active_user_info = posix_getpwuid($uid);
+            if ($active_user_info['name'] !=
+                $this->default_server_globals['USER']) {
+                $user_info =
+                    posix_getpwnam($this->default_server_globals['USER']);
+                if (!empty($user_info['uid'])) {
+                    posix_setuid($user_info['uid']);
+                    $uid = posix_getuid();
+                    if ($uid == $user_info['uid']) {
+                        $as_user = " running as user " .
+                            $this->default_server_globals['USER'];
+                    }
+                }
+            }
+        }
         $this->immortal_stream_keys[] = (int)$server;
         $this->in_streams = [self::CONNECTION => [(int)$server => $server],
             self::DATA => [""]];
@@ -697,7 +718,7 @@ class GopherSite
                 $out .= "i" . $line .
                     $this->default_server_globals['INFORMATION_EOL'];
             } else {
-                $out .= rtrim($line, "\x0A") . "\xA\x0D";
+                $out .= rtrim($line, "\x0A") . "\x0D\x0A";
             }
         }
         return $out . ".\x0D\x0A";
@@ -1093,7 +1114,7 @@ function link($uri, $link_text)
         $path = "/";
     } else {
         $path = $uri_parts['path'];
-        if (strlen($path) >=3 && $path[0] == '/' && $path[2] == '/' &&
+        if (strlen($path) >= 3 && $path[0] == '/' && $path[2] == '/' &&
             in_array($path[1], $line_starts)) {
             $link_type = $path[1];
             $path = substr($path, 2);
@@ -1112,7 +1133,7 @@ function link($uri, $link_text)
         $host = $_SERVER['SERVER_NAME'];
         $port = $default_port;
     }
-    return PHP_EOL .$link_type . $link_text . "\t" . $path . "\t" . $host .
+    return "PHP_EOL" . $link_type . $link_text . "\t" . $path . "\t" . $host .
         "\t" . $port . PHP_EOL;
 }
 

@@ -688,6 +688,9 @@ class GopherSite
             $this->processTimers();
             if ($num_selected > 0) {
                 $this->processRequestStreams($server, $in_streams_with_data);
+                $out_streams_with_data = $this->out_streams[self::CONNECTION];
+                $num_selected = stream_select($in_streams_with_data,
+                    $out_streams_with_data, $excepts, $timeout, $micro_timeout);
                 $this->processResponseStreams($out_streams_with_data);
             }
             $this->cullDeadStreams();
@@ -915,12 +918,7 @@ class GopherSite
     protected function processResponseStreams($out_streams_with_data)
     {
         foreach ($out_streams_with_data as $out_stream) {
-            $meta = stream_get_meta_data($out_stream);
             $key = (int)$out_stream;
-            if ($meta['eof']) {
-                $this->shutdownGopherStream($key);
-                continue;
-            }
             $data = $this->out_streams[self::DATA][$key];
             $num_bytes = fwrite($out_stream, $data);
             $remaining_bytes = max(0, strlen($data) - $num_bytes);
@@ -1046,12 +1044,15 @@ class GopherSite
             if (in_array($key, $this->immortal_stream_keys)) {
                 continue;
             }
+            $meta = stream_get_meta_data(
+                $this->in_streams[self::CONNECTION][$key]);
             $in_time = empty($this->in_streams[self::MODIFIED_TIME][$key]) ?
                 0 : $this->in_streams[self::MODIFIED_TIME][$key];
             $out_time = empty($this->out_streams[self::MODIFIED_TIME][$key]) ?
                 0 : $this->out_streams[self::MODIFIED_TIME][$key];
             $modified_time = max($in_time, $out_time);
-            if (time() - $modified_time > $this->default_server_globals[
+            if ($meta['eof'] ||
+                time() - $modified_time > $this->default_server_globals[
                 'CONNECTION_TIMEOUT']) {
                 $this->shutdownGopherStream($key);
             }

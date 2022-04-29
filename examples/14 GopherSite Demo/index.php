@@ -71,9 +71,8 @@ Places to Visit:
     argument true after the callback.
  */
 $test->request('/{name}.{file_extension}', function() use ($test) {
-    $name = filter_var($_REQUEST["name"], FILTER_SANITIZE_STRING);
-    $extension = filter_var($_REQUEST["file_extension"],
-        FILTER_SANITIZE_STRING);
+    $name = htmlspecialchars($_REQUEST["name"]);
+    $extension = htmlspecialchars($_REQUEST["file_extension"]);
     $filename = "$name.$extension";
     if (file_exists($filename)) {
         echo $test->fileGetContents($filename);
@@ -105,7 +104,7 @@ You are currently visiting the number:
  */
 $test->request('/magic-eight-ball', function() {
     $query = empty($_SERVER['QUERY_STRING']) ? "" :
-        filter_var($_SERVER['QUERY_STRING'], FILTER_SANITIZE_STRING);
+        htmlspecialchars($_SERVER['QUERY_STRING']);
     $another = empty($query) ? "a" : "Another";
     $answers = ["It is certain", "It is decidedly so", "Without a doubt",
         "Yes definitely", "You may rely on it", "As I see it, yes",

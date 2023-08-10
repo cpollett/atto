@@ -1044,10 +1044,15 @@ class GopherSite
             if (in_array($key, $this->immortal_stream_keys)) {
                 continue;
             }
-            $meta = stream_get_meta_data(
-                $this->in_streams[self::CONNECTION][$key]);
-            $in_time = empty($this->in_streams[self::MODIFIED_TIME][$key]) ?
-                0 : $this->in_streams[self::MODIFIED_TIME][$key];
+            if (empty($this->in_streams[self::CONNECTION][$key])) {
+                $meta = ['eof' => true];
+                $in_time = 0;
+            } else {
+                $meta = stream_get_meta_data(
+                    $this->in_streams[self::CONNECTION][$key]);
+                $in_time = empty($this->in_streams[self::MODIFIED_TIME][$key]) ?
+                    0 : $this->in_streams[self::MODIFIED_TIME][$key];
+            }
             $out_time = empty($this->out_streams[self::MODIFIED_TIME][$key]) ?
                 0 : $this->out_streams[self::MODIFIED_TIME][$key];
             $modified_time = max($in_time, $out_time);

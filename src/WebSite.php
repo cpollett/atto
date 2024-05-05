@@ -1285,10 +1285,9 @@ class WebSite
             if ($this->is_secure) {
                 stream_set_blocking($connection, true);
                 set_error_handler(null);
-                $this->checkHttpType($connection);
+                $additional_context = $this->checkHttpType($connection);
                 stream_socket_enable_crypto($connection, true,
                     STREAM_CRYPTO_METHOD_TLS_SERVER);
-                var_dump(stream_get_meta_data($connection));
                 $custom_error_handler =
                     $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
                     null;
@@ -1297,16 +1296,28 @@ class WebSite
             }
             $key = (int)$connection;
             $this->in_streams[self::CONNECTION][$key] = $connection;
-            $this->initRequestStream($key);
+            $this->initRequestStream($key, $additional_context);
         }
     }
     /**
+     * Tries to determine from a connection (as it just starts, provided it
+     * is TLS ClientHello message) whether ALPN extension indicate the
+     * client is trying to use HTTP/2 or HTTP/3
      *
+     * @param resource $connection a client connection that is just being
+     *   initialized before stream_socket_enable_crypto has been called
      */
     function checkHttpType($connection)
     {
-        echo chunk_split(bin2hex(stream_socket_recvfrom($connection, 1000,
-            STREAM_PEEK)), 2, " ");
+        $stream_start = stream_socket_recvfrom($connection, 256, STREAM_PEEK);
+        $context = ["CLIENT_HTTP" => "http/1.1"];
+        if ( preg_match("/\x00\x10(.){2}.+(h2|h3)/", $stream_start, $matches)) {
+            if(!empty($matches[2])) {
+                $context["CLIENT_HTTP"] = $matches[2];
+            }
+        }
+        echo "HTTP version {$context['CLIENT_HTTP']} from TLS handshake\n";
+        return $context;
     }
     /**
      * Gets info about an incoming request stream and uses this to set up
@@ -1314,8 +1325,10 @@ class WebSite
      * variable when the request is later processed.
      *
      * @param int key id of request stream to initialize context for
+     * @param array $additional_context any additional key value field to
+     *   set for the stream's context
      */
-    protected function initRequestStream($key)
+    protected function initRequestStream($key, $additional_context = [])
     {
         $connection = $this->in_streams[self::CONNECTION][$key];
         $remote_name = stream_socket_get_name($connection, true);

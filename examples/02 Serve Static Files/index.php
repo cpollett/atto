@@ -3,7 +3,10 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-exit(); // you need to comment this line to be able to run this example.
+if (!defined("seekquarry\\atto\\RUN")) {
+    exit(); /* you need to comment this line to be able to run this example.
+               under a web server */
+}
 $test = new WebSite();
 /*
     A WebSite used to illustrate how static files can be served as part of

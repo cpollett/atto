@@ -3,7 +3,10 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-exit(); // you need to comment this line to be able to run this example.
+if (!defined("seekquarry\\atto\\RUN")) {
+    exit(); /* you need to comment this line to be able to run this example.
+               under a web server */
+}
 /*
     An Atto WebSite consisting of a single landing page. When run from a shell
     a timer is called every 10 seconds which prints out the current memory

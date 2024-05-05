@@ -1,9 +1,9 @@
 <?php
 /**
- * seekquarry\atto\Website -- a small web server and web routing engine
+ * seekquarry\yioop\Website --
+ * a small web server and web routing engine
  *
- *
- * Copyright (C) 2018  Chris Pollett chris@pollett.org
+ * Copyright (C) 2018-2020  Chris Pollett chris@pollett.org
  *
  * LICENSE:
  *
@@ -18,14 +18,14 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  *
  * END LICENSE
  *
  * @author Chris Pollett chris@pollett.org
- * @license http://www.gnu.org/licenses/ GPL-3.0-or-later
- * @link http://www.seekquarry.com/
- * @copyright 2018
+ * @license https://www.gnu.org/licenses/ GPL3
+ * @link https://www.seekquarry.com/
+ * @copyright 2018-2024
  * @filesource
  */
 
@@ -45,6 +45,8 @@ namespace seekquarry\atto;
  * PHP superglobals like $_GET, $_POST, $_REQUEST, $_COOKIE, $_SESSION,
  * $_FILES, etc and endeavors to make it easy to code apps in a rapid PHP
  * style.
+ *
+ * @author Chris Pollett
  */
 class WebSite
 {
@@ -71,6 +73,16 @@ class WebSite
      * @var string
      */
     public $base_path;
+    /**
+     * Check if the current run of the website is after a restart
+     * @var boolean
+     */
+    public $restart;
+    /**
+     * Used to signal stopping the website
+     * @var boolean
+     */
+    public $stop;
     /**
      * Default values to write into $_SERVER before processing a connection
      * request (in CLI mode)
@@ -163,7 +175,7 @@ class WebSite
      */
     protected $file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
     /**
-     * Whether this object is being run from teh command line with a listen()
+     * Whether this object is being run from the command line with a listen()
      * call or if it is being run under a web server and so only used for
      * routing
      * @var bool
@@ -209,7 +221,7 @@ class WebSite
      * Returns whether this class is being used from the command-line or in a
      * web server/cgi setting
      *
-     * @return boolean whther the class is being run from the command line
+     * @return boolean whether the class is being run from the command line
      */
     public function isCli()
     {
@@ -222,7 +234,7 @@ class WebSite
      * are a two element array with a route and a callback function and add
      * the appropriate route to a routing table.
      *
-     * @param string $method HTTP command to add $route_Callack for in routing
+     * @param string $method HTTP command to add $route_callack for in routing
      *      table
      * @param array $route_callback a two element array consisting of a routing
      *      pattern and a callback function.
@@ -362,8 +374,8 @@ class WebSite
         if(empty($this->routes[$method])) {
             return false;
         }
-        if (in_array($method . " ". $route, $_SERVER['RECURSION']) ) {
-            echo "<br />\nError: Recursion detected for $method $route.\n";
+        if (in_array($method . " " . $route, $_SERVER['RECURSION']) ) {
+            echo "<br>\nError: Recursion detected for $method $route.\n";
             return true;
         }
         $method_routes = $this->routes[$method];
@@ -420,7 +432,7 @@ class WebSite
      * is run from a non-CLI context then this function defaults to PHP's
      * built-in function setcookie();
      *
-     * Cookies returned from a parituclar client will appear in the $_COOKIE
+     * Cookies returned from a particular client will appear in the $_COOKIE
      * superglobal.
      *
      * @param string $name name of cookie
@@ -442,8 +454,13 @@ class WebSite
             }
             $out_cookie = "Set-Cookie: $name=$value";
             if ($expire != 0) {
+                set_error_handler(null);
                 $out_cookie .= "; Expires=" . @gmdate("D, d M Y H:i:s",
                     $expire) . " GMT";
+                $custom_error_handler =
+                    $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
+                    null;
+                set_error_handler($custom_error_handler);
             }
             if ($path != "") {
                 $out_cookie .= "; Path=$path";
@@ -485,10 +502,10 @@ class WebSite
                  $_COOKIE[$cookie_name];
             $time = time();
             $lifetime = intval($options['cookie_lifetime']);
-            if ($lifetime == 0) {
+            $expires = max($time + $lifetime, 0);
+            if ($lifetime <= 0) {
                 $lifetime = $time;
             }
-            $expires = ($lifetime > 0) ? $time + $lifetime : 0;
             if (empty($session_id)) {
                 $session_id = md5($cookie_name . microtime(true) .
                     $this->default_server_globals['SERVER_SOFTWARE'] .
@@ -526,7 +543,13 @@ class WebSite
             $_COOKIE[$cookie_name] = $session_id;
             $this->current_session = $cookie_name;
         } else {
-            session_start($options);
+            if (empty($options['cookie_lifetime']) ||
+            $options['cookie_lifetime'] >= 0) {
+                session_start($options);
+            } else if (!empty($_COOKIE)) {
+                setcookie($options['name'], "", time() - 3600,
+                    $options['cookie_path'] ?? "/");
+            }
         }
     }
     /**
@@ -543,7 +566,7 @@ class WebSite
      *
      * @param string $filename name of file to get contents of
      * @param bool $force_read whether to force the file to be read from
-     *      presistent storage rather than the cache
+     *      persistent storage rather than the cache
      * @return string contents of the file given by $filename
      */
     public function fileGetContents($filename, $force_read = false)
@@ -596,7 +619,7 @@ class WebSite
                             unset($this->file_cache['PATH'][$name]);
                         }
                     }
-                    foreach($this->file_cache['MARKED'] as $path => $data) {
+                    foreach ($this->file_cache['MARKED'] as $path => $data) {
                         $this->file_cache['UNMARKED'][$path] = $data;
                         unset($this->file_cache['MARKED'][$path]);
                     }
@@ -647,6 +670,7 @@ class WebSite
             }
         }
         $num_bytes = file_put_contents($filename, $data);
+        @chmod($filename, 0777);
         return $num_bytes;
     }
     /**
@@ -678,70 +702,6 @@ class WebSite
         return move_uploaded_file($filename, $destination);
     }
     /**
-     * Returns the mime type of the provided file name if it can be determined.
-     * (This function is from the seekquarry/yioop project)
-     *
-     * @param string $file_name (name of file including path to figure out
-     *      mime type for)
-     * @param bool $use_extension whether to just try to guess from the file
-     *      extension rather than looking at the file
-     * @return string mime type or unknown if can't be determined
-     */
-    function mimeType($file_name, $use_extension = false)
-    {
-        $mime_type = "unknown";
-        $last_chars = "-1";
-        if (!$use_extension && !file_exists($file_name)) {
-            return $mime_type;
-        }
-        if (!$use_extension && class_exists("\finfo")) {
-            $finfo = new \finfo(FILEINFO_MIME);
-            $mime_type = $finfo->file($file_name);
-        } else {
-            $last_chars = strtolower(substr($file_name,
-                strrpos($file_name, ".")));
-            $mime_types = [
-                ".aac" => "audio/aac",
-                ".aif" => "audio/aiff",
-                ".aiff" => "audio/aiff",
-                ".aifc" => "audio/aiff",
-                ".avi" => "video/x-msvideo",
-                ".bmp" => "image/bmp",
-                ".bz" => "application/bzip",
-                ".ico" => "image/x-icon",
-                ".css" => "text/css",
-                ".csv" => "text/csv",
-                ".epub" => "application/epub+zip",
-                ".gif" => "image/gif",
-                ".gz" => "application/gzip",
-                ".html" => 'text/html',
-                ".jpeg" => "image/jpeg",
-                ".jpg" => "image/jpeg",
-                ".oga" => "audio/ogg",
-                ".ogg" => "audio/ogg",
-                ".opus" => "audio/opus",
-                ".mov" => "video/quicktime",
-                ".mp3" => "audio/mpeg",
-                ".mp4" => "video/mp4",
-                ".m4a" => "audio/mp4",
-                ".m4v" => "video/mp4",
-                ".pdf" => "application/pdf",
-                ".png" => "image/png",
-                ".tex" => "text/plain",
-                ".txt" => "text/plain",
-                ".wav" => "audio/vnd.wave",
-                ".webm" => "video/webm",
-                ".zip" => "application/zip",
-                ".Z" => "application/x-compress",
-            ];
-            if (isset($mime_types[$last_chars])) {
-                $mime_type = $mime_types[$last_chars];
-            }
-        }
-        $mime_type = str_replace('application/ogg', 'video/ogg', $mime_type);
-        return $mime_type;
-    }
-    /**
      * Sets up a repeating or one-time timer that calls $callback every or after
      * $time seconds
      *
@@ -760,7 +720,7 @@ class WebSite
             throw new \Exception("Atto WebSite Timers require CLI execution");
         }
         $next_time = microtime(true) + $time;
-        $this->timers[$next_time] = [$repeating, $time, $callback];
+        $this->timers["$next_time"] = [$repeating, $time, $callback];
         $this->timer_alarms->insert([$next_time, $next_time]);
         return $next_time;
     }
@@ -771,7 +731,7 @@ class WebSite
      */
     public function clearTimer($timer_id)
     {
-        unset($this->timers[$timer_id]);
+        unset($this->timers["$timer_id"]);
     }
     /**
      * Starts an Atto Web Server listening at $address using the configuration
@@ -799,12 +759,14 @@ class WebSite
         $path = (!empty($_SERVER['PATH'])) ? $_SERVER['PATH'] :
             ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
         $default_server_globals = ["CONNECTION_TIMEOUT" => 20,
-            "CULL_OLD_SESSION_NUM" => 5, "DOCUMENT_ROOT" => getcwd(),
+            "CULL_OLD_SESSION_NUM" => 5, "CUSTOM_ERROR_HANDLER" => null,
+            "DOCUMENT_ROOT" => getcwd(),
             "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
             "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
-            "MAX_REQUEST_LEN" => 10000000, "PATH" => $path,
+            "MAX_REQUEST_LEN" => 10000000, "PATH" => $path,  "PHP_PATH" => "",
             "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
             "SERVER_SIGNATURE" => "",
+            "USER" => empty($_SERVER['USER']) ? "" : $_SERVER['USER'],
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
         ];
         $original_address = $address;
@@ -860,6 +822,12 @@ class WebSite
         if (!empty($context['ssl'])) {
             $this->is_secure = true;
         }
+        /* Raise the default queue size for connections from 5 to 200.
+           Depending on OS, this might help server handle more incoming
+           request at a time.
+         */
+        $context["socket"]["backlog"] = empty($context["socket"]["backlog"]) ?
+            200 : $context["socket"]["backlog"];
         $server_context = stream_context_create($context);
         $server = stream_socket_server($address, $errno, $errstr,
             STREAM_SERVER_BIND|STREAM_SERVER_LISTEN, $server_context);
@@ -867,7 +835,7 @@ class WebSite
             echo "Failed to bind address $address\nServer Stopping\n";
             exit();
         }
-        stream_set_blocking($server, 0);
+        stream_set_blocking($server, false);
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $server_globals);
         $as_user = "";
@@ -896,7 +864,7 @@ class WebSite
             self::DATA => [""]];
         $this->out_streams = [self::CONNECTION => [], self::DATA => []];
         $excepts = null;
-        echo "SERVER listening at $address\n";
+        echo "SERVER listening at $address $as_user\n";
         $num_selected = 1;
         while (!$this->stop || $num_selected > 0) {
             if ($this->stop) {
@@ -930,7 +898,8 @@ class WebSite
         }
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
             $session_path = substr($this->restart, strlen('restart') + 1);
-            $php = (!empty($_ENV['HHVM'])) ? "hhvm" : "php";
+            $php_path = $this->default_server_globals["PHP_PATH"] ?? "";
+            $php = (empty($_ENV['HHVM'])) ? "$php_path/php" : "$php_path/hhvm";
             $script = "$php " . $_SERVER['SCRIPT_NAME'] .
                 " " . $original_address . " 2 \"$session_path\"";
             if (strstr(PHP_OS, "WIN")) {
@@ -988,9 +957,6 @@ class WebSite
             $uri .= '?' . $url_parts['query'];
             $context['QUERY_STRING'] = $url_parts['query'];
         }
-        if (!empty($url_parts['fragment'])) {
-            $uri .= '#' . $url_parts['fragment'];
-        }
         $context['REQUEST_METHOD'] = ($post_data) ? 'POST' : 'GET';
         $context['SERVER_PROTOCOL'] = 'HTTP/1.1';
         $context['REQUEST_URI'] = $uri;
@@ -1001,7 +967,7 @@ class WebSite
         $context['SCRIPT_FILENAME'] =
             $this->default_server_globals['DOCUMENT_ROOT'] .
             $context['PHP_SELF'];
-        $context['CONTENT'] = "";
+        $context['CONTENT'] = (empty($post_data)) ? "" : $post_data;
         $request_context[] = ["SERVER" => $_SERVER, "GET" => $_GET,
             "POST" => $_POST, "REQUEST" => $_REQUEST, "COOKIE" => $_COOKIE,
             "SESSION" => $_SESSION,
@@ -1011,7 +977,6 @@ class WebSite
             "CURRENT_SESSION" => empty($this->current_session) ? "" :
                 $this->current_session];
         $this->setGlobals($context);
-        $_POST = (empty($post_data)) ? [] : $post_data;
         $out_data = $this->getResponseData($include_headers);
         $r = array_pop($request_context);
         $_SERVER = $r["SERVER"];
@@ -1026,13 +991,89 @@ class WebSite
         return $out_data;
     }
     /**
+     * Used to export info (but not change) about running sessions
+     */
+    public function getSessions()
+    {
+        return $this->sessions;
+    }
+    /**
+     * Returns the mime type of the provided file name if it can be determined.
+     * (This function is from the seekquarry/yioop project)
+     *
+     * @param string $file_name (name of file including path to figure out
+     *      mime type for)
+     * @param bool $use_extension whether to just try to guess from the file
+     *      extension rather than looking at the file
+     * @return string mime type or unknown if can't be determined
+     */
+    public static function mimeType($file_name, $use_extension = false)
+    {
+        $mime_type = "unknown";
+        $last_chars = "-1";
+        if (!$use_extension && !file_exists($file_name)) {
+            return $mime_type;
+        }
+        if (!$use_extension && class_exists("\finfo")) {
+            $finfo = new \finfo(FILEINFO_MIME);
+            $mime_type = $finfo->file($file_name);
+        } else {
+            $last_chars = trim(strtolower(substr($file_name,
+                strrpos($file_name, "."))));
+            $mime_types = [
+                ".aac" => "audio/aac",
+                ".aif" => "audio/aiff",
+                ".aiff" => "audio/aiff",
+                ".aifc" => "audio/aiff",
+                ".avi" => "video/x-msvideo",
+                ".bmp" => "image/bmp",
+                ".bz" => "application/bzip",
+                ".ico" => "image/x-icon",
+                ".css" => "text/css",
+                ".csv" => "text/csv",
+                ".epub" => "application/epub+zip",
+                ".gif" => "image/gif",
+                ".gz" => "application/gzip",
+                ".html" => 'text/html',
+                ".jpeg" => "image/jpeg",
+                ".jpg" => "image/jpeg",
+                ".js" => "text/javascript",
+                ".oga" => "audio/ogg",
+                ".ogg" => "audio/ogg",
+                ".opus" => "audio/opus",
+                ".mov" => "video/quicktime",
+                ".mp3" => "audio/mpeg",
+                ".mp4" => "video/mp4",
+                ".m2ts" => "video/m2ts",
+                ".MTS" => "video/m2ts",
+                ".m4a" => "audio/mp4",
+                ".m4v" => "video/mp4",
+                ".pdf" => "application/pdf",
+                ".png" => "image/png",
+                ".tex" => "text/plain",
+                ".txt" => "text/plain",
+                ".wasm" => "application/wasm",
+                ".wav" => "audio/vnd.wave",
+                ".webp" => "image/webp",
+                ".webm" => "video/webm",
+                ".zip" => "application/zip",
+                ".Z" => "application/x-compress",
+            ];
+            if (isset($mime_types[$last_chars])) {
+                $mime_type = $mime_types[$last_chars];
+            }
+        }
+        $mime_type = str_replace('application/ogg', 'video/ogg', $mime_type);
+        return $mime_type;
+    }
+    /**
      * Used  by usual and internal requests to compute response  string of the
      * web server to the web client's request. In the case of internal requests,
      * it is sometimes usesful to return just the body of the response without
      * HTTP headers
      *
      * @param bool $include_headers whether to include HTTP headers at beginning
-     *      of reponse
+     *      of response
      * @return string HTTP response to web client request
      */
     protected function getResponseData($include_headers = true)
@@ -1143,8 +1184,8 @@ class WebSite
         $top = $this->timer_alarms->top();
         while ($now > $top[0]) {
             $this->timer_alarms->extract();
-            if (!empty($this->timers[$top[1]])) {
-                list($repeating, $time, $callback) = $this->timers[$top[1]];
+            if (!empty($this->timers["{$top[1]}"])) {
+                list($repeating, $time, $callback) = $this->timers["{$top[1]}"];
                 $callback();
                 if ($repeating) {
                     $next_time = $now + $time;
@@ -1177,6 +1218,7 @@ class WebSite
             $meta = stream_get_meta_data($in_stream);
             $key = (int)$in_stream;
             if ($meta['eof']) {
+                $this->shutdownHttpStream($key);
                 continue;
             }
             $len = strlen($this->in_streams[self::DATA][$key]);
@@ -1186,7 +1228,7 @@ class WebSite
                 continue;
             }
             if (!$too_long) {
-                stream_set_blocking($in_stream, 0);
+                stream_set_blocking($in_stream, false);
                 $data = stream_get_contents($in_stream, min(
                     $this->default_server_globals['MAX_IO_LEN'],
                     $max_len - $len));
@@ -1233,23 +1275,38 @@ class WebSite
                 ini_get("default_socket_timeout")), 0);
         }
         if ($this->is_secure) {
-            stream_set_blocking($server, 1);
+            stream_set_blocking($server, true);
         }
         $connection = stream_socket_accept($server, $timeout);
         if ($this->is_secure) {
-            stream_set_blocking($server, 0);
+            stream_set_blocking($server, false);
         }
         if ($connection) {
             if ($this->is_secure) {
-                stream_set_blocking($connection, 1);
-                @stream_socket_enable_crypto($connection, true,
+                stream_set_blocking($connection, true);
+                set_error_handler(null);
+                $this->checkHttpType($connection);
+                stream_socket_enable_crypto($connection, true,
                     STREAM_CRYPTO_METHOD_TLS_SERVER);
-                stream_set_blocking($connection, 0);
+                var_dump(stream_get_meta_data($connection));
+                $custom_error_handler =
+                    $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
+                    null;
+                set_error_handler($custom_error_handler);
+                stream_set_blocking($connection, false);
             }
             $key = (int)$connection;
             $this->in_streams[self::CONNECTION][$key] = $connection;
             $this->initRequestStream($key);
         }
+    }
+    /**
+     *
+     */
+    function checkHttpType($connection)
+    {
+        echo chunk_split(bin2hex(stream_socket_recvfrom($connection, 1000,
+            STREAM_PEEK)), 2, " ");
     }
     /**
      * Gets info about an incoming request stream and uses this to set up
@@ -1291,8 +1348,17 @@ class WebSite
         foreach ($out_streams_with_data as $out_stream) {
             $key = (int)$out_stream;
             $data = $this->out_streams[self::DATA][$key];
-            $num_bytes = fwrite($out_stream, $data);
-            $remaining_bytes = max(0, strlen($data) - $num_bytes);
+            $custom_error_handler =
+                $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ?? null;
+            //suppress connection reset notices
+            set_error_handler(null);
+            $num_bytes = @fwrite($out_stream, $data);
+            set_error_handler($custom_error_handler);
+            if ($num_bytes === false) {
+                $remaining_bytes = 0;
+            } else {
+                $remaining_bytes = max(0, strlen($data) - $num_bytes);
+            }
             if ($num_bytes > 0) {
                 $this->out_streams[self::DATA][$key] =
                     substr($data, $num_bytes);
@@ -1477,7 +1543,21 @@ class WebSite
                     continue;
                 }
                 if (empty($file_name)) {
-                    $_POST[$name] = rtrim($content, "\x0D\x0A");
+                    //we support up to 3D arrays in form variables
+                    if (preg_match("/^(\w+)\[(\w+)\]\[(\w+)\]\[(\w+)\]$/",
+                        $name, $matches)) {
+                        $_POST[$matches[1]][$matches[2]][$matches[3]][
+                            $matches[4]] = $content;
+                    } else if (preg_match("/^(\w+)\[(\w+)\]\[(\w+)\]$/", $name,
+                        $matches)) {
+                        $_POST[$matches[1]][$matches[2]][$matches[3]] =
+                            $content;
+                    } else if (preg_match("/^(\w+)\[(\w+)\]$/", $name,
+                        $matches)) {
+                        $_POST[$matches[1]][$matches[2]] = $content;
+                    } else {
+                        $_POST[$name] = rtrim($content, "\x0D\x0A");
+                    }
                     continue;
                 }
                 $file_array = ['name' => $file_name, 'tmp_name' => $file_name,
@@ -1563,6 +1643,10 @@ class WebSite
             if (in_array($key, $this->immortal_stream_keys)) {
                 continue;
             }
+            if (empty($this->in_streams[self::CONNECTION][$key])) {
+                $this->shutdownHttpStream($key);
+                continue;
+            }
             $meta = stream_get_meta_data(
                 $this->in_streams[self::CONNECTION][$key]);
             $in_time = empty($this->in_streams[self::MODIFIED_TIME][$key]) ?
@@ -1586,8 +1670,13 @@ class WebSite
     protected function shutdownHttpStream($key)
     {
         if (!empty($this->in_streams[self::CONNECTION][$key])) {
+            set_error_handler(null);
             @stream_socket_shutdown($this->in_streams[self::CONNECTION][$key],
                 STREAM_SHUT_RDWR);
+            $custom_error_handler =
+                $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
+                null;
+            set_error_handler($custom_error_handler);
         }
         unset($this->in_streams[self::CONNECTION][$key],
             $this->in_streams[self::CONTEXT][$key],
@@ -1635,5 +1724,6 @@ function webExit($err_msg = "")
 /**
  * Exception generated when a running WebSite script calls webExit()
  */
-class WebException extends \Exception {
+class WebException extends \Exception
+{
 }

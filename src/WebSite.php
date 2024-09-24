@@ -1,4 +1,5 @@
 <?php
+
 /**
  * seekquarry\yioop\Website --
  * a small web server and web routing engine
@@ -48,6 +49,9 @@ namespace seekquarry\atto;
  *
  * @author Chris Pollett
  */
+
+require 'Frame.php';
+
 class WebSite
 {
     /*
@@ -301,9 +305,7 @@ class WebSite
         }
         $this->routes[$method][$route] = $callback;
     }
-    /*
-        HTTP/HTTPS Processing Methods
-     */
+
     /**
      * Adds a middle ware callback that should be called before any processing
      * on the request is done.
@@ -327,6 +329,15 @@ class WebSite
         foreach ($this->middle_wares as $middleware) {
             $middleware();
         }
+
+        // Handle Upgrade Header
+        if (isset($_SERVER['HTTP_UPGRADE']) && $_SERVER['HTTP_UPGRADE'] === 'HTTP/2') {
+            $this->header_data = "UPGRADE";
+            $this->header_data = "UPGRADE";
+            // $this->handleUpgradeToHttp2();
+            return;
+        }
+
         $method = empty($_SERVER['REQUEST_METHOD']) ? "ERROR" :
             $_SERVER['REQUEST_METHOD'];
         if (empty($_SERVER['QUERY_STRING'])) {
@@ -432,7 +443,7 @@ class WebSite
      * is run from a non-CLI context then this function defaults to PHP's
      * built-in function setcookie();
      *
-     * Cookies returned from a particular client will appear in the $_COOKIE
+     * Cookies returned from a parituclar client will appear in the $_COOKIE
      * superglobal.
      *
      * @param string $name name of cookie
@@ -445,8 +456,7 @@ class WebSite
      * @param bool $httponly whether or not the cookie is available only over
      *      HTTP, and not available to client-side Javascript
      */
-    public function setCookie($name, $value = "", $expire = 0, $path = "",
-        $domain = "", $secure = false, $httponly = false)
+    public function setCookie($name, $value = "", $expire = 0, $path = "", $domain = "", $secure = false, $httponly = false)
     {
         if ($this->isCli()) {
             if ($secure && !$_SERVER['HTTPS']) {
@@ -702,6 +712,70 @@ class WebSite
         return move_uploaded_file($filename, $destination);
     }
     /**
+     * Returns the mime type of the provided file name if it can be determined.
+     * (This function is from the seekquarry/yioop project)
+     *
+     * @param string $file_name (name of file including path to figure out
+     *      mime type for)
+     * @param bool $use_extension whether to just try to guess from the file
+     *      extension rather than looking at the file
+     * @return string mime type or unknown if can't be determined
+     */
+    function mimeType($file_name, $use_extension = false)
+    {
+        $mime_type = "unknown";
+        $last_chars = "-1";
+        if (!$use_extension && !file_exists($file_name)) {
+            return $mime_type;
+        }
+        if (!$use_extension && class_exists("\finfo")) {
+            $finfo = new \finfo(FILEINFO_MIME);
+            $mime_type = $finfo->file($file_name);
+        } else {
+            $last_chars = strtolower(substr($file_name,
+                strrpos($file_name, ".")));
+            $mime_types = [
+                ".aac" => "audio/aac",
+                ".aif" => "audio/aiff",
+                ".aiff" => "audio/aiff",
+                ".aifc" => "audio/aiff",
+                ".avi" => "video/x-msvideo",
+                ".bmp" => "image/bmp",
+                ".bz" => "application/bzip",
+                ".ico" => "image/x-icon",
+                ".css" => "text/css",
+                ".csv" => "text/csv",
+                ".epub" => "application/epub+zip",
+                ".gif" => "image/gif",
+                ".gz" => "application/gzip",
+                ".html" => 'text/html',
+                ".jpeg" => "image/jpeg",
+                ".jpg" => "image/jpeg",
+                ".oga" => "audio/ogg",
+                ".ogg" => "audio/ogg",
+                ".opus" => "audio/opus",
+                ".mov" => "video/quicktime",
+                ".mp3" => "audio/mpeg",
+                ".mp4" => "video/mp4",
+                ".m4a" => "audio/mp4",
+                ".m4v" => "video/mp4",
+                ".pdf" => "application/pdf",
+                ".png" => "image/png",
+                ".tex" => "text/plain",
+                ".txt" => "text/plain",
+                ".wav" => "audio/vnd.wave",
+                ".webm" => "video/webm",
+                ".zip" => "application/zip",
+                ".Z" => "application/x-compress",
+            ];
+            if (isset($mime_types[$last_chars])) {
+                $mime_type = $mime_types[$last_chars];
+            }
+        }
+        $mime_type = str_replace('application/ogg', 'video/ogg', $mime_type);
+        return $mime_type;
+    }
+    /**
      * Sets up a repeating or one-time timer that calls $callback every or after
      * $time seconds
      *
@@ -720,7 +794,7 @@ class WebSite
             throw new \Exception("Atto WebSite Timers require CLI execution");
         }
         $next_time = microtime(true) + $time;
-        $this->timers["$next_time"] = [$repeating, $time, $callback];
+        $this->timers[$next_time] = [$repeating, $time, $callback];
         $this->timer_alarms->insert([$next_time, $next_time]);
         return $next_time;
     }
@@ -731,7 +805,7 @@ class WebSite
      */
     public function clearTimer($timer_id)
     {
-        unset($this->timers["$timer_id"]);
+        unset($this->timers[$timer_id]);
     }
     /**
      * Starts an Atto Web Server listening at $address using the configuration
@@ -821,6 +895,16 @@ class WebSite
         }
         if (!empty($context['ssl'])) {
             $this->is_secure = true;
+        } else if(!empty($_SERVER['HTTPS'])) {
+            $this->is_secure = true;
+            $context['ssl'] = [
+                "local_cert" => "../cert.pem'", 
+                "local_pk" => "../key.pem'", 
+                "verify_peer" => false,
+                "verify_peer_name" => false,
+                "allow_self_signed" => true,
+                "alpn_protocols" => "h2,http/1.1"
+            ];
         }
         /* Raise the default queue size for connections from 5 to 200.
            Depending on OS, this might help server handle more incoming
@@ -835,7 +919,7 @@ class WebSite
             echo "Failed to bind address $address\nServer Stopping\n";
             exit();
         }
-        stream_set_blocking($server, false);
+        stream_set_blocking($server, 0);
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $server_globals);
         $as_user = "";
@@ -864,7 +948,7 @@ class WebSite
             self::DATA => [""]];
         $this->out_streams = [self::CONNECTION => [], self::DATA => []];
         $excepts = null;
-        echo "SERVER listening at $address $as_user\n";
+        echo "SERVER listening at $address\n";
         $num_selected = 1;
         while (!$this->stop || $num_selected > 0) {
             if ($this->stop) {
@@ -887,8 +971,8 @@ class WebSite
                 $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
             }
-            $num_selected = stream_select($in_streams_with_data,
-                $out_streams_with_data, $excepts, $timeout, $micro_timeout);
+            $num_selected = stream_select($in_streams_with_data, $out_streams_with_data, $excepts, $timeout, $micro_timeout);
+         
             $this->processTimers();
             if ($num_selected > 0) {
                 $this->processRequestStreams($server, $in_streams_with_data);
@@ -898,9 +982,8 @@ class WebSite
         }
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
             $session_path = substr($this->restart, strlen('restart') + 1);
-            $php_path = $this->default_server_globals["PHP_PATH"] ?? "";
-            $php = (empty($_ENV['HHVM'])) ? "$php_path/php" : "$php_path/hhvm";
-            $script = "$php " . $_SERVER['SCRIPT_NAME'] .
+            $php = (!empty($_ENV['HHVM'])) ? "hhvm" : "php";
+             $script = "$php " . $_SERVER['SCRIPT_NAME'] .
                 " " . $original_address . " 2 \"$session_path\"";
             if (strstr(PHP_OS, "WIN")) {
                 $script = str_replace("/", "\\", $script);
@@ -923,7 +1006,7 @@ class WebSite
      * Used to handle local web page/HTTP requests made from a running
      * WebSite script  back to itself. For example, if while processing a
      * Website ROUTE, one wanted to do curl request for another local page.
-     * Since WebSite is is single-threaded, such a request would block until the
+     * Since WebSite is single-threaded, such a request would block until the
      * current page was done processing, but as the current page depends on the
      * blocked request, this would cause a deadlock. To avoid this WebSite's
      * should check if a request is local, and if so, call
@@ -938,8 +1021,7 @@ class WebSite
      * @return string web page that WebSite would have reqsponded with if
      *      the request had been made as a usual web request.
      */
-    public function processInternalRequest($url, $include_headers = false,
-        $post_data = null)
+    public function processInternalRequest($url, $include_headers = false, $post_data = null)
     {
         static $request_context = [];
         if (count($request_context) > 5) {
@@ -956,6 +1038,9 @@ class WebSite
         if (!empty($url_parts['query'])) {
             $uri .= '?' . $url_parts['query'];
             $context['QUERY_STRING'] = $url_parts['query'];
+        }
+        if (!empty($url_parts['fragment'])) {
+            $uri .= '#' . $url_parts['fragment'];
         }
         $context['REQUEST_METHOD'] = ($post_data) ? 'POST' : 'GET';
         $context['SERVER_PROTOCOL'] = 'HTTP/1.1';
@@ -989,82 +1074,6 @@ class WebSite
         $this->content_type = $r["CONTENT_TYPE"];
         $this->current_session = $r["CURRENT_SESSION"];
         return $out_data;
-    }
-    /**
-     * Used to export info (but not change) about running sessions
-     */
-    public function getSessions()
-    {
-        return $this->sessions;
-    }
-    /**
-     * Returns the mime type of the provided file name if it can be determined.
-     * (This function is from the seekquarry/yioop project)
-     *
-     * @param string $file_name (name of file including path to figure out
-     *      mime type for)
-     * @param bool $use_extension whether to just try to guess from the file
-     *      extension rather than looking at the file
-     * @return string mime type or unknown if can't be determined
-     */
-    public static function mimeType($file_name, $use_extension = false)
-    {
-        $mime_type = "unknown";
-        $last_chars = "-1";
-        if (!$use_extension && !file_exists($file_name)) {
-            return $mime_type;
-        }
-        if (!$use_extension && class_exists("\finfo")) {
-            $finfo = new \finfo(FILEINFO_MIME);
-            $mime_type = $finfo->file($file_name);
-        } else {
-            $last_chars = trim(strtolower(substr($file_name,
-                strrpos($file_name, "."))));
-            $mime_types = [
-                ".aac" => "audio/aac",
-                ".aif" => "audio/aiff",
-                ".aiff" => "audio/aiff",
-                ".aifc" => "audio/aiff",
-                ".avi" => "video/x-msvideo",
-                ".bmp" => "image/bmp",
-                ".bz" => "application/bzip",
-                ".ico" => "image/x-icon",
-                ".css" => "text/css",
-                ".csv" => "text/csv",
-                ".epub" => "application/epub+zip",
-                ".gif" => "image/gif",
-                ".gz" => "application/gzip",
-                ".html" => 'text/html',
-                ".jpeg" => "image/jpeg",
-                ".jpg" => "image/jpeg",
-                ".js" => "text/javascript",
-                ".oga" => "audio/ogg",
-                ".ogg" => "audio/ogg",
-                ".opus" => "audio/opus",
-                ".mov" => "video/quicktime",
-                ".mp3" => "audio/mpeg",
-                ".mp4" => "video/mp4",
-                ".m2ts" => "video/m2ts",
-                ".MTS" => "video/m2ts",
-                ".m4a" => "audio/mp4",
-                ".m4v" => "video/mp4",
-                ".pdf" => "application/pdf",
-                ".png" => "image/png",
-                ".tex" => "text/plain",
-                ".txt" => "text/plain",
-                ".wasm" => "application/wasm",
-                ".wav" => "audio/vnd.wave",
-                ".webp" => "image/webp",
-                ".webm" => "video/webm",
-                ".zip" => "application/zip",
-                ".Z" => "application/x-compress",
-            ];
-            if (isset($mime_types[$last_chars])) {
-                $mime_type = $mime_types[$last_chars];
-            }
-        }
-        $mime_type = str_replace('application/ogg', 'video/ogg', $mime_type);
-        return $mime_type;
     }
     /**
      * Used  by usual and internal requests to compute response  string of the
@@ -1104,12 +1113,23 @@ class WebSite
         }
         $out_data = ob_get_contents();
         ob_end_clean();
+        
+        if ($this->header_data == "UPGRADE") {
+            $out_data = "";
+            $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                " 101 Switching Protocols\x0D\x0A" .
+                "Upgrade: HTTP/2\x0D\x0A" .
+                "Connection: Upgrade\x0D\x0A";
+            $out_data = $this->header_data;
+            return $out_data;
+        }
         if ($this->current_session != "" &&
             !empty($_COOKIE[$this->current_session])) {
             $session_id = $_COOKIE[$this->current_session];
             $this->sessions[$session_id]['DATA'] = $_SESSION;
         }
         $redirect = false;
+
         if (substr($this->header_data, 0, 5) != "HTTP/") {
             if (stristr($this->header_data, "Location") != false) {
                 $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
@@ -1216,6 +1236,7 @@ class WebSite
                 return;
             }
             $meta = stream_get_meta_data($in_stream);
+
             $key = (int)$in_stream;
             if ($meta['eof']) {
                 $this->shutdownHttpStream($key);
@@ -1232,26 +1253,38 @@ class WebSite
                 $data = stream_get_contents($in_stream, min(
                     $this->default_server_globals['MAX_IO_LEN'],
                     $max_len - $len));
+
             } else {
                 $data = "";
                 $this->initializeBadRequestResponse($key);
             }
-            if ($too_long || $this->parseRequest($key, $data)) {
-                if (!empty($this->in_streams[self::CONTEXT][$key][
-                    'PRE_BAD_RESPONSE'])) {
-                    $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
-                        true;
+            if (isset($this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']) && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'] == "HTTP/2.0") {
+                if($too_long || $this->parseH2Request($key, $data)) {
+                    if (!empty($this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
+                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] = true;
+                    }
+                    if (empty($this->out_streams[self::CONNECTION][$key])) {
+                        $this->out_streams[self::CONNECTION][$key] = $in_stream;
+                        $this->out_streams[self::DATA][$key] = $out_data;
+                        $this->out_streams[self::CONTEXT][$key] = $_SERVER;
+                        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+                    }
                 }
-                $out_data = $this->getResponseData();
-                if (empty($this->in_streams[self::CONTEXT][$key][
-                    'BAD_RESPONSE'])) {
-                    $this->initRequestStream($key);
-                }
-                if (empty($this->out_streams[self::CONNECTION][$key])) {
-                    $this->out_streams[self::CONNECTION][$key] = $in_stream;
-                    $this->out_streams[self::DATA][$key] = $out_data;
-                    $this->out_streams[self::CONTEXT][$key] = $_SERVER;
-                    $this->out_streams[self::MODIFIED_TIME][$key] = time();
+            } else {
+                if ($too_long || $this->parseRequest($key, $data)) {
+                    if (!empty($this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
+                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] = true;
+                    }
+                    $out_data = $this->getResponseData();
+                    if (empty($this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])) {
+                        $this->initRequestStream($key);
+                    }
+                    if (empty($this->out_streams[self::CONNECTION][$key])) {
+                        $this->out_streams[self::CONNECTION][$key] = $in_stream;
+                        $this->out_streams[self::DATA][$key] = $out_data;
+                        $this->out_streams[self::CONTEXT][$key] = $_SERVER;
+                        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+                    }
                 }
             }
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
@@ -1262,43 +1295,65 @@ class WebSite
      * used to check if the server has detected a
      * new connection. In which case, a read stream is set-up.
      *
-     * @param resource $server socket server used to listen for incoming
-     *  connections
+     * @param resource $server Socket server used to listen for incoming connections.
      */
     protected function processServerRequest($server)
-    {
-        if ($this->timer_alarms->isEmpty()) {
-            $timeout = ini_get("default_socket_timeout");
-        } else {
-            $next_alarm = $this->timer_alarms->top();
-            $timeout = max(min( $next_alarm[0] - microtime(true),
-                ini_get("default_socket_timeout")), 0);
-        }
-        if ($this->is_secure) {
-            stream_set_blocking($server, true);
-        }
-        $connection = stream_socket_accept($server, $timeout);
-        if ($this->is_secure) {
-            stream_set_blocking($server, false);
-        }
-        if ($connection) {
-            if ($this->is_secure) {
-                stream_set_blocking($connection, true);
-                set_error_handler(null);
-                $additional_context = $this->checkHttpType($connection);
-                stream_socket_enable_crypto($connection, true,
-                    STREAM_CRYPTO_METHOD_TLS_SERVER);
-                $custom_error_handler =
-                    $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
-                    null;
-                set_error_handler($custom_error_handler);
-                stream_set_blocking($connection, false);
-            }
-            $key = (int)$connection;
-            $this->in_streams[self::CONNECTION][$key] = $connection;
-            $this->initRequestStream($key, $additional_context);
-        }
+{
+    if ($this->timer_alarms->isEmpty()) {
+        $timeout = ini_get("default_socket_timeout");
+    } else {
+        $next_alarm = $this->timer_alarms->top();
+        $timeout = max(min($next_alarm[0] - microtime(true), ini_get("default_socket_timeout")), 0);
     }
+
+    if ($this->is_secure) {
+        stream_set_blocking($server, true);
+    }
+    $connection = stream_socket_accept($server, $timeout);
+    if ($this->is_secure) {
+        stream_set_blocking($server, false);
+    }
+
+    if (!$connection) {
+        echo "No connection accepted or timed out.\n";
+        return;
+    }
+
+    $stream_start = stream_socket_recvfrom($connection, 512, STREAM_PEEK);
+    $additional_context = !empty($stream_start)
+        ? $this->checkHttpType($stream_start)
+        : ["CLIENT_HTTP" => "unknown"];
+
+    if ($this->is_secure && $additional_context["CLIENT_HTTP"] !== "h2c") {
+        stream_set_blocking($connection, true);
+        if (!@stream_socket_enable_crypto($connection, true, STREAM_CRYPTO_METHOD_TLS_SERVER)) {
+            $sslError = error_get_last();
+            echo "\n\nSSL Error: " . $sslError['message'] . "\nL1387\n\n";
+            return;
+        }
+        set_error_handler(null);
+        $custom_error_handler = $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ?? null;
+        set_error_handler($custom_error_handler);
+        stream_set_blocking($connection, false);
+    }
+
+    $key = (int) $connection;
+    $this->in_streams[self::CONNECTION][$key] = $connection;
+
+    if ($additional_context["CLIENT_HTTP"] == "unknown") {
+        $stream_start = fread($connection, 1024);
+        $additional_context = $this->checkHttpType($stream_start);
+    }
+
+    if ($additional_context["CLIENT_HTTP"] == "HTTP/2.0") {
+        $this->parseH2InitRequest($connection);
+    } else if ($additional_context["CLIENT_HTTP"] == "h2c") {
+        $this->parseH2CInitRequest($connection);
+    } else {
+        $this->initRequestStream($key, $additional_context);
+    }
+}
+
     /**
      * Tries to determine from a connection (as it just starts, provided it
      * is TLS ClientHello message) whether ALPN extension indicate the
@@ -1307,18 +1362,201 @@ class WebSite
      * @param resource $connection a client connection that is just being
      *   initialized before stream_socket_enable_crypto has been called
      */
-    function checkHttpType($connection)
+    function checkHttpType($stream_start)
     {
-        $stream_start = stream_socket_recvfrom($connection, 256, STREAM_PEEK);
-        $context = ["CLIENT_HTTP" => "http/1.1"];
-        if ( preg_match("/\x00\x10(.){2}.+(h2|h3)/", $stream_start, $matches)) {
-            if(!empty($matches[2])) {
-                $context["CLIENT_HTTP"] = $matches[2];
+
+        $s ="from request data";
+        $context = ["CLIENT_HTTP" => "HTTP/2.0"];
+        if (preg_match("/HTTP\/([23])\.0/", $stream_start, $matches)) {
+            if(!empty($matches[0])) {
+                $context["CLIENT_HTTP"] = "h2c";
             }
         }
-        echo "HTTP version {$context['CLIENT_HTTP']} from TLS handshake\n";
+        if (preg_match("/^((GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT) \S+ HTTP\/1\.1)/", $stream_start, $matches)) {
+            $context["CLIENT_HTTP"] = "HTTP/1.1";
+            // $s = "from request data";
+        }
+        echo "HTTP version {$context['CLIENT_HTTP']} $s\n";
         return $context;
     }
+
+    /**
+     */
+    protected function parseH2InitRequest($connection)
+    {
+        $data = "";
+        $i = 5;
+        while ($i > 0) {
+            $data .= fread($connection, 1024);
+            $i = $i - 1;
+        }
+        $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        $magicStrLen = strlen($magic_string);
+        $rawRcvdFrames = substr($data, $magicStrLen);
+        $rawSettingsHeader = substr($rawRcvdFrames, 0, 9);
+    
+        list($settingsHeader, $length) = SettingsFrame::parseFrameHeader($rawSettingsHeader);
+        $settingsFrmData = substr($rawRcvdFrames, 9, $length);
+    
+        // Save settings
+        try {
+            $initialSettingsFrm = new SettingsFrame(0, []);
+            $initialSettingsFrm->parse_body($settingsFrmData);
+        } catch (Exception $e) {
+            echo "Exception in creating connection preface settings frame: " . $e->getMessage();
+            echo "Exception in parsing body of the received initial settings frame: " . $e->getMessage();
+        }
+    
+        // Send initial settings frame
+        try {
+            $out_data = $initialSettingsFrm->serialize();
+            @fwrite($connection, $out_data);
+        } catch (Exception $e) {
+            echo "Exception in encoding and sending connection preface settings frame: " . $e->getMessage();
+        }
+    
+        // Receive Window Update
+        $rcvdWinUpdate = substr($rawRcvdFrames, 9 + $length, 13);
+    
+        // Send ACK
+        try {
+            $frame = new SettingsFrame(0, []);
+            $frame->flags->add('ACK');
+            $out_data = $frame->serialize();
+            @fwrite($connection, $out_data);
+        } catch (Exception $e) {
+            echo "Caught exception: " . $e->getMessage();
+        }
+    
+        // Receive Header frame - GET request
+        $rawHeaderFrame = substr($rawRcvdFrames, 9 + $length + 13);
+        list($headerFrame, $length) = HeaderFrame::parseFrameHeader(substr($rawHeaderFrame, 0, 9));
+        $headerFrame_data = substr($rawHeaderFrame, 9, $length);
+    
+        $url = $headerFrame->parseBody($headerFrame_data);
+    
+        // Get Response
+        $_SESSION = [];
+        $response = $this->processInternalRequest($url);
+        // Create response frames
+        if (strlen($response) != 0 && $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
+            $messageHeaders = [
+                [":status", "200"],
+                ["content-type", "text/html; charset=utf-8"],
+                ["content-length", strlen($response)]
+            ];
+            $responseHeader = new HeaderFrame($headerFrame->stream_id, $messageHeaders, []);
+            $responseHeader->flags->add("END_HEADERS");
+            $responseHeaderSerialized = $responseHeader->serialize();
+    
+            $responseDataFrame = new DataFrame($headerFrame->stream_id, $response, []);
+            $responseDataFrame->flags->add("END_STREAM");
+            $responseDataFrameSerialized = $responseDataFrame->serialize();
+    
+            $out_data = $responseHeaderSerialized . $responseDataFrameSerialized;
+        } else {
+            $messageHeaders = [[":status", "404"]];
+            $responseHeader = new HeaderFrame($headerFrame->stream_id, $messageHeaders, []);
+            $responseHeader->flags->add("END_HEADERS");
+            $responseHeader->flags->add("END_STREAM");
+            $out_data = $responseHeader->serialize();
+        }
+
+        // Send Response
+        try {
+            @fwrite($connection, $out_data);
+        } catch (Exception $e) {
+            echo "Caught exception: " . $e->getMessage();
+        }
+    }
+    
+    /**
+     */
+    protected function parseH2CInitRequest($connection)
+    {
+        // Parse the settings frame received from client
+        $data = stream_socket_recvfrom($connection, 256);
+    
+        $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        $magicStrLen = strlen($magic_string);
+        $rawRcvdFrames = substr($data, $magicStrLen);
+        $rawSettingsHeader = substr($rawRcvdFrames, 0, 9);
+    
+        list($settingsHeader, $length) = SettingsFrame::parseFrameHeader($rawSettingsHeader);
+        $settingsFrmData = substr($rawRcvdFrames, 9, $length);
+    
+        // Save settings
+        try {
+            $initialSettingsFrm = new SettingsFrame(0, []);
+            $initialSettingsFrm->parse_body($settingsFrmData);
+        } catch (Exception $e) {
+            echo "Exception in creating connection preface settings frame: " . $e->getMessage();
+            echo "Exception in parsing body of the received initial settings frame: " . $e->getMessage();
+        }
+    
+        // Send initial settings frame
+        try {
+            $out_data = $initialSettingsFrm->serialize();
+            @fwrite($connection, $out_data);
+        } catch (Exception $e) {
+            echo "Exception in encoding and sending connection preface settings frame: " . $e->getMessage();
+        }
+    
+        // Receive Window Update
+        $rcvdWinUpdate = substr($rawRcvdFrames, 9 + $length, 13);
+    
+        // Send ACK
+        try {
+            $frame = new SettingsFrame(0, []);
+            $frame->flags->add('ACK');
+            $out_data = $frame->serialize();
+            @fwrite($connection, $out_data);
+        } catch (Exception $e) {
+            echo "Caught exception: " . $e->getMessage();
+        }
+    
+        // Receive Header frame - GET request
+        $rawHeaderFrame = substr($rawRcvdFrames, 9 + $length + 13);
+        list($headerFrame, $length) = HeaderFrame::parseFrameHeader(substr($rawHeaderFrame, 0, 9));
+        $headerFrame_data = substr($rawHeaderFrame, 9, $length);
+    
+        $url = $headerFrame->parseBody($headerFrame_data);
+    
+        // Get Response
+        $_SESSION = [];
+        $response = $this->processInternalRequest($url);
+        // Create response frames
+        if (strlen($response) != 0 && $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
+            $messageHeaders = [
+                [":status", "200"],
+                ["content-type", "text/html; charset=utf-8"],
+                ["content-length", strlen($response)]
+            ];
+            $responseHeader = new HeaderFrame($headerFrame->stream_id, $messageHeaders, []);
+            $responseHeader->flags->add("END_HEADERS");
+            $responseHeaderSerialized = $responseHeader->serialize();
+    
+            $responseDataFrame = new DataFrame($headerFrame->stream_id, $response, []);
+            $responseDataFrame->flags->add("END_STREAM");
+            $responseDataFrameSerialized = $responseDataFrame->serialize();
+    
+            $out_data = $responseHeaderSerialized . $responseDataFrameSerialized;
+        } else {
+            $messageHeaders = [[":status", "404"]];
+            $responseHeader = new HeaderFrame($headerFrame->stream_id, $messageHeaders, []);
+            $responseHeader->flags->add("END_HEADERS");
+            $responseHeader->flags->add("END_STREAM");
+            $out_data = $responseHeader->serialize();
+        }
+    
+        // Send Response
+        try {
+            @fwrite($connection, $out_data);
+        } catch (Exception $e) {
+            echo "Caught exception: " . $e->getMessage();
+        }
+    }
+  
     /**
      * Gets info about an incoming request stream and uses this to set up
      * an initial stream context. This context is used to populate the $_SERVER
@@ -1333,19 +1571,24 @@ class WebSite
         $connection = $this->in_streams[self::CONNECTION][$key];
         $remote_name = stream_socket_get_name($connection, true);
         $remote_col = strrpos($remote_name, ":");
-        $server_name = stream_socket_get_name($connection,
-            false);
+        $server_name = stream_socket_get_name($connection, false);
         $server_col = strrpos($server_name, ":");
-        $this->in_streams[self::CONTEXT][$key] =
-            [self::REQUEST_HEAD => false,
-             'REQUEST_METHOD' => false,
-             "REMOTE_ADDR" => substr($remote_name, 0, $remote_col),
-             "REMOTE_PORT" => substr($remote_name, $remote_col + 1),
-             "REQUEST_TIME" => time(),
-             "REQUEST_TIME_FLOAT" => microtime(true),
-             "SERVER_ADDR" => substr($server_name, 0, $server_col),
-             "SERVER_PORT" => substr($server_name, $server_col + 1),
-             ];
+        $this->in_streams[self::CONTEXT][$key] = [
+            self::REQUEST_HEAD => false,
+            'REQUEST_METHOD' => false,
+            "REMOTE_ADDR" => substr($remote_name, 0, $remote_col),
+            "REMOTE_PORT" => substr($remote_name, $remote_col + 1),
+            "REQUEST_TIME" => time(),
+            "REQUEST_TIME_FLOAT" => microtime(true),
+            "SERVER_ADDR" => substr($server_name, 0, $server_col),
+            "SERVER_PORT" => substr($server_name, $server_col + 1),
+        ];
+        if (empty($additional_context)) {
+            $this->in_streams[self::CONTEXT][$key] = array_merge(
+                $this->in_streams[self::CONTEXT][$key], 
+                ["CLIENT_HTTP" => "unknown"]
+            );
+        }
         $this->in_streams[self::DATA][$key] = "";
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
     }
@@ -1373,8 +1616,7 @@ class WebSite
                 $remaining_bytes = max(0, strlen($data) - $num_bytes);
             }
             if ($num_bytes > 0) {
-                $this->out_streams[self::DATA][$key] =
-                    substr($data, $num_bytes);
+                $this->out_streams[self::DATA][$key] = substr($data, $num_bytes);
                 $this->out_streams[self::MODIFIED_TIME][$key] = time();
             }
             if ($remaining_bytes == 0) {
@@ -1409,15 +1651,18 @@ class WebSite
             return false;
         }
         $context = $this->in_streams[self::CONTEXT][$key];
+
         if (!$context['REQUEST_METHOD']) {
             $request_start = substr($this->in_streams[self::DATA][$key], 0,
                 self::LEN_LONGEST_HTTP_METHOD + 1);
             $start_parts = explode(" ", $request_start);
+
             if (!in_array($start_parts[0], $this->http_methods)) {
                 $this->initializeBadRequestResponse($key);
                 return true;
             }
         }
+
         $data = $this->in_streams[self::DATA][$key];
         $eol = "\x0D\x0A"; /*
             spec says use CRLF, but hard to type as human on Mac or Linux
@@ -1444,6 +1689,7 @@ class WebSite
             }
             list(, $context['REQUEST_METHOD'], $context['REQUEST_URI'],
                 $context['SERVER_PROTOCOL']) = $matches;
+
             if (($question_pos = strpos($context['REQUEST_URI'],"?"))===false) {
                 $context['PHP_SELF'] = $context['REQUEST_URI'];
                 $context['QUERY_STRING'] = "";
@@ -1476,6 +1722,7 @@ class WebSite
                 }
                 $context[$prefix . $header] = $value;
             }
+
             $this->in_streams[self::CONTEXT][$key] = $context;
             if (empty($context['CONTENT_LENGTH'])) {
                 $context['CONTENT'] = "";
@@ -1497,6 +1744,8 @@ class WebSite
         $this->setGlobals($context);
         return true;
     }
+    
+
     /**
      * Used to initialize the superglobals before process() is called when
      * WebSite is run in CLI-mode. The values for the globals come from the
@@ -1613,7 +1862,7 @@ class WebSite
      *      For example, /404 for a NOT FOUND error.
      */
     protected function defaultErrorHandler($route = "")
-    {
+    {   
         $request_uri = (empty($route) || $route == '/400') ?
             0 : trim($route, "/");
         $error = ($request_uri < 100 || $request_uri > 600) ?

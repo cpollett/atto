@@ -3,10 +3,7 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-if (!defined("seekquarry\\atto\\RUN")) {
-    exit(); /* you need to comment this line to be able to run this example.
-               under a web server */
-}
+// exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();
 /*
     An Atto WebSite consisting of landing pages for three different host.
@@ -77,7 +74,7 @@ $host3site->get('/', function() {
 });
 $test->subsite('/host3', $host3site);
 if ($test->isCli()) {
-    $test->listen(8080);
+    $test->listen(8000);
 } else {
     $test->process();
 }

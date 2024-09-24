@@ -3,9 +3,7 @@ require '../../src/GopherSite.php';
 
 use seekquarry\atto as G;
 
-if (!defined("seekquarry\\atto\\RUN")) {
-    exit();
-}
+exit(); // you need to comment this line to be able to run this example.
 $test = new G\GopherSite();
 /*
     A simple GopherSite used to demonstrate the main features of the

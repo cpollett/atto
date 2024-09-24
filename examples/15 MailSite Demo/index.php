@@ -3,9 +3,7 @@ require '../../src/MailSite.php';
 
 use seekquarry\atto\MailSite;
 
-if (!defined("seekquarry\\atto\\RUN")) {
-    exit();
-}
+//exit(); // you need to comment this line to be able to run this example.
 
 define("MAIL_DB_FILE", "mail_db.txt");
 
@@ -164,7 +162,7 @@ class MailDB
         }
         foreach ($table1['ROWS'] as $row1) {
             foreach ($table2['ROWS'] as $row2) {
-                if ($row1[$table1['COLS'][$join_col_name1]] ==
+                if ($row1[$table1['COLS'][$join_col_name1]] == 
                     $row1[$table2['COLS'][$join_col_name2]]) {
                     $row = array_merge($row1, $row2);
                     if (empty($project_cols)) {
@@ -414,7 +412,7 @@ class MailDB
     }
     public function hasFlag($item_id, $item_type, $flag)
     {
-        if ($item_type == MailDB::FOLDER_TYPE &&
+        if ($item_type == MailDB::FOLDER_TYPE && 
             in_array($flag, ['HasChildren', 'HasNoChildren'])) {
             $subfolder_table = @$this->selectTable('PARENT_ID', $item_id,
                 [$this, "eq"], $this->getUserFolders($_SERVER['AUTH_USER']));
@@ -966,3 +964,4 @@ $test->listen("", ['SERVER_CONTEXT' => ['ssl' => [
     'local_pk' => 'key.pem', // Private key
     'verify_peer' => false
 ]]]);
+

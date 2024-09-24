@@ -3,10 +3,7 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-if (!defined("seekquarry\\atto\\RUN")) {
-    exit(); /* you need to comment this line to be able to run this example.
-               under a web server */
-}
+exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();
 
 /*

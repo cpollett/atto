@@ -1,0 +1,295 @@
+State:
+250 127.0.0.1
+
+State:
+500 BAD COMMAND
+State:
+500 BAD COMMAND
+State:
+500 BAD COMMAND
+State:
+500 BAD COMMAND
+State:
+500 BAD COMMAND
+State:HELO
+250 127.0.0.1
+
+State:TLS
+220  2.0.0 Ready to start TLS
+State:TLS
+503 5.5.1 Error: send HELO/EHLO first
+State:EHLO_TLS
+250 127.0.0.1
+
+State:MAIL
+250 2.1.0 Ok
+State:MAIL
+550 Mail refused for local policy reasons.
+State:MAIL
+550 Mail refused for local policy reasons.
+State:INIT
+500 BAD COMMAND
+State:INIT
+500 BAD COMMAND
+State:INIT
+1
+State:INIT
+214- Available commands:
+[AUTH] 
+
+ Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.
+
+
+[EHLO] 
+
+ Initiates the SMTP session with the server and requests extended SMTP capabilities. It is used to identify the client to the server and to negotiate the supported features.
+
+
+[HELO] 
+
+ Initiates the SMTP session with the server. It is a simpler version of EHLO and is used when extended capabilities are not required.
+
+
+[NOOP] 
+
+ Does nothing but can be used as a keep-alive mechanism during the SMTP session to prevent the connection from timing out.
+
+
+[QUIT] 
+
+ Ends the SMTP session with the server and closes the connection. It is used to gracefully terminate the session.
+
+
+[RSET] 
+
+ Resets the current SMTP session state. It is used to abort the current email transaction and return to the initial state.
+
+
+[STARTTLS] 
+
+ Initiates a TLS-encrypted SMTP session. It is used to secure the connection between the client and server by encrypting the data transmission.
+
+
+[MAIL] 
+
+ Specifies the sender's email address in the email transaction. It is used to indicate who is sending the email.
+
+
+[RCPT] 
+
+ Specifies the recipient's email address in the email transaction. It is used to indicate who is receiving the email.
+
+
+[DATA] 
+
+ Indicates the start of the email message body. It is used to transmit the content of the email message.
+
+
+[VRFY] 
+
+ Verifies if a given email address is valid and exists on the server. It can be used to check the validity of email addresses before sending emails.
+
+
+[HELP] 
+
+ Requests help information from the server. It can be used to retrieve information about available commands and their usage.
+
+
+214 End of HELP response
+
+
+State:INIT
+214- Available commands:
+[AUTH] 
+
+ Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.
+
+
+[EHLO] 
+
+ Initiates the SMTP session with the server and requests extended SMTP capabilities. It is used to identify the client to the server and to negotiate the supported features.
+
+
+[HELO] 
+
+ Initiates the SMTP session with the server. It is a simpler version of EHLO and is used when extended capabilities are not required.
+
+
+[NOOP] 
+
+ Does nothing but can be used as a keep-alive mechanism during the SMTP session to prevent the connection from timing out.
+
+
+[QUIT] 
+
+ Ends the SMTP session with the server and closes the connection. It is used to gracefully terminate the session.
+
+
+[RSET] 
+
+ Resets the current SMTP session state. It is used to abort the current email transaction and return to the initial state.
+
+
+[STARTTLS] 
+
+ Initiates a TLS-encrypted SMTP session. It is used to secure the connection between the client and server by encrypting the data transmission.
+
+
+[MAIL] 
+
+ Specifies the sender's email address in the email transaction. It is used to indicate who is sending the email.
+
+
+[RCPT] 
+
+ Specifies the recipient's email address in the email transaction. It is used to indicate who is receiving the email.
+
+
+[DATA] 
+
+ Indicates the start of the email message body. It is used to transmit the content of the email message.
+
+
+[VRFY] 
+
+ Verifies if a given email address is valid and exists on the server. It can be used to check the validity of email addresses before sending emails.
+
+
+[HELP] 
+
+ Requests help information from the server. It can be used to retrieve information about available commands and their usage.
+
+
+214 End of HELP response
+
+
+State:INIT
+214- Available commands:
+[AUTH] 
+
+ Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.
+
+
+[EHLO] 
+
+ Initiates the SMTP session with the server and requests extended SMTP capabilities. It is used to identify the client to the server and to negotiate the supported features.
+
+
+[HELO] 
+
+ Initiates the SMTP session with the server. It is a simpler version of EHLO and is used when extended capabilities are not required.
+
+
+[NOOP] 
+
+ Does nothing but can be used as a keep-alive mechanism during the SMTP session to prevent the connection from timing out.
+
+
+[QUIT] 
+
+ Ends the SMTP session with the server and closes the connection. It is used to gracefully terminate the session.
+
+
+[RSET] 
+
+ Resets the current SMTP session state. It is used to abort the current email transaction and return to the initial state.
+
+
+[STARTTLS] 
+
+ Initiates a TLS-encrypted SMTP session. It is used to secure the connection between the client and server by encrypting the data transmission.
+
+
+[MAIL] 
+
+ Specifies the sender's email address in the email transaction. It is used to indicate who is sending the email.
+
+
+[RCPT] 
+
+ Specifies the recipient's email address in the email transaction. It is used to indicate who is receiving the email.
+
+
+[DATA] 
+
+ Indicates the start of the email message body. It is used to transmit the content of the email message.
+
+
+[VRFY] 
+
+ Verifies if a given email address is valid and exists on the server. It can be used to check the validity of email addresses before sending emails.
+
+
+[HELP] 
+
+ Requests help information from the server. It can be used to retrieve information about available commands and their usage.
+
+
+214 End of HELP response
+
+
+State:INIT
+214- Available commands:
+[AUTH] 
+
+ Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.
+
+
+[EHLO] 
+
+ Initiates the SMTP session with the server and requests extended SMTP capabilities. It is used to identify the client to the server and to negotiate the supported features.
+
+
+[HELO] 
+
+ Initiates the SMTP session with the server. It is a simpler version of EHLO and is used when extended capabilities are not required.
+
+
+[NOOP] 
+
+ Does nothing but can be used as a keep-alive mechanism during the SMTP session to prevent the connection from timing out.
+
+
+[QUIT] 
+
+ Ends the SMTP session with the server and closes the connection. It is used to gracefully terminate the session.
+
+
+[RSET] 
+
+ Resets the current SMTP session state. It is used to abort the current email transaction and return to the initial state.
+
+
+[STARTTLS] 
+
+ Initiates a TLS-encrypted SMTP session. It is used to secure the connection between the client and server by encrypting the data transmission.
+
+
+[MAIL] 
+
+ Specifies the sender's email address in the email transaction. It is used to indicate who is sending the email.
+
+
+[RCPT] 
+
+ Specifies the recipient's email address in the email transaction. It is used to indicate who is receiving the email.
+
+
+[DATA] 
+
+ Indicates the start of the email message body. It is used to transmit the content of the email message.
+
+
+[VRFY] 
+
+ Verifies if a given email address is valid and exists on the server. It can be used to check the validity of email addresses before sending emails.
+
+
+[HELP] 
+
+ Requests help information from the server. It can be used to retrieve information about available commands and their usage.
+
+
+214 End of HELP response
+
+

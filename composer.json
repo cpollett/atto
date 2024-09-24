@@ -15,7 +15,8 @@
         "ext-pcre": "*",
         "ext-SPL":"*",
         "ext-zip": "*",
-        "lib-pcre": "*"
+        "lib-pcre": "*",
+        "amphp/http": "^2.1"
     },
     "autoload": {
         "psr-4": {

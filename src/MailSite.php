@@ -71,9 +71,7 @@ class MailSite
             'EHLO_TLS' => ['AUTH', 'MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
             'MAIL' => ['NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
             'RCPT' => ['DATA', 'NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
-            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
-            // 'VRFY' => ['NOOP', 'QUIT', 'RSET'],
-            // 'HELP' => ['NOOP', 'QUIT', 'RSET']
+            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP']
         ],
         'IMAP' => [
             'APPEND' => ['APPEND'],
@@ -422,11 +420,9 @@ echo "C:" . $data."\n";
             }
             if ($too_long || $this->parseRequest($key, $data)) {
                 if (empty($this->in_streams[self::CONTEXT][$key]['RESPONSE'])) {
-                    // echo "here";
                     continue;
                 }
                 $out_data = $this->in_streams[self::CONTEXT][$key]['RESPONSE'] . "\x0D\x0A";
-// echo "S:" . $out_data."\n";
 echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
 
                 $this->logIncomingMailRequest($out_data, $key);
@@ -603,7 +599,6 @@ print_r($allowed_commands);
             $this->in_streams[self::CONTEXT][$key]['RESPONSE'] = $jsonCmds;
             return true;
         }
-        // echo "passed";
         $data = $this->in_streams[self::DATA][$key];
         $eol = "\x0D\x0A"; /*
             spec says use CRLF, but hard to type as human on Mac or Linux
@@ -1568,24 +1563,18 @@ print_r($allowed_commands);
     {
         $filename = 'cmds.json';
         if (!file_exists($filename)) {
-            // echo "Error: File '$filename' not found.";
             return "Error: File '$filename' not found.";
         }
         $jsonContent = file_get_contents($filename);
         $commands = json_decode($jsonContent, true);
         if ($commands === null) {
-            // echo "Error: Unable to decode JSON from file '$filename'.";
             return "Error: Unable to decode JSON from file '$filename'.";
         }
         $helpResponse = "214- Available commands:\r\n";
-        // $helpResponse .= $commands;
-        // print_r($commands);
         foreach ($commands as $command => $desc) {
             $helpResponse .= "[$command] \r\n\r\n $desc\r\n\r\n\r\n";
         }
         $helpResponse .= "214 End of HELP response\r\n\r\n";
-    
-        // echo $helpResponse;
         return $helpResponse;
     }
     

@@ -441,7 +441,7 @@ class WebSite
      * is run from a non-CLI context then this function defaults to PHP's
      * built-in function setcookie();
      *
-     * Cookies returned from a parituclar client will appear in the $_COOKIE
+     * Cookies returned from a particular client will appear in the $_COOKIE
      * superglobal.
      *
      * @param string $name name of cookie
@@ -917,7 +917,7 @@ class WebSite
             echo "Failed to bind address $address\nServer Stopping\n";
             exit();
         }
-        stream_set_blocking($server, 0);
+        stream_set_blocking($server, false);
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $server_globals);
         $as_user = "";
@@ -980,8 +980,9 @@ class WebSite
         }
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
             $session_path = substr($this->restart, strlen('restart') + 1);
-            $php = (!empty($_ENV['HHVM'])) ? "hhvm" : "php";
-             $script = "$php " . $_SERVER['SCRIPT_NAME'] .
+            $php_path = $this->default_server_globals["PHP_PATH"] ?? "";
+            $php = (empty($_ENV['HHVM'])) ? "$php_path/php" : "$php_path/hhvm";
+            $script = "$php " . $_SERVER['SCRIPT_NAME'] .
                 " " . $original_address . " 2 \"$session_path\"";
             if (strstr(PHP_OS, "WIN")) {
                 $script = str_replace("/", "\\", $script);

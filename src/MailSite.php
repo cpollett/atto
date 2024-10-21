@@ -38,7 +38,7 @@ namespace seekquarry\atto;
  * This software can be used to serve mail apps. It is request
  * event-driven, supporting asynchronous I/O for mail traffic. It also
  * supports timers for background events. It automatically sets up
- * subperglobals such as $_REQUEST and $_SERVER which cna be useful in
+ * subperglobals such as $_REQUEST and $_SERVER which can be useful in
  * processing requests.
  */
 class MailSite
@@ -64,14 +64,14 @@ class MailSite
         "UNSUBSCRIBE" => []];
     protected $state_commands = [
         'SMTP' => [
-            'AUTH' => ['AUTH'],
-            'INIT' => ['EHLO', 'HELO', 'NOOP', 'QUIT', 'RSET', 'STARTTLS'],
-            'HELO' => ['NOOP', 'QUIT', 'RSET','STARTTLS'],
-            'TLS' => ['EHLO', 'HELO', 'NOOP', 'QUIT', 'RSET'],
-            'EHLO_TLS' => ['AUTH', 'MAIL', 'NOOP', 'QUIT', 'RSET'],
-            'MAIL' => ['NOOP', 'QUIT', 'RCPT', 'RSET'],
-            'RCPT' => ['DATA', 'NOOP', 'QUIT', 'RCPT', 'RSET'],
-            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET'],
+            'AUTH' => ['AUTH', 'HELP'],
+            'INIT' => ['EHLO', 'HELO', 'NOOP', 'QUIT', 'RSET', 'STARTTLS', 'HELP'],
+            'HELO' => ['NOOP', 'QUIT', 'RSET','STARTTLS', 'HELP'],
+            'TLS' => ['EHLO', 'HELO', 'NOOP', 'QUIT', 'RSET', 'HELP'],
+            'EHLO_TLS' => ['AUTH', 'MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
+            'MAIL' => ['NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
+            'RCPT' => ['DATA', 'NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
+            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP']
         ],
         'IMAP' => [
             'APPEND' => ['APPEND'],
@@ -346,6 +346,7 @@ class MailSite
             $this->cullDeadStreams();
         }
     }
+
     /**
      * Handles processing timers on this Atto Mail Site. This method is called
      * from the event loop in @see listen and checks to see if any callbacks
@@ -418,14 +419,14 @@ echo "C:" . $data."\n";
                     '500 LINE TOO LONG';
             }
             if ($too_long || $this->parseRequest($key, $data)) {
-                if (empty($this->in_streams[self::CONTEXT][$key][
-                    'RESPONSE'])) {
+                if (empty($this->in_streams[self::CONTEXT][$key]['RESPONSE'])) {
                     continue;
                 }
-                $out_data = $this->in_streams[self::CONTEXT][$key]['RESPONSE'] .
-                    "\x0D\x0A";
-echo "S:" . $out_data."\n";
+                $out_data = $this->in_streams[self::CONTEXT][$key]['RESPONSE'] . "\x0D\x0A";
 echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
+
+                $this->logIncomingMailRequest($out_data, $key);
+
                 if (empty($this->out_streams[self::CONNECTION][$key])) {
                     $this->out_streams[self::CONNECTION][$key] = $in_stream;
                     $this->out_streams[self::DATA][$key] = $out_data;
@@ -437,6 +438,21 @@ echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
         }
     }
+
+    protected function logIncomingMailRequest($requestData, $key) {
+        // Log the incoming mail request
+        $logMessage = "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
+        // $logMessage .= "Incoming Mail Request: " . date('Y-m-d H:i:s') . "\n";
+        // $logMessage .= "From: " . $requestData['from'] . "\n";
+        // $logMessage .= "To: " . $requestData['to'] . "\n";
+        // $logMessage .= "Subject: " . $requestData['subject'] . "\n";
+        // $logMessage .= "Body: " . $requestData['body'] . "\n";
+        $logMessage .= $requestData;
+        
+        // Append the log to a file
+        file_put_contents('mail_log.txt', $logMessage, FILE_APPEND);
+    }
+
     /**
      * Used to process any timers for MailSite and
      * used to check if the server has detected a
@@ -571,8 +587,18 @@ echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
             return false;
         }
         $allowed_commands = $this->state_commands[$protocol][$state];
-echo "Current State:".$state;
+echo "Current protocol:".$protocol."\r\n";
+echo "Current State:".$state."\r\n";
+echo "Allowed commands \r\n";
 print_r($allowed_commands);
+
+        // Check for the HELP command
+        if ($protocol == 'SMTP' && str_starts_with(strtoupper($data), 'HELP')) {
+            $jsonCmds = $this->parseHelp();
+            $context['RESPONSE'] = $jsonCmds;
+            $this->in_streams[self::CONTEXT][$key]['RESPONSE'] = $jsonCmds;
+            return true;
+        }
         $data = $this->in_streams[self::DATA][$key];
         $eol = "\x0D\x0A"; /*
             spec says use CRLF, but hard to type as human on Mac or Linux
@@ -1264,11 +1290,11 @@ print_r($allowed_commands);
         }
         $search_pattern = "ALL|ANSWERED|BCC\s+[^\s]+|BEFORE\s+[^\s]+|BODY" .
             "|CC\s+[^\s]+|DELETED|DRAFT|FLAGGED|FROM\s+[^\s]+".
-            "|HEADER\s+[^\s]+\s+[^\s]+|KEYWORD\s+[^\s]+|LARGER\s+\d+|NEW" .
-            "|NOT|OLD|ON\s+[^\s]|OR|RECENT|SEEN|SENTBEFORE\s+[^\s]+" .
-            "|SENTON\s+[^\s]+|SENTSINCE\s+[^\s]+|SINCE\s+[^\s+]" .
-            "|SMALLER\s+\d+|SUBJECT\s+[^\s]+|TEXT\s+[^\s]+|TO\s+[^\s]+" .
-            "|UID\s+[^\s]+|UNANSWERED|UNDRAFT|UNFLAGGED|UNKEYWORD\s+[^\s]+" .
+            "|HEADER\s+[^\s]+\s+[^\s]+|KEYWORD\s+[^\s]+|LARGER\s+\d+|NEW".
+            "|NOT|OLD|ON\s+[^\s]|OR|RECENT|SEEN|SENTBEFORE\s+[^\s]+".
+            "|SENTON\s+[^\s]+|SENTSINCE\s+[^\s]+|SINCE\s+[^\s+]".
+            "|SMALLER\s+\d+|SUBJECT\s+[^\s]+|TEXT\s+[^\s]+|TO\s+[^\s]+".
+            "|UID\s+[^\s]+|UNANSWERED|UNDRAFT|UNFLAGGED|UNKEYWORD\s+[^\s]+".
             "|UNSEEN";
         if ($_REQUEST['sequence_set'] =
             $this->getSequenceSetArrays($line_parts[2])) {
@@ -1529,6 +1555,29 @@ print_r($allowed_commands);
         return filter_var($email_parts[0] . "@somewhere.com",
             FILTER_VALIDATE_EMAIL) && $this->isDomain($email_parts[1]);
     }
+    /**
+     * Handler for the HELP command. 
+     * Reads in the cmds.json and prints it for the user.
+     */
+    protected function parseHelp() 
+    {
+        $filename = 'cmds.json';
+        if (!file_exists($filename)) {
+            return "Error: File '$filename' not found.";
+        }
+        $jsonContent = file_get_contents($filename);
+        $commands = json_decode($jsonContent, true);
+        if ($commands === null) {
+            return "Error: Unable to decode JSON from file '$filename'.";
+        }
+        $helpResponse = "214- Available commands:\r\n";
+        foreach ($commands as $command => $desc) {
+            $helpResponse .= "[$command] \r\n\r\n $desc\r\n\r\n\r\n";
+        }
+        $helpResponse .= "214 End of HELP response\r\n\r\n";
+        return $helpResponse;
+    }
+    
     /**
      * Used to initialize the superglobals before process() is called.
      * The values for the globals come from the

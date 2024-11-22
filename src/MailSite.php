@@ -72,8 +72,6 @@ class MailSite
             'MAIL' => ['NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
             'RCPT' => ['DATA', 'NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
             'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
-            // 'VRFY' => ['NOOP', 'QUIT', 'RSET'],
-            // 'HELP' => ['NOOP', 'QUIT', 'RSET']
         ],
         'IMAP' => [
             'APPEND' => ['APPEND'],
@@ -413,7 +411,6 @@ class MailSite
             if (!$too_long) {
                 stream_set_blocking($in_stream, 0);
                 $data = stream_get_contents($in_stream, $max_len - $len);
-echo "C:" . $data."\n";
             } else {
                 $data = "";
                 $this->in_streams[self::DATA][$key] = "";
@@ -422,15 +419,10 @@ echo "C:" . $data."\n";
             }
             if ($too_long || $this->parseRequest($key, $data)) {
                 if (empty($this->in_streams[self::CONTEXT][$key]['RESPONSE'])) {
-                    // echo "here";
                     continue;
                 }
                 $out_data = $this->in_streams[self::CONTEXT][$key]['RESPONSE'] . "\x0D\x0A";
-// echo "S:" . $out_data."\n";
-echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
-
                 $this->logIncomingMailRequest($out_data, $key);
-
                 if (empty($this->out_streams[self::CONNECTION][$key])) {
                     $this->out_streams[self::CONNECTION][$key] = $in_stream;
                     $this->out_streams[self::DATA][$key] = $out_data;
@@ -442,21 +434,6 @@ echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
         }
     }
-
-    protected function logIncomingMailRequest($requestData, $key) {
-        // Log the incoming mail request
-        $logMessage = "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
-        // $logMessage .= "Incoming Mail Request: " . date('Y-m-d H:i:s') . "\n";
-        // $logMessage .= "From: " . $requestData['from'] . "\n";
-        // $logMessage .= "To: " . $requestData['to'] . "\n";
-        // $logMessage .= "Subject: " . $requestData['subject'] . "\n";
-        // $logMessage .= "Body: " . $requestData['body'] . "\n";
-        $logMessage .= $requestData;
-        
-        // Append the log to a file
-        file_put_contents('mail_log.txt', $logMessage, FILE_APPEND);
-    }
-
     /**
      * Used to process any timers for MailSite and
      * used to check if the server has detected a
@@ -591,11 +568,6 @@ echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
             return false;
         }
         $allowed_commands = $this->state_commands[$protocol][$state];
-echo "Current protocol:".$protocol."\r\n";
-echo "Current State:".$state."\r\n";
-echo "Allowed commands \r\n";
-print_r($allowed_commands);
-
         // Check for the HELP command
         if ($protocol == 'SMTP' && str_starts_with(strtoupper($data), 'HELP')) {
             $jsonCmds = $this->parseHelp();
@@ -603,7 +575,6 @@ print_r($allowed_commands);
             $this->in_streams[self::CONTEXT][$key]['RESPONSE'] = $jsonCmds;
             return true;
         }
-        // echo "passed";
         $data = $this->in_streams[self::DATA][$key];
         $eol = "\x0D\x0A"; /*
             spec says use CRLF, but hard to type as human on Mac or Linux

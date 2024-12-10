@@ -972,7 +972,8 @@ class WebSite
                 $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
             }
-            $num_selected = stream_select($in_streams_with_data, $out_streams_with_data, $excepts, $timeout, $micro_timeout);
+            $num_selected = stream_select($in_streams_with_data, 
+                $out_streams_with_data, $excepts, $timeout, $micro_timeout);
          
             $this->processTimers();
             if ($num_selected > 0) {
@@ -1023,7 +1024,8 @@ class WebSite
      * @return string web page that WebSite would have reqsponded with if
      *      the request had been made as a usual web request.
      */
-    public function processInternalRequest($url, $include_headers = false, $post_data = null)
+    public function processInternalRequest($url, 
+        $include_headers = false, $post_data = null)
     {
         static $request_context = [];
         if (count($request_context) > 5) {
@@ -1260,7 +1262,8 @@ class WebSite
                 $data = "";
                 $this->initializeBadRequestResponse($key);
             }
-            if (isset($this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']) && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'] == "HTTP/2.0") {
+            if (isset($this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']) 
+                && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'] == "HTTP/2.0") {
                 if($too_long || $this->parseH2Request($key, $data)) {
                     if (!empty($this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
                         $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] = true;
@@ -1274,7 +1277,8 @@ class WebSite
                 }
             } else {
                 if ($too_long || $this->parseRequest($key, $data)) {
-                    if (!empty($this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
+                    if (!empty(
+                        $this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
                         $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] = true;
                     }
                     $out_data = $this->getResponseData();
@@ -1670,7 +1674,8 @@ class WebSite
             return false;
         }
         $context = $this->in_streams[self::CONTEXT][$key];
-
+        if (!isset($context[self::REQUEST_HEAD])) 
+            $context[self::REQUEST_HEAD] = false;
         if (!$context['REQUEST_METHOD']) {
             $request_start = substr($this->in_streams[self::DATA][$key], 0,
                 self::LEN_LONGEST_HTTP_METHOD + 1);
@@ -2330,11 +2335,11 @@ class DataFrame extends Frame
      */
     public function serializeBody() 
     {
-        $binaryString = '';
+        $binary_string = '';
         for ($i = 0; $i < strlen($this->data); $i++) {
-            $binaryString .= pack('C', ord($this->data[$i]));
+            $binary_string .= pack('C', ord($this->data[$i]));
         }
-        return $binaryString;
+        return $binary_string;
     }
     /** 
      * Parses the binary data of the DATA frame and extracts the data payload.
@@ -2472,12 +2477,16 @@ class PushPromiseFrame extends Frame
         if (strlen($data) < $padding_data_length + 4) {
             throw new InvalidFrameException("Invalid PUSH_PROMISE body");
         }
-        $this->promised_stream_id = unpack('N', substr($data, $padding_data_length, 4))[1];
-        $this->data = substr($data, $padding_data_length + 4, -$this->pad_length);
+        $this->promised_stream_id = 
+            unpack('N', substr($data, $padding_data_length, 4))[1];
+        $this->data = 
+            substr($data, $padding_data_length + 4, -$this->pad_length);
 
-        if ($this->promised_stream_id == 0 || $this->promised_stream_id % 2 != 0) {
+        if ($this->promised_stream_id == 0 
+            || $this->promised_stream_id % 2 != 0) {
             throw new InvalidDataException(
-                "Invalid PUSH_PROMISE promised stream id: $this->promised_stream_id");
+                "Invalid PUSH_PROMISE promised stream id: 
+                    $this->promised_stream_id");
         }
         if ($this->pad_length && $this->pad_length >= strlen($data)) {
             throw new InvalidPaddingException("Padding is too long.");
@@ -2516,7 +2525,8 @@ class PingFrame extends Frame
     public function serializeBody() 
     {
         if (strlen($this->opaque_data) != 8) {
-            throw new InvalidDataException("PING frame body must be 8 bytes");
+            throw new InvalidDataException(
+                "PING frame body must be 8 bytes");
         }
         return $this->opaque_data;
     }
@@ -2536,7 +2546,8 @@ class PingFrame extends Frame
 }
 /*
  * GoAwayFrame class handles the HTTP/2 GOAWAY frame,
- * which is used to indicate that the sender is gracefully shutting down a connection.
+ * which is used to indicate that the sender is gracefully 
+ * shutting down a connection.
  */
 class GoAwayFrame extends Frame 
 {
@@ -2549,8 +2560,8 @@ class GoAwayFrame extends Frame
     /** 
      * Constructor to create a new GoAwayFrame object.
      * @param int $stream_id The stream ID for this frame.
-     * @param int $last_stream_id The last stream ID the sender will accept.
-     * @param int $error_code The error code indicating the reason for shutting down.
+     * @param int $last_stream_id last stream ID the sender will accept.
+     * @param int $error_code indicating the reason for shutting down.
      * @param string $additional_data Additional debug data (optional).
      */
     public function __construct($stream_id = 0, $last_stream_id = 0, 
@@ -2628,7 +2639,8 @@ class WindowUpdateFrame extends Frame
                  (8 hex characters): got " . strlen($data));
         }
         $this->window_increment = hexdec($data);
-        if ($this->window_increment < 1 || $this->window_increment > (2**31 - 1)) {
+        if ($this->window_increment < 1 
+            || $this->window_increment > (2**31 - 1)) {
             throw new InvalidDataException(
                 "WINDOW_UPDATE increment must be between 1 to 2^31-1");
         }
@@ -2675,7 +2687,7 @@ class ContinuationFrame extends Frame
     }
 }
 /*
- * Exception classes for the exceptions thrown in all frame classes above.
+ * Exception classes for exceptions thrown in all frame classes.
  */
 class InvalidFrameException extends \Exception {}
 class InvalidDataException extends \Exception {}
@@ -2701,14 +2713,14 @@ class Flag {
  * adding, removing, and checking for the presence of flags.
  */
 class Flags {
-    private array $validFlags;
+    private array $valid_flags;
     private array $flags;
     /** 
      * Constructor for Flags.
-     * @param array $definedFlags Array of defined valid flags.
+     * @param array $defined_flags Array of defined valid flags.
      */
-    public function __construct($definedFlags) {
-        $this->validFlags = array_keys($definedFlags);
+    public function __construct($defined_flags) {
+        $this->valid_flags = array_keys($defined_flags);
         $this->flags = [];
     }
     /** 
@@ -2716,9 +2728,9 @@ class Flags {
      * and joining all active flags.
      */
     public function __toString() {
-        $sortedFlags = $this->flags;
-        sort($sortedFlags);
-        return implode(", ", $sortedFlags);
+        $sorted_flags = $this->flags;
+        sort($sorted_flags);
+        return implode(", ", $sorted_flags);
     }
     /** 
      * Checks if the specified flag is present.
@@ -2732,11 +2744,11 @@ class Flags {
      * @param string $flag The flag to add.
      */
     public function add($flag) {
-        if (!in_array($flag, $this->validFlags)) {
+        if (!in_array($flag, $this->valid_flags)) {
             throw new InvalidArgumentException(sprintf(
                 'Unexpected flag: %s. Valid flags are: %s',
                 $flag,
-                implode(', ', $this->validFlags)
+                implode(', ', $this->valid_flags)
             ));
         }
         if (!in_array($flag, $this->flags)) {
@@ -2922,31 +2934,73 @@ class HPack {
         60 => ['via', ''],
         61 => ['www-authenticate', '']
     ];
-    private $dynamic_table = [];
-    private $max_table_size = 4096;
+
+    private static $headers_table = [];
+    private static $never_index_list = [];
+    private $max_table_size = 100; // number of indices allowed in the table
     private $current_table_size = 0;
+    private $debug_output;
+
+    public function getDebugOutput() {
+        return $this->debug_output;
+    }
+
+    public function __construct() {
+        if (empty(self::$headers_table)) {
+            self::$headers_table[0] = ["not defined", ""];
+            foreach (self::STATIC_TABLE as $index => $header) {
+                self::$headers_table[$index] = $header;
+            }
+        }
+        $this->debug_output .=  
+            "\n\nIn Constructor\nInitial Headers table created: \n";
+        $this->debug_output .= 
+            json_encode(self::$headers_table, JSON_PRETTY_PRINT) . PHP_EOL;
+
+    }
     /**
-     * Encodes headers using HPack format.
-     * @param array $headers Array of headers to encode.
+     * Returns the full headers table (static + dynamic). For debugging.
      */
-    public function encode($headers) {
-        $encoded = '';
-        foreach ($headers as $header) {
-            $name = (string) $header[0];
-            $value = (string) $header[1];
-            $index = null;
-            foreach(self::STATIC_TABLE as $i => [$header_name, $header_value]){
-                if ($header_name === $name && 
-                    ($header_value === '' || $header_value === $value)) {
-                    $index = $i;
-                    break;
+    public static function getHeadersTable() {
+        return self::$headers_table;
+    }
+    /**
+     * Evicts the first entry in the table and shifts the rest of the entries.
+     * Ensures that the table maintains a size of $max_table_size.
+     */
+    private function evictEntry() {
+        $static_table_len = count(self::STATIC_TABLE);
+        if (count(self::$headers_table) > $static_table_len) {
+            $this->debug_output .=  
+                "Evicting header at index " . 
+                ($static_table_len + 1) . "..." . PHP_EOL;
+            foreach (self::$headers_table as $index => $header) {
+                if ($index > $static_table_len + 1) {
+                    self::$headers_table[$index - 1] = $header;
                 }
             }
-            $encoded .= chr(0x40);
-            $encoded .= chr(strlen($name)) . $name;
-            $encoded .= chr(strlen($value)) . $value;
+            array_pop(self::$headers_table);
+            $this->debug_output .=  "Entry at index " . 
+                    ($static_table_len + 1) . 
+                    " has been evicted, and table has been shifted." . PHP_EOL;
         }
-        return $encoded;
+    }  
+    /**
+     * Adds a header to the headers_table after checking the max table size.
+     *
+     * @param string $name  The name of the header.
+     * @param string $value The value of the header.
+     */
+    public function addHeader($name, $value) {
+        $current_size = count(self::$headers_table);
+        while (($current_size + 1) > $this->max_table_size) {
+            $this->evictEntry();
+            $current_size = count(self::$headers_table); 
+        }
+        self::$headers_table[] = [$name, $value];
+        $this->debug_output .=  
+            "Added header: [$name, $value] at the end of the table." . PHP_EOL;
+        
     }
     /**
      * Decodes a header block fragment from hex.
@@ -2959,36 +3013,59 @@ class HPack {
         while ($offset < $input_length) {
             $first_byte_hex = substr($hex_input, $offset, 2);
             $first_byte = hexdec($first_byte_hex);
+            $bits_for_dbg = 
+                str_pad(decbin(hexdec($first_byte_hex)), 8, '0', STR_PAD_LEFT);
             if (($first_byte & 0x80) === 0x80) {
+                $this->debug_output .= "\nFirst byte: 
+                    $first_byte_hex ($bits_for_dbg) matches indexed field representation. 
+                    Bit pattern: ( 1 * * *   * * * * )\n";
                 $header = $this->decodeIndexedHeaderField(
-                    substr($hex_input, $offset)
-                );
+                    substr($hex_input, $offset));
                 if ($header === null) break;
                 $offset += $header['length'];
             } elseif (($first_byte & 0xC0) === 0x40) {
+                $this->debug_output .= "\nFirst byte: $first_byte_hex 
+                    ($bits_for_dbg) matches literal header with
+                    incremental indexing representation. 
+                    Bit pattern: ( 0 1 * *   * * * * )\n";
                 $header = $this->decodeLiteralWithIncrementalIndexing(
-                    substr($hex_input, $offset)
-                );
+                    substr($hex_input, $offset));
                 $offset += $header['length'];
             } elseif (($first_byte & 0xF0) === 0x10) {
+                $this->debug_output .= "\nFirst byte: $first_byte_hex 
+                    ($bits_for_dbg) matches literal header never 
+                    indexed representation. 
+                    Bit pattern: ( 0 0 0 0   * * * * )\n";
                 $header = $this->decodeLiteralNeverIndexed(
-                    substr($hex_input, $offset)
-                );
+                    substr($hex_input, $offset));
                 $offset += $header['length'];
             } elseif (($first_byte & 0xE0) === 0x00) {
+                $this->debug_output .= "\nFirst byte: $first_byte_hex 
+                    ($bits_for_dbg) matches literal header without 
+                    indexing representation. 
+                    Bit pattern: ( 0 0 0 1   * * * * )\n";
                 $header = $this->decodeLiteralWithoutIndexing(
-                    substr($hex_input, $offset)
-                );
+                    substr($hex_input, $offset));
                 $offset += $header['length'];
             } else {
                 $header = "Exception occurred";
+                $this->debug_output .= 
+                    "Exception: Invalid header type detected.\n";
             }
+            
             $headers[] = $header['decoded'];
         }
+        $this->debug_output .= 
+            "Total decoded headers: " . count($headers) ."\n";
+        $this->debug_output .= print_r($headers, true);
+
+        $this->debug_output .= "\n\nFinal dynamic table: \n";
+        $this->debug_output .= print_r(self::$headers_table, true);
         return $header === null ? null : $headers;
     }
     /**
-     * Decodes indexed header field from hex.
+     * Decodes indexed header field from hex using $headers_table.
+     * indexed header field => both name and value are present at index.
      * @param string $hex_field Hexadecimal field to decode.
      */
     public function decodeIndexedHeaderField($hex_field) {
@@ -3000,26 +3077,22 @@ class HPack {
         $byte_hex = substr($hex_field, 0, 2);
         $byte = hexdec($byte_hex);
         $index = $byte & 0x7F;
-        if ($index <= count(self::STATIC_TABLE)) {
-            if (isset(self::STATIC_TABLE[$index])) {
-                [$name, $value] = self::STATIC_TABLE[$index];
-            } else {
-                return null;
-            }
+        if ($index >= 1 && $index <= count(self::$headers_table)) {
+            [$name, $value] = self::$headers_table[$index];
+            $this->debug_output .= "Index $index matched in headers table.\n";
+            $this->debug_output .= "Decoded name: $name, value: $value\n";
         } else {
-            $dynamic_index = $index - count(self::STATIC_TABLE);
-            if ($dynamic_index < 1 || 
-                $dynamic_index > count($this->dynamic_table)) {
-                return null;
-            }
-            if (isset($this->dynamic_table[$dynamic_index - 1])) {
-                [$name, $value] = $this->dynamic_table[$dynamic_index - 1];
-            } else {
-                return null;
-            }
+            // Invalid index
+            $this->debug_output .= "Decoding error: Index value ". 
+                $index . " found in an indexed header field representation.";
+            return null;
         }
-        return ['decoded' => [$name => $value], 'length' => 2];
-    }    
+        return [
+            'decoded' => [$name => $value],   
+            'encoded' => ['name' => bin2hex($name),'value' => bin2hex($value)],
+            'length' => 2
+        ];
+    }
     /**
      * Decodes a literal with incremental indexing.
      * @param string $hex_field Hexadecimal field to decode.
@@ -3029,129 +3102,235 @@ class HPack {
         $first_byte_hex = substr($hex_field, $offset, 2);
         $first_byte = hexdec($first_byte_hex);
         $offset += 2;
-        if (($first_byte & 0x3F) === 0x00) {
+        if (($first_byte & 0x3F) === 0x00) { 
+            $this->debug_output .= "Bit pattern (0 1 0 0   0 0 0 0) 
+                => Name not in headers table\n";
+            $this->debug_output .= "Decoding new name: \n";
             $name_length_hex = substr($hex_field, $offset, 2);
             $name_length_byte = hexdec($name_length_hex);
             $use_huffman = ($name_length_byte & 0x80) !== 0;
             $name_length = $name_length_byte & 0x7F;
+            $offset += 2;
+            $this->debug_output .= "Length hex: $name_length_hex 
+                => length = $name_length and huffman encoding 
+                used = $use_huffman\n";
+            $name_hex = substr($hex_field, $offset, $name_length * 2);
+            $offset += $name_length * 2;
+            $name = $use_huffman ? 
+                $this->huffmanDecode($name_hex) : hex2bin($name_hex); 
+            $this->debug_output .= "Decoded name: $name";
+    
+        } else { 
+            $this->debug_output .= 
+                "Bit pattern (0 1 * *   * * * *) 
+                => Name indexed in headers table\n";
+            $this->debug_output .= "Decoding indexed name: \n";
+            $name_index = $first_byte & 0x3F;
+            if ($name_index > 0 && $name_index < count(self::$headers_table)) { 
+                $name = self::$headers_table[$name_index][0];
+                $this->debug_output .= "Name found at index $name_index: $name\n";
+            } else { 
+                throw new \Exception(
+                    "Invalid name index: exceeds dynamic table size."
+                );
+            }
+        }
+        $value_length_hex = substr($hex_field, $offset, 2);
+        $value_length_byte = hexdec($value_length_hex); 
+        $use_huffman = ($value_length_byte & 0x80) !== 0; 
+        $value_length = $value_length_byte & 0x7F; 
+        $offset += 2;
+        $this->debug_output .= "Decoding value: \n";
+        $this->debug_output .= "Length hex: $value_length_hex 
+            => length = $value_length and huffman encoding used = 
+            $use_huffman\n";
+        $value_hex = substr($hex_field, $offset, $value_length * 2); 
+        $offset += $value_length * 2;
+        $value = $use_huffman ? 
+            $this->huffmanDecode($value_hex) : hex2bin($value_hex); 
+        $this->debug_output .= "Decoded value: $value";
+        if (($first_byte & 0x3F) !== 0x00) { 
+            if ($name_index < count(self::$headers_table)) {
+                self::$headers_table[$name_index] = [$name, $value]; 
+                $this->debug_output .= "Value updated in headers 
+                    table at index $name_index";
+            } 
+        } else {
+            self::$headers_table[] = [$name, $value];
+            $this->debug_output .= 
+                "New entry added to headers table [$name, $value]";
+        }
+        return [
+            'decoded' => [$name => $value],  
+            'encoded' => [
+                'name' => bin2hex($name), 
+                'value' => bin2hex($value)
+            ], 
+            'length' => $offset
+        ];
+    }    
+    /**
+     * Decodes a literal that will never be indexed.
+     * @param string $hex_field Hexadecimal field to decode.
+     */
+    public function decodeLiteralWithoutIndexing($hex_field) {
+        $offset = 0;
+        $first_byte = hexdec(substr($hex_field, $offset, 2));
+        $offset += 2;
+        if (($first_byte & 0x0F) === 0x00) {
+            $name_length_hex = substr($hex_field, $offset, 2);
+            $name_length_byte = hexdec($name_length_hex);
+            $use_huffman = ($name_length_byte & 0x80) !== 0;
+            $name_length = $name_length_byte & 0x7F; 
             $offset += 2;
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
             $name = $use_huffman ? 
                 $this->huffmanDecode($name_hex) : hex2bin($name_hex);
         } else {
-            $name_index = $first_byte & 0x3F;
-            if ($name_index <= count(self::STATIC_TABLE)) {
-                $name = self::STATIC_TABLE[$name_index][0];
+            $name_index = $first_byte & 0x0F;
+
+            if ($name_index > 0 && $name_index <= count(self::$headers_table)) {
+                $name = self::$headers_table[$name_index][0];
             } else {
-                $dynamic_index = $name_index - count(self::STATIC_TABLE);
-                if ($dynamic_index < 1 || 
-                    $dynamic_index > count($this->dynamic_table)) {
-                    throw new \Exception(
-                        "Invalid name index: exceeds dynamic table size."
-                    );
-                }
-                $name = $this->dynamic_table[$dynamic_index - 1][0];
+                throw new \Exception("Invalid name index: exceeds table size.");
             }
         }
         $value_length_hex = substr($hex_field, $offset, 2);
         $value_length_byte = hexdec($value_length_hex);
-        $use_huffman = ($value_length_byte & 0x80) !== 0;
-        $value_length = $value_length_byte & 0x7F;
+        $use_huffman = ($value_length_byte & 0x80) !== 0; 
+        $value_length = $value_length_byte & 0x7F; 
         $offset += 2;
         $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
         $value = $use_huffman ? 
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
-        $this->dynamic_table[] = [$name, $value];
-        return ['decoded' => [$name => $value], 'length' => $offset];
+            $this->huffmanDecode($value_hex) : hex2bin($value_hex); 
+        return [
+            'decoded' => [$name => $value],  
+            'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)], 
+            'length' => $offset
+        ];
     }
+
     /**
-     * Decodes a literal that will never be indexed.
-     * @param string $hexField Hexadecimal field to decode.
+     * Decodes a literal that will never be indexed. Literal header field
+     * never-indexed representation starts with the '0001' 4-bit pattern.
+     * @param string $hex_field Hexadecimal field to decode.
      */
-    public function decodeLiteralNeverIndexed($hexField) {
+    public function decodeLiteralNeverIndexed($hex_field) 
+    {
         $offset = 0;
-        $firstByte = hexdec(substr($hexField, $offset, 2));
+        $first_byte = hexdec(substr($hex_field, $offset, 2));
         $offset += 2;
-        if (($firstByte & 0x0F) === 0x00) {
-            $nameLengthByte = hexdec(substr($hexField, $offset, 2));
-            $useHuffman = ($nameLengthByte & 0x80) !== 0;
-            $nameLength = $nameLengthByte & 0x7F;
+        if (($first_byte & 0x0F) === 0x00) {
+            $name_length_byte = hexdec(substr($hex_field, $offset, 2));
+            $use_huffman = ($name_length_byte & 0x80) !== 0; 
+            $name_length = $name_length_byte & 0x7F; 
             $offset += 2;
-            $nameHex = substr($hexField, $offset, $nameLength * 2);
-            $offset += $nameLength * 2;
-            $name = $useHuffman ? $this->huffmanDecode($nameHex) : hex2bin($nameHex);
+            $name_hex = substr($hex_field, $offset, $name_length * 2);
+            $offset += $name_length * 2;
+            $name = $use_huffman ? 
+                $this->huffmanDecode($name_hex) : hex2bin($name_hex);
         } else {
-            $nameIndex = $firstByte & 0x0F;
-            if ($nameIndex <= count(self::STATIC_TABLE)) {
-                $name = self::STATIC_TABLE[$nameIndex][0];
+            $name_index = $first_byte & 0x0F;
+            if ($name_index > 0 && $name_index <= count(self::$headers_table)) {
+                $name = self::$headers_table[$name_index][0];
             } else {
-                $dynamicIndex = $nameIndex - count(self::STATIC_TABLE);
-                if ($dynamicIndex < 1 || $dynamicIndex > count($this->dynamic_table)) {
-                    throw new Exception("Invalid name index: exceeds dynamic table size.");
-                }
-                $name = $this->dynamic_table[$dynamicIndex - 1][0];
+                throw new \Exception("Invalid name index: exceeds table size.");
             }
         }
-        $valueLengthByte = hexdec(substr($hexField, $offset, 2));
-        $useHuffman = ($valueLengthByte & 0x80) !== 0;
-        $valueLength = $valueLengthByte & 0x7F;
+        $value_length_byte = hexdec(substr($hex_field, $offset, 2));
+        $use_huffman = ($value_length_byte & 0x80) !== 0; 
+        $value_length = $value_length_byte & 0x7F; 
         $offset += 2;
-        $valueHex = substr($hexField, $offset, $valueLength * 2);
-        $offset += $valueLength * 2;
-        $value = $useHuffman ? $this->huffmanDecode($valueHex) : hex2bin($valueHex);
+        $value_hex = substr($hex_field, $offset, $value_length * 2);
+        $offset += $value_length * 2;
+        $value = $use_huffman ? 
+            $this->huffmanDecode($value_hex) : hex2bin($value_hex); 
+        self::$never_index_list[] = $name;
         return [
-            'decoded' => [$name => $value],
+            'decoded' => [$name => $value],  
+            'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
             'length' => $offset
         ];
     }
     /**
-     * Decodes a literal that will never be indexed.
-     * @param string $hexField Hexadecimal field to decode.
+     * Encodes headers using HPack format.
+     * If a header name is in the never-index list, it will be encoded accordingly.
+     * Otherwise, the function checks the headers table for matches and encodes them.
+     * @param array $headers Array of headers to encode. Each header is an array of [name, value].
      */
-    public function decodeLiteralWithoutIndexing($hexField) {
-        $offset = 0;
-        $firstByteHex = substr($hexField, $offset, 2);
-        $firstByte = hexdec($firstByteHex);
-        $offset += 2;
-        if (($firstByte & 0x0F) === 0x00) {
-            $nameLengthHex = substr($hexField, $offset, 2);
-            $nameLengthByte = hexdec($nameLengthHex);
-            $useHuffman = ($nameLengthByte & 0x80) !== 0; 
-            $nameLength = $nameLengthByte & 0x7F;
-            $offset += 2;
-            $nameHex = substr($hexField, $offset, $nameLength * 2);
-            $offset += $nameLength * 2;
-            $name = $useHuffman ? 
-                $this->huffmanDecode($nameHex) : hex2bin($nameHex);
-        } else {
-            $nameIndex = $firstByte & 0x0F;
-            if ($nameIndex <= count(self::STATIC_TABLE)) {
-                $name = self::STATIC_TABLE[$nameIndex][0];
-            } else {
-                $dynamicIndex = $nameIndex - count(self::STATIC_TABLE);
-                if ($dynamicIndex < 1 || 
-                    $dynamicIndex > count($this->dynamic_table)) {
-                    throw new \Exception(
-                        "Invalid name index: exceeds dynamic table size.");
-                }
-                $name = $this->dynamic_table[$dynamicIndex - 1][0];
+    public function encode($headers) {
+        $this->debug_output .= "\n\nEncoding headers: " . 
+            json_encode($headers, JSON_PRETTY_PRINT) . PHP_EOL;
+        $encoded = '';
+        $h = 1;
+        foreach ($headers as [$name, $value]) {
+            $name = (string) $name;
+            $value = (string) $value;
+            $encoded_header = '';
+            $is_indexed = false;
+            $name_only_match = false;
+            $matched_index = null;
+            $this->debug_output .= "\nHeader $h: Name = $name, Value = $value" . PHP_EOL;
+            $h++;
+            if (in_array($name, self::$never_index_list)) {
+                $encoded_header .= chr(0x10);
+                $encoded_header .= $this->encodeString($name);
+                $encoded_header .= $this->encodeString($value);
+                $this->debug_output .= "Never indexed header encoded: " . 
+                    bin2hex($encoded_header) . PHP_EOL;
+                $encoded .= $encoded_header;
+                continue;
             }
+            foreach (self::$headers_table as $i => [$header_name, $header_value]) {
+                if ($header_name === $name && $header_value === $value) {
+                    $encoded_header .= chr(0x80 | ($i & 0x7F));
+                    $is_indexed = true;
+                    $this->debug_output .= "Header found in headers table at 
+                        index: $i, Encoded as indexed header: " . 
+                        bin2hex($encoded_header) . PHP_EOL;
+                    break;
+                } elseif ($header_name === $name) {
+                    $name_only_match = true;
+                    $matched_index = $i;
+                }
+            }
+            if (!$is_indexed && $name_only_match) {
+                $encoded_header .= chr(0x40 | ($matched_index & 0x3F));
+                $this->debug_output .= "Name-only match found in headers table at 
+                    index: $matched_index, Encoding with incremental indexing." . PHP_EOL;
+                $encoded_header .= $this->encodeString($value); 
+            } 
+            elseif (!$is_indexed && !$name_only_match) {
+                $encoded_header .= chr(0x40);
+                $encoded_header .= $this->encodeString($name);
+                $encoded_header .= $this->encodeString($value);
+                $this->debug_output .= "No match found, encoding as new name with incremental indexing." . PHP_EOL;
+            }
+            $encoded .= $encoded_header;
         }
-        $valueLengthHex = substr($hexField, $offset, 2);
-        $valueLengthByte = hexdec($valueLengthHex);
-        $useHuffman = ($valueLengthByte & 0x80) !== 0;
-        $valueLength = $valueLengthByte & 0x7F;
-        $offset += 2;
-        $valueHex = substr($hexField, $offset, $valueLength * 2);
-        $offset += $valueLength * 2;
-        $value = $useHuffman ? 
-            $this->huffmanDecode($valueHex) : hex2bin($valueHex);
-        return [
-            'decoded' => [$name => $value],
-            'length' => $offset 
-        ];
+        $this->debug_output .= "Encoded headers result: " . bin2hex($encoded) . PHP_EOL;
+        return $encoded;
+    }
+    /**
+     * Encodes a given string using Huffman Encoding if it provides compression.
+     * If Huffman encoding is more efficient, the encoded string is returned; 
+     * otherwise, the original string is returned in hexadecimal format.
+     * @param string $str The input string to encode.
+     */
+    private function encodeString($str) {
+        $this->debug_output .= "Compressing string: $str" . PHP_EOL;
+        $huffman = $this->huffmanEncode($str);
+        $this->debug_output .= "Hex compression length = " . strlen($str) . PHP_EOL;
+        $this->debug_output .= "Huffman compression length = " . strlen($huffman) . PHP_EOL;
+        if (strlen($huffman) < strlen($str)) {
+            $this->debug_output .= "Huffman encoding chosen" . PHP_EOL;
+            return chr(0x80 | strlen($huffman)) . $huffman;
+        } else {
+            $this->debug_output .= "Hex encoding chosen" . PHP_EOL;
+            return chr(strlen($str)) . $str;
+        }
     }
     /**
      * Encodes input using Huffman encoding.
@@ -3160,87 +3339,82 @@ class HPack {
     public function huffmanEncode($input) {
         global $HUFFMAN_CODES;
         $encoded = '';
+        $this->debug_output .= "Huffman encoding for input: $input" . PHP_EOL;
         foreach (str_split($input) as $char) {
             if (isset($HUFFMAN_CODES[$char])) {
-                $encoded .= $HUFFMAN_CODES[$char]['bin'];
+                $huffman_code = $HUFFMAN_CODES[$char]['bin'];
+                $encoded .= $huffman_code;
+                $this->debug_output .= 
+                    "Character: $char, Huffman code: $huffman_code" . PHP_EOL;
             } else {
-                throw new \Exception(
-                    "Character not found in Huffman table: $char");
+                throw new \Exception("Character not found in Huffman table: $char");
             }
         }
+        // Padding is done with the MSBs of the End-Of-String 
+        // symbol which in RFC is encoded as 11111111111111
+        $this->debug_output .= 
+            "Huffman encoded binary string (before padding): $encoded" . PHP_EOL;
         if (strlen($encoded) % 8 !== 0) {
             $padding = 8 - (strlen($encoded) % 8);
-            $encoded .= str_repeat('0', $padding);
+            $encoded .= str_repeat('1', $padding); 
+            $this->debug_output .= "Padding applied: $padding bits" . PHP_EOL;
         }
+        $this->debug_output .= 
+            "Huffman encoded binary string (after padding): $encoded" . PHP_EOL;
         $output = '';
         foreach (str_split($encoded, 8) as $byte) {
-            $output .= chr(bindec($byte));
+            $byteValue = chr(bindec($byte));
+            $output .= $byteValue;
+            $this->debug_output .= "Byte segment: $byte, Converted to: " . 
+                bin2hex($byteValue) . PHP_EOL;
         }
+        $this->debug_output .= "Final Huffman encoded output (hex): " . 
+            bin2hex($output) . PHP_EOL;
         return $output;
     }
     /**
      * Decodes Huffman-encoded hexadecimal input.
      * @param string $hexInput Huffman-encoded hexadecimal string.
      */
-    public function huffmanDecode($hexInput) {
+    public function huffmanDecode($hex_input) {
         global $HUFFMAN_LOOKUP;
-        $binaryString = '';
-        for ($i = 0; $i < strlen($hexInput); $i += 2) {
-            $byte = hexdec(substr($hexInput, $i, 2));
-            $binaryString .= str_pad(decbin($byte), 8, '0', STR_PAD_LEFT);
+        $binary_string = '';
+        $this->debug_output .= 
+            "Starting Huffman decoding for hex input: $hex_input\n";
+        for ($i = 0; $i < strlen($hex_input); $i += 2) {
+            $byte = hexdec(substr($hex_input, $i, 2));
+            $binary_chunk = str_pad(decbin($byte), 8, '0', STR_PAD_LEFT);
+            $binary_string .= $binary_chunk;
+            $this->debug_output .= "Hex chunk: " . substr($hex_input, $i, 2) . 
+                " -> Binary chunk: $binary_chunk\n";
         }
         $decoded = '';
         $buffer = '';
+        $this->debug_output .= "Complete binary string: $binary_string\n";
         $i = 0;
-        while ($i < strlen($binaryString)) {
-            $buffer .= $binaryString[$i];
+        while ($i < strlen($binary_string)) {
+            $buffer .= $binary_string[$i];
             $i++;
+            $this->debug_output .= "Current buffer: $buffer\n";
             if (isset($HUFFMAN_LOOKUP[$buffer])) {
                 $ascii = $HUFFMAN_LOOKUP[$buffer];
-                $decoded .= chr($ascii);
-                $buffer = '';
+                $decoded_char = chr($ascii);
+                $decoded .= $decoded_char;
+                $this->debug_output .= 
+                    "Decoded character: $decoded_char 
+                    (ASCII: $ascii) from buffer: $buffer\n";
+                $buffer = ''; 
             }
         }
+        if ($buffer !== '') {
+            $this->debug_output .= 
+            "Padding found in buffer after decoding: $buffer\n";
+        }
+        $this->debug_output .= "Final decoded string: $decoded\n";
         return $decoded;
     }
+
 }
-/**
- * A word about HPACK implementation:
- * 
- * Indexed header fields
- * ---------------------
- * An Indexed header field starts with 1 1-bit patter and the rest of the octet 
- * is filled by the index of the matching header field
- * 
- * bits : 1 * * *   * * * *  --> Indexed header
- * 
- * Literal header fields
- * ---------------------
- * 
- * A literal header field representation contains a literal header value. 
- * This could be either a string literal or a reference to an existing table entry
- * 
- *      incremental indexing
- *          bits : 0 1 * *   * * * *  --> LHF with indexed Name
- *          bits : 0 1 0 0   0 0 0 0  --> LHF with new name
- * 
- *      without indexing
- *          bits : 0 0 0 0   * * * *  --> indexed Name
- *          bits : 0 0 0 0   0 0 0 0  --> new name
- *      
- *      never indexed
- *          bits : 0 0 0 1   * * * *  --> indexed Name
- *          bits : 0 0 0 1   0 0 0 0  --> new name
- * 
- * Huffman Encoding
- * ----------------
- * The encoding and decoding are based on the tables below, which follow
- * the guidelines specified in the RFC. These tables cover a significant 
- * portion of the entire Huffman table defined in the RFC, including any 
- * character commonly encountered in HTTP requests.
- * Note: This implementation does not cover the full 
- * range of characters defined by the RFC.
- */
 $HUFFMAN_LOOKUP = [
     '010100' => 32,           '1111111000' => 33,       '1111111001' => 34,
     '111111111010' => 35,     '1111111111001' => 36,    '010101' => 37,

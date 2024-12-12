@@ -71,7 +71,7 @@ class MailSite
             'EHLO_TLS' => ['AUTH', 'MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
             'MAIL' => ['NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
             'RCPT' => ['DATA', 'NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
-            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP']
+            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
         ],
         'IMAP' => [
             'APPEND' => ['APPEND'],
@@ -411,7 +411,6 @@ class MailSite
             if (!$too_long) {
                 stream_set_blocking($in_stream, 0);
                 $data = stream_get_contents($in_stream, $max_len - $len);
-echo "C:" . $data."\n";
             } else {
                 $data = "";
                 $this->in_streams[self::DATA][$key] = "";
@@ -423,10 +422,7 @@ echo "C:" . $data."\n";
                     continue;
                 }
                 $out_data = $this->in_streams[self::CONTEXT][$key]['RESPONSE'] . "\x0D\x0A";
-echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
-
                 $this->logIncomingMailRequest($out_data, $key);
-
                 if (empty($this->out_streams[self::CONNECTION][$key])) {
                     $this->out_streams[self::CONNECTION][$key] = $in_stream;
                     $this->out_streams[self::DATA][$key] = $out_data;
@@ -438,21 +434,6 @@ echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
         }
     }
-
-    protected function logIncomingMailRequest($requestData, $key) {
-        // Log the incoming mail request
-        $logMessage = "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
-        // $logMessage .= "Incoming Mail Request: " . date('Y-m-d H:i:s') . "\n";
-        // $logMessage .= "From: " . $requestData['from'] . "\n";
-        // $logMessage .= "To: " . $requestData['to'] . "\n";
-        // $logMessage .= "Subject: " . $requestData['subject'] . "\n";
-        // $logMessage .= "Body: " . $requestData['body'] . "\n";
-        $logMessage .= $requestData;
-        
-        // Append the log to a file
-        file_put_contents('mail_log.txt', $logMessage, FILE_APPEND);
-    }
-
     /**
      * Used to process any timers for MailSite and
      * used to check if the server has detected a
@@ -587,11 +568,6 @@ echo "State:". $this->in_streams[self::CONTEXT][$key]['SERVER_STATE']."\n";
             return false;
         }
         $allowed_commands = $this->state_commands[$protocol][$state];
-echo "Current protocol:".$protocol."\r\n";
-echo "Current State:".$state."\r\n";
-echo "Allowed commands \r\n";
-print_r($allowed_commands);
-
         // Check for the HELP command
         if ($protocol == 'SMTP' && str_starts_with(strtoupper($data), 'HELP')) {
             $jsonCmds = $this->parseHelp();
@@ -1556,28 +1532,33 @@ print_r($allowed_commands);
             FILTER_VALIDATE_EMAIL) && $this->isDomain($email_parts[1]);
     }
     /**
-     * Handler for the HELP command. 
-     * Reads in the cmds.json and prints it for the user.
-     */
-    protected function parseHelp() 
-    {
-        $filename = 'cmds.json';
-        if (!file_exists($filename)) {
-            return "Error: File '$filename' not found.";
-        }
-        $jsonContent = file_get_contents($filename);
-        $commands = json_decode($jsonContent, true);
-        if ($commands === null) {
-            return "Error: Unable to decode JSON from file '$filename'.";
-        }
-        $helpResponse = "214- Available commands:\r\n";
-        foreach ($commands as $command => $desc) {
-            $helpResponse .= "[$command] \r\n\r\n $desc\r\n\r\n\r\n";
-        }
-        $helpResponse .= "214 End of HELP response\r\n\r\n";
-        return $helpResponse;
+ * Handler for the HELP command. 
+ * Contains a list of commands and their descriptions in an array.
+ */
+protected function parseHelp() 
+{
+    $commands = [
+        "AUTH" => "Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.",
+        "EHLO" => "Initiates the SMTP session with the server and requests extended SMTP capabilities. It is used to identify the client to the server and to negotiate the supported features.",
+        "HELO" => "Initiates the SMTP session with the server. It is a simpler version of EHLO and is used when extended capabilities are not required.",
+        "NOOP" => "Does nothing but can be used as a keep-alive mechanism during the SMTP session to prevent the connection from timing out.",
+        "QUIT" => "Ends the SMTP session with the server and closes the connection. It is used to gracefully terminate the session.",
+        "RSET" => "Resets the current SMTP session state. It is used to abort the current email transaction and return to the initial state.",
+        "STARTTLS" => "Initiates a TLS-encrypted SMTP session. It is used to secure the connection between the client and server by encrypting the data transmission.",
+        "MAIL" => "Specifies the sender's email address in the email transaction. It is used to indicate who is sending the email.",
+        "RCPT" => "Specifies the recipient's email address in the email transaction. It is used to indicate who is receiving the email.",
+        "DATA" => "Indicates the start of the email message body. It is used to transmit the content of the email message.",
+        "VRFY" => "Verifies if a given email address is valid and exists on the server. It can be used to check the validity of email addresses before sending emails.",
+        "HELP" => "Requests help information from the server. It can be used to retrieve information about available commands and their usage."
+    ];
+    $helpResponse = "214 - Available commands:\r\n";
+    foreach ($commands as $command => $desc) {
+        $helpResponse .= "[$command] \r\n\r\n $desc\r\n\r\n\r\n";
     }
-    
+    $helpResponse .= "214 End of HELP response\r\n\r\n";
+    return $helpResponse;
+}
+
     /**
      * Used to initialize the superglobals before process() is called.
      * The values for the globals come from the

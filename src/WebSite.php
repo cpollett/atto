@@ -1,5 +1,4 @@
 <?php
-
 /**
  * seekquarry\yioop\Website --
  * a small web server and web routing engine
@@ -329,15 +328,14 @@ class WebSite
         foreach ($this->middle_wares as $middleware) {
             $middleware();
         }
-
         // Handle Upgrade Header
-        if (isset($_SERVER['HTTP_UPGRADE']) && $_SERVER['HTTP_UPGRADE'] === 'HTTP/2') {
+        if (isset($_SERVER['HTTP_UPGRADE']) &&
+            $_SERVER['HTTP_UPGRADE'] === 'HTTP/2') {
             $this->header_data = "UPGRADE";
             $this->header_data = "UPGRADE";
             // $this->handleUpgradeToHttp2();
             return;
         }
-
         $method = empty($_SERVER['REQUEST_METHOD']) ? "ERROR" :
             $_SERVER['REQUEST_METHOD'];
         if (empty($_SERVER['QUERY_STRING'])) {
@@ -456,7 +454,7 @@ class WebSite
      * @param bool $httponly whether or not the cookie is available only over
      *      HTTP, and not available to client-side Javascript
      */
-    public function setCookie($name, $value = "", $expire = 0, 
+    public function setCookie($name, $value = "", $expire = 0,
         $path = "", $domain = "", $secure = false, $httponly = false)
     {
         if ($this->isCli()) {
@@ -899,8 +897,8 @@ class WebSite
         } else if(!empty($_SERVER['HTTPS'])) {
             $this->is_secure = true;
             $context['ssl'] = [
-                "local_cert" => "../cert.pem'", 
-                "local_pk" => "../key.pem'", 
+                "local_cert" => "../cert.pem'",
+                "local_pk" => "../key.pem'",
                 "verify_peer" => false,
                 "verify_peer_name" => false,
                 "allow_self_signed" => true,
@@ -972,9 +970,9 @@ class WebSite
                 $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
             }
-            $num_selected = stream_select($in_streams_with_data, 
+            $num_selected = stream_select($in_streams_with_data,
                 $out_streams_with_data, $excepts, $timeout, $micro_timeout);
-         
+
             $this->processTimers();
             if ($num_selected > 0) {
                 $this->processRequestStreams($server, $in_streams_with_data);
@@ -1024,7 +1022,7 @@ class WebSite
      * @return string web page that WebSite would have reqsponded with if
      *      the request had been made as a usual web request.
      */
-    public function processInternalRequest($url, 
+    public function processInternalRequest($url,
         $include_headers = false, $post_data = null)
     {
         static $request_context = [];
@@ -1117,7 +1115,7 @@ class WebSite
         }
         $out_data = ob_get_contents();
         ob_end_clean();
-        
+
         if ($this->header_data == "UPGRADE") {
             $out_data = "";
             $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
@@ -1262,11 +1260,14 @@ class WebSite
                 $data = "";
                 $this->initializeBadRequestResponse($key);
             }
-            if (isset($this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']) 
-                && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'] == "HTTP/2.0") {
+            if (isset($this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']) &&
+                $this->in_streams[self::CONTEXT][$key][
+                'CLIENT_HTTP'] == "HTTP/2.0") {
                 if($too_long || $this->parseH2Request($key, $data)) {
-                    if (!empty($this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
-                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] = true;
+                    if (!empty($this->in_streams[
+                        self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
+                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
+                            true;
                     }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
                         $this->out_streams[self::CONNECTION][$key] = $in_stream;
@@ -1278,11 +1279,14 @@ class WebSite
             } else {
                 if ($too_long || $this->parseRequest($key, $data)) {
                     if (!empty(
-                        $this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
-                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] = true;
+                        $this->in_streams[self::CONTEXT][$key][
+                            'PRE_BAD_RESPONSE'])) {
+                        $this->in_streams[self::CONTEXT][$key][
+                            'BAD_RESPONSE'] = true;
                     }
                     $out_data = $this->getResponseData();
-                    if (empty($this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])) {
+                    if (empty($this->in_streams[self::CONTEXT][$key][
+                        'BAD_RESPONSE'])) {
                         $this->initRequestStream($key);
                     }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
@@ -1300,7 +1304,7 @@ class WebSite
      * Used to process any timers for WebSite and
      * used to check if the server has detected a
      * new connection. In which case, a read stream is set-up.
-     * @param resource $server Socket server used to listen 
+     * @param resource $server Socket server used to listen
      * for incoming connections.
      */
     protected function processServerRequest($server)
@@ -1309,7 +1313,7 @@ class WebSite
             $timeout = ini_get("default_socket_timeout");
         } else {
             $next_alarm = $this->timer_alarms->top();
-            $timeout = max(min($next_alarm[0] - microtime(true), 
+            $timeout = max(min($next_alarm[0] - microtime(true),
                         ini_get("default_socket_timeout")), 0);
         }
         if ($this->is_secure) {
@@ -1336,7 +1340,7 @@ class WebSite
                 return;
             }
             set_error_handler(null);
-            $custom_error_handler = 
+            $custom_error_handler =
                 $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ?? null;
             set_error_handler($custom_error_handler);
             stream_set_blocking($connection, false);
@@ -1371,20 +1375,20 @@ class WebSite
                 $context["CLIENT_HTTP"] = "h2c";
             }
         }
-        if (preg_match(
-            "/^((GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT) \S+ HTTP\/1\.1)/",
+        if (preg_match("/^((GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|".
+            "TRACE|CONNECT) \S+ HTTP\/1\.1)/",
             $stream_start, $matches)) {
             $context["CLIENT_HTTP"] = "HTTP/1.1";
-        }        
+        }
         return $context;
     }
     /**
-     * Handles the initial connection preface frames of an HTTP/2 connection 
+     * Handles the initial connection preface frames of an HTTP/2 connection
      * established in the ALPN extension of handshake.
      * It establishes the connection configurations and stores them for use
      * throughout the connection.
      *
-     * @param resource $connection A client connection that has been 
+     * @param resource $connection A client connection that has been
      * categorized as HTTP/2 and is receiving the initial data.
      */
     protected function parseH2InitRequest($connection)
@@ -1398,38 +1402,38 @@ class WebSite
         $data = bin2hex($data);
         $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         $magic_string_len = strlen(bin2hex($magic_string));
-        $HEADER_LEN = 18; 
-        $offset = $magic_string_len; 
+        $HEADER_LEN = 18;
+        $offset = $magic_string_len;
         $settings_frame_header_hex = substr($data, $offset, $HEADER_LEN);
         $offset += $HEADER_LEN;
-        list($settings_frame_header, $settings_frame_data_len) = 
+        list($settings_frame_header, $settings_frame_data_len) =
             SettingsFrame::parseFrameHeader($settings_frame_header_hex);
-        $settings_frame_data_hex = 
+        $settings_frame_data_hex =
             substr($data, $offset, $settings_frame_data_len);
         $offset += $settings_frame_data_len;
-        $settings_frame_header->parseBody($settings_frame_data_hex); 
+        $settings_frame_header->parseBody($settings_frame_data_hex);
         $winupdate_frame_header_hex = substr($data, $offset, $HEADER_LEN);
         $offset += $HEADER_LEN;
-        list($winupdate_frame_header, $winupdate_frame_data_len) = 
+        list($winupdate_frame_header, $winupdate_frame_data_len) =
             WindowUpdateFrame::parseFrameHeader($winupdate_frame_header_hex);
-        $winupdate_frame_data_hex = 
+        $winupdate_frame_data_hex =
             substr($data, $offset, $winupdate_frame_data_len);
-        $offset += $winupdate_frame_data_len; 
+        $offset += $winupdate_frame_data_len;
         $winupdate_frame_header->parseBody($winupdate_frame_data_hex);
         $header_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN; 
-        list($header_frame_header, $header_frame_data_len) = 
+        $offset += $HEADER_LEN;
+        list($header_frame_header, $header_frame_data_len) =
             HeaderFrame::parseFrameHeader($header_frame_header_hex);
-        $header_frame_data_hex = 
+        $header_frame_data_hex =
             substr($data, $offset, $header_frame_data_len);
-        $offset += $header_frame_data_len; 
+        $offset += $header_frame_data_len;
         $url = $header_frame_header->parseBody($header_frame_data_hex);
         try {
             $server_settings_frame = new SettingsFrame(0, []);
             $server_settings_frame->parseBody($settings_frame_data_hex);
         } catch (Exception $e) {
             throw new \Exception(
-                "Exception in creating connection preface settings frame: " 
+                "Exception in creating connection preface settings frame: "
                 . $e->getMessage());
         }
         try {
@@ -1437,7 +1441,7 @@ class WebSite
             fwrite($connection, $out_data);
         } catch (Exception $e) {
             throw new \Exception(
-                "Exception in transmitting connection preface setting frame: " 
+                "Exception in transmitting connection preface setting frame: "
                 . $e->getMessage());
         }
         try {
@@ -1450,26 +1454,26 @@ class WebSite
         }
         $_SESSION = [];
         $response = $this->processInternalRequest($url);
-        if (strlen($response) != 0 && 
+        if (strlen($response) != 0 &&
             $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
             $message_headers = [
                 [":status", "200"],
                 ["content-type", "text/html; charset=utf-8"],
                 ["content-length", strlen($response)]
             ];
-            $response_header = 
+            $response_header =
                 new HeaderFrame(
                     $header_frame_header->stream_id, $message_headers, []);
             $response_header->flags->add("END_HEADERS");
             $response_header_serial = $response_header->serialize();
-            $response_data_frame = 
+            $response_data_frame =
                 new DataFrame($header_frame_header->stream_id, $response, []);
             $response_data_frame->flags->add("END_STREAM");
             $response_data_frame_serial = $response_data_frame->serialize();
             $out_data = $response_header_serial . $response_data_frame_serial;
         } else {
             $message_headers = [[":status", "404"]];
-            $response_header = 
+            $response_header =
                 new HeaderFrame(
                     $header_frame_header->stream_id, $message_headers, []);
             $response_header->flags->add("END_HEADERS");
@@ -1483,11 +1487,11 @@ class WebSite
         }
     }
     /**
-     * Handles the initial connection preface frames of an HTTP/2 
-     * connection established as a clear text version of HTTP/2 
-     * over TCP. It establishes the connection configurations and 
+     * Handles the initial connection preface frames of an HTTP/2
+     * connection established as a clear text version of HTTP/2
+     * over TCP. It establishes the connection configurations and
      * stores them for use throughout the connection.
-     * @param resource $connection A client connection that has been 
+     * @param resource $connection A client connection that has been
      * categorized as HTTP/2 and is receiving the initial data.
      */
     protected function parseH2CInitRequest($connection)
@@ -1495,39 +1499,39 @@ class WebSite
         $data = bin2hex(stream_socket_recvfrom($connection, 256));
         $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         $magic_string_len = strlen(bin2hex($magic_string));
-        $HEADER_LEN = 18; 
-        $offset = $magic_string_len; 
+        $HEADER_LEN = 18;
+        $offset = $magic_string_len;
 
         $settings_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN; 
+        $offset += $HEADER_LEN;
 
-        list($settings_frame_header, $settings_frame_data_len) = 
+        list($settings_frame_header, $settings_frame_data_len) =
             SettingsFrame::parseFrameHeader($settings_frame_header_hex);
-        $settings_frame_data_hex = 
+        $settings_frame_data_hex =
             substr($data, $offset, $settings_frame_data_len);
         $offset += $settings_frame_data_len;
         $settings_frame_header->parseBody($settings_frame_data_hex);
         $winupdate_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN; 
-        list($winupdate_frame_header, $winupdate_frame_data_len) = 
+        $offset += $HEADER_LEN;
+        list($winupdate_frame_header, $winupdate_frame_data_len) =
             WindowUpdateFrame::parseFrameHeader($winupdate_frame_header_hex);
-        $winupdate_frame_data_hex = 
+        $winupdate_frame_data_hex =
             substr($data, $offset, $winupdate_frame_data_len);
-        $offset += $winupdate_frame_data_len; 
+        $offset += $winupdate_frame_data_len;
         $winupdate_frame_header->parseBody($winupdate_frame_data_hex);
         $header_frame_header_hex = substr($data, $offset, $HEADER_LEN);
         $offset += $HEADER_LEN;
-        list($header_frame_header, $header_frame_data_len) = 
+        list($header_frame_header, $header_frame_data_len) =
             HeaderFrame::parseFrameHeader($header_frame_header_hex);
         $header_frame_data_hex = substr($data, $offset, $header_frame_data_len);
-        $offset += $header_frame_data_len; 
+        $offset += $header_frame_data_len;
         $url = $header_frame_header->parseBody($header_frame_data_hex);
         try {
             $server_settings_frame = new SettingsFrame(0, []);
             $server_settings_frame->parseBody($settings_frame_data_hex);
         } catch (Exception $e) {
             throw new \Exception(
-                "Exception in creating connection preface settings frame: " 
+                "Exception in creating connection preface settings frame: "
                 . $e->getMessage());
         }
         try {
@@ -1549,27 +1553,29 @@ class WebSite
         }
         $_SESSION = [];
         $response = $this->processInternalRequest($url);
-        if (strlen($response) != 0 && 
+        if (strlen($response) != 0 &&
             $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
             $message_headers = [
                 [":status", "200"],
                 ["content-type", "text/html; charset=utf-8"],
                 ["content-length", strlen($response)]
             ];
-            $response_header = 
-                new HeaderFrame($header_frame_header->stream_id, $message_headers, []);
+            $response_header =
+                new HeaderFrame($header_frame_header->stream_id,
+                $message_headers, []);
             $response_header->flags->add("END_HEADERS");
             $response_header_serial = $response_header->serialize();
 
-            $response_data_frame = 
+            $response_data_frame =
                 new DataFrame($header_frame_header->stream_id, $response, []);
             $response_data_frame->flags->add("END_STREAM");
             $response_data_frame_serial = $response_data_frame->serialize();
             $out_data = $response_header_serial . $response_data_frame_serial;
         } else {
             $message_headers = [[":status", "404"]];
-            $response_header = 
-                new HeaderFrame($header_frame_header->stream_id, $message_headers, []);
+            $response_header =
+                new HeaderFrame($header_frame_header->stream_id,
+                $message_headers, []);
             $response_header->flags->add("END_HEADERS");
             $response_header->flags->add("END_STREAM");
             $out_data = $response_header->serialize();
@@ -1608,7 +1614,7 @@ class WebSite
         ];
         if (empty($additional_context)) {
             $this->in_streams[self::CONTEXT][$key] = array_merge(
-                $this->in_streams[self::CONTEXT][$key], 
+                $this->in_streams[self::CONTEXT][$key],
                 ["CLIENT_HTTP" => "unknown"]
             );
         }
@@ -1639,7 +1645,8 @@ class WebSite
                 $remaining_bytes = max(0, strlen($data) - $num_bytes);
             }
             if ($num_bytes > 0) {
-                $this->out_streams[self::DATA][$key] = substr($data, $num_bytes);
+                $this->out_streams[self::DATA][$key] = substr($data,
+                    $num_bytes);
                 $this->out_streams[self::MODIFIED_TIME][$key] = time();
             }
             if ($remaining_bytes == 0) {
@@ -1674,7 +1681,7 @@ class WebSite
             return false;
         }
         $context = $this->in_streams[self::CONTEXT][$key];
-        if (!isset($context[self::REQUEST_HEAD])) 
+        if (!isset($context[self::REQUEST_HEAD]))
             $context[self::REQUEST_HEAD] = false;
         if (!$context['REQUEST_METHOD']) {
             $request_start = substr($this->in_streams[self::DATA][$key], 0,
@@ -1884,7 +1891,7 @@ class WebSite
      *      For example, /404 for a NOT FOUND error.
      */
     protected function defaultErrorHandler($route = "")
-    {   
+    {
         $request_uri = (empty($route) || $route == '/400') ?
             0 : trim($route, "/");
         $error = ($request_uri < 100 || $request_uri > 600) ?
@@ -1980,7 +1987,7 @@ class WebSite
      *
      * @param int $key id of stream to remove from outstream arrays.
      */
-    protected function shutdownHttpWriteStream($key) 
+    protected function shutdownHttpWriteStream($key)
     {
         unset($this->out_streams[self::CONNECTION][$key],
             $this->out_streams[self::CONTEXT][$key],
@@ -1996,7 +2003,7 @@ class WebSite
      * @param string $err_msg error message to send on exiting
      * @throws WebException
      */
-    function webExit($err_msg = "") 
+    function webExit($err_msg = "")
     {
         if (php_sapi_name() == 'cli') {
             throw new WebException($err_msg);
@@ -2014,7 +2021,7 @@ class WebException extends \Exception
 /**
  * HTTP/2 frame handler classes
  */
-class Frame 
+class Frame
 {
     // Properties
     protected $defined_flags = [];
@@ -2023,7 +2030,7 @@ class Frame
     protected $payload_length;
     public $stream_id;
     public $flags;
-    
+
     // Constants
     const STREAM_ASSOC_HAS_STREAM = "has-stream";
     const STREAM_ASSOC_NO_STREAM = "no-stream";
@@ -2031,9 +2038,9 @@ class Frame
     const FRAME_MAX_LEN = (2 ** 14); //initial
     const FRAME_MAX_ALLOWED_LEN = (2 ** 24) - 1; //max-allowed
     /**
-     * reads the stream id and flags set for the frame 
+     * reads the stream id and flags set for the frame
      *
-     * @param resource $stream_id the stream number with whom 
+     * @param resource $stream_id the stream number with whom
      * this frame is associated.
      * @param resource $flags array of all flags in the frame
      */
@@ -2044,17 +2051,15 @@ class Frame
         foreach ($flags as $flag) {
             $this->flags->add($flag);
         }
-        if (!$this->stream_id && 
+        if (!$this->stream_id &&
             $this->stream_association == self::STREAM_ASSOC_HAS_STREAM) {
-            throw new \Exception("Stream ID must be non-zero for " . 
-                                    get_class($this));
+            throw new \Exception("Stream ID must be non-zero for " .
+                get_class($this));
         }
-        if ($this->stream_id && 
+        if ($this->stream_id &&
             $this->stream_association == self::STREAM_ASSOC_NO_STREAM) {
-            throw new \Exception("Stream ID must be zero for " . 
-                                    get_class($this) . 
-                                    " with stream_id=" . 
-                                    $this->stream_id);
+            throw new \Exception("Stream ID must be zero for " .
+                get_class($this) . " with stream_id=" . $this->stream_id);
         }
     }
     /**
@@ -2066,8 +2071,8 @@ class Frame
         throw new \Exception("Not implemented");
     }
     /**
-     * method to serialize the frame into binary. Internally calls 
-     * serializeBody. Uses the pack function to serialize the bits 
+     * method to serialize the frame into binary. Internally calls
+     * serializeBody. Uses the pack function to serialize the bits
      * of frame header and concatenate it with the body.
      */
     public function serialize()
@@ -2081,10 +2086,10 @@ class Frame
                 $flags |= $flag_bit;
             }
         }
-        $header = pack("nCCCN", 
-            ($this->payload_length >> 8) & 0xFFFF, 
-            $this->payload_length & 0xFF, 
-            $this->type, 
+        $header = pack("nCCCN",
+            ($this->payload_length >> 8) & 0xFFFF,
+            $this->payload_length & 0xFF,
+            $this->type,
             $flags,
             $this->stream_id & 0x7FFFFFFF
         );
@@ -2093,19 +2098,20 @@ class Frame
     /**
      * Parses the header of a frame from its binary representation.
      * Uses FrameFactory to determine the frame type based on the type number.
-     * 
-     * @param string $header Binary data of the frame header in hexadecimal format.
+     *
+     * @param string $header Binary data of the frame header in hexadecimal
+     *  format.
      */
     public static function parseFrameHeader($header)
     {
         if (strlen($header) != 18) {
-            throw new \Exception("Invalid frame header: 
+            throw new \Exception("Invalid frame header:
                 length should be 18 (hex), received " . strlen($header));
             return;
         }
-        $fields['length'] = $length = hexdec(substr($header, 0, 6)); 
+        $fields['length'] = $length = hexdec(substr($header, 0, 6));
         $fields['type'] = $type = hexdec(substr($header, 6, 2));
-        $fields['flags'] = $flags = substr($header, 8, 2); 
+        $fields['flags'] = $flags = substr($header, 8, 2);
         $fields['stream_id'] = $stream_id = hexdec(substr($header, 10, 8));
         if (!isset(FrameFactory::$frames[$type])) {
             throw new \Exception("Unknown frame type: " . $type);
@@ -2115,12 +2121,12 @@ class Frame
             $frame->payload_length = $length;
         }
         $frame->parseFlags($flags);
-        return [$frame, $length * 2]; 
+        return [$frame, $length * 2];
     }
     /**
-     * Parses all flags of the frame against the defined flags 
+     * Parses all flags of the frame against the defined flags
      * which are present in each child class.
-     * @param string $flag_byte Binary data representing the flag 
+     * @param string $flag_byte Binary data representing the flag
      * byte in hexadecimal format.
      */
     public function parseFlags($flag_byte)
@@ -2136,7 +2142,7 @@ class Frame
     /**
      * Parses the body of the frame from binary.
      * Different implementations are provided for each child class.
-     * @param string $data Binary data representing the frame body 
+     * @param string $data Binary data representing the frame body
      * in hexadecimal format.
      */
     public function parseBody($data)
@@ -2144,10 +2150,12 @@ class Frame
         throw new \Exception("Not implemented");
     }
 }
-/* Mapping of frame types to classes, so that frame objects can be  
+/**
+ * Mapping of frame types to classes, so that frame objects can be
  * created dynamically based on the type number.
  */
-class FrameFactory {
+class FrameFactory
+{
     public static $frames = [
         0x0 => DataFrame::class,
         0x1 => HeaderFrame::class,
@@ -2162,10 +2170,10 @@ class FrameFactory {
     ];
 }
 /*
- * SettingsFrame class is responsible for handling the HTTP/2 SETTINGS frame, 
+ * SettingsFrame class is responsible for handling the HTTP/2 SETTINGS frame,
  * helps configure communication parameters between the client and server.
  */
-class SettingsFrame extends Frame 
+class SettingsFrame extends Frame
 {
     protected $defined_flags = [
         'ACK' => 0x01
@@ -2182,50 +2190,52 @@ class SettingsFrame extends Frame
         0x08 => 'ENABLE_CONNECT_PROTOCOL',
     ];
     protected $settings = [];
-    /** 
+    /**
      * Constructor to create a new SettingsFrame object.
-     * @param int $stream_id The stream ID for this frame 
+     * @param int $stream_id The stream ID for this frame
      * (default is 0 since SETTINGS frames aren't tied to a stream).
      * @param array $settings The settings to be included in the frame.
      * @param array $flags Any flags associated with the frame (e.g., 'ACK').
      */
-    public function __construct($stream_id = 0, $settings = [], $flags = []) 
+    public function __construct($stream_id = 0, $settings = [], $flags = [])
     {
         parent::__construct($stream_id, $flags);
         if (!empty($settings) && in_array('ACK', $flags)) {
-            throw new InvalidDataError("Settings must be empty if ACK flag is set.");
+            throw new InvalidDataError(
+                "Settings must be empty if ACK flag is set.");
         }
         $this->settings = $settings;
     }
-    /** 
+    /**
      * Converts the settings into the format required for transmission.
-     * Each setting is packed as 6 bytes: 2 bytes for the setting identifier 
+     * Each setting is packed as 6 bytes: 2 bytes for the setting identifier
      * and 4 bytes for its value.
      * @return string Returns the settings as serialized binary data.
      */
-    public function serializeBody() {
+    public function serializeBody()
+    {
         $body = '';
         foreach ($this->settings as $setting => $value) {
-            $body .= pack('nN', $setting, $value); 
+            $body .= pack('nN', $setting, $value);
         }
         return $body;
     }
-    /** 
+    /**
      * Parses binary data of the SETTINGS frame body and extracts the settings
      * into the frame's settings array in a readable format.
      * @param string $data The binary data to parse.
      */
     public function parseBody($data) {
         if (in_array('ACK', $this->flags->getFlags()) && strlen($data) > 0) {
-            throw new \Exception("Exception: SETTINGS ack frame must not have 
+            throw new \Exception("Exception: SETTINGS ack frame must not have
                             payload: got " . strlen($data) . " bytes");
         }
-        $entries = str_split($data, 12); 
+        $entries = str_split($data, 12);
         $payload_length = 0;
         foreach ($entries as $entry) {
-            $identifier = hexdec(substr($entry, 0, 4)); 
+            $identifier = hexdec(substr($entry, 0, 4));
             $value = hexdec(substr($entry, 4, 8));
-            $identifier_name = SettingsFrame::PAYLOAD_SETTINGS[$identifier] 
+            $identifier_name = SettingsFrame::PAYLOAD_SETTINGS[$identifier]
                 ?? 'UNKNOWN-SETTING';
             $this->settings[$identifier] = $value;
             $payload_length += 6;
@@ -2233,11 +2243,12 @@ class SettingsFrame extends Frame
         $this->payload_length = $payload_length;
     }
 }
-/*
+/**
  * HeaderFrame class is responsible for handling the HTTP/2 HEADER frame,
- * which carries header parameters related to a stream between the client and server.
+ * which carries header parameters related to a stream between the client and
+ * server.
  */
-class HeaderFrame extends Frame 
+class HeaderFrame extends Frame
 {
     protected $defined_flags = [
         'END_STREAM' => 0x01,
@@ -2254,12 +2265,12 @@ class HeaderFrame extends Frame
      * @param array $data The header data to include in the frame.
      * @param array $flags Any flags associated with the frame.
      */
-    public function __construct($stream_id = 0, $data = [], $flags = []) 
+    public function __construct($stream_id = 0, $data = [], $flags = [])
     {
         parent::__construct($stream_id, $flags);
         $this->data = $data;
     }
-    /** 
+    /**
      * Serializes the header data into the format required for transmission.
      * This method uses HPACK encoding to compress headers into binary format.
      */
@@ -2267,23 +2278,24 @@ class HeaderFrame extends Frame
         $headers = "";
         if (!empty($this->data)) {
             $hpack = new HPack();
-            $headers = $hpack->encode($this->data, 4096); 
+            $headers = $hpack->encode($this->data, 4096);
         }
         return $headers;
     }
-    /** 
+    /**
      * Parses the binary data of the HEADER frame and extracts the header
      * fields into readable format of key-values like the URL.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) {
+    public function parseBody($data)
+    {
         $hpack = new HPack();
-        $headers = $hpack->decodeHeaderBlockFragment($data, 4096); 
+        $headers = $hpack->decodeHeaderBlockFragment($data, 4096);
         $scheme = '';
         $authority = '';
         $path = '';
         if ($headers == NULL) {
-            return "http://localhost:8080/"; 
+            return "http://localhost:8080/";
         }
         foreach ($headers as $header) {
             foreach ($header as $key => $value) {
@@ -2301,14 +2313,14 @@ class HeaderFrame extends Frame
             }
         }
         $url = $scheme . "://" . $authority . $path;
-        return $url; 
-    } 
+        return $url;
+    }
 }
 /*
- * DataFrame class handles the HTTP/2 DATA frame, 
+ * DataFrame class handles the HTTP/2 DATA frame,
  * which carries the data of a stream between the client and server.
  */
-class DataFrame extends Frame 
+class DataFrame extends Frame
 {
     protected $defined_flags = [
         'END_STREAM' => 0x01,
@@ -2317,23 +2329,23 @@ class DataFrame extends Frame
     protected $type = 0x0;
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     public $data;
-    /** 
+    /**
      * Constructor to create a new DataFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param string $data The data payload for the frame.
      * @param array $flags Flags associated with the frame .
      */
-    public function __construct(int $stream_id, string $data = '', 
-        array $flags = []) 
+    public function __construct(int $stream_id, string $data = '',
+        array $flags = [])
     {
         parent::__construct($stream_id, $flags);
         $this->data = $data;
     }
-    /** 
+    /**
      * Serializes the body of the frame into a binary string.
      * Converts the ASCII data to binary format for transmission.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         $binary_string = '';
         for ($i = 0; $i < strlen($this->data); $i++) {
@@ -2341,14 +2353,14 @@ class DataFrame extends Frame
         }
         return $binary_string;
     }
-    /** 
+    /**
      * Parses the binary data of the DATA frame and extracts the data payload.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         $padding_data_length = $this->parsePaddingData($data);
-        $this->data = substr($data, $padding_data_length, 
+        $this->data = substr($data, $padding_data_length,
             strlen($data) - $this->pad_length);
         $this->payload_length = strlen($data);
 
@@ -2361,24 +2373,24 @@ class DataFrame extends Frame
  * PriorityFrame class handles the HTTP/2 PRIORITY frame,
  * which specifies the priority of a stream.
  */
-class PriorityFrame extends Priority 
+class PriorityFrame extends Priority
 {
     protected $defined_flags = [];
     protected $type = 0x02;
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
-    /** 
+    /**
      * Serializes the priority data into a binary format.
      * @return string The serialized binary data.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         return $this->serializePriorityData();
     }
-    /** 
+    /**
      * Parses the binary data of the PRIORITY frame.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         if (strlen($data) != 5) {
             throw new InvalidFrameException(
@@ -2392,35 +2404,35 @@ class PriorityFrame extends Priority
  * RstStreamFrame class handles the HTTP/2 RST_STREAM frame,
  * which is used to abruptly terminate a stream.
  */
-class RstStreamFrame extends Frame 
+class RstStreamFrame extends Frame
 {
     protected $defined_flags = [];
     protected $type = 0x03;
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     protected $error_code;
-    /** 
+    /**
      * Constructor to create a new RstStreamFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $error_code The error code for the RST_STREAM frame.
      */
     public function __construct($stream_id, $error_code = 0,
-        array $kwargs = []) 
+        array $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
         $this->error_code = $error_code;
     }
-    /** 
+    /**
      * Serializes the RST_STREAM frame body into a binary format.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         return pack('N', $this->error_code);
     }
-    /** 
+    /**
      * Parses the binary data of the RST_STREAM frame.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         if (strlen($data) != 4) {
             throw new InvalidFrameException(
@@ -2434,7 +2446,7 @@ class RstStreamFrame extends Frame
  * PushPromiseFrame class handles the HTTP/2 PUSH_PROMISE frame,
  * which is used to notify the client of an upcoming stream.
  */
-class PushPromiseFrame extends Frame 
+class PushPromiseFrame extends Frame
 {
     protected $defined_flags = [
         'END_HEADERS' => 0x04,
@@ -2444,48 +2456,48 @@ class PushPromiseFrame extends Frame
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     protected $promised_stream_id;
     protected $data;
-    /** 
+    /**
      * Constructor to create a new PushPromiseFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $promised_stream_id The promised stream ID.
      * @param string $data The data payload.
      */
-    public function __construct($stream_id, $promised_stream_id = 0, 
-        $data = '', $kwargs = []) 
+    public function __construct($stream_id, $promised_stream_id = 0,
+        $data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
         $this->promised_stream_id = $promised_stream_id;
         $this->data = $data;
     }
-    /** 
+    /**
      * Serializes the PUSH_PROMISE frame body into binary format.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         $padding_data = $this->serializePaddingData();
         $padding = str_repeat("\0", $this->pad_length);
         $data = pack('N', $this->promised_stream_id);
         return $padding_data . $data . $this->data . $padding;
     }
-    /** 
+    /**
      * Parses the binary data of the PUSH_PROMISE frame.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         $padding_data_length = $this->parsePaddingData($data);
         if (strlen($data) < $padding_data_length + 4) {
             throw new InvalidFrameException("Invalid PUSH_PROMISE body");
         }
-        $this->promised_stream_id = 
+        $this->promised_stream_id =
             unpack('N', substr($data, $padding_data_length, 4))[1];
-        $this->data = 
+        $this->data =
             substr($data, $padding_data_length + 4, -$this->pad_length);
 
-        if ($this->promised_stream_id == 0 
+        if ($this->promised_stream_id == 0
             || $this->promised_stream_id % 2 != 0) {
             throw new InvalidDataException(
-                "Invalid PUSH_PROMISE promised stream id: 
+                "Invalid PUSH_PROMISE promised stream id:
                     $this->promised_stream_id");
         }
         if ($this->pad_length && $this->pad_length >= strlen($data)) {
@@ -2498,7 +2510,7 @@ class PushPromiseFrame extends Frame
  * PingFrame class handles the HTTP/2 PING frame,
  * which is used for measuring round-trip times or verifying connection health.
  */
-class PingFrame extends Frame 
+class PingFrame extends Frame
 {
     protected $defined_flags = [
         'ACK' => 0x01
@@ -2506,23 +2518,23 @@ class PingFrame extends Frame
     protected $type = 0x06;
     protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
     protected $opaque_data;
-    /** 
+    /**
      * Constructor to create a new PingFrame object.
      * @param int $stream_id The stream ID for this frame.
-     * @param string $opaque_data The opaque data (8 bytes) 
+     * @param string $opaque_data The opaque data (8 bytes)
      * associated with the PING frame.
      */
-    public function __construct($stream_id = 0, $opaque_data = '', 
-        $kwargs = []) 
+    public function __construct($stream_id = 0, $opaque_data = '',
+        $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
         $this->opaque_data = $opaque_data;
     }
-    /** 
+    /**
      * Serializes the PING frame body into binary format.
      * @return string The serialized binary data.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         if (strlen($this->opaque_data) != 8) {
             throw new InvalidDataException(
@@ -2530,11 +2542,11 @@ class PingFrame extends Frame
         }
         return $this->opaque_data;
     }
-    /** 
+    /**
      * Parses the binary data of the PING frame.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         if (strlen($data) != 8) {
             throw new InvalidFrameException(
@@ -2546,53 +2558,53 @@ class PingFrame extends Frame
 }
 /*
  * GoAwayFrame class handles the HTTP/2 GOAWAY frame,
- * which is used to indicate that the sender is gracefully 
+ * which is used to indicate that the sender is gracefully
  * shutting down a connection.
  */
-class GoAwayFrame extends Frame 
+class GoAwayFrame extends Frame
 {
     protected $defined_flags = [];
     protected $type = 0x07;
-    protected $stream_association = '_STREAM_ASSOC_NO_STREAM';  
+    protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
     protected $last_stream_id;
     protected $error_code;
     protected $additional_data;
-    /** 
+    /**
      * Constructor to create a new GoAwayFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $last_stream_id last stream ID the sender will accept.
      * @param int $error_code indicating the reason for shutting down.
      * @param string $additional_data Additional debug data (optional).
      */
-    public function __construct($stream_id = 0, $last_stream_id = 0, 
-        $error_code = 0, $additional_data = '', $kwargs = []) 
+    public function __construct($stream_id = 0, $last_stream_id = 0,
+        $error_code = 0, $additional_data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
         $this->last_stream_id = $last_stream_id;
         $this->error_code = $error_code;
         $this->additional_data = $additional_data;
     }
-    /** 
+    /**
      * Serializes the GOAWAY frame body into a binary format.
      * @return string The serialized binary data.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
-        $data = pack('N', $this->last_stream_id & 0x7FFFFFFF) . 
+        $data = pack('N', $this->last_stream_id & 0x7FFFFFFF) .
                 pack('N', $this->error_code);
         return $data . $this->additional_data;
     }
-    /** 
+    /**
      * Parses the binary data of the GOAWAY frame.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         if (strlen($data) < 8) {
             throw new InvalidFrameException("Invalid GOAWAY body.");
         }
 
-        $this->last_stream_id = unpack('N', substr($data, 0, 4))[1] & 
+        $this->last_stream_id = unpack('N', substr($data, 0, 4))[1] &
                                 0x7FFFFFFF;
         $this->error_code = unpack('N', substr($data, 4, 4))[1];
         $this->additional_data = substr($data, 8);
@@ -2603,27 +2615,27 @@ class GoAwayFrame extends Frame
  * WindowUpdateFrame class handles the HTTP/2 WINDOW_UPDATE frame,
  * which is used to implement flow control.
  */
-class WindowUpdateFrame extends Frame 
+class WindowUpdateFrame extends Frame
 {
     protected $defined_flags = [];
     protected $type = 0x08;
-    protected $stream_association = '_STREAM_ASSOC_EITHER';  
+    protected $stream_association = '_STREAM_ASSOC_EITHER';
     protected $window_increment;
-    /** 
+    /**
      * Constructor to create a new WindowUpdateFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $window_increment The increment to the window size.
      */
-    public function __construct($stream_id, $window_increment = 0, 
-        $kwargs = []) 
+    public function __construct($stream_id, $window_increment = 0,
+        $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
         $this->window_increment = $window_increment;
     }
-    /** 
+    /**
      * Serializes the WINDOW_UPDATE frame body into binary format.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         return pack('N', $this->window_increment & 0x7FFFFFFF);
     }
@@ -2631,15 +2643,15 @@ class WindowUpdateFrame extends Frame
      * Parses the hexadecimal data of the WINDOW_UPDATE frame.
      * @param string $data The hexadecimal data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         if (strlen($data) != 8) {
             throw new InvalidFrameException(
-                "WINDOW_UPDATE frame must have 4 byte length 
+                "WINDOW_UPDATE frame must have 4 byte length
                  (8 hex characters): got " . strlen($data));
         }
         $this->window_increment = hexdec($data);
-        if ($this->window_increment < 1 
+        if ($this->window_increment < 1
             || $this->window_increment > (2**31 - 1)) {
             throw new InvalidDataException(
                 "WINDOW_UPDATE increment must be between 1 to 2^31-1");
@@ -2651,36 +2663,36 @@ class WindowUpdateFrame extends Frame
  * ContinuationFrame class handles the HTTP/2 CONTINUATION frame,
  * which is used to continue a sequence of header block fragments.
  */
-class ContinuationFrame extends Frame 
+class ContinuationFrame extends Frame
 {
     protected $defined_flags = [
         'END_HEADERS' => 0x04,
     ];
     protected $type = 0x09;
-    protected $stream_association = self::_STREAM_ASSOC_HAS_STREAM;   
+    protected $stream_association = self::_STREAM_ASSOC_HAS_STREAM;
     public $data;
-    /** 
+    /**
      * Constructor to create a new ContinuationFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param string $data The continuation frame payload.
      */
-    public function __construct($stream_id, $data = '', $kwargs = []) 
+    public function __construct($stream_id, $data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
         $this->data = $data;
     }
-    /** 
+    /**
      * Serializes the CONTINUATION frame body into binary format.
      */
-    public function serializeBody() 
+    public function serializeBody()
     {
         return $this->data;
     }
-    /** 
+    /**
      * Parses the binary data of the CONTINUATION frame.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
         $this->data = $data;
         $this->payload_length = strlen($data);
@@ -2692,58 +2704,65 @@ class ContinuationFrame extends Frame
 class InvalidFrameException extends \Exception {}
 class InvalidDataException extends \Exception {}
 class InvalidPaddingException extends \Exception {}
-/*
+/**
  * Represents a single flag with a name and bit value.
  */
-class Flag {
+class Flag
+{
     public string $name;
     public int $bit;
-    /** 
+    /**
      * Constructor for Flag.
      * @param string $name The name of the flag.
      * @param int $bit The bit value associated with the flag.
      */
-    public function __construct($name, $bit) {
+    public function __construct($name, $bit)
+    {
         $this->name = $name;
         $this->bit = $bit;
     }
 }
-/*
+/**
  * Flags class manages a collection of valid flags and supports
  * adding, removing, and checking for the presence of flags.
  */
-class Flags {
+class Flags
+{
     private array $valid_flags;
     private array $flags;
-    /** 
+    /**
      * Constructor for Flags.
      * @param array $defined_flags Array of defined valid flags.
      */
-    public function __construct($defined_flags) {
+    public function __construct($defined_flags)
+    {
         $this->valid_flags = array_keys($defined_flags);
         $this->flags = [];
     }
-    /** 
-     * Converts the Flags object to a string by sorting 
+    /**
+     * Converts the Flags object to a string by sorting
      * and joining all active flags.
      */
-    public function __toString() {
+    public function __toString()
+    {
         $sorted_flags = $this->flags;
         sort($sorted_flags);
         return implode(", ", $sorted_flags);
     }
-    /** 
+    /**
      * Checks if the specified flag is present.
      * @param string $flag The flag to check.
      */
-    public function contains($flag) {
+    public function contains($flag)
+    {
         return in_array($flag, $this->flags);
     }
-    /** 
+    /**
      * Adds a valid flag to the collection.
      * @param string $flag The flag to add.
      */
-    public function add($flag) {
+    public function add($flag)
+    {
         if (!in_array($flag, $this->valid_flags)) {
             throw new InvalidArgumentException(sprintf(
                 'Unexpected flag: %s. Valid flags are: %s',
@@ -2755,53 +2774,60 @@ class Flags {
             $this->flags[] = $flag;
         }
     }
-    /** 
+    /**
      * Removes the specified flag from the collection.
      * @param string $flag The flag to remove.
      */
-    public function discard(string $flag) {
+    public function discard(string $flag)
+    {
         $this->flags = array_diff($this->flags, [$flag]);
     }
-    /** 
+    /**
      * Counts the number of active flags.
      */
-    public function count() {
+    public function count()
+    {
         return count($this->flags);
     }
-    /** 
+    /**
      * Returns the array of current flags.
      */
-    public function getFlags() {
+    public function getFlags()
+    {
         return $this->flags;
     }
 }
 /*
  * Trait for handling padding in HTTP/2 frames.
  */
-trait Padding {
+trait Padding
+{
     protected $pad_length;
-    /** 
+    /**
      * Constructor for Padding trait.
      * @param int $stream_id The stream ID associated with the padding.
      * @param int $pad_length The length of the padding (default: 0).
      */
-    public function __construct(int $stream_id, int $pad_length = 0) {
+    public function __construct(int $stream_id, int $pad_length = 0)
+    {
         $this->pad_length = $pad_length;
     }
-    /** 
+    /**
      * Serializes padding data into binary format.
      */
-    public function serializePaddingData() {
+    public function serializePaddingData()
+    {
         if (in_array('PADDED', $this->flags)) {
             return pack('C', $this->pad_length);
         }
         return '';
     }
-    /** 
+    /**
      * Parses padding data from binary format.
      * @param string $data The data to parse.
      */
-    public function parsePaddingData($data) {
+    public function parsePaddingData($data)
+    {
         if (in_array('PADDED', $this->flags->getFlags())) {
             if (strlen($data) < 1) {
                 throw new InvalidFrameError("Invalid Padding data");
@@ -2817,44 +2843,48 @@ trait Padding {
  * Priority class handles the HTTP/2 PRIORITY frame,
  * managing stream priority and dependencies.
  */
-class Priority {
+class Priority
+{
     protected $stream_id;
     protected $depends_on;
     protected $stream_weight;
     protected $exclusive;
-    /** 
+    /**
      * Constructor for Priority.
      * @param int $stream_id The stream ID.
      * @param int $depends_on The stream ID this one depends on (default: 0x0).
      * @param int $stream_weight The weight of the stream (default: 0x0).
-     * @param bool $exclusive If the stream dependency is 
+     * @param bool $exclusive If the stream dependency is
      * exclusive (default: false).
      * @param array $kwargs Additional parameters for inheritance.
      */
-    public function __construct($stream_id, $depends_on = 0x0, 
-        $stream_weight = 0x0, $exclusive = false, $kwargs = []) {
+    public function __construct($stream_id, $depends_on = 0x0,
+        $stream_weight = 0x0, $exclusive = false, $kwargs = [])
+    {
         $this->stream_id = $stream_id;
         $this->depends_on = $depends_on;
         $this->stream_weight = $stream_weight;
         $this->exclusive = $exclusive;
         if (method_exists($this, 'parent::__construct')) {
-            call_user_func_array('parent::__construct', 
+            call_user_func_array('parent::__construct',
                 array_merge([$stream_id], $kwargs));
         }
     }
-    /** 
+    /**
      * Serializes priority data into binary format.
      */
-    public function serializePriorityData() {
-        $depends_on_with_exclusive = $this->depends_on + 
-                                    ($this->exclusive ? 0x80000000 : 0);
+    public function serializePriorityData()
+    {
+        $depends_on_with_exclusive = $this->depends_on +
+            ($this->exclusive ? 0x80000000 : 0);
         return pack('N C', $depends_on_with_exclusive, $this->stream_weight);
     }
-    /** 
+    /**
      * Parses priority data from binary format.
      * @param string $data The binary data to parse.
      */
-    public function parsePriorityData(string $data) {
+    public function parsePriorityData(string $data)
+    {
         if (strlen($data) < 5) {
             throw new InvalidFrameException("Invalid Priority data");
         }
@@ -2867,10 +2897,11 @@ class Priority {
     }
 }
 /*
- * Handles HPack compression for HTTP/2, utilizing static and dynamic 
+ * Handles HPack compression for HTTP/2, utilizing static and dynamic
  * tables with Huffman encoding. Supports encoding and decoding.
  */
-class HPack {
+class HPack
+{
     private const STATIC_TABLE = [
         1  => [':authority', ''],
         2  => [':method', 'GET'],
@@ -2934,45 +2965,46 @@ class HPack {
         60 => ['via', ''],
         61 => ['www-authenticate', '']
     ];
-
     private static $headers_table = [];
     private static $never_index_list = [];
     private $max_table_size = 100; // number of indices allowed in the table
     private $current_table_size = 0;
     private $debug_output;
-
-    public function getDebugOutput() {
+    public function getDebugOutput()
+    {
         return $this->debug_output;
     }
-
-    public function __construct() {
+    public function __construct()
+    {
         if (empty(self::$headers_table)) {
             self::$headers_table[0] = ["not defined", ""];
             foreach (self::STATIC_TABLE as $index => $header) {
                 self::$headers_table[$index] = $header;
             }
         }
-        $this->debug_output .=  
+        $this->debug_output .=
             "\n\nIn Constructor\nInitial Headers table created: \n";
-        $this->debug_output .= 
+        $this->debug_output .=
             json_encode(self::$headers_table, JSON_PRETTY_PRINT) . PHP_EOL;
 
     }
     /**
      * Returns the full headers table (static + dynamic). For debugging.
      */
-    public static function getHeadersTable() {
+    public static function getHeadersTable()
+    {
         return self::$headers_table;
     }
     /**
      * Evicts the first entry in the table and shifts the rest of the entries.
      * Ensures that the table maintains a size of $max_table_size.
      */
-    private function evictEntry() {
+    private function evictEntry()
+    {
         $static_table_len = count(self::STATIC_TABLE);
         if (count(self::$headers_table) > $static_table_len) {
-            $this->debug_output .=  
-                "Evicting header at index " . 
+            $this->debug_output .=
+                "Evicting header at index " .
                 ($static_table_len + 1) . "..." . PHP_EOL;
             foreach (self::$headers_table as $index => $header) {
                 if ($index > $static_table_len + 1) {
@@ -2980,85 +3012,89 @@ class HPack {
                 }
             }
             array_pop(self::$headers_table);
-            $this->debug_output .=  "Entry at index " . 
-                    ($static_table_len + 1) . 
+            $this->debug_output .=  "Entry at index " .
+                    ($static_table_len + 1) .
                     " has been evicted, and table has been shifted." . PHP_EOL;
         }
-    }  
+    }
     /**
      * Adds a header to the headers_table after checking the max table size.
      *
      * @param string $name  The name of the header.
      * @param string $value The value of the header.
      */
-    public function addHeader($name, $value) {
+    public function addHeader($name, $value)
+    {
         $current_size = count(self::$headers_table);
         while (($current_size + 1) > $this->max_table_size) {
             $this->evictEntry();
-            $current_size = count(self::$headers_table); 
+            $current_size = count(self::$headers_table);
         }
         self::$headers_table[] = [$name, $value];
-        $this->debug_output .=  
+        $this->debug_output .=
             "Added header: [$name, $value] at the end of the table." . PHP_EOL;
-        
     }
     /**
      * Decodes a header block fragment from hex.
      * @param string $hex_input Hexadecimal input to decode.
      */
-    public function decodeHeaderBlockFragment($hex_input) {
+    public function decodeHeaderBlockFragment($hex_input)
+    {
         $offset = 0;
         $headers = [];
         $input_length = strlen($hex_input);
         while ($offset < $input_length) {
             $first_byte_hex = substr($hex_input, $offset, 2);
             $first_byte = hexdec($first_byte_hex);
-            $bits_for_dbg = 
+            $bits_for_dbg =
                 str_pad(decbin(hexdec($first_byte_hex)), 8, '0', STR_PAD_LEFT);
             if (($first_byte & 0x80) === 0x80) {
-                $this->debug_output .= "\nFirst byte: 
-                    $first_byte_hex ($bits_for_dbg) matches indexed field representation. 
+                $this->debug_output .= "\nFirst byte:
+                    $first_byte_hex ($bits_for_dbg) matches indexed field" .
+                    "representation.
                     Bit pattern: ( 1 * * *   * * * * )\n";
                 $header = $this->decodeIndexedHeaderField(
                     substr($hex_input, $offset));
-                if ($header === null) break;
+                if ($header === null) {
+                    break;
+                }
                 $offset += $header['length'];
-            } elseif (($first_byte & 0xC0) === 0x40) {
-                $this->debug_output .= "\nFirst byte: $first_byte_hex 
+            } else if (($first_byte & 0xC0) === 0x40) {
+                $this->debug_output .= "\nFirst byte: $first_byte_hex
                     ($bits_for_dbg) matches literal header with
-                    incremental indexing representation. 
+                    incremental indexing representation.
                     Bit pattern: ( 0 1 * *   * * * * )\n";
                 $header = $this->decodeLiteralWithIncrementalIndexing(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
-            } elseif (($first_byte & 0xF0) === 0x10) {
-                $this->debug_output .= "\nFirst byte: $first_byte_hex 
-                    ($bits_for_dbg) matches literal header never 
-                    indexed representation. 
+            } else if (($first_byte & 0xF0) === 0x10) {
+                $this->debug_output .= "\nFirst byte: $first_byte_hex
+                    ($bits_for_dbg) matches literal header never
+                    indexed representation.
                     Bit pattern: ( 0 0 0 0   * * * * )\n";
                 $header = $this->decodeLiteralNeverIndexed(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
-            } elseif (($first_byte & 0xE0) === 0x00) {
-                $this->debug_output .= "\nFirst byte: $first_byte_hex 
-                    ($bits_for_dbg) matches literal header without 
-                    indexing representation. 
+            } else if (($first_byte & 0xE0) === 0x00) {
+                $this->debug_output .= "\nFirst byte: $first_byte_hex
+                    ($bits_for_dbg) matches literal header without
+                    indexing representation.
                     Bit pattern: ( 0 0 0 1   * * * * )\n";
                 $header = $this->decodeLiteralWithoutIndexing(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
             } else {
-                $header = "Exception occurred";
-                $this->debug_output .= 
+                $header = null;
+                $this->debug_output .=
                     "Exception: Invalid header type detected.\n";
             }
-            
-            $headers[] = $header['decoded'];
+            if ($header) {
+                $headers[] = $header['decoded'];
+            }
         }
-        $this->debug_output .= 
+        $this->debug_output .=
             "Total decoded headers: " . count($headers) ."\n";
         $this->debug_output .= print_r($headers, true);
-
         $this->debug_output .= "\n\nFinal dynamic table: \n";
         $this->debug_output .= print_r(self::$headers_table, true);
         return $header === null ? null : $headers;
@@ -3068,7 +3104,8 @@ class HPack {
      * indexed header field => both name and value are present at index.
      * @param string $hex_field Hexadecimal field to decode.
      */
-    public function decodeIndexedHeaderField($hex_field) {
+    public function decodeIndexedHeaderField($hex_field)
+    {
         if (strlen($hex_field) < 2) {
             throw new \Exception(
                 "Invalid hex field: too short for an indexed header."
@@ -3083,12 +3120,12 @@ class HPack {
             $this->debug_output .= "Decoded name: $name, value: $value\n";
         } else {
             // Invalid index
-            $this->debug_output .= "Decoding error: Index value ". 
+            $this->debug_output .= "Decoding error: Index value ".
                 $index . " found in an indexed header field representation.";
             return null;
         }
         return [
-            'decoded' => [$name => $value],   
+            'decoded' => [$name => $value],
             'encoded' => ['name' => bin2hex($name),'value' => bin2hex($value)],
             'length' => 2
         ];
@@ -3097,13 +3134,14 @@ class HPack {
      * Decodes a literal with incremental indexing.
      * @param string $hex_field Hexadecimal field to decode.
      */
-    public function decodeLiteralWithIncrementalIndexing($hex_field) {
+    public function decodeLiteralWithIncrementalIndexing($hex_field)
+    {
         $offset = 0;
         $first_byte_hex = substr($hex_field, $offset, 2);
         $first_byte = hexdec($first_byte_hex);
         $offset += 2;
-        if (($first_byte & 0x3F) === 0x00) { 
-            $this->debug_output .= "Bit pattern (0 1 0 0   0 0 0 0) 
+        if (($first_byte & 0x3F) === 0x00) {
+            $this->debug_output .= "Bit pattern (0 1 0 0   0 0 0 0)
                 => Name not in headers table\n";
             $this->debug_output .= "Decoding new name: \n";
             $name_length_hex = substr($hex_field, $offset, 2);
@@ -3111,69 +3149,70 @@ class HPack {
             $use_huffman = ($name_length_byte & 0x80) !== 0;
             $name_length = $name_length_byte & 0x7F;
             $offset += 2;
-            $this->debug_output .= "Length hex: $name_length_hex 
-                => length = $name_length and huffman encoding 
+            $this->debug_output .= "Length hex: $name_length_hex
+                => length = $name_length and huffman encoding
                 used = $use_huffman\n";
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
-            $name = $use_huffman ? 
-                $this->huffmanDecode($name_hex) : hex2bin($name_hex); 
+            $name = $use_huffman ?
+                $this->huffmanDecode($name_hex) : hex2bin($name_hex);
             $this->debug_output .= "Decoded name: $name";
-    
-        } else { 
-            $this->debug_output .= 
-                "Bit pattern (0 1 * *   * * * *) 
+
+        } else {
+            $this->debug_output .=
+                "Bit pattern (0 1 * *   * * * *)
                 => Name indexed in headers table\n";
             $this->debug_output .= "Decoding indexed name: \n";
             $name_index = $first_byte & 0x3F;
-            if ($name_index > 0 && $name_index < count(self::$headers_table)) { 
+            if ($name_index > 0 && $name_index < count(self::$headers_table)) {
                 $name = self::$headers_table[$name_index][0];
                 $this->debug_output .= "Name found at index $name_index: $name\n";
-            } else { 
+            } else {
                 throw new \Exception(
                     "Invalid name index: exceeds dynamic table size."
                 );
             }
         }
         $value_length_hex = substr($hex_field, $offset, 2);
-        $value_length_byte = hexdec($value_length_hex); 
-        $use_huffman = ($value_length_byte & 0x80) !== 0; 
-        $value_length = $value_length_byte & 0x7F; 
+        $value_length_byte = hexdec($value_length_hex);
+        $use_huffman = ($value_length_byte & 0x80) !== 0;
+        $value_length = $value_length_byte & 0x7F;
         $offset += 2;
         $this->debug_output .= "Decoding value: \n";
-        $this->debug_output .= "Length hex: $value_length_hex 
-            => length = $value_length and huffman encoding used = 
+        $this->debug_output .= "Length hex: $value_length_hex
+            => length = $value_length and huffman encoding used =
             $use_huffman\n";
-        $value_hex = substr($hex_field, $offset, $value_length * 2); 
+        $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
-        $value = $use_huffman ? 
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex); 
+        $value = $use_huffman ?
+            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
         $this->debug_output .= "Decoded value: $value";
-        if (($first_byte & 0x3F) !== 0x00) { 
+        if (($first_byte & 0x3F) !== 0x00) {
             if ($name_index < count(self::$headers_table)) {
-                self::$headers_table[$name_index] = [$name, $value]; 
-                $this->debug_output .= "Value updated in headers 
+                self::$headers_table[$name_index] = [$name, $value];
+                $this->debug_output .= "Value updated in headers
                     table at index $name_index";
-            } 
+            }
         } else {
             self::$headers_table[] = [$name, $value];
-            $this->debug_output .= 
+            $this->debug_output .=
                 "New entry added to headers table [$name, $value]";
         }
         return [
-            'decoded' => [$name => $value],  
+            'decoded' => [$name => $value],
             'encoded' => [
-                'name' => bin2hex($name), 
+                'name' => bin2hex($name),
                 'value' => bin2hex($value)
-            ], 
+            ],
             'length' => $offset
         ];
-    }    
+    }
     /**
      * Decodes a literal that will never be indexed.
      * @param string $hex_field Hexadecimal field to decode.
      */
-    public function decodeLiteralWithoutIndexing($hex_field) {
+    public function decodeLiteralWithoutIndexing($hex_field)
+    {
         $offset = 0;
         $first_byte = hexdec(substr($hex_field, $offset, 2));
         $offset += 2;
@@ -3181,11 +3220,11 @@ class HPack {
             $name_length_hex = substr($hex_field, $offset, 2);
             $name_length_byte = hexdec($name_length_hex);
             $use_huffman = ($name_length_byte & 0x80) !== 0;
-            $name_length = $name_length_byte & 0x7F; 
+            $name_length = $name_length_byte & 0x7F;
             $offset += 2;
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
-            $name = $use_huffman ? 
+            $name = $use_huffman ?
                 $this->huffmanDecode($name_hex) : hex2bin($name_hex);
         } else {
             $name_index = $first_byte & 0x0F;
@@ -3198,38 +3237,37 @@ class HPack {
         }
         $value_length_hex = substr($hex_field, $offset, 2);
         $value_length_byte = hexdec($value_length_hex);
-        $use_huffman = ($value_length_byte & 0x80) !== 0; 
-        $value_length = $value_length_byte & 0x7F; 
+        $use_huffman = ($value_length_byte & 0x80) !== 0;
+        $value_length = $value_length_byte & 0x7F;
         $offset += 2;
         $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
-        $value = $use_huffman ? 
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex); 
+        $value = $use_huffman ?
+            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
         return [
-            'decoded' => [$name => $value],  
-            'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)], 
+            'decoded' => [$name => $value],
+            'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
             'length' => $offset
         ];
     }
-
     /**
      * Decodes a literal that will never be indexed. Literal header field
      * never-indexed representation starts with the '0001' 4-bit pattern.
      * @param string $hex_field Hexadecimal field to decode.
      */
-    public function decodeLiteralNeverIndexed($hex_field) 
+    public function decodeLiteralNeverIndexed($hex_field)
     {
         $offset = 0;
         $first_byte = hexdec(substr($hex_field, $offset, 2));
         $offset += 2;
         if (($first_byte & 0x0F) === 0x00) {
             $name_length_byte = hexdec(substr($hex_field, $offset, 2));
-            $use_huffman = ($name_length_byte & 0x80) !== 0; 
-            $name_length = $name_length_byte & 0x7F; 
+            $use_huffman = ($name_length_byte & 0x80) !== 0;
+            $name_length = $name_length_byte & 0x7F;
             $offset += 2;
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
-            $name = $use_huffman ? 
+            $name = $use_huffman ?
                 $this->huffmanDecode($name_hex) : hex2bin($name_hex);
         } else {
             $name_index = $first_byte & 0x0F;
@@ -3240,16 +3278,16 @@ class HPack {
             }
         }
         $value_length_byte = hexdec(substr($hex_field, $offset, 2));
-        $use_huffman = ($value_length_byte & 0x80) !== 0; 
-        $value_length = $value_length_byte & 0x7F; 
+        $use_huffman = ($value_length_byte & 0x80) !== 0;
+        $value_length = $value_length_byte & 0x7F;
         $offset += 2;
         $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
-        $value = $use_huffman ? 
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex); 
+        $value = $use_huffman ?
+            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
         self::$never_index_list[] = $name;
         return [
-            'decoded' => [$name => $value],  
+            'decoded' => [$name => $value],
             'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
             'length' => $offset
         ];
@@ -3260,8 +3298,9 @@ class HPack {
      * Otherwise, the function checks the headers table for matches and encodes them.
      * @param array $headers Array of headers to encode. Each header is an array of [name, value].
      */
-    public function encode($headers) {
-        $this->debug_output .= "\n\nEncoding headers: " . 
+    public function encode($headers)
+    {
+        $this->debug_output .= "\n\nEncoding headers: " .
             json_encode($headers, JSON_PRETTY_PRINT) . PHP_EOL;
         $encoded = '';
         $h = 1;
@@ -3272,13 +3311,14 @@ class HPack {
             $is_indexed = false;
             $name_only_match = false;
             $matched_index = null;
-            $this->debug_output .= "\nHeader $h: Name = $name, Value = $value" . PHP_EOL;
+            $this->debug_output .= "\nHeader $h: Name = $name, Value = $value" .
+                PHP_EOL;
             $h++;
             if (in_array($name, self::$never_index_list)) {
                 $encoded_header .= chr(0x10);
                 $encoded_header .= $this->encodeString($name);
                 $encoded_header .= $this->encodeString($value);
-                $this->debug_output .= "Never indexed header encoded: " . 
+                $this->debug_output .= "Never indexed header encoded: " .
                     bin2hex($encoded_header) . PHP_EOL;
                 $encoded .= $encoded_header;
                 continue;
@@ -3287,8 +3327,8 @@ class HPack {
                 if ($header_name === $name && $header_value === $value) {
                     $encoded_header .= chr(0x80 | ($i & 0x7F));
                     $is_indexed = true;
-                    $this->debug_output .= "Header found in headers table at 
-                        index: $i, Encoded as indexed header: " . 
+                    $this->debug_output .= "Header found in headers table at
+                        index: $i, Encoded as indexed header: " .
                         bin2hex($encoded_header) . PHP_EOL;
                     break;
                 } elseif ($header_name === $name) {
@@ -3298,32 +3338,39 @@ class HPack {
             }
             if (!$is_indexed && $name_only_match) {
                 $encoded_header .= chr(0x40 | ($matched_index & 0x3F));
-                $this->debug_output .= "Name-only match found in headers table at 
-                    index: $matched_index, Encoding with incremental indexing." . PHP_EOL;
-                $encoded_header .= $this->encodeString($value); 
-            } 
+                $this->debug_output .=
+                    "Name-only match found in headers table at " .
+                    "index: $matched_index, Encoding with incremental ".
+                    "indexing." . PHP_EOL;
+                $encoded_header .= $this->encodeString($value);
+            }
             elseif (!$is_indexed && !$name_only_match) {
                 $encoded_header .= chr(0x40);
                 $encoded_header .= $this->encodeString($name);
                 $encoded_header .= $this->encodeString($value);
-                $this->debug_output .= "No match found, encoding as new name with incremental indexing." . PHP_EOL;
+                $this->debug_output .= "No match found, encoding as new name " .
+                    "with incremental indexing." . PHP_EOL;
             }
             $encoded .= $encoded_header;
         }
-        $this->debug_output .= "Encoded headers result: " . bin2hex($encoded) . PHP_EOL;
+        $this->debug_output .= "Encoded headers result: " . bin2hex($encoded) .
+            PHP_EOL;
         return $encoded;
     }
     /**
      * Encodes a given string using Huffman Encoding if it provides compression.
-     * If Huffman encoding is more efficient, the encoded string is returned; 
+     * If Huffman encoding is more efficient, the encoded string is returned;
      * otherwise, the original string is returned in hexadecimal format.
      * @param string $str The input string to encode.
      */
-    private function encodeString($str) {
+    private function encodeString($str)
+    {
         $this->debug_output .= "Compressing string: $str" . PHP_EOL;
         $huffman = $this->huffmanEncode($str);
-        $this->debug_output .= "Hex compression length = " . strlen($str) . PHP_EOL;
-        $this->debug_output .= "Huffman compression length = " . strlen($huffman) . PHP_EOL;
+        $this->debug_output .= "Hex compression length = " . strlen($str) .
+            PHP_EOL;
+        $this->debug_output .= "Huffman compression length = " .
+            strlen($huffman) . PHP_EOL;
         if (strlen($huffman) < strlen($str)) {
             $this->debug_output .= "Huffman encoding chosen" . PHP_EOL;
             return chr(0x80 | strlen($huffman)) . $huffman;
@@ -3336,7 +3383,8 @@ class HPack {
      * Encodes input using Huffman encoding.
      * @param string $input The string to encode.
      */
-    public function huffmanEncode($input) {
+    public function huffmanEncode($input)
+    {
         global $HUFFMAN_CODES;
         $encoded = '';
         $this->debug_output .= "Huffman encoding for input: $input" . PHP_EOL;
@@ -3344,31 +3392,33 @@ class HPack {
             if (isset($HUFFMAN_CODES[$char])) {
                 $huffman_code = $HUFFMAN_CODES[$char]['bin'];
                 $encoded .= $huffman_code;
-                $this->debug_output .= 
+                $this->debug_output .=
                     "Character: $char, Huffman code: $huffman_code" . PHP_EOL;
             } else {
-                throw new \Exception("Character not found in Huffman table: $char");
+                throw new \Exception(
+                    "Character not found in Huffman table: $char");
             }
         }
-        // Padding is done with the MSBs of the End-Of-String 
+        // Padding is done with the MSBs of the End-Of-String
         // symbol which in RFC is encoded as 11111111111111
-        $this->debug_output .= 
-            "Huffman encoded binary string (before padding): $encoded" . PHP_EOL;
+        $this->debug_output .=
+            "Huffman encoded binary string (before padding): $encoded" .
+            PHP_EOL;
         if (strlen($encoded) % 8 !== 0) {
             $padding = 8 - (strlen($encoded) % 8);
-            $encoded .= str_repeat('1', $padding); 
+            $encoded .= str_repeat('1', $padding);
             $this->debug_output .= "Padding applied: $padding bits" . PHP_EOL;
         }
-        $this->debug_output .= 
+        $this->debug_output .=
             "Huffman encoded binary string (after padding): $encoded" . PHP_EOL;
         $output = '';
         foreach (str_split($encoded, 8) as $byte) {
             $byteValue = chr(bindec($byte));
             $output .= $byteValue;
-            $this->debug_output .= "Byte segment: $byte, Converted to: " . 
+            $this->debug_output .= "Byte segment: $byte, Converted to: " .
                 bin2hex($byteValue) . PHP_EOL;
         }
-        $this->debug_output .= "Final Huffman encoded output (hex): " . 
+        $this->debug_output .= "Final Huffman encoded output (hex): " .
             bin2hex($output) . PHP_EOL;
         return $output;
     }
@@ -3376,16 +3426,17 @@ class HPack {
      * Decodes Huffman-encoded hexadecimal input.
      * @param string $hexInput Huffman-encoded hexadecimal string.
      */
-    public function huffmanDecode($hex_input) {
+    public function huffmanDecode($hex_input)
+    {
         global $HUFFMAN_LOOKUP;
         $binary_string = '';
-        $this->debug_output .= 
+        $this->debug_output .=
             "Starting Huffman decoding for hex input: $hex_input\n";
         for ($i = 0; $i < strlen($hex_input); $i += 2) {
             $byte = hexdec(substr($hex_input, $i, 2));
             $binary_chunk = str_pad(decbin($byte), 8, '0', STR_PAD_LEFT);
             $binary_string .= $binary_chunk;
-            $this->debug_output .= "Hex chunk: " . substr($hex_input, $i, 2) . 
+            $this->debug_output .= "Hex chunk: " . substr($hex_input, $i, 2) .
                 " -> Binary chunk: $binary_chunk\n";
         }
         $decoded = '';
@@ -3400,14 +3451,14 @@ class HPack {
                 $ascii = $HUFFMAN_LOOKUP[$buffer];
                 $decoded_char = chr($ascii);
                 $decoded .= $decoded_char;
-                $this->debug_output .= 
-                    "Decoded character: $decoded_char 
+                $this->debug_output .=
+                    "Decoded character: $decoded_char
                     (ASCII: $ascii) from buffer: $buffer\n";
-                $buffer = ''; 
+                $buffer = '';
             }
         }
         if ($buffer !== '') {
-            $this->debug_output .= 
+            $this->debug_output .=
             "Padding found in buffer after decoding: $buffer\n";
         }
         $this->debug_output .= "Final decoded string: $decoded\n";

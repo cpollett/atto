@@ -3,12 +3,14 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-// exit(); // you need to comment this line to be able to run this example.
+if (!defined("seekquarry\\atto\\RUN")) {
+    exit(); /* you need to comment this line to be able to run this example.
+               under a web server */
+}
 $test = new WebSite();
-
 /*
     A Simple Atto WebSite used to display a Hello World landing page using
-    HTTPS. 
+    HTTPS.
     Make sure php is configured with openssl and ssl is enabled in the php.ini
     file.
     After commenting the exit() line above, you can run this example
@@ -42,4 +44,3 @@ if($test->isCli()) {
 } else {
    $test->process();
 }
-

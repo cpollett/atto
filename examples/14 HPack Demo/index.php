@@ -6,28 +6,23 @@ use seekquarry\atto\HPack;
 
 $test = new WebSite();
 $hpack = new HPack();
-
 $test->get('/', function() use ($hpack) {
     echo renderHPackDemoPage();
 });
-
 $test->post('/', function() use ($hpack) {
     $headersInput = [];
     $result = [];
-
     $result['output'] = '';
     $result['debug'] = '';
-    
     if (isset($_POST['encode']) && !empty(trim($_POST['headers_encode']))) {
         $headersInput = explode("\n", trim($_POST['headers_encode']));
         $headersArray = [];
-
         try {
             foreach ($headersInput as $header) {
-                if (!preg_match("/^\['(.+)',\s*'(.+)'\]$/", 
+                if (!preg_match("/^\['(.+)',\s*'(.+)'\]$/",
                     trim($header), $matches)) {
                     throw new Exception(
-                        'Invalid header format. 
+                        'Invalid header format.
                          Use "[\'Header-Name\', \'Header-Value\']".');
                 }
                 $name = $matches[1];
@@ -39,13 +34,13 @@ $test->post('/', function() use ($hpack) {
                 'action' => 'encode',
                 'input' => $headersInput,
                 'output' => bin2hex($encodedHeaders),
-                'debug' => $hpack->getDebugOutput() 
+                'debug' => $hpack->getDebugOutput()
             ];
         } catch (Exception $e) {
             $result = ['error' => $e->getMessage()];
         }
     }
-    elseif (isset($_POST['decode']) && 
+    elseif (isset($_POST['decode']) &&
         !empty(trim($_POST['headers_decode']))) {
         $hexInput = trim($_POST['headers_decode']);
         try {
@@ -54,7 +49,7 @@ $test->post('/', function() use ($hpack) {
                 'action' => 'decode',
                 'input' => [$hexInput],
                 'output' => json_encode($decodedHeaders, JSON_PRETTY_PRINT),
-                'debug' => $hpack->getDebugOutput() 
+                'debug' => $hpack->getDebugOutput()
             ];
         } catch (Exception $e) {
             $result = ['error' => $e->getMessage()];
@@ -65,22 +60,22 @@ $test->post('/', function() use ($hpack) {
     echo renderHPackDemoPage($result);
 });
 
-function renderHPackDemoPage($result = null) {
+function renderHPackDemoPage($result = null)
+{
     $outputHTML = '';
-
     if ($result) {
         if (isset($result['error'])) {
-            $outputHTML .= '<div class="error">' . 
+            $outputHTML .= '<div class="error">' .
                 htmlspecialchars($result['error']) . '</div>';
         } else {
-            $outputHTML .= '<h3>Result of ' . 
+            $outputHTML .= '<h3>Result of ' .
                 ucfirst($result['action']) . '</h3>';
-            $outputHTML .= '<pre><strong>Input:</strong><br>' . 
+            $outputHTML .= '<pre><strong>Input:</strong><br>' .
                 htmlspecialchars(implode("\n", $result['input'])) . '</pre>';
-            $outputHTML .= '<pre><strong>Output:</strong><br>' . 
+            $outputHTML .= '<pre><strong>Output:</strong><br>' .
                 htmlspecialchars($result['output']) . '</pre>';
             if (isset($result['debug'])) {
-                $outputHTML .= '<pre><strong>Debug Info:</strong><br>' . 
+                $outputHTML .= '<pre><strong>Debug Info:</strong><br>' .
                     htmlspecialchars($result['debug']) . '</pre>';
             }
         }
@@ -184,7 +179,7 @@ function renderHPackDemoPage($result = null) {
 }
 
 if($test->isCli()) {
-    $test->listen(8000);
+    $test->listen(8080);
 } else {
     $test->process();
 }

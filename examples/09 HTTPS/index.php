@@ -3,14 +3,12 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-if (!defined("seekquarry\\atto\\RUN")) {
-    exit(); /* you need to comment this line to be able to run this example.
-               under a web server */
-}
+// exit(); // you need to comment this line to be able to run this example.
 $test = new WebSite();
+
 /*
     A Simple Atto WebSite used to display a Hello World landing page using
-    HTTPS.
+    HTTPS. 
     Make sure php is configured with openssl and ssl is enabled in the php.ini
     file.
     After commenting the exit() line above, you can run this example
@@ -31,12 +29,26 @@ $test->get('/', function() {
 <?php
 });
 
+// if($test->isCli()) {
+//    $test->listen(8080, ['SERVER_CONTEXT' => ['ssl' => [
+//       'local_cert' => 'cert.pem', /* Self-signed cert - in practice get signed
+//                                       by some certificate authority
+//                                    */
+//       'local_pk' => 'key.pem', // Private key
+//       'allow_self_signed' => true,
+//       'verify_peer' => false,
+//       "alpn_protocols" => "h2,http/1.1"
+//       ]]]);
+// } else {
+//    $test->process();
+// }
+
 if($test->isCli()) {
    $test->listen(8080, ['SERVER_CONTEXT' => ['ssl' => [
-      'local_cert' => 'cert.pem', /* Self-signed cert - in practice get signed
+      'local_cert' => 'server.crt', /* Self-signed cert - in practice get signed
                                       by some certificate authority
                                    */
-      'local_pk' => 'key.pem', // Private key
+      'local_pk' => 'server.key', // Private key
       'allow_self_signed' => true,
       'verify_peer' => false,
       "alpn_protocols" => "h2,http/1.1"
@@ -44,3 +56,4 @@ if($test->isCli()) {
 } else {
    $test->process();
 }
+

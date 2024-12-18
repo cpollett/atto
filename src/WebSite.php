@@ -1394,88 +1394,92 @@ class WebSite
     protected function parseH2InitRequest($connection)
     {
         $data = "";
-        $i = 10;
+        $i = 10; 
         while ($i > 0) {
-            $data .= fread($connection, 1024);
+            $chunk = fread($connection, 1024);
+            $data .= $chunk;
             $i = $i - 1;
         }
         $data = bin2hex($data);
         $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
         $magic_string_len = strlen(bin2hex($magic_string));
-        $HEADER_LEN = 18;
+        $HEADER_LEN = 18; 
         $offset = $magic_string_len;
         $settings_frame_header_hex = substr($data, $offset, $HEADER_LEN);
         $offset += $HEADER_LEN;
         list($settings_frame_header, $settings_frame_data_len) =
             SettingsFrame::parseFrameHeader($settings_frame_header_hex);
-        $settings_frame_data_hex =
-            substr($data, $offset, $settings_frame_data_len);
+        $settings_frame_data_hex = substr($data, $offset, $settings_frame_data_len);
         $offset += $settings_frame_data_len;
-        $settings_frame_header->parseBody($settings_frame_data_hex);
         $winupdate_frame_header_hex = substr($data, $offset, $HEADER_LEN);
         $offset += $HEADER_LEN;
         list($winupdate_frame_header, $winupdate_frame_data_len) =
             WindowUpdateFrame::parseFrameHeader($winupdate_frame_header_hex);
-        $winupdate_frame_data_hex =
-            substr($data, $offset, $winupdate_frame_data_len);
+        $winupdate_frame_data_hex = substr($data, $offset, $winupdate_frame_data_len);
         $offset += $winupdate_frame_data_len;
-        $winupdate_frame_header->parseBody($winupdate_frame_data_hex);
-        $header_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-        list($header_frame_header, $header_frame_data_len) =
-            HeaderFrame::parseFrameHeader($header_frame_header_hex);
-        $header_frame_data_hex =
-            substr($data, $offset, $header_frame_data_len);
-        $offset += $header_frame_data_len;
-        $url = $header_frame_header->parseBody($header_frame_data_hex);
         try {
             $server_settings_frame = new SettingsFrame(0, []);
             $server_settings_frame->parseBody($settings_frame_data_hex);
-        } catch (Exception $e) {
-            throw new \Exception(
-                "Exception in creating connection preface settings frame: "
-                . $e->getMessage());
-        }
-        try {
             $out_data = $server_settings_frame->serialize();
             fwrite($connection, $out_data);
         } catch (Exception $e) {
             throw new \Exception(
-                "Exception in transmitting connection preface setting frame: "
-                . $e->getMessage());
+                "Exception in transmitting 
+                connection preface setting frame: " . $e->getMessage()
+            );
         }
         try {
-            $frame = new SettingsFrame(0, []);
-            $frame->flags->add('ACK');
-            $out_data = $frame->serialize();
-            @fwrite($connection, $out_data);
+            $ack_frame = new SettingsFrame(0, []);
+            $ack_frame->flags->add('ACK');
+            $out_data = $ack_frame->serialize();
+            fwrite($connection, $out_data);
         } catch (Exception $e) {
-            echo "Caught exception: " . $e->getMessage();
+            throw new \Exception(
+                "Exception in settings frame: " . $e->getMessage()
+            );
         }
+        if (strlen($data) < $offset + $HEADER_LEN) {
+            $data = hex2bin($data);
+            while (strlen($data) < $offset + $HEADER_LEN) {
+                $chunk = fread($connection, 1024);
+                $data .= $chunk;
+            }
+            $data = bin2hex($data);
+        }
+        $header_frame_header_hex = substr($data, $offset, $HEADER_LEN);
+        $offset += $HEADER_LEN;
+        list($header_frame_header, $header_frame_data_len) =
+            HeaderFrame::parseFrameHeader($header_frame_header_hex);
+        while (strlen($data) < $offset + $header_frame_data_len) {
+            sleep(5);
+            $chunk = fread($connection, 1024);
+            $data .= bin2hex($chunk);
+        }
+        $header_frame_data_hex = substr($data, $offset, $header_frame_data_len);
+        $offset += $header_frame_data_len;
+        $url = $header_frame_header->parseBody($header_frame_data_hex);
         $_SESSION = [];
         $response = $this->processInternalRequest($url);
-        if (strlen($response) != 0 &&
-            $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
+        if (strlen($response) != 0 
+            && $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
             $message_headers = [
                 [":status", "200"],
                 ["content-type", "text/html; charset=utf-8"],
                 ["content-length", strlen($response)]
             ];
-            $response_header =
-                new HeaderFrame(
-                    $header_frame_header->stream_id, $message_headers, []);
+            $response_header = new HeaderFrame(
+                $header_frame_header->stream_id, $message_headers, []);
             $response_header->flags->add("END_HEADERS");
             $response_header_serial = $response_header->serialize();
-            $response_data_frame =
-                new DataFrame($header_frame_header->stream_id, $response, []);
+            $response_data_frame = new DataFrame(
+                $header_frame_header->stream_id, $response, []);
             $response_data_frame->flags->add("END_STREAM");
             $response_data_frame_serial = $response_data_frame->serialize();
             $out_data = $response_header_serial . $response_data_frame_serial;
         } else {
             $message_headers = [[":status", "404"]];
-            $response_header =
-                new HeaderFrame(
-                    $header_frame_header->stream_id, $message_headers, []);
+            $response_header = new HeaderFrame(
+                $header_frame_header->stream_id, $message_headers, []);
             $response_header->flags->add("END_HEADERS");
             $response_header->flags->add("END_STREAM");
             $out_data = $response_header->serialize();
@@ -2225,7 +2229,8 @@ class SettingsFrame extends Frame
      * into the frame's settings array in a readable format.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) {
+    public function parseBody($data) 
+    {
         if (in_array('ACK', $this->flags->getFlags()) && strlen($data) > 0) {
             throw new \Exception("Exception: SETTINGS ack frame must not have
                             payload: got " . strlen($data) . " bytes");
@@ -2274,7 +2279,8 @@ class HeaderFrame extends Frame
      * Serializes the header data into the format required for transmission.
      * This method uses HPACK encoding to compress headers into binary format.
      */
-    public function serializeBody() {
+    public function serializeBody() 
+    {
         $headers = "";
         if (!empty($this->data)) {
             $hpack = new HPack();
@@ -2291,28 +2297,59 @@ class HeaderFrame extends Frame
     {
         $hpack = new HPack();
         $headers = $hpack->decodeHeaderBlockFragment($data, 4096);
+
+        // Define the base URL
+        $base_url = "https://localhost:8080/";
         $scheme = '';
         $authority = '';
         $path = '';
-        if ($headers == NULL) {
-            return "http://localhost:8080/";
+
+        if ($headers === null) {
+            return $base_url;
         }
+
         foreach ($headers as $header) {
             foreach ($header as $key => $value) {
                 switch ($key) {
                     case ":scheme":
-                        $scheme = $value;
+                        $scheme = strtolower($value);
+                        if (!in_array($scheme, ['http', 'https'])) {
+                            $scheme = 'https'; // Enforce a default scheme
+                        }
                         break;
+
                     case ":authority":
                         $authority = $value;
+                        // Validate authority (e.g., domain or IP)
+                        if (!filter_var("http://$authority", FILTER_VALIDATE_URL)) {
+                            $authority = "localhost:8080"; // Default authority
+                        }
                         break;
+
                     case ":path":
                         $path = $value;
+                        // Ensure path starts with a forward slash
+                        if ($path === '' || $path[0] !== '/') {
+                            $path = '/'; // Default path
+                        }
                         break;
                 }
             }
         }
+
+        // If any critical part is missing or invalid, fallback to the base URL
+        if ($scheme === '' || $authority === '' || $path === '') {
+            return $base_url;
+        }
+
+        // Construct and return the final URL
         $url = $scheme . "://" . $authority . $path;
+
+        // Ensure the URL is valid; fallback to the base URL if not
+        if (!filter_var($url, FILTER_VALIDATE_URL)) {
+            return $base_url;
+        }
+
         return $url;
     }
 }
@@ -3043,6 +3080,7 @@ class HPack
         $offset = 0;
         $headers = [];
         $input_length = strlen($hex_input);
+        if ($input_length <= 0) return null;
         while ($offset < $input_length) {
             $first_byte_hex = substr($hex_input, $offset, 2);
             $first_byte = hexdec($first_byte_hex);
@@ -3051,7 +3089,7 @@ class HPack
             if (($first_byte & 0x80) === 0x80) {
                 $this->debug_output .= "\nFirst byte:
                     $first_byte_hex ($bits_for_dbg) matches indexed field" .
-                    "representation.
+                    " representation.
                     Bit pattern: ( 1 * * *   * * * * )\n";
                 $header = $this->decodeIndexedHeaderField(
                     substr($hex_input, $offset));
@@ -3071,7 +3109,7 @@ class HPack
                 $this->debug_output .= "\nFirst byte: $first_byte_hex
                     ($bits_for_dbg) matches literal header never
                     indexed representation.
-                    Bit pattern: ( 0 0 0 0   * * * * )\n";
+                    Bit pattern: ( 0 0 0 1   * * * * )\n";
                 $header = $this->decodeLiteralNeverIndexed(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
@@ -3079,12 +3117,13 @@ class HPack
                 $this->debug_output .= "\nFirst byte: $first_byte_hex
                     ($bits_for_dbg) matches literal header without
                     indexing representation.
-                    Bit pattern: ( 0 0 0 1   * * * * )\n";
+                    Bit pattern: ( 0 0 0 0   * * * * )\n";
                 $header = $this->decodeLiteralWithoutIndexing(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
             } else {
                 $header = null;
+                return null;
                 $this->debug_output .=
                     "Exception: Invalid header type detected.\n";
             }

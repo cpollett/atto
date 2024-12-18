@@ -1,0 +1,22 @@
+[req]
+default_bits       = 4096
+default_md         = sha256
+distinguished_name = dn
+req_extensions     = req_ext
+
+[dn]
+C = US
+ST = California
+L = San Jose
+O = Seekquarry
+OU = Atto Server
+CN = Atto
+emailAddress = chris@pollett.org
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = localhost
+IP.1 = 127.0.0.1
+

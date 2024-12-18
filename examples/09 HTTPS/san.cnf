@@ -2,18 +2,18 @@
 default_bits       = 4096
 default_md         = sha256
 distinguished_name = dn
-req_extensions     = req_ext
+req_extensions     = v3_req
 
 [dn]
 C = US
-ST = California
+ST = CA
 L = San Jose
 O = Seekquarry
 OU = Atto Server
-CN = Atto
+CN = localhost
 emailAddress = chris@pollett.org
 
-[req_ext]
+[v3_req]
 subjectAltName = @alt_names
 
 [alt_names]

@@ -897,8 +897,8 @@ class WebSite
         } else if(!empty($_SERVER['HTTPS'])) {
             $this->is_secure = true;
             $context['ssl'] = [
-                "local_cert" => "../cert.pem'",
-                "local_pk" => "../key.pem'",
+                "local_cert" => "server.crt'", 
+                "local_pk" => "server.key'",
                 "verify_peer" => false,
                 "verify_peer_name" => false,
                 "allow_self_signed" => true,
@@ -1409,13 +1409,15 @@ class WebSite
         $offset += $HEADER_LEN;
         list($settings_frame_header, $settings_frame_data_len) =
             SettingsFrame::parseFrameHeader($settings_frame_header_hex);
-        $settings_frame_data_hex = substr($data, $offset, $settings_frame_data_len);
+        $settings_frame_data_hex = 
+            substr($data, $offset, $settings_frame_data_len);
         $offset += $settings_frame_data_len;
         $winupdate_frame_header_hex = substr($data, $offset, $HEADER_LEN);
         $offset += $HEADER_LEN;
         list($winupdate_frame_header, $winupdate_frame_data_len) =
             WindowUpdateFrame::parseFrameHeader($winupdate_frame_header_hex);
-        $winupdate_frame_data_hex = substr($data, $offset, $winupdate_frame_data_len);
+        $winupdate_frame_data_hex = 
+            substr($data, $offset, $winupdate_frame_data_len);
         $offset += $winupdate_frame_data_len;
         try {
             $server_settings_frame = new SettingsFrame(0, []);
@@ -2297,59 +2299,44 @@ class HeaderFrame extends Frame
     {
         $hpack = new HPack();
         $headers = $hpack->decodeHeaderBlockFragment($data, 4096);
-
-        // Define the base URL
         $base_url = "https://localhost:8080/";
         $scheme = '';
         $authority = '';
         $path = '';
-
-        if ($headers === null) {
-            return $base_url;
-        }
-
+        if ($headers === null) return $base_url;
         foreach ($headers as $header) {
             foreach ($header as $key => $value) {
                 switch ($key) {
                     case ":scheme":
                         $scheme = strtolower($value);
                         if (!in_array($scheme, ['http', 'https'])) {
-                            $scheme = 'https'; // Enforce a default scheme
+                            $scheme = 'https'; 
                         }
                         break;
-
                     case ":authority":
                         $authority = $value;
-                        // Validate authority (e.g., domain or IP)
-                        if (!filter_var("http://$authority", FILTER_VALIDATE_URL)) {
-                            $authority = "localhost:8080"; // Default authority
+                        if (!filter_var("http://$authority", 
+                                FILTER_VALIDATE_URL)) {
+                            $authority = "localhost:8080"; 
                         }
                         break;
 
                     case ":path":
                         $path = $value;
-                        // Ensure path starts with a forward slash
                         if ($path === '' || $path[0] !== '/') {
-                            $path = '/'; // Default path
+                            $path = '/'; 
                         }
                         break;
                 }
             }
         }
-
-        // If any critical part is missing or invalid, fallback to the base URL
         if ($scheme === '' || $authority === '' || $path === '') {
             return $base_url;
         }
-
-        // Construct and return the final URL
         $url = $scheme . "://" . $authority . $path;
-
-        // Ensure the URL is valid; fallback to the base URL if not
         if (!filter_var($url, FILTER_VALIDATE_URL)) {
             return $base_url;
         }
-
         return $url;
     }
 }

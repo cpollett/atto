@@ -29,20 +29,6 @@ $test->get('/', function() {
 <?php
 });
 
-// if($test->isCli()) {
-//    $test->listen(8080, ['SERVER_CONTEXT' => ['ssl' => [
-//       'local_cert' => 'cert.pem', /* Self-signed cert - in practice get signed
-//                                       by some certificate authority
-//                                    */
-//       'local_pk' => 'key.pem', // Private key
-//       'allow_self_signed' => true,
-//       'verify_peer' => false,
-//       "alpn_protocols" => "h2,http/1.1"
-//       ]]]);
-// } else {
-//    $test->process();
-// }
-
 if($test->isCli()) {
    $test->listen(8080, ['SERVER_CONTEXT' => ['ssl' => [
       'local_cert' => 'server.crt', /* Self-signed cert - in practice get signed

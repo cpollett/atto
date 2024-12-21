@@ -1029,7 +1029,7 @@ class WebSite
         if (count($request_context) > 5) {
             return "INTERNAL REQUEST FAILED DUE TO RECURSION";
         }
-        $url_parts = parse_url($url);
+        $url_parts = parse_url($url ?? "");
         $uri = '';
         if (!empty($url_parts['path'])) {
             $uri .= $url_parts['path'];

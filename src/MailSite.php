@@ -583,9 +583,9 @@ class MailSite
         if (strpos($data, "\x0D") === false && strpos($data, "\x0A") === false){
             return false;
         }
-        if (($request_pos = strpos($data, "$eol")) === false) {
+        if (($request_pos = strpos($data, $eol)) === false) {
             $eol = \PHP_EOL;
-            $request_pos = strpos($data, "$eol");
+            $request_pos = strpos($data, $eol);
             if ($request_pos === false) {
                 $context['RESPONSE'] = ($protocol == 'SMTP') ?
                     "500 BAD COMMAND" : "{$line_parts[0]} BAD Unknown Command";
@@ -1532,10 +1532,10 @@ class MailSite
             FILTER_VALIDATE_EMAIL) && $this->isDomain($email_parts[1]);
     }
     /**
- * Handler for the HELP command. 
+ * Handler for the HELP command.
  * Contains a list of commands and their descriptions in an array.
  */
-protected function parseHelp() 
+protected function parseHelp()
 {
     $commands = [
         "AUTH" => "Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.",

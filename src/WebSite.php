@@ -65,6 +65,16 @@ class WebSite
       CONNECT OPTIONS and the longest named HTTP method. It has length 7
      */
     const LEN_LONGEST_HTTP_METHOD = 7;
+    /*
+        Length in bytes of an HTTP/2 frame header (RFC 7540 sec 4.1):
+        3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream id
+     */
+    const H2_FRAME_HEADER_LEN = 9;
+    /*
+        The 24-byte connection preface an HTTP/2 client must send
+        as the first data on an H2 connection (RFC 7540 sec 3.5)
+     */
+    const H2_CLIENT_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     /**
      * Keys of stream that won't disappear (for example the server socket)
      * @var array
@@ -435,6 +445,30 @@ class WebSite
         } else {
             header($header);
         }
+    }
+    /**
+     * Emits a Link: rel=preload response header telling browsers to
+     * begin fetching the given resource in parallel with parsing of
+     * the current response. Works on HTTP/1.1, HTTP/2, and HTTP/3
+     * since it is a standard HTTP response header.
+     *
+     * For HTTP/2 the preloaded resource requests multiplex over the
+     * existing connection. For fonts, crossorigin="anonymous" is
+     * typically required or the browser will fetch the font twice.
+     *
+     * @param string $url URL or path of the resource to preload
+     * @param string $as resource type hint: image, style, script,
+     *      font, video, audio, document, fetch
+     * @param string $crossorigin optional CORS mode: anonymous or
+     *      use-credentials; required for font preloads
+     */
+    public function preload($url, $as, $crossorigin = "")
+    {
+        $link = "<" . $url . ">; rel=preload; as=" . $as;
+        if ($crossorigin !== "") {
+            $link .= "; crossorigin=" . $crossorigin;
+        }
+        $this->header("Link: " . $link);
     }
     /**
      * Sends an HTTP cookie header as part of the HTTP response. If this method
@@ -897,8 +931,8 @@ class WebSite
         } else if(!empty($_SERVER['HTTPS'])) {
             $this->is_secure = true;
             $context['ssl'] = [
-                "local_cert" => "server.crt'", 
-                "local_pk" => "server.key'",
+                "local_cert" => "server.crt",
+                "local_pk" => "server.key",
                 "verify_peer" => false,
                 "verify_peer_name" => false,
                 "allow_self_signed" => true,
@@ -1220,15 +1254,19 @@ class WebSite
     /**
      * Processes incoming streams with data. If the server has detected a
      * new connection, then a stream is set-up. For other streams,
-     * request data is processed as it comes in. Once the request is complete,
-     * superglobals are set up and process() is used route the request which
-     * is output buffered. When this is complete, an output stream is
-     * instantiated to send this data asynchronously back to the browser.
+     * request data is processed as it comes in. Once the request is
+     * complete, superglobals are set up and process() is used to route
+     * the request which is output buffered. When this is complete, an
+     * output stream is instantiated to send this data asynchronously
+     * back to the browser. HTTP/2 connections are handled differently:
+     * parseH2Request reads and writes directly on the connection rather
+     * than going through the out_streams async write path, since H2
+     * framing handles its own flow control.
      *
      * @param resource $server socket server used to listen for incoming
-     *  connections
+     *      connections
      * @param array $in_streams_with_data streams with request data to be
-     *  processed.
+     *      processed
      */
     protected function processRequestStreams($server, $in_streams_with_data)
     {
@@ -1238,7 +1276,6 @@ class WebSite
                 return;
             }
             $meta = stream_get_meta_data($in_stream);
-
             $key = (int)$in_stream;
             if ($meta['eof']) {
                 $this->shutdownHttpStream($key);
@@ -1247,53 +1284,55 @@ class WebSite
             $len = strlen($this->in_streams[self::DATA][$key]);
             $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
             $too_long = $len >= $max_len;
-            if (!empty($this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])){
+            if (!empty(
+                $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])) {
                 continue;
             }
-            if (!$too_long) {
-                stream_set_blocking($in_stream, false);
-                $data = stream_get_contents($in_stream, min(
-                    $this->default_server_globals['MAX_IO_LEN'],
-                    $max_len - $len));
-
-            } else {
-                $data = "";
-                $this->initializeBadRequestResponse($key);
-            }
-            if (isset($this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']) &&
-                $this->in_streams[self::CONTEXT][$key][
-                'CLIENT_HTTP'] == "HTTP/2.0") {
-                if($too_long || $this->parseH2Request($key, $data)) {
-                    if (!empty($this->in_streams[
-                        self::CONTEXT][$key]['PRE_BAD_RESPONSE'])) {
-                        $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'] =
-                            true;
-                    }
-                    if (empty($this->out_streams[self::CONNECTION][$key])) {
-                        $this->out_streams[self::CONNECTION][$key] = $in_stream;
-                        $this->out_streams[self::DATA][$key] = $out_data;
-                        $this->out_streams[self::CONTEXT][$key] = $_SERVER;
-                        $this->out_streams[self::MODIFIED_TIME][$key] = time();
-                    }
+            $is_h2 = isset(
+                $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'])
+                && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']
+                    == "HTTP/2.0";
+            if ($is_h2) {
+                /*
+                    H2 connections bypass the chunk-read and out_streams
+                    async write path entirely. parseH2Request does its own
+                    blocking frame read and writes the response directly,
+                    the same way initH2Request handled the preface.
+                 */
+                if ($too_long) {
+                    $this->shutdownHttpStream($key);
+                } else {
+                    $this->parseH2Request($key,
+                        $this->in_streams[self::CONNECTION][$key]);
                 }
             } else {
+                if (!$too_long) {
+                    stream_set_blocking($in_stream, false);
+                    $data = stream_get_contents($in_stream, min(
+                        $this->default_server_globals['MAX_IO_LEN'],
+                        $max_len - $len));
+                } else {
+                    $data = "";
+                    $this->initializeBadRequestResponse($key);
+                }
                 if ($too_long || $this->parseRequest($key, $data)) {
-                    if (!empty(
-                        $this->in_streams[self::CONTEXT][$key][
+                    if (!empty($this->in_streams[self::CONTEXT][$key][
                             'PRE_BAD_RESPONSE'])) {
                         $this->in_streams[self::CONTEXT][$key][
                             'BAD_RESPONSE'] = true;
                     }
                     $out_data = $this->getResponseData();
                     if (empty($this->in_streams[self::CONTEXT][$key][
-                        'BAD_RESPONSE'])) {
+                            'BAD_RESPONSE'])) {
                         $this->initRequestStream($key);
                     }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
-                        $this->out_streams[self::CONNECTION][$key] = $in_stream;
+                        $this->out_streams[self::CONNECTION][$key] =
+                            $in_stream;
                         $this->out_streams[self::DATA][$key] = $out_data;
                         $this->out_streams[self::CONTEXT][$key] = $_SERVER;
-                        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+                        $this->out_streams[self::MODIFIED_TIME][$key] =
+                            time();
                     }
                 }
             }
@@ -1301,11 +1340,16 @@ class WebSite
         }
     }
     /**
-     * Used to process any timers for WebSite and
-     * used to check if the server has detected a
-     * new connection. In which case, a read stream is set-up.
-     * @param resource $server Socket server used to listen
-     * for incoming connections.
+     * Accepts a new incoming connection from the server socket and
+     * determines the HTTP protocol version. For TLS connections the
+     * ALPN-negotiated protocol is read from the stream context after
+     * the handshake. For cleartext connections the first bytes are
+     * peeked. H2 and h2c connections are handed to initH2Request.
+     * HTTP/1.1 and unknown connections are registered via
+     * initRequestStream for the normal event loop.
+     *
+     * @param resource $server socket server used to listen for
+     *      incoming connections
      */
     protected function processServerRequest($server)
     {
@@ -1327,270 +1371,325 @@ class WebSite
             echo "No connection accepted or timed out.\n";
             return;
         }
-        $stream_start = stream_socket_recvfrom($connection, 512, STREAM_PEEK);
-        $additional_context = !empty($stream_start)
-            ? $this->checkHttpType($stream_start)
-            : ["CLIENT_HTTP" => "unknown"];
-        if ($this->is_secure && $additional_context["CLIENT_HTTP"] !== "h2c") {
+        if ($this->is_secure) {
             stream_set_blocking($connection, true);
             if (!@stream_socket_enable_crypto(
-                $connection, true, STREAM_CRYPTO_METHOD_TLS_SERVER)) {
-                $sslError = error_get_last();
-                echo "\n\nSSL Error: " . $sslError['message'];
+                    $connection, true,
+                    STREAM_CRYPTO_METHOD_TLS_SERVER)) {
+                $ssl_error = error_get_last();
+                echo "\n\nSSL Error: " . $ssl_error['message'];
+                fclose($connection);
                 return;
             }
             set_error_handler(null);
             $custom_error_handler =
-                $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ?? null;
+                $this->default_server_globals[
+                "CUSTOM_ERROR_HANDLER"] ?? null;
             set_error_handler($custom_error_handler);
+            /*
+                PHP does not expose the ALPN-negotiated protocol
+                so after the TLS handshake we read the decrypted
+                bytes while still in blocking mode. An H2 client
+                always sends the 24-byte magic string as its
+                first data.
+             */
+            $magic_len = strlen(self::H2_CLIENT_MAGIC);
+            $stream_start = fread($connection, $magic_len);
             stream_set_blocking($connection, false);
+            if ($stream_start === self::H2_CLIENT_MAGIC) {
+                $additional_context =
+                    ["CLIENT_HTTP" => "HTTP/2.0"];
+            } else {
+                $additional_context =
+                    ["CLIENT_HTTP" => "HTTP/1.1",
+                    "LEFTOVER" => $stream_start];
+            }
+        } else {
+            /*
+                Cleartext: safe to peek since there is no TLS wrapping
+             */
+            $stream_start = stream_socket_recvfrom($connection, 512,
+                STREAM_PEEK);
+            $additional_context = !empty($stream_start)
+                ? $this->checkHttpType($stream_start)
+                : ["CLIENT_HTTP" => "unknown"];
         }
         $key = (int) $connection;
         $this->in_streams[self::CONNECTION][$key] = $connection;
-        try {
-            if ($additional_context["CLIENT_HTTP"] == "HTTP/2.0") {
-                $this->parseH2InitRequest($connection);
-            } else if ($additional_context["CLIENT_HTTP"] == "h2c") {
-                $this->parseH2CInitRequest($connection);
-            } else {
-                throw new Exception("Unsupported HTTP version");
+        $client_http = $additional_context["CLIENT_HTTP"];
+        if ($client_http == "HTTP/2.0") {
+            try {
+                /*
+                    TLS: magic was already consumed by fread
+                    during protocol detection
+                 */
+                $this->initH2Request($connection, false);
+                $additional_context['HPACK_DECODE'] = new HPack();
+                $additional_context['HPACK_ENCODE'] = new HPack();
+                $this->initRequestStream($key,
+                    $additional_context);
+            } catch (\Exception $e) {
+                $this->shutdownHttpStream($key);
             }
-        } catch (Exception $e) {
+        } else if ($client_http == "h2c") {
+            try {
+                /*
+                    Cleartext: STREAM_PEEK was used so the magic
+                    is still in the buffer
+                 */
+                $this->initH2Request($connection, true);
+                $additional_context['HPACK_DECODE'] = new HPack();
+                $additional_context['HPACK_ENCODE'] = new HPack();
+                $this->initRequestStream($key,
+                    $additional_context);
+            } catch (\Exception $e) {
+                $this->shutdownHttpStream($key);
+            }
+        } else {
             $this->initRequestStream($key, $additional_context);
-        }
-    }
-    /**
-     * Tries to determine from a connection (as it just starts, provided it
-     * is TLS ClientHello message) whether ALPN extension indicate the
-     * client is trying to use HTTP/2 or HTTP/3
-     *
-     * @param resource $connection a client connection that is just being
-     *   initialized before stream_socket_enable_crypto has been called
-     */
-    function checkHttpType($stream_start)
-    {
-        $context = ["CLIENT_HTTP" => "HTTP/2.0"];
-        if (preg_match("/HTTP\/([23])\.0/", $stream_start, $matches)) {
-            if(!empty($matches[0])) {
-                $context["CLIENT_HTTP"] = "h2c";
+            /*
+                For TLS connections where the fread consumed bytes
+                that turned out to be HTTP/1.1, prepopulate the
+                stream data so parseRequest sees them.
+             */
+            if (!empty($additional_context["LEFTOVER"])) {
+                $this->in_streams[self::DATA][$key] =
+                    $additional_context["LEFTOVER"];
             }
         }
-        if (preg_match("/^((GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|".
-            "TRACE|CONNECT) \S+ HTTP\/1\.1)/",
-            $stream_start, $matches)) {
-            $context["CLIENT_HTTP"] = "HTTP/1.1";
-        }
-        return $context;
     }
     /**
-     * Handles the initial connection preface frames of an HTTP/2 connection
-     * established in the ALPN extension of handshake.
-     * It establishes the connection configurations and stores them for use
-     * throughout the connection.
+     * Determines HTTP version from the ALPN protocol negotiated during
+     * the TLS handshake. This is the correct method for TLS connections.
+     * By the time this is called, stream_socket_enable_crypto has
+     * already completed so the negotiated protocol is available.
      *
-     * @param resource $connection A client connection that has been
-     * categorized as HTTP/2 and is receiving the initial data.
+     * @param string $alpns the ALPN protocol string from stream context,
+     *      e.g. "h2" or "http/1.1", or null if ALPN was not negotiated
+     * @return array context array with CLIENT_HTTP key set
      */
-    protected function parseH2InitRequest($connection)
+    protected function checkHttpTypeFromAlpn($alpns)
     {
-        $data = "";
-        $i = 10; 
-        while ($i > 0) {
-            $chunk = fread($connection, 1024);
-            $data .= $chunk;
-            $i = $i - 1;
-        }
-        $data = bin2hex($data);
-        $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-        $magic_string_len = strlen(bin2hex($magic_string));
-        $HEADER_LEN = 18; 
-        $offset = $magic_string_len;
-        $settings_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-        list($settings_frame_header, $settings_frame_data_len) =
-            SettingsFrame::parseFrameHeader($settings_frame_header_hex);
-        $settings_frame_data_hex = 
-            substr($data, $offset, $settings_frame_data_len);
-        $offset += $settings_frame_data_len;
-        $winupdate_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-        list($winupdate_frame_header, $winupdate_frame_data_len) =
-            WindowUpdateFrame::parseFrameHeader($winupdate_frame_header_hex);
-        $winupdate_frame_data_hex = 
-            substr($data, $offset, $winupdate_frame_data_len);
-        $offset += $winupdate_frame_data_len;
-        try {
-            $server_settings_frame = new SettingsFrame(0, []);
-            $server_settings_frame->parseBody($settings_frame_data_hex);
-            $out_data = $server_settings_frame->serialize();
-            fwrite($connection, $out_data);
-        } catch (Exception $e) {
-            throw new \Exception(
-                "Exception in transmitting 
-                connection preface setting frame: " . $e->getMessage()
-            );
-        }
-        try {
-            $ack_frame = new SettingsFrame(0, []);
-            $ack_frame->flags->add('ACK');
-            $out_data = $ack_frame->serialize();
-            fwrite($connection, $out_data);
-        } catch (Exception $e) {
-            throw new \Exception(
-                "Exception in settings frame: " . $e->getMessage()
-            );
-        }
-        if (strlen($data) < $offset + $HEADER_LEN) {
-            $data = hex2bin($data);
-            while (strlen($data) < $offset + $HEADER_LEN) {
-                $chunk = fread($connection, 1024);
-                $data .= $chunk;
+        if (is_string($alpns)) {
+            $alpn_parts = preg_split("/\s*,\s*/", $alpns);
+            if (in_array('h2', $alpn_parts)) {
+                return ["CLIENT_HTTP" => "HTTP/2.0"];
+            } else if (in_array('http/1.1', $alpn_parts)) {
+                return ["CLIENT_HTTP" => "HTTP/1.1"];
             }
-            $data = bin2hex($data);
+        } else if ($alpns == null) {
+            return ["CLIENT_HTTP" => "HTTP/1.1"];
         }
-        $header_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-        list($header_frame_header, $header_frame_data_len) =
-            HeaderFrame::parseFrameHeader($header_frame_header_hex);
-        while (strlen($data) < $offset + $header_frame_data_len) {
-            sleep(5);
-            $chunk = fread($connection, 1024);
-            $data .= bin2hex($chunk);
-        }
-        $header_frame_data_hex = substr($data, $offset, $header_frame_data_len);
-        $offset += $header_frame_data_len;
-        $url = $header_frame_header->parseBody($header_frame_data_hex);
-        $_SESSION = [];
-        $response = $this->processInternalRequest($url);
-        if (strlen($response) != 0 
-            && $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
-            $message_headers = [
-                [":status", "200"],
-                ["content-type", "text/html; charset=utf-8"],
-                ["content-length", strlen($response)]
-            ];
-            $response_header = new HeaderFrame(
-                $header_frame_header->stream_id, $message_headers, []);
-            $response_header->flags->add("END_HEADERS");
-            $response_header_serial = $response_header->serialize();
-            $response_data_frame = new DataFrame(
-                $header_frame_header->stream_id, $response, []);
-            $response_data_frame->flags->add("END_STREAM");
-            $response_data_frame_serial = $response_data_frame->serialize();
-            $out_data = $response_header_serial . $response_data_frame_serial;
-        } else {
-            $message_headers = [[":status", "404"]];
-            $response_header = new HeaderFrame(
-                $header_frame_header->stream_id, $message_headers, []);
-            $response_header->flags->add("END_HEADERS");
-            $response_header->flags->add("END_STREAM");
-            $out_data = $response_header->serialize();
-        }
-        try {
-            fwrite($connection, $out_data);
-        } catch (Exception $e) {
-            echo "Caught exception: " . $e->getMessage();
-        }
+        return ["CLIENT_HTTP" => "unknown"];
     }
     /**
-     * Handles the initial connection preface frames of an HTTP/2
-     * connection established as a clear text version of HTTP/2
-     * over TCP. It establishes the connection configurations and
-     * stores them for use throughout the connection.
-     * @param resource $connection A client connection that has been
-     * categorized as HTTP/2 and is receiving the initial data.
+     * Determines HTTP version by inspecting the first bytes of a
+     * plaintext (non-TLS) connection. Used only for cleartext
+     * connections. Never call this on a TLS connection before
+     * stream_socket_enable_crypto as the bytes will be an
+     * unintelligible ClientHello.
+     *
+     * @param string $stream_start first bytes peeked from connection
+     * @return array context array with CLIENT_HTTP key set
      */
-    protected function parseH2CInitRequest($connection)
+    protected function checkHttpType($stream_start)
     {
-        $data = bin2hex(stream_socket_recvfrom($connection, 256));
-        $magic_string = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-        $magic_string_len = strlen(bin2hex($magic_string));
-        $HEADER_LEN = 18;
-        $offset = $magic_string_len;
-
-        $settings_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-
-        list($settings_frame_header, $settings_frame_data_len) =
-            SettingsFrame::parseFrameHeader($settings_frame_header_hex);
-        $settings_frame_data_hex =
-            substr($data, $offset, $settings_frame_data_len);
-        $offset += $settings_frame_data_len;
-        $settings_frame_header->parseBody($settings_frame_data_hex);
-        $winupdate_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-        list($winupdate_frame_header, $winupdate_frame_data_len) =
-            WindowUpdateFrame::parseFrameHeader($winupdate_frame_header_hex);
-        $winupdate_frame_data_hex =
-            substr($data, $offset, $winupdate_frame_data_len);
-        $offset += $winupdate_frame_data_len;
-        $winupdate_frame_header->parseBody($winupdate_frame_data_hex);
-        $header_frame_header_hex = substr($data, $offset, $HEADER_LEN);
-        $offset += $HEADER_LEN;
-        list($header_frame_header, $header_frame_data_len) =
-            HeaderFrame::parseFrameHeader($header_frame_header_hex);
-        $header_frame_data_hex = substr($data, $offset, $header_frame_data_len);
-        $offset += $header_frame_data_len;
-        $url = $header_frame_header->parseBody($header_frame_data_hex);
-        try {
-            $server_settings_frame = new SettingsFrame(0, []);
-            $server_settings_frame->parseBody($settings_frame_data_hex);
-        } catch (Exception $e) {
-            throw new \Exception(
-                "Exception in creating connection preface settings frame: "
-                . $e->getMessage());
+        /*
+            Cleartext HTTP/2 upgrade starts with the client connection
+            preface magic string
+         */
+        if (str_starts_with($stream_start, self::H2_CLIENT_MAGIC)) {
+            return ["CLIENT_HTTP" => "h2c"];
         }
-        try {
-            $out_data = $server_settings_frame->serialize();
-            fwrite($connection, $out_data);
-        } catch (Exception $e) {
-            throw new \Exception(
-                "Exception in transmitting connection preface setting frame: "
-                . $e->getMessage());
+        if (preg_match(
+            "/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT)".
+            " \S+ HTTP\/1\.1/",
+            $stream_start)) {
+            return ["CLIENT_HTTP" => "HTTP/1.1"];
         }
-        try {
-            $frame = new SettingsFrame(0, []);
-            $frame->flags->add('ACK');
-            $out_data = $frame->serialize();
-            fwrite($connection, $out_data);
-        } catch (Exception $e) {
-            throw new \Exception(
-                "Caught exception: " . $e->getMessage());
+        return ["CLIENT_HTTP" => "unknown"];
+    }
+    /**
+     * Handles the HTTP/2 connection preface exchange. Reads the
+     * client SETTINGS frame, sends the server SETTINGS frame and
+     * a SETTINGS ACK, then returns with the connection left open.
+     * Any further frames (WINDOW_UPDATE, PRIORITY, HEADERS) are
+     * handled by parseH2Request in the normal event loop. Used
+     * for both TLS and cleartext h2c connections.
+     *
+     * @param resource $connection client connection ready for
+     *      H2 traffic
+     * @param bool $read_magic whether to read and verify the
+     *      24-byte client magic string. Set to false when the
+     *      caller has already consumed it (TLS detection via
+     *      fread). Set to true for cleartext h2c where
+     *      STREAM_PEEK was used and the magic is still buffered.
+     */
+    protected function initH2Request($connection,
+        $read_magic = false)
+    {
+        stream_set_blocking($connection, true);
+        if ($read_magic) {
+            $magic = $this->readExactly($connection,
+                strlen(self::H2_CLIENT_MAGIC));
+            if ($magic !== self::H2_CLIENT_MAGIC) {
+                throw new \Exception(
+                    "Invalid HTTP/2 client connection preface");
+            }
         }
+        $hdr = $this->readExactly($connection,
+            self::H2_FRAME_HEADER_LEN);
+        [$client_settings, $settings_len] =
+            Frame::parseFrameHeader($hdr);
+        if (!($client_settings instanceof SettingsFrame)) {
+            throw new \Exception("Expected SETTINGS frame, got "
+                . get_class($client_settings));
+        }
+        $client_settings->parseBody(
+            $this->readExactly($connection, $settings_len));
+        $server_settings = new SettingsFrame(0, []);
+        fwrite($connection, $server_settings->serialize());
+        $ack = new SettingsFrame(0, []);
+        $ack->flags->add('ACK');
+        fwrite($connection, $ack->serialize());
+        stream_set_blocking($connection, false);
+    }
+    /**
+     * Processes one incoming HTTP/2 frame on an established connection.
+     * Called from processRequestStreams each time the socket is readable.
+     * HEADERS frames are dispatched as requests via setGlobals and
+     * getResponseData, matching the HTTP/1.1 path exactly. PING and
+     * SETTINGS frames are answered inline. GOAWAY closes the connection.
+     *
+     * @param int $key stream id of the connection in in_streams
+     * @param resource $connection the client socket
+     * @return bool true if a response was written, false otherwise
+     */
+    protected function parseH2Request($key, $connection)
+    {
+        stream_set_blocking($connection, true);
+        try {
+            $hdr = $this->readExactly($connection,
+                self::H2_FRAME_HEADER_LEN);
+        } catch (\Exception $e) {
+            stream_set_blocking($connection, false);
+            $this->shutdownHttpStream($key);
+            return false;
+        }
+        [$frame, $payload_len] = Frame::parseFrameHeader($hdr);
+        $payload = $this->readExactly($connection, $payload_len);
+        stream_set_blocking($connection, false);
+        if ($frame instanceof GoAwayFrame) {
+            $this->shutdownHttpStream($key);
+            return false;
+        }
+        if ($frame instanceof PingFrame) {
+            $pong = new PingFrame(0, $payload);
+            $pong->flags->add('ACK');
+            fwrite($connection, $pong->serialize());
+            return false;
+        }
+        if ($frame instanceof SettingsFrame
+            && !$frame->flags->contains('ACK')) {
+            $ack = new SettingsFrame(0, []);
+            $ack->flags->add('ACK');
+            fwrite($connection, $ack->serialize());
+            return false;
+        }
+        if (!($frame instanceof HeaderFrame)) {
+            return false;
+        }
+        $hpack_decode = $this->in_streams[self::CONTEXT][$key][
+            'HPACK_DECODE'] ?? new HPack();
+        $hpack_encode = $this->in_streams[self::CONTEXT][$key][
+            'HPACK_ENCODE'] ?? new HPack();
+        $context = $frame->parseBody($payload, $hpack_decode);
+        $stream_id = $frame->stream_id;
         $_SESSION = [];
-        $response = $this->processInternalRequest($url);
-        if (strlen($response) != 0 &&
-            $response != "INTERNAL REQUEST FAILED DUE TO RECURSION") {
-            $message_headers = [
-                [":status", "200"],
-                ["content-type", "text/html; charset=utf-8"],
-                ["content-length", strlen($response)]
-            ];
-            $response_header =
-                new HeaderFrame($header_frame_header->stream_id,
-                $message_headers, []);
-            $response_header->flags->add("END_HEADERS");
-            $response_header_serial = $response_header->serialize();
-
-            $response_data_frame =
-                new DataFrame($header_frame_header->stream_id, $response, []);
-            $response_data_frame->flags->add("END_STREAM");
-            $response_data_frame_serial = $response_data_frame->serialize();
-            $out_data = $response_header_serial . $response_data_frame_serial;
-        } else {
-            $message_headers = [[":status", "404"]];
-            $response_header =
-                new HeaderFrame($header_frame_header->stream_id,
-                $message_headers, []);
-            $response_header->flags->add("END_HEADERS");
-            $response_header->flags->add("END_STREAM");
-            $out_data = $response_header->serialize();
+        $this->setGlobals($context);
+        $body = $this->getResponseData(false);
+        $status = "200";
+        if (preg_match("/HTTP\/[\d.]+ (\d+)/",
+                $this->header_data, $matches)) {
+            $status = $matches[1];
         }
-        try {
-            fwrite($connection, $out_data);
-        } catch (Exception $e) {
-            throw new \Exception("Caught exception: " . $e->getMessage());
+        $resp_headers_data = [[":status", $status]];
+        /*
+            Parse user-set response headers from $this->header_data.
+            The first line is the HTTP status line, subsequent lines
+            are header_name: value pairs terminated by \r\n. HTTP/2
+            requires lowercase header names (RFC 7540 sec 8.1.2) and
+            forbids connection-specific headers (sec 8.1.2.2).
+         */
+        $forbidden = ["connection", "keep-alive", "proxy-connection",
+            "transfer-encoding", "upgrade"];
+        $has_content_type = false;
+        $has_content_length = false;
+        $header_lines = explode("\r\n", $this->header_data);
+        array_shift($header_lines);
+        foreach ($header_lines as $line) {
+            $colon = strpos($line, ":");
+            if ($colon === false) {
+                continue;
+            }
+            $name = strtolower(trim(substr($line, 0, $colon)));
+            $value = trim(substr($line, $colon + 1));
+            if ($name === "" || $name[0] === ":"
+                || in_array($name, $forbidden)) {
+                continue;
+            }
+            if ($name === "content-type") {
+                $has_content_type = true;
+            }
+            if ($name === "content-length") {
+                $has_content_length = true;
+            }
+            $resp_headers_data[] = [$name, $value];
         }
+        if (!$has_content_type) {
+            $resp_headers_data[] =
+                ["content-type", "text/html; charset=utf-8"];
+        }
+        if (!$has_content_length) {
+            $resp_headers_data[] =
+                ["content-length", (string) strlen($body)];
+        }
+        $resp_headers = new HeaderFrame($stream_id, $resp_headers_data);
+        $resp_headers->flags->add("END_HEADERS");
+        $resp_data = new DataFrame($stream_id, $body);
+        $resp_data->flags->add("END_STREAM");
+        fwrite($connection,
+            $resp_headers->serialize($hpack_encode)
+            . $resp_data->serialize());
+        return true;
+    }
+    /**
+     * Reads exactly $length bytes from $connection, blocking until
+     * all bytes are available. Returns the binary string, or throws
+     * if the connection closes before enough data arrives.
+     *
+     * @param resource $connection
+     * @param int $length Number of bytes to read
+     * @return string
+     */
+    protected function readExactly($connection, $length)
+    {
+        if ($length === 0) {
+            return "";
+        }
+        $buffer = "";
+        $remaining = $length;
+        while ($remaining > 0) {
+            $chunk = fread($connection, $remaining);
+            if ($chunk === false || $chunk === "") {
+                throw new \Exception(
+                    "Connection closed after reading "
+                    . strlen($buffer) . " of $length expected bytes");
+            }
+            $buffer .= $chunk;
+            $remaining -= strlen($chunk);
+        }
+        return $buffer;
     }
     /**
      * Gets info about an incoming request stream and uses this to set up
@@ -1608,22 +1707,20 @@ class WebSite
         $remote_col = strrpos($remote_name, ":");
         $server_name = stream_socket_get_name($connection, false);
         $server_col = strrpos($server_name, ":");
-        $this->in_streams[self::CONTEXT][$key] = [
-            self::REQUEST_HEAD => false,
-            'REQUEST_METHOD' => false,
-            "REMOTE_ADDR" => substr($remote_name, 0, $remote_col),
-            "REMOTE_PORT" => substr($remote_name, $remote_col + 1),
-            "REQUEST_TIME" => time(),
-            "REQUEST_TIME_FLOAT" => microtime(true),
-            "SERVER_ADDR" => substr($server_name, 0, $server_col),
-            "SERVER_PORT" => substr($server_name, $server_col + 1),
-        ];
-        if (empty($additional_context)) {
-            $this->in_streams[self::CONTEXT][$key] = array_merge(
-                $this->in_streams[self::CONTEXT][$key],
-                ["CLIENT_HTTP" => "unknown"]
-            );
-        }
+        $this->in_streams[self::CONTEXT][$key] = array_merge(
+            [
+                self::REQUEST_HEAD => false,
+                'REQUEST_METHOD' => false,
+                "CLIENT_HTTP" => "unknown",
+                "REMOTE_ADDR" => substr($remote_name, 0, $remote_col),
+                "REMOTE_PORT" => substr($remote_name, $remote_col + 1),
+                "REQUEST_TIME" => time(),
+                "REQUEST_TIME_FLOAT" => microtime(true),
+                "SERVER_ADDR" => substr($server_name, 0, $server_col),
+                "SERVER_PORT" => substr($server_name, $server_col + 1),
+            ],
+            $additional_context
+        );
         $this->in_streams[self::DATA][$key] = "";
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
     }
@@ -2071,63 +2168,77 @@ class Frame
     /**
      * method to serialize body of the frame into binary.
      * Different implementations for each child class.
+     *
+     * @param object $hpack optional HPack instance used by
+     *      HeaderFrame for encoding
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         throw new \Exception("Not implemented");
     }
     /**
-     * method to serialize the frame into binary. Internally calls
-     * serializeBody. Uses the pack function to serialize the bits
-     * of frame header and concatenate it with the body.
+     * Serializes the frame into binary. Internally calls serializeBody.
+     * Uses pack to serialize the frame header and concatenates with body.
+     *
+     * @param object $hpack optional HPack instance to pass through
+     *      to serializeBody for HeaderFrame encoding
+     * @return string binary serialized frame
      */
-    public function serialize()
+    public function serialize($hpack = null)
     {
-        $body = $this->serializeBody();
+        $body = $this->serializeBody($hpack);
         $this->payload_length = strlen($body);
-        // Build the common frame header
         $flags = 0;
         foreach ($this->defined_flags as $flag => $flag_bit) {
             if ($this->flags->contains($flag)) {
                 $flags |= $flag_bit;
             }
         }
-        $header = pack("nCCCN",
-            ($this->payload_length >> 8) & 0xFFFF,
-            $this->payload_length & 0xFF,
-            $this->type,
-            $flags,
-            $this->stream_id & 0x7FFFFFFF
-        );
-        return ($header . $body);
+        /*
+            HTTP/2 frame header layout (9 bytes):
+            - 3 bytes: payload length (24-bit big-endian)
+            - 1 byte:  frame type
+            - 1 byte:  flags
+            - 4 bytes: stream id (31-bit, high bit reserved)
+            pack() has no 24-bit format so the length is split
+            manually into three C (unsigned char) fields.
+         */
+         $header = pack("CCCCCN",
+             ($this->payload_length >> 16) & 0xFF,
+             ($this->payload_length >> 8)  & 0xFF,
+              $this->payload_length        & 0xFF,
+             $this->type,
+             $flags,
+             $this->stream_id & 0x7FFFFFFF
+         );
+        return $header . $body;
     }
     /**
      * Parses the header of a frame from its binary representation.
      * Uses FrameFactory to determine the frame type based on the type number.
      *
-     * @param string $header Binary data of the frame header in hexadecimal
+     * @param string $data Binary data of the frame header in hexadecimal
      *  format.
      */
-    public static function parseFrameHeader($header)
+    public static function parseFrameHeader($data)
     {
-        if (strlen($header) != 18) {
-            throw new \Exception("Invalid frame header:
-                length should be 18 (hex), received " . strlen($header));
-            return;
+        if (strlen($data) < 9) {
+            throw new \Exception("Invalid frame header: need 9 bytes, got "
+                . strlen($data));
         }
-        $fields['length'] = $length = hexdec(substr($header, 0, 6));
-        $fields['type'] = $type = hexdec(substr($header, 6, 2));
-        $fields['flags'] = $flags = substr($header, 8, 2);
-        $fields['stream_id'] = $stream_id = hexdec(substr($header, 10, 8));
+        $length = (ord($data[0]) << 16)
+                | (ord($data[1]) << 8)
+                |  ord($data[2]);
+        $type      = ord($data[3]);
+        $flag_byte = ord($data[4]);
+        $stream_id = unpack('N', substr($data, 5, 4))[1] & 0x7FFFFFFF;
         if (!isset(FrameFactory::$frames[$type])) {
             throw new \Exception("Unknown frame type: " . $type);
-            return;
-        } else {
-            $frame = new FrameFactory::$frames[$type]($stream_id);
-            $frame->payload_length = $length;
         }
-        $frame->parseFlags($flags);
-        return [$frame, $length * 2];
+        $frame = new FrameFactory::$frames[$type]($stream_id);
+        $frame->payload_length = $length;
+        $frame->parseFlags($flag_byte);
+        return [$frame, $length];
     }
     /**
      * Parses all flags of the frame against the defined flags
@@ -2137,7 +2248,6 @@ class Frame
      */
     public function parseFlags($flag_byte)
     {
-        $flag_byte = hexdec($flag_byte);
         foreach ($this->defined_flags as $flag => $flag_bit) {
             if ($flag_byte & $flag_bit) {
                 $this->flags->add($flag);
@@ -2146,10 +2256,9 @@ class Frame
         return $this->flags;
     }
     /**
-     * Parses the body of the frame from binary.
-     * Different implementations are provided for each child class.
-     * @param string $data Binary data representing the frame body
-     * in hexadecimal format.
+     * Parses the binary body of the WINDOW_UPDATE frame.
+     *
+     * @param string $data binary payload of the frame (4 bytes)
      */
     public function parseBody($data)
     {
@@ -2218,7 +2327,7 @@ class SettingsFrame extends Frame
      * and 4 bytes for its value.
      * @return string Returns the settings as serialized binary data.
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         $body = '';
         foreach ($this->settings as $setting => $value) {
@@ -2231,23 +2340,25 @@ class SettingsFrame extends Frame
      * into the frame's settings array in a readable format.
      * @param string $data The binary data to parse.
      */
-    public function parseBody($data) 
+    public function parseBody($data)
     {
-        if (in_array('ACK', $this->flags->getFlags()) && strlen($data) > 0) {
-            throw new \Exception("Exception: SETTINGS ack frame must not have
-                            payload: got " . strlen($data) . " bytes");
+        if ($this->flags->contains('ACK') && strlen($data) > 0) {
+            throw new \Exception(
+                "SETTINGS ACK frame must have empty payload, got "
+                . strlen($data) . " bytes");
         }
-        $entries = str_split($data, 12);
-        $payload_length = 0;
-        foreach ($entries as $entry) {
-            $identifier = hexdec(substr($entry, 0, 4));
-            $value = hexdec(substr($entry, 4, 8));
-            $identifier_name = SettingsFrame::PAYLOAD_SETTINGS[$identifier]
-                ?? 'UNKNOWN-SETTING';
+        if (strlen($data) % 6 !== 0) {
+            throw new \Exception(
+                "SETTINGS payload must be a multiple of 6 bytes, got "
+                . strlen($data));
+        }
+        $this->settings = [];
+        for ($i = 0; $i < strlen($data); $i += 6) {
+            $identifier = unpack('n', substr($data, $i, 2))[1];
+            $value      = unpack('N', substr($data, $i + 2, 4))[1];
             $this->settings[$identifier] = $value;
-            $payload_length += 6;
         }
-        $this->payload_length = $payload_length;
+        $this->payload_length = strlen($data);
     }
 }
 /**
@@ -2278,66 +2389,108 @@ class HeaderFrame extends Frame
         $this->data = $data;
     }
     /**
-     * Serializes the header data into the format required for transmission.
-     * This method uses HPACK encoding to compress headers into binary format.
+     * Serializes the header data into the format required for
+     * transmission. Uses HPACK encoding to compress headers.
+     *
+     * @param object $hpack HPack instance for this connection. If
+     *      null a fresh instance is created.
+     * @return string binary HPACK-encoded header block
      */
-    public function serializeBody() 
+    public function serializeBody($hpack = null)
     {
         $headers = "";
         if (!empty($this->data)) {
-            $hpack = new HPack();
+            if ($hpack === null) {
+                $hpack = new HPack();
+            }
             $headers = $hpack->encode($this->data, 4096);
         }
         return $headers;
     }
     /**
-     * Parses the binary data of the HEADER frame and extracts the header
-     * fields into readable format of key-values like the URL.
-     * @param string $data The binary data to parse.
+     * Parses the binary HPACK-encoded header block of a HEADERS frame
+     * and returns a context array in the same format that parseRequest
+     * builds, suitable for passing directly to setGlobals.
+     *
+     * @param string $data binary payload of the HEADERS frame
+     * @param object $hpack HPack instance for this connection. If
+     *      null a fresh instance is created.
+     * @return array context array with REQUEST_METHOD, REQUEST_URI,
+     *      SERVER_PROTOCOL, QUERY_STRING, PHP_SELF, HTTP_* headers
      */
-    public function parseBody($data)
+    public function parseBody($data, $hpack = null)
     {
-        $hpack = new HPack();
-        $headers = $hpack->decodeHeaderBlockFragment($data, 4096);
-        $base_url = "https://localhost:8080/";
-        $scheme = '';
-        $authority = '';
-        $path = '';
-        if ($headers === null) return $base_url;
-        foreach ($headers as $header) {
-            foreach ($header as $key => $value) {
-                switch ($key) {
-                    case ":scheme":
-                        $scheme = strtolower($value);
-                        if (!in_array($scheme, ['http', 'https'])) {
-                            $scheme = 'https'; 
+        if ($hpack === null) {
+            $hpack = new HPack();
+        }
+        $offset = 0;
+        $padding = 0;
+        /*
+            If the PADDED flag is set the first byte is the pad
+            length and that many zero bytes appear at the end of
+            the payload. Strip both before HPACK decoding.
+         */
+        if ($this->flags->contains('PADDED')) {
+            $padding = ord($data[0]);
+            $offset += 1;
+        }
+        /*
+            If the PRIORITY flag is set the next 5 bytes are the
+            stream dependency (4 bytes) and weight (1 byte).
+            These come before the HPACK header block.
+         */
+        if ($this->flags->contains('PRIORITY')) {
+            $offset += 5;
+        }
+        $hpack_data = substr($data, $offset,
+            strlen($data) - $offset - $padding);
+        $headers = $hpack->decodeHeaderBlockFragment(
+            bin2hex($hpack_data));
+        $method    = 'GET';
+        $authority = 'localhost';
+        $path      = '/';
+        $scheme    = 'https';
+        $context   = [];
+        if ($headers !== null) {
+            foreach ($headers as $header) {
+                foreach ($header as $key => $value) {
+                    if ($key === ':method') {
+                        $method = strtoupper($value);
+                    } else if ($key === ':path') {
+                        $path = ($value !== ''
+                            && $value[0] === '/') ? $value : '/';
+                    } else if ($key === ':scheme') {
+                        if (in_array($value, ['http', 'https'])) {
+                            $scheme = $value;
                         }
-                        break;
-                    case ":authority":
+                    } else if ($key === ':authority'
+                        && filter_var("http://$value",
+                            FILTER_VALIDATE_URL)) {
                         $authority = $value;
-                        if (!filter_var("http://$authority", 
-                                FILTER_VALIDATE_URL)) {
-                            $authority = "localhost:8080"; 
-                        }
-                        break;
-
-                    case ":path":
-                        $path = $value;
-                        if ($path === '' || $path[0] !== '/') {
-                            $path = '/'; 
-                        }
-                        break;
+                    } else if ($key[0] !== ':') {
+                        $context['HTTP_' . strtoupper(
+                            str_replace('-', '_', $key))] = $value;
+                    }
                 }
             }
         }
-        if ($scheme === '' || $authority === '' || $path === '') {
-            return $base_url;
+        $question = strpos($path, '?');
+        if ($question === false) {
+            $context['PHP_SELF'] = $path;
+            $context['QUERY_STRING'] = '';
+        } else {
+            $context['PHP_SELF'] = substr($path, 0, $question);
+            $context['QUERY_STRING'] = substr($path, $question + 1);
         }
-        $url = $scheme . "://" . $authority . $path;
-        if (!filter_var($url, FILTER_VALIDATE_URL)) {
-            return $base_url;
-        }
-        return $url;
+        $context['REQUEST_METHOD'] = $method;
+        $context['REQUEST_URI'] = $path;
+        $context['SERVER_PROTOCOL']  = 'HTTP/2.0';
+        $context['HTTPS'] = 'on';
+        $context['HTTP_HOST'] = $authority;
+        $context['CONTENT']= '';
+        $context['REMOTE_ADDR'] = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        $context['SCRIPT_FILENAME']  = '';
+        return $context;
     }
 }
 /*
@@ -2359,8 +2512,7 @@ class DataFrame extends Frame
      * @param string $data The data payload for the frame.
      * @param array $flags Flags associated with the frame .
      */
-    public function __construct(int $stream_id, string $data = '',
-        array $flags = [])
+    public function __construct($stream_id, $data = '', $flags = [])
     {
         parent::__construct($stream_id, $flags);
         $this->data = $data;
@@ -2369,13 +2521,9 @@ class DataFrame extends Frame
      * Serializes the body of the frame into a binary string.
      * Converts the ASCII data to binary format for transmission.
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
-        $binary_string = '';
-        for ($i = 0; $i < strlen($this->data); $i++) {
-            $binary_string .= pack('C', ord($this->data[$i]));
-        }
-        return $binary_string;
+        return $this->data;
     }
     /**
      * Parses the binary data of the DATA frame and extracts the data payload.
@@ -2395,24 +2543,44 @@ class DataFrame extends Frame
 }
 /*
  * PriorityFrame class handles the HTTP/2 PRIORITY frame,
- * which specifies the priority of a stream.
+ * which specifies the sender-advised priority of a stream.
  */
-class PriorityFrame extends Priority
+class PriorityFrame extends Frame
 {
     protected $defined_flags = [];
     protected $type = 0x02;
-    protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
+    protected $stream_association = self::STREAM_ASSOC_HAS_STREAM;
+    protected $depends_on;
+    protected $stream_weight;
+    protected $exclusive;
     /**
-     * Serializes the priority data into a binary format.
-     * @return string The serialized binary data.
+     * Constructor for PriorityFrame.
+     *
+     * @param int $stream_id the stream ID this frame belongs to
+     * @param array $flags any flags for this frame
      */
-    public function serializeBody()
+    public function __construct($stream_id, $flags = [])
     {
-        return $this->serializePriorityData();
+        parent::__construct($stream_id, $flags);
+        $this->depends_on = 0;
+        $this->stream_weight = 0;
+        $this->exclusive = false;
     }
     /**
-     * Parses the binary data of the PRIORITY frame.
-     * @param string $data The binary data to parse.
+     * Serializes the PRIORITY frame body into binary format.
+     *
+     * @return string 5-byte serialized priority data
+     */
+    public function serializeBody($hpack = null)
+    {
+        $dep = $this->depends_on
+            + ($this->exclusive ? 0x80000000 : 0);
+        return pack('NC', $dep, $this->stream_weight);
+    }
+    /**
+     * Parses the binary body of a PRIORITY frame.
+     *
+     * @param string $data binary payload, must be exactly 5 bytes
      */
     public function parseBody($data)
     {
@@ -2420,7 +2588,11 @@ class PriorityFrame extends Priority
             throw new InvalidFrameException(
                 "PRIORITY must have a 5 byte body.");
         }
-        $this->parsePriorityData($data);
+        $unpacked = unpack('Ndepends_on/Cstream_weight',
+            substr($data, 0, 5));
+        $this->depends_on = $unpacked['depends_on'] & 0x7FFFFFFF;
+        $this->stream_weight = $unpacked['stream_weight'];
+        $this->exclusive = (bool)($unpacked['depends_on'] >> 31);
         $this->payload_length = 5;
     }
 }
@@ -2446,15 +2618,21 @@ class RstStreamFrame extends Frame
         $this->error_code = $error_code;
     }
     /**
-     * Serializes the RST_STREAM frame body into a binary format.
+     * Serializes the RST_STREAM frame body into binary format.
+     * The body is the 4-byte error code packed as big-endian.
+     *
+     * @param object $hpack unused, present for signature compatibility
+     *      with HeaderFrame::serializeBody
+     * @return string 4-byte serialized body
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         return pack('N', $this->error_code);
     }
     /**
-     * Parses the binary data of the RST_STREAM frame.
-     * @param string $data The binary data to parse.
+     * Parses the binary body of a RST_STREAM frame.
+     *
+     * @param string $data binary payload, must be exactly 4 bytes
      */
     public function parseBody($data)
     {
@@ -2495,8 +2673,14 @@ class PushPromiseFrame extends Frame
     }
     /**
      * Serializes the PUSH_PROMISE frame body into binary format.
+     * The body is padding length (if PADDED), promised stream id,
+     * the header block fragment, then padding bytes.
+     *
+     * @param object $hpack unused, present for signature compatibility
+     *      with HeaderFrame::serializeBody
+     * @return string binary serialized body
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         $padding_data = $this->serializePaddingData();
         $padding = str_repeat("\0", $this->pad_length);
@@ -2558,7 +2742,7 @@ class PingFrame extends Frame
      * Serializes the PING frame body into binary format.
      * @return string The serialized binary data.
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         if (strlen($this->opaque_data) != 8) {
             throw new InvalidDataException(
@@ -2612,7 +2796,7 @@ class GoAwayFrame extends Frame
      * Serializes the GOAWAY frame body into a binary format.
      * @return string The serialized binary data.
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         $data = pack('N', $this->last_stream_id & 0x7FFFFFFF) .
                 pack('N', $this->error_code);
@@ -2658,27 +2842,33 @@ class WindowUpdateFrame extends Frame
     }
     /**
      * Serializes the WINDOW_UPDATE frame body into binary format.
+     * The body is the 4-byte window size increment with the high
+     * bit (reserved) cleared.
+     *
+     * @param object $hpack unused, present for signature compatibility
+     *      with HeaderFrame::serializeBody
+     * @return string 4-byte serialized body
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         return pack('N', $this->window_increment & 0x7FFFFFFF);
     }
     /**
-     * Parses the hexadecimal data of the WINDOW_UPDATE frame.
-     * @param string $data The hexadecimal data to parse.
+     * Parses the binary body of a WINDOW_UPDATE frame.
+     *
+     * @param string $data binary payload, must be exactly 4 bytes
      */
     public function parseBody($data)
     {
-        if (strlen($data) != 8) {
+        if (strlen($data) != 4) {
             throw new InvalidFrameException(
-                "WINDOW_UPDATE frame must have 4 byte length
-                 (8 hex characters): got " . strlen($data));
+                "WINDOW_UPDATE body must be 4 bytes, got "
+                . strlen($data));
         }
-        $this->window_increment = hexdec($data);
-        if ($this->window_increment < 1
-            || $this->window_increment > (2**31 - 1)) {
+        $this->window_increment = unpack('N', $data)[1] & 0x7FFFFFFF;
+        if ($this->window_increment < 1) {
             throw new InvalidDataException(
-                "WINDOW_UPDATE increment must be between 1 to 2^31-1");
+                "WINDOW_UPDATE increment must be between 1 and 2^31-1");
         }
         $this->payload_length = 4;
     }
@@ -2693,7 +2883,6 @@ class ContinuationFrame extends Frame
         'END_HEADERS' => 0x04,
     ];
     protected $type = 0x09;
-    protected $stream_association = self::_STREAM_ASSOC_HAS_STREAM;
     public $data;
     /**
      * Constructor to create a new ContinuationFrame object.
@@ -2707,14 +2896,22 @@ class ContinuationFrame extends Frame
     }
     /**
      * Serializes the CONTINUATION frame body into binary format.
+     * The body is the raw continuation of an HPACK-encoded header
+     * block fragment started by a preceding HEADERS or PUSH_PROMISE
+     * frame.
+     *
+     * @param object $hpack unused, present for signature compatibility
+     *      with HeaderFrame::serializeBody
+     * @return string binary serialized body
      */
-    public function serializeBody()
+    public function serializeBody($hpack = null)
     {
         return $this->data;
     }
     /**
-     * Parses the binary data of the CONTINUATION frame.
-     * @param string $data The binary data to parse.
+     * Parses the binary body of a CONTINUATION frame.
+     *
+     * @param string $data binary payload, a header block fragment
      */
     public function parseBody($data)
     {
@@ -2733,8 +2930,8 @@ class InvalidPaddingException extends \Exception {}
  */
 class Flag
 {
-    public string $name;
-    public int $bit;
+    public $name;
+    public $bit;
     /**
      * Constructor for Flag.
      * @param string $name The name of the flag.
@@ -2752,8 +2949,8 @@ class Flag
  */
 class Flags
 {
-    private array $valid_flags;
-    private array $flags;
+    private $valid_flags;
+    private $flags;
     /**
      * Constructor for Flags.
      * @param array $defined_flags Array of defined valid flags.
@@ -2802,19 +2999,23 @@ class Flags
      * Removes the specified flag from the collection.
      * @param string $flag The flag to remove.
      */
-    public function discard(string $flag)
+    public function discard($flag)
     {
         $this->flags = array_diff($this->flags, [$flag]);
     }
     /**
-     * Counts the number of active flags.
+     * Counts the number of currently active flags.
+     *
+     * @return int the number of active flags
      */
     public function count()
     {
         return count($this->flags);
     }
     /**
-     * Returns the array of current flags.
+     * Returns the array of currently active flag names.
+     *
+     * @return array list of flag name strings
      */
     public function getFlags()
     {
@@ -2832,12 +3033,17 @@ trait Padding
      * @param int $stream_id The stream ID associated with the padding.
      * @param int $pad_length The length of the padding (default: 0).
      */
-    public function __construct(int $stream_id, int $pad_length = 0)
+    public function __construct($stream_id, $pad_length = 0)
     {
         $this->pad_length = $pad_length;
     }
     /**
-     * Serializes padding data into binary format.
+     * Serializes padding data into binary format. When the PADDED
+     * flag is set, this emits a single byte giving the pad length.
+     * When not set, it returns an empty string.
+     *
+     * @return string either a 1-byte pad length prefix or the empty
+     *      string depending on whether PADDED is set
      */
     public function serializePaddingData()
     {
@@ -2847,8 +3053,13 @@ trait Padding
         return '';
     }
     /**
-     * Parses padding data from binary format.
-     * @param string $data The data to parse.
+     * Parses padding data from binary format. When the PADDED flag
+     * is set, reads the first byte of $data as the pad length.
+     *
+     * @param string $data binary payload whose first byte is the
+     *      pad length when PADDED is set
+     * @return int number of bytes consumed from the front of $data
+     *      (1 if PADDED is set, 0 otherwise)
      */
     public function parsePaddingData($data)
     {
@@ -2861,63 +3072,6 @@ trait Padding
             return 1;
         }
         return 0;
-    }
-}
-/*
- * Priority class handles the HTTP/2 PRIORITY frame,
- * managing stream priority and dependencies.
- */
-class Priority
-{
-    protected $stream_id;
-    protected $depends_on;
-    protected $stream_weight;
-    protected $exclusive;
-    /**
-     * Constructor for Priority.
-     * @param int $stream_id The stream ID.
-     * @param int $depends_on The stream ID this one depends on (default: 0x0).
-     * @param int $stream_weight The weight of the stream (default: 0x0).
-     * @param bool $exclusive If the stream dependency is
-     * exclusive (default: false).
-     * @param array $kwargs Additional parameters for inheritance.
-     */
-    public function __construct($stream_id, $depends_on = 0x0,
-        $stream_weight = 0x0, $exclusive = false, $kwargs = [])
-    {
-        $this->stream_id = $stream_id;
-        $this->depends_on = $depends_on;
-        $this->stream_weight = $stream_weight;
-        $this->exclusive = $exclusive;
-        if (method_exists($this, 'parent::__construct')) {
-            call_user_func_array('parent::__construct',
-                array_merge([$stream_id], $kwargs));
-        }
-    }
-    /**
-     * Serializes priority data into binary format.
-     */
-    public function serializePriorityData()
-    {
-        $depends_on_with_exclusive = $this->depends_on +
-            ($this->exclusive ? 0x80000000 : 0);
-        return pack('N C', $depends_on_with_exclusive, $this->stream_weight);
-    }
-    /**
-     * Parses priority data from binary format.
-     * @param string $data The binary data to parse.
-     */
-    public function parsePriorityData(string $data)
-    {
-        if (strlen($data) < 5) {
-            throw new InvalidFrameException("Invalid Priority data");
-        }
-        list($depends_on, $stream_weight) = array_values(
-            unpack('Ndepends_on/Cstream_weight', substr($data, 0, 5)));
-        $this->depends_on = $depends_on & 0x7FFFFFFF;
-        $this->stream_weight = $stream_weight;
-        $this->exclusive = (bool)($depends_on >> 31);
-        return 5;
     }
 }
 /*
@@ -2989,35 +3143,47 @@ class HPack
         60 => ['via', ''],
         61 => ['www-authenticate', '']
     ];
-    private static $headers_table = [];
-    private static $never_index_list = [];
-    private $max_table_size = 100; // number of indices allowed in the table
-    private $current_table_size = 0;
-    private $debug_output;
-    public function getDebugOutput()
-    {
-        return $this->debug_output;
-    }
+    /**
+     * Per-instance HPACK header table. Indices 1-61 are pre-populated
+     * with the static table entries from RFC 7541 Appendix A; entries
+     * appended at index 62 and beyond form the dynamic table.
+     * @var array
+     */
+    private $headers_table = [];
+    /**
+     * List of header names that have been encoded as
+     * "Literal Never Indexed" and so must not be added to the
+     * dynamic table by intermediaries (RFC 7541 sec 6.2.3).
+     * @var array
+     */
+    private $never_index_list = [];
+    /**
+     * Maximum number of entries allowed in the dynamic table
+     * before the eviction algorithm runs.
+     * @var int
+     */
+    private $max_table_size = 100;
+    /**
+     * Constructs a new HPack instance with a fresh dynamic table
+     * pre-populated with the static table entries from RFC 7541
+     * Appendix A.
+     */
     public function __construct()
     {
-        if (empty(self::$headers_table)) {
-            self::$headers_table[0] = ["not defined", ""];
-            foreach (self::STATIC_TABLE as $index => $header) {
-                self::$headers_table[$index] = $header;
-            }
+        $this->headers_table[0] = ["not defined", ""];
+        foreach (self::STATIC_TABLE as $index => $header) {
+            $this->headers_table[$index] = $header;
         }
-        $this->debug_output .=
-            "\n\nIn Constructor\nInitial Headers table created: \n";
-        $this->debug_output .=
-            json_encode(self::$headers_table, JSON_PRETTY_PRINT) . PHP_EOL;
-
     }
     /**
-     * Returns the full headers table (static + dynamic). For debugging.
+     * Returns the full headers table (static plus dynamic entries).
+     * Intended for debugging and inspection only.
+     *
+     * @return array the complete header table
      */
-    public static function getHeadersTable()
+    public function getHeadersTable()
     {
-        return self::$headers_table;
+        return $this->headers_table;
     }
     /**
      * Evicts the first entry in the table and shifts the rest of the entries.
@@ -3026,19 +3192,13 @@ class HPack
     private function evictEntry()
     {
         $static_table_len = count(self::STATIC_TABLE);
-        if (count(self::$headers_table) > $static_table_len) {
-            $this->debug_output .=
-                "Evicting header at index " .
-                ($static_table_len + 1) . "..." . PHP_EOL;
-            foreach (self::$headers_table as $index => $header) {
+        if (count($this->headers_table) > $static_table_len) {
+            foreach ($this->headers_table as $index => $header) {
                 if ($index > $static_table_len + 1) {
-                    self::$headers_table[$index - 1] = $header;
+                    $this->headers_table[$index - 1] = $header;
                 }
             }
-            array_pop(self::$headers_table);
-            $this->debug_output .=  "Entry at index " .
-                    ($static_table_len + 1) .
-                    " has been evicted, and table has been shifted." . PHP_EOL;
+            array_pop($this->headers_table);
         }
     }
     /**
@@ -3049,14 +3209,12 @@ class HPack
      */
     public function addHeader($name, $value)
     {
-        $current_size = count(self::$headers_table);
+        $current_size = count($this->headers_table);
         while (($current_size + 1) > $this->max_table_size) {
             $this->evictEntry();
-            $current_size = count(self::$headers_table);
+            $current_size = count($this->headers_table);
         }
-        self::$headers_table[] = [$name, $value];
-        $this->debug_output .=
-            "Added header: [$name, $value] at the end of the table." . PHP_EOL;
+        $this->headers_table[] = [$name, $value];
     }
     /**
      * Decodes a header block fragment from hex.
@@ -3069,15 +3227,8 @@ class HPack
         $input_length = strlen($hex_input);
         if ($input_length <= 0) return null;
         while ($offset < $input_length) {
-            $first_byte_hex = substr($hex_input, $offset, 2);
-            $first_byte = hexdec($first_byte_hex);
-            $bits_for_dbg =
-                str_pad(decbin(hexdec($first_byte_hex)), 8, '0', STR_PAD_LEFT);
+            $first_byte = hexdec(substr($hex_input, $offset, 2));
             if (($first_byte & 0x80) === 0x80) {
-                $this->debug_output .= "\nFirst byte:
-                    $first_byte_hex ($bits_for_dbg) matches indexed field" .
-                    " representation.
-                    Bit pattern: ( 1 * * *   * * * * )\n";
                 $header = $this->decodeIndexedHeaderField(
                     substr($hex_input, $offset));
                 if ($header === null) {
@@ -3085,45 +3236,49 @@ class HPack
                 }
                 $offset += $header['length'];
             } else if (($first_byte & 0xC0) === 0x40) {
-                $this->debug_output .= "\nFirst byte: $first_byte_hex
-                    ($bits_for_dbg) matches literal header with
-                    incremental indexing representation.
-                    Bit pattern: ( 0 1 * *   * * * * )\n";
                 $header = $this->decodeLiteralWithIncrementalIndexing(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
+            } else if (($first_byte & 0xE0) === 0x20) {
+                /*
+                    Dynamic table size update (RFC 7541 sec 6.3).
+                    Bit pattern 001xxxxx. The new max size is in the
+                    low 5 bits. If all 5 bits are set the size
+                    continues in subsequent bytes as a multi-byte
+                    integer. We parse past it but do not enforce
+                    eviction beyond the existing max_table_size.
+                 */
+                $new_size = $first_byte & 0x1F;
+                $offset += 2;
+                if ($new_size == 0x1F) {
+                    while ($offset < $input_length) {
+                        $next_byte = hexdec(
+                            substr($hex_input, $offset, 2));
+                        $offset += 2;
+                        if (($next_byte & 0x80) === 0) {
+                            break;
+                        }
+                    }
+                }
+                $header = ['decoded' => [], 'length' => 0];
+                continue;
             } else if (($first_byte & 0xF0) === 0x10) {
-                $this->debug_output .= "\nFirst byte: $first_byte_hex
-                    ($bits_for_dbg) matches literal header never
-                    indexed representation.
-                    Bit pattern: ( 0 0 0 1   * * * * )\n";
                 $header = $this->decodeLiteralNeverIndexed(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
-            } else if (($first_byte & 0xE0) === 0x00) {
-                $this->debug_output .= "\nFirst byte: $first_byte_hex
-                    ($bits_for_dbg) matches literal header without
-                    indexing representation.
-                    Bit pattern: ( 0 0 0 0   * * * * )\n";
+            } else if (($first_byte & 0xF0) === 0x00) {
                 $header = $this->decodeLiteralWithoutIndexing(
                     substr($hex_input, $offset));
                 $offset += $header['length'];
             } else {
                 $header = null;
                 return null;
-                $this->debug_output .=
-                    "Exception: Invalid header type detected.\n";
             }
             if ($header) {
                 $headers[] = $header['decoded'];
             }
         }
-        $this->debug_output .=
-            "Total decoded headers: " . count($headers) ."\n";
-        $this->debug_output .= print_r($headers, true);
-        $this->debug_output .= "\n\nFinal dynamic table: \n";
-        $this->debug_output .= print_r(self::$headers_table, true);
-        return $header === null ? null : $headers;
+        return empty($headers) ? null : $headers;
     }
     /**
      * Decodes indexed header field from hex using $headers_table.
@@ -3140,14 +3295,10 @@ class HPack
         $byte_hex = substr($hex_field, 0, 2);
         $byte = hexdec($byte_hex);
         $index = $byte & 0x7F;
-        if ($index >= 1 && $index <= count(self::$headers_table)) {
-            [$name, $value] = self::$headers_table[$index];
-            $this->debug_output .= "Index $index matched in headers table.\n";
-            $this->debug_output .= "Decoded name: $name, value: $value\n";
+        if ($index >= 1 && $index <= count($this->headers_table)) {
+            [$name, $value] = $this->headers_table[$index];
         } else {
             // Invalid index
-            $this->debug_output .= "Decoding error: Index value ".
-                $index . " found in an indexed header field representation.";
             return null;
         }
         return [
@@ -3167,32 +3318,20 @@ class HPack
         $first_byte = hexdec($first_byte_hex);
         $offset += 2;
         if (($first_byte & 0x3F) === 0x00) {
-            $this->debug_output .= "Bit pattern (0 1 0 0   0 0 0 0)
-                => Name not in headers table\n";
-            $this->debug_output .= "Decoding new name: \n";
             $name_length_hex = substr($hex_field, $offset, 2);
             $name_length_byte = hexdec($name_length_hex);
             $use_huffman = ($name_length_byte & 0x80) !== 0;
             $name_length = $name_length_byte & 0x7F;
             $offset += 2;
-            $this->debug_output .= "Length hex: $name_length_hex
-                => length = $name_length and huffman encoding
-                used = $use_huffman\n";
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
             $name = $use_huffman ?
-                $this->huffmanDecode($name_hex) : hex2bin($name_hex);
-            $this->debug_output .= "Decoded name: $name";
+                $this->huffmanDecode(hex2bin($name_hex)) : hex2bin($name_hex);
 
         } else {
-            $this->debug_output .=
-                "Bit pattern (0 1 * *   * * * *)
-                => Name indexed in headers table\n";
-            $this->debug_output .= "Decoding indexed name: \n";
             $name_index = $first_byte & 0x3F;
-            if ($name_index > 0 && $name_index < count(self::$headers_table)) {
-                $name = self::$headers_table[$name_index][0];
-                $this->debug_output .= "Name found at index $name_index: $name\n";
+            if ($name_index > 0 && $name_index < count($this->headers_table)) {
+                $name = $this->headers_table[$name_index][0];
             } else {
                 throw new \Exception(
                     "Invalid name index: exceeds dynamic table size."
@@ -3204,26 +3343,17 @@ class HPack
         $use_huffman = ($value_length_byte & 0x80) !== 0;
         $value_length = $value_length_byte & 0x7F;
         $offset += 2;
-        $this->debug_output .= "Decoding value: \n";
-        $this->debug_output .= "Length hex: $value_length_hex
-            => length = $value_length and huffman encoding used =
-            $use_huffman\n";
         $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
         $value = $use_huffman ?
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
-        $this->debug_output .= "Decoded value: $value";
-        if (($first_byte & 0x3F) !== 0x00) {
-            if ($name_index < count(self::$headers_table)) {
-                self::$headers_table[$name_index] = [$name, $value];
-                $this->debug_output .= "Value updated in headers
-                    table at index $name_index";
-            }
-        } else {
-            self::$headers_table[] = [$name, $value];
-            $this->debug_output .=
-                "New entry added to headers table [$name, $value]";
-        }
+            $this->huffmanDecode(hex2bin($value_hex)) : hex2bin($value_hex);
+        /*
+            HPACK RFC 7541 section 6.2.1: incremental indexing always
+            appends a new entry to the dynamic table. The name index
+            only identifies which existing entry to copy the name
+            from and must never be overwritten.
+         */
+        $this->headers_table[] = [$name, $value];
         return [
             'decoded' => [$name => $value],
             'encoded' => [
@@ -3251,12 +3381,12 @@ class HPack
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
             $name = $use_huffman ?
-                $this->huffmanDecode($name_hex) : hex2bin($name_hex);
+                $this->huffmanDecode(hex2bin($name_hex)) : hex2bin($name_hex);
         } else {
             $name_index = $first_byte & 0x0F;
 
-            if ($name_index > 0 && $name_index <= count(self::$headers_table)) {
-                $name = self::$headers_table[$name_index][0];
+            if ($name_index > 0 && $name_index <= count($this->headers_table)) {
+                $name = $this->headers_table[$name_index][0];
             } else {
                 throw new \Exception("Invalid name index: exceeds table size.");
             }
@@ -3269,7 +3399,7 @@ class HPack
         $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
         $value = $use_huffman ?
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
+            $this->huffmanDecode(hex2bin($value_hex)) : hex2bin($value_hex);
         return [
             'decoded' => [$name => $value],
             'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
@@ -3294,11 +3424,11 @@ class HPack
             $name_hex = substr($hex_field, $offset, $name_length * 2);
             $offset += $name_length * 2;
             $name = $use_huffman ?
-                $this->huffmanDecode($name_hex) : hex2bin($name_hex);
+                $this->huffmanDecode(hex2bin($name_hex)) : hex2bin($name_hex);
         } else {
             $name_index = $first_byte & 0x0F;
-            if ($name_index > 0 && $name_index <= count(self::$headers_table)) {
-                $name = self::$headers_table[$name_index][0];
+            if ($name_index > 0 && $name_index <= count($this->headers_table)) {
+                $name = $this->headers_table[$name_index][0];
             } else {
                 throw new \Exception("Invalid name index: exceeds table size.");
             }
@@ -3310,8 +3440,8 @@ class HPack
         $value_hex = substr($hex_field, $offset, $value_length * 2);
         $offset += $value_length * 2;
         $value = $use_huffman ?
-            $this->huffmanDecode($value_hex) : hex2bin($value_hex);
-        self::$never_index_list[] = $name;
+            $this->huffmanDecode(hex2bin($value_hex)) : hex2bin($value_hex);
+        $this->never_index_list[] = $name;
         return [
             'decoded' => [$name => $value],
             'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
@@ -3319,15 +3449,17 @@ class HPack
         ];
     }
     /**
-     * Encodes headers using HPack format.
-     * If a header name is in the never-index list, it will be encoded accordingly.
-     * Otherwise, the function checks the headers table for matches and encodes them.
-     * @param array $headers Array of headers to encode. Each header is an array of [name, value].
+     * Encodes headers using the HPack format. If a header name is in
+     * the never-index list, it is encoded as "Literal Never Indexed".
+     * Otherwise the function checks the headers table for matches
+     * and encodes using the most compact representation that applies.
+     *
+     * @param array $headers array of headers to encode. Each header
+     *      is an array of [name, value]
+     * @return string binary HPACK-encoded header block
      */
     public function encode($headers)
     {
-        $this->debug_output .= "\n\nEncoding headers: " .
-            json_encode($headers, JSON_PRETTY_PRINT) . PHP_EOL;
         $encoded = '';
         $h = 1;
         foreach ($headers as [$name, $value]) {
@@ -3337,25 +3469,19 @@ class HPack
             $is_indexed = false;
             $name_only_match = false;
             $matched_index = null;
-            $this->debug_output .= "\nHeader $h: Name = $name, Value = $value" .
-                PHP_EOL;
             $h++;
-            if (in_array($name, self::$never_index_list)) {
+            if (in_array($name, $this->never_index_list)) {
                 $encoded_header .= chr(0x10);
                 $encoded_header .= $this->encodeString($name);
                 $encoded_header .= $this->encodeString($value);
-                $this->debug_output .= "Never indexed header encoded: " .
-                    bin2hex($encoded_header) . PHP_EOL;
                 $encoded .= $encoded_header;
                 continue;
             }
-            foreach (self::$headers_table as $i => [$header_name, $header_value]) {
+            foreach ($this->headers_table as $i =>
+                    [$header_name, $header_value]) {
                 if ($header_name === $name && $header_value === $value) {
                     $encoded_header .= chr(0x80 | ($i & 0x7F));
                     $is_indexed = true;
-                    $this->debug_output .= "Header found in headers table at
-                        index: $i, Encoded as indexed header: " .
-                        bin2hex($encoded_header) . PHP_EOL;
                     break;
                 } elseif ($header_name === $name) {
                     $name_only_match = true;
@@ -3364,23 +3490,15 @@ class HPack
             }
             if (!$is_indexed && $name_only_match) {
                 $encoded_header .= chr(0x40 | ($matched_index & 0x3F));
-                $this->debug_output .=
-                    "Name-only match found in headers table at " .
-                    "index: $matched_index, Encoding with incremental ".
-                    "indexing." . PHP_EOL;
                 $encoded_header .= $this->encodeString($value);
             }
             elseif (!$is_indexed && !$name_only_match) {
                 $encoded_header .= chr(0x40);
                 $encoded_header .= $this->encodeString($name);
                 $encoded_header .= $this->encodeString($value);
-                $this->debug_output .= "No match found, encoding as new name " .
-                    "with incremental indexing." . PHP_EOL;
             }
             $encoded .= $encoded_header;
         }
-        $this->debug_output .= "Encoded headers result: " . bin2hex($encoded) .
-            PHP_EOL;
         return $encoded;
     }
     /**
@@ -3391,103 +3509,76 @@ class HPack
      */
     private function encodeString($str)
     {
-        $this->debug_output .= "Compressing string: $str" . PHP_EOL;
         $huffman = $this->huffmanEncode($str);
-        $this->debug_output .= "Hex compression length = " . strlen($str) .
-            PHP_EOL;
-        $this->debug_output .= "Huffman compression length = " .
-            strlen($huffman) . PHP_EOL;
         if (strlen($huffman) < strlen($str)) {
-            $this->debug_output .= "Huffman encoding chosen" . PHP_EOL;
             return chr(0x80 | strlen($huffman)) . $huffman;
         } else {
-            $this->debug_output .= "Hex encoding chosen" . PHP_EOL;
             return chr(strlen($str)) . $str;
         }
     }
     /**
-     * Encodes input using Huffman encoding.
-     * @param string $input The string to encode.
+     * Encodes an ASCII input string using HPACK Huffman encoding.
+     * Looks each character up in the HUFFMAN_CODES table to get its
+     * variable-length bit code, concatenates all codes into a bit
+     * string, pads to a byte boundary with 1-bits (per RFC 7541
+     * section 5.2), then packs the bit string into binary bytes.
+     *
+     * @param string $input ASCII string to encode
+     * @return string binary Huffman-encoded byte string
      */
     public function huffmanEncode($input)
     {
         global $HUFFMAN_CODES;
         $encoded = '';
-        $this->debug_output .= "Huffman encoding for input: $input" . PHP_EOL;
         foreach (str_split($input) as $char) {
             if (isset($HUFFMAN_CODES[$char])) {
                 $huffman_code = $HUFFMAN_CODES[$char]['bin'];
                 $encoded .= $huffman_code;
-                $this->debug_output .=
-                    "Character: $char, Huffman code: $huffman_code" . PHP_EOL;
             } else {
                 throw new \Exception(
                     "Character not found in Huffman table: $char");
             }
         }
-        // Padding is done with the MSBs of the End-Of-String
-        // symbol which in RFC is encoded as 11111111111111
-        $this->debug_output .=
-            "Huffman encoded binary string (before padding): $encoded" .
-            PHP_EOL;
+        /*
+            Padding is done with the MSBs of the End-Of-String
+            symbol which in RFC 7541 is encoded as 11111111111111
+         */
         if (strlen($encoded) % 8 !== 0) {
             $padding = 8 - (strlen($encoded) % 8);
             $encoded .= str_repeat('1', $padding);
-            $this->debug_output .= "Padding applied: $padding bits" . PHP_EOL;
         }
-        $this->debug_output .=
-            "Huffman encoded binary string (after padding): $encoded" . PHP_EOL;
         $output = '';
         foreach (str_split($encoded, 8) as $byte) {
             $byteValue = chr(bindec($byte));
             $output .= $byteValue;
-            $this->debug_output .= "Byte segment: $byte, Converted to: " .
-                bin2hex($byteValue) . PHP_EOL;
         }
-        $this->debug_output .= "Final Huffman encoded output (hex): " .
-            bin2hex($output) . PHP_EOL;
         return $output;
     }
     /**
-     * Decodes Huffman-encoded hexadecimal input.
-     * @param string $hexInput Huffman-encoded hexadecimal string.
+     * Decodes Huffman-encoded binary input using the HPACK Huffman
+     * code table defined in $HUFFMAN_LOOKUP. Walks bits one at a time
+     * from each byte using bit shifts, building up a bit-string
+     * buffer that is looked up in the prefix-free code table.
+     *
+     * @param string $input binary Huffman-encoded byte string
+     * @return string decoded ASCII string
      */
-    public function huffmanDecode($hex_input)
+    public function huffmanDecode($input)
     {
         global $HUFFMAN_LOOKUP;
-        $binary_string = '';
-        $this->debug_output .=
-            "Starting Huffman decoding for hex input: $hex_input\n";
-        for ($i = 0; $i < strlen($hex_input); $i += 2) {
-            $byte = hexdec(substr($hex_input, $i, 2));
-            $binary_chunk = str_pad(decbin($byte), 8, '0', STR_PAD_LEFT);
-            $binary_string .= $binary_chunk;
-            $this->debug_output .= "Hex chunk: " . substr($hex_input, $i, 2) .
-                " -> Binary chunk: $binary_chunk\n";
-        }
         $decoded = '';
         $buffer = '';
-        $this->debug_output .= "Complete binary string: $binary_string\n";
-        $i = 0;
-        while ($i < strlen($binary_string)) {
-            $buffer .= $binary_string[$i];
-            $i++;
-            $this->debug_output .= "Current buffer: $buffer\n";
-            if (isset($HUFFMAN_LOOKUP[$buffer])) {
-                $ascii = $HUFFMAN_LOOKUP[$buffer];
-                $decoded_char = chr($ascii);
-                $decoded .= $decoded_char;
-                $this->debug_output .=
-                    "Decoded character: $decoded_char
-                    (ASCII: $ascii) from buffer: $buffer\n";
-                $buffer = '';
+        $length = strlen($input);
+        for ($i = 0; $i < $length; $i++) {
+            $byte = ord($input[$i]);
+            for ($bit = 7; $bit >= 0; $bit--) {
+                $buffer .= (($byte >> $bit) & 1) ? '1' : '0';
+                if (isset($HUFFMAN_LOOKUP[$buffer])) {
+                    $decoded .= chr($HUFFMAN_LOOKUP[$buffer]);
+                    $buffer = '';
+                }
             }
         }
-        if ($buffer !== '') {
-            $this->debug_output .=
-            "Padding found in buffer after decoding: $buffer\n";
-        }
-        $this->debug_output .= "Final decoded string: $decoded\n";
         return $decoded;
     }
 

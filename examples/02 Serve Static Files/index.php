@@ -33,7 +33,9 @@ $test->get('/', function() {
     <ul>
     <li><a href="images/me1.jpg">Photo 1</a></li>
     <li><a href="images/me2.jpg">Photo 2</a></li>
-    <li><a href="images/me3.jpg">Photo 3</a></li>
+    <li><a href="images/me3.jpg">Photo 3</a><!--does not exist
+        demonstrates 404 path
+    --></li>
     </ul>
     </body>
     </html>
@@ -55,7 +57,8 @@ $test->get('/', function() {
       Here if the file is not found we trigger a route to a file not found page
  */
 $test->get('/images/{file_name}', function () use ($test) {
-        $file_name = __DIR__ . "/images/" . urldecode($_REQUEST['file_name']);
+        $file_name = __DIR__ .
+            "/../../images/" . urldecode($_REQUEST['file_name']);
         if (file_exists($file_name)) {
             $test->header("Content-Type: " . $test->mimeType($file_name));
             echo $test->fileGetContents($file_name);

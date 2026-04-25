@@ -16,7 +16,8 @@ $test = new WebSite();
        php index.php
     and pointing a browser to https://localhost:8080/
  */
-$test->get('/', function() {
+$test->get('/', function()  use ($test) {
+    $test->preload('/me1.jpg', 'image'); // sends HTTP/2 pre-fetch header
     ?>
     <!DOCTYPE html>
     <html>
@@ -24,15 +25,17 @@ $test->get('/', function() {
     <body>
     <h1>HTTPS Hello World!</h1>
     <img src="/me1.jpg" alt="a photo of me" />
-    <div>My first atto server route running on HTTPS!</div>
+    <div>My first atto server routes running on HTTPS! This example
+        also demos support for HTTP/2 and url pre-fetching.
+    </div>
     </body>
     </html>
 <?php
 });
 $test->get('/{file_name}', function () use ($test) {
         if(!empty($_REQUEST['file_name'])) {
-            $file_name = __DIR__ . "/". urldecode($_REQUEST['file_name']);
-            error_log($file_name);
+            $file_name = __DIR__ . "/../../images/".
+                urldecode($_REQUEST['file_name']);
             if (file_exists($file_name)) {
                 $test->header("Content-Type: " . $test->mimeType($file_name));
                 echo $test->fileGetContents($file_name);
@@ -44,10 +47,11 @@ $test->get('/{file_name}', function () use ($test) {
 );
 if($test->isCli()) {
    $test->listen(8080, ['SERVER_CONTEXT' => ['ssl' => [
-      'local_cert' => 'server.crt', /* Self-signed cert - in practice get signed
+      'local_cert' => __DIR__ . "/../../security/server.crt",
+                                   /* Self-signed cert - in practice get signed
                                       by some certificate authority
                                    */
-      'local_pk' => 'server.key', // Private key
+      'local_pk' => __DIR__ . "/../../security/server.key", // Private key
       'allow_self_signed' => true,
       'verify_peer' => false,
       "alpn_protocols" => "h2,http/1.1"

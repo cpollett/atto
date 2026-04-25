@@ -1,9 +1,9 @@
 <?php
 /**
- * seekquarry\yioop\Website --
+ * seekquarry\atto\Website --
  * a small web server and web routing engine
  *
- * Copyright (C) 2018-2020  Chris Pollett chris@pollett.org
+ * Copyright (C) 2018-2026  Chris Pollett chris@pollett.org
  *
  * LICENSE:
  *
@@ -25,7 +25,7 @@
  * @author Chris Pollett chris@pollett.org
  * @license https://www.gnu.org/licenses/ GPL3
  * @link https://www.seekquarry.com/
- * @copyright 2018-2024
+ * @copyright 2018-2026
  * @filesource
  */
 
@@ -75,6 +75,29 @@ class WebSite
         as the first data on an H2 connection (RFC 7540 sec 3.5)
      */
     const H2_CLIENT_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    /*
+        Magic GUID concatenated with the client-supplied
+        Sec-WebSocket-Key during the WebSocket handshake to compute
+        the Sec-WebSocket-Accept response header (RFC 6455 sec 4.2.2)
+     */
+    const WS_MAGIC_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    /*
+        WebSocket frame opcodes (RFC 6455 sec 5.2). Continuation is
+        used for fragmented messages; text and binary are application
+        data; close, ping, pong are control frames.
+     */
+    const WS_OPCODE_CONTINUATION = 0x0;
+    const WS_OPCODE_TEXT = 0x1;
+    const WS_OPCODE_BINARY = 0x2;
+    const WS_OPCODE_CLOSE = 0x8;
+    const WS_OPCODE_PING = 0x9;
+    const WS_OPCODE_PONG = 0xA;
+    /*
+        Maximum permitted size of a single inbound WebSocket message
+        in bytes. Messages exceeding this cause the connection to be
+        closed with status 1009 (message too big).
+     */
+    const WS_MAX_MESSAGE_SIZE = 1048576;
     /**
      * Keys of stream that won't disappear (for example the server socket)
      * @var array
@@ -109,7 +132,7 @@ class WebSite
      */
     protected $routes = ["CONNECT" => [], "DELETE"  => [], "ERROR"  => [],
         "GET" => [], "HEAD" => [], "OPTIONS"  => [], "POST"  => [],
-        "PUT" => [], "TRACE" => []];
+        "PUT" => [], "TRACE" => [], "WS" => []];
     /**
      * Default values used to set up session variables
      * @var array
@@ -199,6 +222,30 @@ class WebSite
      * @var bool
      */
     protected $is_secure = false;
+    /**
+     * List of acceptable Origin header values for WebSocket
+     * upgrade requests, or empty array to accept any origin.
+     * @var array
+     */
+    protected $ws_allowed_origins = [];
+    /**
+     * Seconds between server-initiated PINGs to each established
+     * WebSocket connection. Zero disables the keepalive timer.
+     * @var int
+     */
+    protected $ws_keepalive_interval = 30;
+    /**
+     * Seconds without a PONG response after which a WebSocket
+     * connection is considered dead and closed.
+     * @var int
+     */
+    protected $ws_keepalive_timeout = 60;
+    /**
+     * Whether the keepalive timer has been registered with the
+     * timer heap. Set on first WebSocket upgrade.
+     * @var bool
+     */
+    protected $ws_keepalive_registered = false;
     /**
      * Sets the base path used for determining request routes. Sets
      * precision for timed events and sets up timer heap and other
@@ -314,6 +361,72 @@ class WebSite
         }
         $this->routes[$method][$route] = $callback;
     }
+    /**
+     * Registers a WebSocket route. When a client sends a WebSocket
+     * upgrade request whose URI matches $route, the handshake is
+     * completed automatically and $callback is invoked once with a
+     * WebSocket object. The callback typically registers handlers
+     * via $ws->onMessage() and $ws->onClose() and may send an
+     * initial greeting frame via $ws->send(). Subsequent inbound
+     * frames are read from the event loop and dispatched to the
+     * registered handlers without re-invoking $callback.
+     *
+     * @param string $route URI pattern matching the WebSocket path,
+     *      using the same {var_name} and * syntax as get/post routes
+     * @param callable $callback function called once on successful
+     *      upgrade with a single WebSocket argument
+     */
+    public function ws($route, callable $callback)
+    {
+        $this->addRoute("WS", $route, $callback);
+    }
+    /**
+     * Restricts which Origin header values are accepted for
+     * WebSocket upgrade requests. By default all origins are
+     * accepted, which is appropriate for development and for
+     * services that intentionally expose themselves to any web
+     * page. For production deployments behind a known origin,
+     * pass an array of exact origin strings (scheme + host +
+     * optional port, no trailing slash).
+     *
+     * Example:
+     *   $site->setAllowedOrigins(['https://example.com',
+     *       'https://www.example.com']);
+     *
+     * Requests whose Origin header is not in the list receive a
+     * 403 Forbidden during the WebSocket handshake. Requests
+     * lacking an Origin header (typically from non-browser
+     * clients like curl, native apps, or test scripts) are
+     * always allowed since the protection target is the browser
+     * same-origin model.
+     *
+     * @param array $origins list of acceptable origin strings,
+     *      or empty array to allow all origins
+     */
+    public function setAllowedOrigins(array $origins)
+    {
+        $this->ws_allowed_origins = $origins;
+    }
+    /**
+     * Configures the keepalive timer for established WebSocket
+     * connections. Every $interval seconds the server sends a
+     * PING to each open WebSocket. If a PONG is not received
+     * within $timeout seconds of the last PING, the connection
+     * is presumed dead and closed. Pass interval = 0 to disable
+     * keepalive entirely (the default is 30 seconds with a 60
+     * second timeout, which is appropriate for most NAT and
+     * load balancer idle-connection timers).
+     *
+     * @param int $interval seconds between server PINGs, or 0
+     *      to disable
+     * @param int $timeout seconds without PONG after which a
+     *      connection is closed as dead
+     */
+    public function setWebSocketKeepalive($interval, $timeout = 60)
+    {
+        $this->ws_keepalive_interval = $interval;
+        $this->ws_keepalive_timeout = $timeout;
+    }
 
     /**
      * Adds a middle ware callback that should be called before any processing
@@ -337,6 +450,28 @@ class WebSite
         }
         foreach ($this->middle_wares as $middleware) {
             $middleware();
+        }
+        /*
+            WebSocket upgrades cannot be handled in SAPI mode
+            (PHP-FPM, mod_php, CGI) because those environments do
+            not expose the underlying TCP socket to the script.
+            If the request is a WebSocket upgrade, emit a 501 with
+            an explanatory message so the developer knows to run
+            the server in CLI mode (or behind a reverse proxy that
+            forwards to a CLI Atto server).
+         */
+        if (!empty($_SERVER['HTTP_UPGRADE'])
+            && strtolower($_SERVER['HTTP_UPGRADE']) === 'websocket') {
+            header("HTTP/1.1 501 Not Implemented");
+            header("Content-Type: text/plain");
+            echo "WebSocket upgrades require running this script "
+                . "from the command line (php index.php). The PHP "
+                . "SAPI used by Apache, nginx-FPM, and CGI does not "
+                . "expose the underlying TCP socket and so cannot "
+                . "handle WebSocket frames. A typical deployment "
+                . "runs the CLI server on an internal port behind "
+                . "a reverse proxy.\n";
+            return;
         }
         // Handle Upgrade Header
         if (isset($_SERVER['HTTP_UPGRADE']) &&
@@ -818,8 +953,8 @@ class WebSite
      * @param callable $callback a function to be called after now + $time
      * @param bool $repeating whether $callback should be called every $time
      *      seconds or just once.
-     * @return int an id for the timer that can be used to turn it off (@see
-     *      clearTimer())
+     * @return string an id for the timer that can be used to turn
+     *      it off (@see clearTimer())
      */
     public function setTimer($time, callable $callback, $repeating = true)
     {
@@ -827,14 +962,30 @@ class WebSite
             throw new \Exception("Atto WebSite Timers require CLI execution");
         }
         $next_time = microtime(true) + $time;
-        $this->timers[$next_time] = [$repeating, $time, $callback];
-        $this->timer_alarms->insert([$next_time, $next_time]);
-        return $next_time;
+        /*
+            Use a string key for the timers map. PHP array keys are
+            always ints or strings, so a float key like
+            1777158012.190742 would be implicitly truncated to int
+            (and emit a deprecation notice on PHP 8.1+). Storing
+            the key as a string preserves the full microsecond
+            precision and lets processTimers look it up reliably.
+         */
+        $key = (string) $next_time;
+        $this->timers[$key] = [$repeating, $time, $callback];
+        $this->timer_alarms->insert([$next_time, $key]);
+        return $key;
     }
     /**
-     * Deletes a timer for the list of active timers. (@see setTimer)
+     * Deletes a timer from the list of active timers. The fact
+     * that the timer is removed from the timers map but not from
+     * the timer_alarms heap is intentional. processTimers checks
+     * the timers map before invoking each callback, so a removed
+     * timer is silently skipped when its alarm fires; explicitly
+     * scrubbing the heap would be O(n) per cancellation.
+     * (@see setTimer)
      *
-     * @param int $timer_id the id of the timer to remove
+     * @param string $timer_id the id of the timer to remove,
+     *      as returned by setTimer
      */
     public function clearTimer($timer_id)
     {
@@ -1240,13 +1391,25 @@ class WebSite
         $top = $this->timer_alarms->top();
         while ($now > $top[0]) {
             $this->timer_alarms->extract();
-            if (!empty($this->timers["{$top[1]}"])) {
-                list($repeating, $time, $callback) = $this->timers["{$top[1]}"];
+            $key = (string) $top[1];
+            if (!empty($this->timers[$key])) {
+                list($repeating, $time, $callback) =
+                    $this->timers[$key];
                 $callback();
                 if ($repeating) {
                     $next_time = $now + $time;
-                    $this->timer_alarms->insert([$next_time, $top[1]]);
+                    $new_key = (string) $next_time;
+                    $this->timers[$new_key] =
+                        [$repeating, $time, $callback];
+                    unset($this->timers[$key]);
+                    $this->timer_alarms->insert(
+                        [$next_time, $new_key]);
+                } else {
+                    unset($this->timers[$key]);
                 }
+            }
+            if ($this->timer_alarms->isEmpty()) {
+                return;
             }
             $top = $this->timer_alarms->top();
         }
@@ -1292,7 +1455,18 @@ class WebSite
                 $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'])
                 && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']
                     == "HTTP/2.0";
-            if ($is_h2) {
+            $is_ws = !empty(
+                $this->in_streams[self::CONTEXT][$key]['IS_WEBSOCKET']);
+            if ($is_ws) {
+                /*
+                    Established WebSocket connection. parseWsRequest
+                    reads one frame, dispatches text/binary messages
+                    to the registered onMessage callback, and answers
+                    pings or close frames inline.
+                 */
+                $this->parseWsRequest($key,
+                    $this->in_streams[self::CONNECTION][$key]);
+            } else if ($is_h2) {
                 /*
                     H2 connections bypass the chunk-read and out_streams
                     async write path entirely. parseH2Request does its own
@@ -1316,6 +1490,24 @@ class WebSite
                     $this->initializeBadRequestResponse($key);
                 }
                 if ($too_long || $this->parseRequest($key, $data)) {
+                    /*
+                        Detect WebSocket upgrade requests after
+                        parseRequest has populated the HTTP_*
+                        headers. If the client requested an
+                        upgrade and we have a matching ws() route,
+                        complete the handshake and switch the
+                        connection to WebSocket mode instead of
+                        producing a normal HTTP response.
+                     */
+                    if (empty($this->in_streams[self::CONTEXT][$key][
+                            'BAD_RESPONSE'])
+                        && $this->isWebSocketUpgrade($key)
+                        && $this->handleWebSocketUpgrade($key,
+                            $in_stream)) {
+                        $this->in_streams[self::MODIFIED_TIME][$key]
+                            = time();
+                        continue;
+                    }
                     if (!empty($this->in_streams[self::CONTEXT][$key][
                             'PRE_BAD_RESPONSE'])) {
                         $this->in_streams[self::CONTEXT][$key][
@@ -1692,6 +1884,342 @@ class WebSite
         return $buffer;
     }
     /**
+     * Detects whether the most recently parsed HTTP request on a
+     * connection is a WebSocket upgrade per RFC 6455 sec 4.1. A
+     * valid upgrade has Upgrade: websocket, Connection: upgrade
+     * (case-insensitive, possibly comma-separated for Connection),
+     * and a 16-byte base64-encoded Sec-WebSocket-Key.
+     *
+     * @param int $key connection key in in_streams
+     * @return bool true if this connection should be upgraded
+     */
+    protected function isWebSocketUpgrade($key)
+    {
+        $context = $this->in_streams[self::CONTEXT][$key];
+        if (empty($context['HTTP_UPGRADE'])
+            || empty($context['HTTP_CONNECTION'])
+            || empty($context['HTTP_SEC_WEBSOCKET_KEY'])) {
+            return false;
+        }
+        if (strtolower(trim($context['HTTP_UPGRADE'])) !== 'websocket') {
+            return false;
+        }
+        $connection_lc = strtolower($context['HTTP_CONNECTION']);
+        if (strpos($connection_lc, 'upgrade') === false) {
+            return false;
+        }
+        return true;
+    }
+    /**
+     * Completes the WebSocket handshake for a connection that has
+     * been validated as an upgrade request. Looks up the URI in
+     * the WS routes table, sends the 101 Switching Protocols
+     * response with the computed Sec-WebSocket-Accept header,
+     * marks the connection as a WebSocket in its context, then
+     * invokes the registered route handler exactly once with a
+     * WebSocket object so it can register frame handlers and send
+     * an initial greeting.
+     *
+     * @param int $key connection key in in_streams
+     * @param resource $connection client socket
+     * @return bool true on successful upgrade, false if no
+     *      matching ws() route was found (caller falls back to
+     *      normal HTTP processing which will produce a 404)
+     */
+    protected function handleWebSocketUpgrade($key, $connection)
+    {
+        $context = $this->in_streams[self::CONTEXT][$key];
+        if (!$this->checkWebSocketOrigin($context)) {
+            $forbidden = "HTTP/1.1 403 Forbidden\r\n"
+                . "Content-Type: text/plain\r\n"
+                . "Content-Length: 16\r\n\r\n"
+                . "Origin forbidden";
+            @fwrite($connection, $forbidden);
+            $this->shutdownHttpStream($key);
+            return true;
+        }
+        $uri = $context['REQUEST_URI'] ?? '/';
+        $question_pos = strpos($uri, '?');
+        $path = ($question_pos === false) ? $uri
+            : substr($uri, 0, $question_pos);
+        if (!empty($this->base_path)
+            && strpos($path, $this->base_path) === 0) {
+            $path = substr($path, strlen($this->base_path));
+        }
+        if ($path === '') {
+            $path = '/';
+        }
+        $callback = $this->findWsRoute($path);
+        if ($callback === null) {
+            return false;
+        }
+        $client_key = trim($context['HTTP_SEC_WEBSOCKET_KEY']);
+        $accept = base64_encode(
+            sha1($client_key . self::WS_MAGIC_GUID, true));
+        $response = "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\n"
+            . "Connection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: " . $accept . "\r\n"
+            . "\r\n";
+        $this->in_streams[self::CONTEXT][$key]['IS_WEBSOCKET'] = true;
+        $this->in_streams[self::DATA][$key] = "";
+        $ws = new WebSocket($connection, $key, $this);
+        $this->in_streams[self::CONTEXT][$key]['WS'] = $ws;
+        $this->wsEnqueueWrite($key, $response);
+        if (!$this->ws_keepalive_registered
+            && $this->ws_keepalive_interval > 0) {
+            $this->registerWsKeepalive();
+        }
+        try {
+            $callback($ws);
+        } catch (\Exception $e) {
+            if ($ws->on_error !== null) {
+                ($ws->on_error)($e->getMessage(), $ws);
+            }
+        }
+        return true;
+    }
+    /**
+     * Validates the Origin header of a WebSocket upgrade against
+     * the allowed_origins list configured via setAllowedOrigins.
+     * If no list is configured all origins pass. Requests with
+     * no Origin header (typically non-browser clients) are
+     * always allowed since the protection model targets the
+     * browser same-origin policy.
+     *
+     * @param array $context request context with HTTP_* headers
+     * @return bool true if the request should proceed, false if
+     *      it should be rejected with 403
+     */
+    protected function checkWebSocketOrigin($context)
+    {
+        if (empty($this->ws_allowed_origins)) {
+            return true;
+        }
+        if (empty($context['HTTP_ORIGIN'])) {
+            return true;
+        }
+        return in_array($context['HTTP_ORIGIN'],
+            $this->ws_allowed_origins, true);
+    }
+    /**
+     * Appends a binary blob (already-built WebSocket frame, or
+     * the 101 handshake response) to the out_streams buffer for
+     * a connection. The event loop drains the buffer to the
+     * socket as it becomes writable, handling partial writes
+     * via processResponseStreams. Sets up the out_streams entry
+     * if none exists yet for this key.
+     *
+     * @param int $key connection key
+     * @param string $data binary bytes to send
+     */
+    public function wsEnqueueWrite($key, $data)
+    {
+        if (empty($this->out_streams[self::CONNECTION][$key])) {
+            $this->out_streams[self::CONNECTION][$key] =
+                $this->in_streams[self::CONNECTION][$key];
+            $this->out_streams[self::DATA][$key] = $data;
+            $this->out_streams[self::CONTEXT][$key] =
+                ['IS_WEBSOCKET' => true];
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        } else {
+            $this->out_streams[self::DATA][$key] .= $data;
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        }
+    }
+    /**
+     * Registers the periodic keepalive timer that walks all
+     * established WebSocket connections, sends a PING to those
+     * that have not received any frame in the last
+     * ws_keepalive_interval seconds, and closes those that have
+     * not received any frame in the last ws_keepalive_timeout
+     * seconds. Called once on the first successful WebSocket
+     * upgrade.
+     */
+    protected function registerWsKeepalive()
+    {
+        $this->ws_keepalive_registered = true;
+        $this->setTimer($this->ws_keepalive_interval, function () {
+            $this->wsKeepalivePass();
+        }, true);
+    }
+    /**
+     * One pass of the keepalive scan. Sends a PING to each
+     * idle WebSocket and closes any that are past the
+     * keepalive timeout without a recent frame from the client.
+     */
+    protected function wsKeepalivePass()
+    {
+        $now = time();
+        $contexts = $this->in_streams[self::CONTEXT] ?? [];
+        foreach ($contexts as $key => $context) {
+            if (empty($context['IS_WEBSOCKET'])
+                || empty($context['WS'])) {
+                continue;
+            }
+            $ws = $context['WS'];
+            if ($ws->closed) {
+                continue;
+            }
+            if ($now - $ws->last_pong_time
+                > $this->ws_keepalive_timeout) {
+                $this->shutdownHttpStream($key);
+                if ($ws->on_close !== null) {
+                    ($ws->on_close)($ws);
+                }
+                continue;
+            }
+            if ($now - $ws->last_pong_time
+                >= $this->ws_keepalive_interval) {
+                $ws->last_ping_time = $now;
+                $this->wsEnqueueWrite($key,
+                    WebSocketFrame::build(self::WS_OPCODE_PING,
+                        ""));
+            }
+        }
+    }
+    /**
+     * Looks up a registered ws() route that matches the given
+     * path. Supports the same {var_name} placeholder and *
+     * wildcard syntax as get/post routes; matched placeholders
+     * are written into $_REQUEST so the handler can read them.
+     *
+     * @param string $path request URI path with base_path stripped
+     * @return callable|null matched callback, or null if no
+     *      ws() route matches
+     */
+    protected function findWsRoute($path)
+    {
+        if (empty($this->routes['WS'])) {
+            return null;
+        }
+        foreach ($this->routes['WS'] as $route_pattern => $callback) {
+            if ($route_pattern === $path) {
+                return $callback;
+            }
+            $regex = preg_replace('/\{([^}]+)\}/',
+                '(?P<$1>[^/]+)', $route_pattern);
+            $regex = str_replace('*', '.*', $regex);
+            $regex = '#^' . $regex . '$#';
+            if (preg_match($regex, $path, $matches)) {
+                foreach ($matches as $name => $value) {
+                    if (!is_int($name)) {
+                        $_REQUEST[$name] = $value;
+                        $_GET[$name] = $value;
+                    }
+                }
+                return $callback;
+            }
+        }
+        return null;
+    }
+    /**
+     * Reads one WebSocket frame from an established connection
+     * and dispatches it. Text and binary frames are buffered into
+     * the WebSocket fragment buffer and, when the FIN bit arrives,
+     * delivered to the registered onMessage callback. Ping frames
+     * are answered with a pong inline. Close frames trigger the
+     * onClose callback and shut down the stream. Frames exceeding
+     * WS_MAX_MESSAGE_SIZE cause the connection to be closed with
+     * status code 1009.
+     *
+     * @param int $key connection key in in_streams
+     * @param resource $connection client socket to read from
+     */
+    protected function parseWsRequest($key, $connection)
+    {
+        stream_set_blocking($connection, true);
+        $frame = WebSocketFrame::read($connection);
+        stream_set_blocking($connection, false);
+        $ws = $this->in_streams[self::CONTEXT][$key]['WS'] ?? null;
+        if ($frame === null) {
+            if ($ws !== null && $ws->on_close !== null) {
+                ($ws->on_close)($ws);
+            }
+            $this->shutdownHttpStream($key);
+            return;
+        }
+        if ($ws === null) {
+            $this->shutdownHttpStream($key);
+            return;
+        }
+        /*
+            Any frame from the client counts as proof of life
+            for the keepalive timer, not just PONG frames.
+         */
+        $ws->last_pong_time = time();
+        if (!empty($frame['too_large'])) {
+            if ($ws->on_error !== null) {
+                ($ws->on_error)("Message exceeds maximum size", $ws);
+            }
+            $ws->close(1009, "Message too big");
+            return;
+        }
+        if (!$frame['masked']) {
+            /*
+                Per RFC 6455 sec 5.1 every client to server frame
+                must be masked. An unmasked frame is a protocol
+                error and the connection must be closed.
+             */
+            $ws->close(1002, "Unmasked client frame");
+            return;
+        }
+        $opcode = $frame['opcode'];
+        if ($opcode === self::WS_OPCODE_CLOSE) {
+            if (!$ws->closed) {
+                $ws->closed = true;
+                $this->wsEnqueueWrite($key,
+                    WebSocketFrame::build(self::WS_OPCODE_CLOSE,
+                        $frame['payload']));
+            }
+            if ($ws->on_close !== null) {
+                ($ws->on_close)($ws);
+            }
+            return;
+        }
+        if ($opcode === self::WS_OPCODE_PING) {
+            $this->wsEnqueueWrite($key,
+                WebSocketFrame::build(self::WS_OPCODE_PONG,
+                    $frame['payload']));
+            return;
+        }
+        if ($opcode === self::WS_OPCODE_PONG) {
+            return;
+        }
+        if ($opcode === self::WS_OPCODE_TEXT
+            || $opcode === self::WS_OPCODE_BINARY) {
+            $ws->fragment_buffer = $frame['payload'];
+            $ws->fragment_opcode = $opcode;
+        } else if ($opcode === self::WS_OPCODE_CONTINUATION) {
+            if (strlen($ws->fragment_buffer) + $frame['length']
+                > self::WS_MAX_MESSAGE_SIZE) {
+                $ws->close(1009, "Message too big");
+                return;
+            }
+            $ws->fragment_buffer .= $frame['payload'];
+        } else {
+            /*
+                Reserved opcode. RFC 6455 sec 5.2 says the receiver
+                must fail the connection.
+             */
+            $ws->close(1002, "Unknown opcode");
+            return;
+        }
+        if ($frame['fin']) {
+            $message = $ws->fragment_buffer;
+            $ws->fragment_buffer = "";
+            if ($ws->on_message !== null) {
+                try {
+                    ($ws->on_message)($message, $ws);
+                } catch (\Exception $e) {
+                    if ($ws->on_error !== null) {
+                        ($ws->on_error)($e->getMessage(), $ws);
+                    }
+                }
+            }
+        }
+    }
+    /**
      * Gets info about an incoming request stream and uses this to set up
      * an initial stream context. This context is used to populate the $_SERVER
      * variable when the request is later processed.
@@ -1754,7 +2282,27 @@ class WebSite
             }
             if ($remaining_bytes == 0) {
                 $context = $this->out_streams[self::CONTEXT][$key];
-                if ((!empty($context['HTTP_CONNECTION']) &&
+                if (!empty($context['IS_WEBSOCKET'])) {
+                    /*
+                        WebSocket: drain complete, but the
+                        underlying connection stays open for
+                        future frames. Just remove this entry
+                        from out_streams; the in_streams entry
+                        is unaffected. If the WebSocket has
+                        been marked closed, this drain was the
+                        outbound CLOSE frame, so now it is safe
+                        to tear down the connection.
+                     */
+                    $ws = $this->in_streams[self::CONTEXT][$key]['WS']
+                        ?? null;
+                    unset($this->out_streams[self::CONNECTION][$key],
+                        $this->out_streams[self::DATA][$key],
+                        $this->out_streams[self::CONTEXT][$key],
+                        $this->out_streams[self::MODIFIED_TIME][$key]);
+                    if ($ws !== null && $ws->closed) {
+                        $this->shutdownHttpStream($key);
+                    }
+                } else if ((!empty($context['HTTP_CONNECTION']) &&
                     strtolower($context['HTTP_CONNECTION']) == 'close') ||
                     empty($context['SERVER_PROTOCOL']) ||
                     $context['SERVER_PROTOCOL'] == 'HTTP/1.0') {
@@ -2043,6 +2591,19 @@ class WebSite
             }
             $meta = stream_get_meta_data(
                 $this->in_streams[self::CONNECTION][$key]);
+            if (!empty($this->in_streams[self::CONTEXT][$key][
+                    'IS_WEBSOCKET'])) {
+                /*
+                    WebSockets have their own keepalive timer in
+                    wsKeepalivePass; do not close them based on
+                    the generic HTTP idle timeout. EOF still
+                    applies so dead TCP connections are reaped.
+                 */
+                if ($meta['eof']) {
+                    $this->shutdownHttpStream($key);
+                }
+                continue;
+            }
             $in_time = empty($this->in_streams[self::MODIFIED_TIME][$key]) ?
                 0 : $this->in_streams[self::MODIFIED_TIME][$key];
             $out_time = empty($this->out_streams[self::MODIFIED_TIME][$key]) ?
@@ -2120,6 +2681,342 @@ class WebSite
  */
 class WebException extends \Exception
 {
+}
+/**
+ * Static helpers for parsing and serializing WebSocket frames per
+ * RFC 6455 section 5.2. Frames consist of a 2 to 14 byte header
+ * encoding FIN bit, opcode, mask bit, payload length, optional
+ * masking key, and the payload itself. All client-to-server frames
+ * are masked; server-to-client frames must not be masked.
+ */
+class WebSocketFrame
+{
+    /**
+     * Reads one complete WebSocket frame from a connection,
+     * blocking until all bytes are available. Unmasks the payload
+     * if the mask bit is set. Returns an associative array with
+     * the parsed fields, or null if the connection closes mid-frame.
+     *
+     * @param resource $connection client socket to read from
+     * @return array|null array with keys 'fin' (bool),
+     *      'opcode' (int), 'masked' (bool), 'payload' (string),
+     *      and 'length' (int) on success; null on EOF
+     */
+    public static function read($connection)
+    {
+        $hdr = self::readExactly($connection, 2);
+        if ($hdr === null) {
+            return null;
+        }
+        $byte1 = ord($hdr[0]);
+        $byte2 = ord($hdr[1]);
+        $fin = (bool)($byte1 & 0x80);
+        $opcode = $byte1 & 0x0F;
+        $masked = (bool)($byte2 & 0x80);
+        $length = $byte2 & 0x7F;
+        if ($length === 126) {
+            $ext = self::readExactly($connection, 2);
+            if ($ext === null) {
+                return null;
+            }
+            $length = unpack('n', $ext)[1];
+        } else if ($length === 127) {
+            $ext = self::readExactly($connection, 8);
+            if ($ext === null) {
+                return null;
+            }
+            /*
+                64-bit length: PHP integers are signed 64-bit on
+                most builds; clamp the high bit to avoid negative
+                values. Practically we limit message size below.
+             */
+            $unpacked = unpack('Nhi/Nlo', $ext);
+            $length = ($unpacked['hi'] << 32) | $unpacked['lo'];
+        }
+        if ($length > WebSite::WS_MAX_MESSAGE_SIZE) {
+            return ['fin' => $fin, 'opcode' => $opcode,
+                'masked' => $masked, 'payload' => '',
+                'length' => $length, 'too_large' => true];
+        }
+        $mask_key = '';
+        if ($masked) {
+            $mask_key = self::readExactly($connection, 4);
+            if ($mask_key === null) {
+                return null;
+            }
+        }
+        $payload = '';
+        if ($length > 0) {
+            $payload = self::readExactly($connection, $length);
+            if ($payload === null) {
+                return null;
+            }
+            if ($masked) {
+                $payload = self::unmask($payload, $mask_key);
+            }
+        }
+        return ['fin' => $fin, 'opcode' => $opcode,
+            'masked' => $masked, 'payload' => $payload,
+            'length' => $length, 'too_large' => false];
+    }
+    /**
+     * Builds the binary representation of an outbound (server to
+     * client) WebSocket frame. Server frames are never masked, so
+     * the mask bit is always zero. Always sets FIN since this
+     * server does not fragment outbound messages.
+     *
+     * @param int $opcode one of the WS_OPCODE_* constants
+     * @param string $payload binary payload bytes
+     * @return string binary serialized frame
+     */
+    public static function build($opcode, $payload)
+    {
+        $length = strlen($payload);
+        $byte1 = chr(0x80 | ($opcode & 0x0F));
+        if ($length < 126) {
+            $header = $byte1 . chr($length);
+        } else if ($length <= 0xFFFF) {
+            $header = $byte1 . chr(126) . pack('n', $length);
+        } else {
+            $header = $byte1 . chr(127)
+                . pack('NN', ($length >> 32) & 0xFFFFFFFF,
+                    $length & 0xFFFFFFFF);
+        }
+        return $header . $payload;
+    }
+    /**
+     * Unmasks a payload using the 4-byte masking key provided by
+     * the client. Per RFC 6455 sec 5.3, byte i of the unmasked
+     * payload is byte i of the masked payload XOR byte (i mod 4)
+     * of the masking key.
+     *
+     * @param string $payload masked binary payload
+     * @param string $mask_key 4-byte masking key
+     * @return string unmasked binary payload
+     */
+    private static function unmask($payload, $mask_key)
+    {
+        $unmasked = '';
+        $length = strlen($payload);
+        for ($i = 0; $i < $length; $i++) {
+            $unmasked .= $payload[$i] ^ $mask_key[$i % 4];
+        }
+        return $unmasked;
+    }
+    /**
+     * Reads exactly $count bytes from a connection, blocking until
+     * all bytes are available. Returns null if the connection
+     * closes before enough data arrives.
+     *
+     * @param resource $connection client socket to read from
+     * @param int $count number of bytes to read
+     * @return string|null binary string of length $count, or null
+     *      on EOF
+     */
+    private static function readExactly($connection, $count)
+    {
+        $data = '';
+        $remaining = $count;
+        while ($remaining > 0) {
+            $chunk = @fread($connection, $remaining);
+            if ($chunk === false || $chunk === '') {
+                if (feof($connection)) {
+                    return null;
+                }
+                continue;
+            }
+            $data .= $chunk;
+            $remaining -= strlen($chunk);
+        }
+        return $data;
+    }
+}
+/**
+ * Per-connection WebSocket handle passed to the user route handler.
+ * Wraps a stream resource and provides high-level send and event
+ * registration methods. Inbound frames are read from the event
+ * loop by WebSite::parseWsRequest which dispatches text and binary
+ * messages to the registered onMessage callback. Outbound writes
+ * are queued through the WebSite out_streams machinery so partial
+ * writes to slow clients do not block other connections.
+ */
+class WebSocket
+{
+    /**
+     * Underlying TCP (or TLS-wrapped) connection
+     * @var resource
+     */
+    public $connection;
+    /**
+     * Connection key used by the WebSite event loop to identify
+     * this connection in the in_streams arrays
+     * @var int
+     */
+    public $key;
+    /**
+     * Reference to the owning WebSite instance, used to enqueue
+     * outbound frames into its out_streams buffer
+     * @var WebSite
+     */
+    public $site;
+    /**
+     * User-supplied handler called with each complete inbound text
+     * or binary message
+     * @var callable|null
+     */
+    public $on_message;
+    /**
+     * User-supplied handler called when the connection closes
+     * @var callable|null
+     */
+    public $on_close;
+    /**
+     * User-supplied handler called when a protocol error occurs
+     * @var callable|null
+     */
+    public $on_error;
+    /**
+     * Buffer for accumulating fragmented messages across multiple
+     * frames before the FIN bit is set
+     * @var string
+     */
+    public $fragment_buffer = "";
+    /**
+     * Opcode of the first frame in a fragmented message; used to
+     * remember whether the assembled message is text or binary
+     * @var int
+     */
+    public $fragment_opcode = 0;
+    /**
+     * Whether close() has been called or a close frame received
+     * @var bool
+     */
+    public $closed = false;
+    /**
+     * Unix timestamp of the most recent PONG (or any frame from
+     * the client). Used by the keepalive timer to identify dead
+     * connections that have not responded to recent PINGs.
+     * @var int
+     */
+    public $last_pong_time;
+    /**
+     * Unix timestamp of the most recent PING sent by the server.
+     * Used to compute whether enough time has elapsed without a
+     * PONG to declare the connection dead.
+     * @var int
+     */
+    public $last_ping_time = 0;
+    /**
+     * Constructs a WebSocket handle around an open connection.
+     *
+     * @param resource $connection client socket already upgraded
+     *      from HTTP/1.1 to the WebSocket protocol
+     * @param int $key connection key used by the event loop
+     * @param WebSite $site owning WebSite instance used for
+     *      buffered outbound writes
+     */
+    public function __construct($connection, $key, $site)
+    {
+        $this->connection = $connection;
+        $this->key = $key;
+        $this->site = $site;
+        $this->last_pong_time = time();
+    }
+    /**
+     * Registers a callback invoked once for each complete inbound
+     * text or binary message. The callback receives the message
+     * payload as its first argument and this WebSocket as the
+     * second argument.
+     *
+     * @param callable $callback function(string $message,
+     *      WebSocket $ws)
+     */
+    public function onMessage(callable $callback)
+    {
+        $this->on_message = $callback;
+    }
+    /**
+     * Registers a callback invoked when the connection closes,
+     * either by remote close frame or by network failure.
+     *
+     * @param callable $callback function(WebSocket $ws)
+     */
+    public function onClose(callable $callback)
+    {
+        $this->on_close = $callback;
+    }
+    /**
+     * Registers a callback invoked on protocol errors such as
+     * messages exceeding the maximum size or malformed frames.
+     *
+     * @param callable $callback function(string $reason,
+     *      WebSocket $ws)
+     */
+    public function onError(callable $callback)
+    {
+        $this->on_error = $callback;
+    }
+    /**
+     * Sends a text message to the client. The payload should be a
+     * valid UTF-8 string per RFC 6455 sec 5.6; this method does
+     * not validate or transcode.
+     *
+     * @param string $message UTF-8 text payload to send
+     * @return bool true if queued for delivery, false if the
+     *      connection is already closed
+     */
+    public function send($message)
+    {
+        return $this->enqueue(WebSite::WS_OPCODE_TEXT, $message);
+    }
+    /**
+     * Sends a binary message to the client.
+     *
+     * @param string $data binary payload to send
+     * @return bool true if queued, false if already closed
+     */
+    public function sendBinary($data)
+    {
+        return $this->enqueue(WebSite::WS_OPCODE_BINARY, $data);
+    }
+    /**
+     * Sends a close frame and marks this WebSocket as closed.
+     * The actual TCP close happens after the close frame is
+     * fully written and the remote endpoint reciprocates (or
+     * after a timeout).
+     *
+     * @param int $code close status code (RFC 6455 sec 7.4)
+     * @param string $reason optional UTF-8 reason text
+     */
+    public function close($code = 1000, $reason = "")
+    {
+        if ($this->closed) {
+            return;
+        }
+        $this->closed = true;
+        $payload = pack('n', $code) . $reason;
+        $this->enqueue(WebSite::WS_OPCODE_CLOSE, $payload);
+    }
+    /**
+     * Builds a frame for the given opcode and payload and appends
+     * it to the WebSite out_streams buffer for this connection.
+     * The event loop will drain the buffer to the socket as it
+     * becomes writable, handling partial writes transparently.
+     *
+     * @param int $opcode WS_OPCODE_* constant
+     * @param string $payload binary payload bytes
+     * @return bool true if queued, false if already closed and
+     *      the opcode is not CLOSE
+     */
+    public function enqueue($opcode, $payload)
+    {
+        if ($this->closed && $opcode !== WebSite::WS_OPCODE_CLOSE) {
+            return false;
+        }
+        $frame = WebSocketFrame::build($opcode, $payload);
+        $this->site->wsEnqueueWrite($this->key, $frame);
+        return true;
+    }
 }
 /**
  * HTTP/2 frame handler classes

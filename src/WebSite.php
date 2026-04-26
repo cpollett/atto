@@ -1297,8 +1297,18 @@ class WebSite
             $php = (empty($_ENV['HHVM'])) ? "$php_path/php" : "$php_path/hhvm";
             $restart_arg = is_array($original_address)
                 ? "multi" : $original_address;
-            $script = "$php " . $_SERVER['SCRIPT_NAME'] .
-                " " . $restart_arg . " 2 \"$session_path\"";
+            /*
+                Escape every command-line argument so a route handler
+                that passes attacker-influenced strings into
+                webExit("restart ...") cannot smuggle shell
+                metacharacters. SCRIPT_NAME and PHP_PATH should be
+                trusted in normal usage but get escaped too as
+                defense in depth.
+             */
+            $script = escapeshellcmd($php) . " "
+                . escapeshellarg($_SERVER['SCRIPT_NAME']) . " "
+                . escapeshellarg((string) $restart_arg)
+                . " 2 " . escapeshellarg((string) $session_path);
             if (strstr(PHP_OS, "WIN")) {
                 $script = str_replace("/", "\\", $script);
             }
@@ -2032,7 +2042,26 @@ class WebSite
         }
         $client_settings->parseBody(
             $this->readExactly($connection, $settings_len));
-        $server_settings = new SettingsFrame(0, []);
+        /*
+            Server-advertised settings. We send these explicitly so
+            the client knows our limits rather than relying on
+            protocol defaults.
+              MAX_CONCURRENT_STREAMS=100 caps how many requests a
+                single client can have in flight on this connection
+                so a misbehaving peer cannot exhaust resources by
+                opening millions of streams.
+              MAX_FRAME_SIZE=16384 matches the H2_MAX_FRAME_SIZE
+                check in parseH2Request so the client knows the
+                limit.
+              INITIAL_WINDOW_SIZE=65535 is the HTTP/2 default,
+                emitted explicitly so flow-control state on both
+                sides starts in agreement.
+         */
+        $server_settings = new SettingsFrame(0, [
+            0x03 => 100,
+            0x04 => 65535,
+            0x05 => self::H2_MAX_FRAME_SIZE,
+        ]);
         fwrite($connection, $server_settings->serialize());
         $ack = new SettingsFrame(0, []);
         $ack->flags->add('ACK');
@@ -2091,6 +2120,32 @@ class WebSite
         }
         if ($frame instanceof SettingsFrame
             && !$frame->flags->contains('ACK')) {
+            /*
+                Apply settings the peer sent us. Currently we only
+                act on HEADER_TABLE_SIZE (0x01) since the encoder
+                must honor the decoder's table size or the peer
+                will reject our responses. Other settings are
+                accepted but ignored: ENABLE_PUSH (we never push),
+                MAX_CONCURRENT_STREAMS (this is a server hint to
+                clients, not the other direction),
+                INITIAL_WINDOW_SIZE and MAX_FRAME_SIZE (Atto does
+                not currently process inbound DATA frames so flow
+                control is moot), MAX_HEADER_LIST_SIZE (best-effort
+                only).
+             */
+            $hpack_encode = $this->in_streams[self::CONTEXT][$key][
+                'HPACK_ENCODE'] ?? null;
+            if ($hpack_encode !== null
+                && isset($frame->settings[0x01])) {
+                $octets = $frame->settings[0x01];
+                /*
+                    Atto's HPack tracks size in entries; convert
+                    the peer's octet-budget to a rough entry count
+                    using a conservative 40 bytes per entry.
+                 */
+                $entries = max(0, intdiv($octets, 40));
+                $hpack_encode->setMaxTableSize($entries);
+            }
             $ack = new SettingsFrame(0, []);
             $ack->flags->add('ACK');
             fwrite($connection, $ack->serialize());
@@ -2099,6 +2154,27 @@ class WebSite
         if (!($frame instanceof HeaderFrame)) {
             return false;
         }
+        /*
+            RFC 7540 sec 5.1.1: stream IDs initiated by a peer must
+            be strictly greater than any previous stream ID that
+            peer initiated on this connection. A frame whose stream
+            id is at or below the connection's high-water mark is
+            a protocol error and the connection must be closed.
+            Client-initiated streams are odd-numbered; we accept
+            even numbers too for permissiveness but track them
+            against the same high-water mark.
+         */
+        $client_stream_id = $frame->stream_id;
+        $high_water = $this->in_streams[self::CONTEXT][$key][
+            'H2_LAST_STREAM_ID'] ?? 0;
+        if ($client_stream_id <= $high_water) {
+            $goaway = new GoAwayFrame(0, $high_water, 0x1, "");
+            @fwrite($connection, $goaway->serialize());
+            $this->shutdownHttpStream($key);
+            return false;
+        }
+        $this->in_streams[self::CONTEXT][$key]['H2_LAST_STREAM_ID']
+            = $client_stream_id;
         $hpack_decode = $this->in_streams[self::CONTEXT][$key][
             'HPACK_DECODE'] ?? new HPack();
         $hpack_encode = $this->in_streams[self::CONTEXT][$key][
@@ -4925,6 +5001,31 @@ class HPack
     public function getHeadersTable()
     {
         return $this->headers_table;
+    }
+    /**
+     * Sets the maximum dynamic table size. Called by the H2 layer
+     * when the peer advertises a HEADER_TABLE_SIZE setting; the
+     * encoder needs to honor whatever upper bound the decoder will
+     * accept so emitted incremental-indexing entries do not push
+     * the decoder past its limit.
+     *
+     * Note: the HPack class internally tracks the table by entry
+     * count rather than the RFC 7541 octet count, so the value
+     * passed in is loosely interpreted. A peer-supplied octet limit
+     * is divided by an estimated average entry size of 40 bytes to
+     * convert; for an exact translation of RFC behavior the table
+     * accounting would need to be octet-based.
+     *
+     * @param int $size new dynamic table size in entries
+     */
+    public function setMaxTableSize($size)
+    {
+        $size = max(0, (int) $size);
+        $this->max_table_size = $size;
+        while (count($this->headers_table) - count(self::STATIC_TABLE)
+                > $this->max_table_size) {
+            $this->evictEntry();
+        }
     }
     /**
      * Evicts the first entry in the table and shifts the rest of the entries.

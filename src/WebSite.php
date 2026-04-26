@@ -1580,31 +1580,64 @@ class WebSite
         return $out_data;
     }
     /**
-     * Checks if a portion of a request uri path matches a Atto server route.
+    /**
+     * Checks if a portion of a request uri path matches an Atto server
+     * route. A route may contain {variable} placeholders that capture
+     * a single path segment each (no embedded slashes), and may
+     * contain * wildcards that match any sequence of characters
+     * including slashes. The match is anchored: the request path
+     * must equal the route shape from start to end. Captured
+     * {variable} values are returned as an associative array.
      *
-     * @param string $request_path part of a path portion of a request uri
-     * @param string $route a route that might be handled by Atto Server
-     * @return bool whether the requested path matches the given route.
+     * Anchoring example: a route '/foo/{bar}' matches '/foo/x' but
+     *      not '/wrap/foo/x' or '/foo/x/extra'.
+     * Segment-bounded example: a route '/files/{name}' matches
+     *      '/files/note' but not '/files/sub/note'. Use
+     *      '/files/*' if a multi-segment capture is wanted; the
+     *      captured text is then the request path tail starting
+     *      after the last fixed segment.
+     *
+     * @param string $request_path part of a path portion of a
+     *      request uri
+     * @param string $route a route that might be handled by Atto
+     * @return array|bool associative array of captured variables on
+     *      a successful match (empty array if the route had no
+     *      captures), or false if the route does not match
      */
     protected function checkMatch($request_path, $route)
     {
         $add_vars = [];
         $matches = false;
-        $magic_string = "PDTSTRTP";
+        /*
+            Two distinct magic strings so * and {var} can be
+            substituted with different regex fragments after
+            preg_quote escapes the literal portions of the route.
+            VAR_MAGIC becomes ([^/]+) (single-segment capture);
+            STAR_MAGIC becomes (.*) (multi-segment wildcard).
+         */
+        $var_magic = "PDTVARTP";
+        $star_magic = "PDTSTARTP";
         if (preg_match_all('/\*|\{[a-zA-Z][a-zA-Z0-9_]*\}/', $route,
             $matches) > 0) {
-            $route_regex = preg_replace('/\*|\{[a-zA-Z][a-zA-Z0-9_]*\}/',
-                $magic_string, $route);
-            $route_regex = preg_quote($route_regex, "/");
-            $route_regex = str_replace($magic_string, "(.*)", $route_regex);
-            if (preg_match_all("/$route_regex/", $request_path,
+            $route_regex = preg_replace_callback(
+                '/\*|\{[a-zA-Z][a-zA-Z0-9_]*\}/',
+                function ($m) use ($var_magic, $star_magic) {
+                    return ($m[0] === '*') ? $star_magic : $var_magic;
+                },
+                $route);
+            $route_regex = preg_quote($route_regex, "#");
+            $route_regex = str_replace($var_magic, "([^/]+)",
+                $route_regex);
+            $route_regex = str_replace($star_magic, "(.*)",
+                $route_regex);
+            if (preg_match("#^{$route_regex}$#", $request_path,
                 $request_matches) > 0) {
                 $num_matches = count($matches[0]);
                 array_shift($request_matches);
                 for ($i = 0; $i < $num_matches; $i++) {
                     $match_var = trim($matches[0][$i], "{}");
                     if ($match_var != "*") {
-                        $add_vars[$match_var] = $request_matches[$i][0];
+                        $add_vars[$match_var] = $request_matches[$i];
                     }
                 }
                 return $add_vars;

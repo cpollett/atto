@@ -571,18 +571,34 @@ class WebSite
         return $handled;
     }
     /**
-     * Adds a new HTTP header to the list of header that will be sent with
-     * HTTP response. If the value of $header begins with HTTP/ then it
-     * is assumed that $header is the response message not a header. In this
-     * case, the value of $header will become the response message, replacing
-     * any existing messages if present. This function defaults to PHP's
-     * built-in header() function when this script is run from a non-CLI
-     * context.
+     * Adds a new HTTP header to the list of headers that will be sent
+     * with the HTTP response. If the value of $header begins with
+     * HTTP/ then it is assumed that $header is the response message
+     * not a header. In this case, the value of $header will become
+     * the response message, replacing any existing messages if
+     * present. This function defaults to PHP's built-in header()
+     * function when this script is run from a non-CLI context.
      *
-     * @param string $header HTTP header or message to send with HTTP response
+     * Headers containing CR or LF are rejected to prevent CRLF
+     * (HTTP response splitting) injection. PHP's built-in header()
+     * has had this defense since 5.1.2; Atto matches that behavior
+     * for CLI mode where the header_data buffer is concatenated
+     * directly into the wire output. If a header is rejected this
+     * method writes a warning via trigger_error and returns false
+     * without modifying header_data.
+     *
+     * @param string $header HTTP header or message to send with the
+     *      HTTP response
+     * @return bool true if the header was accepted, false if
+     *      rejected for containing CRLF
      */
     public function header($header)
     {
+        if (strpbrk($header, "\r\n") !== false) {
+            trigger_error("Header contains CR or LF and was rejected"
+                . " to prevent response splitting", E_USER_WARNING);
+            return false;
+        }
         if ($this->isCli()) {
             if (strtolower(substr($header, 0, 5)) == 'http/') {
                 if (strtolower(substr($this->header_data, 0, 5)) == 'http/') {
@@ -602,6 +618,7 @@ class WebSite
         } else {
             header($header);
         }
+        return true;
     }
     /**
      * Emits a Link: rel=preload response header telling browsers to
@@ -678,16 +695,27 @@ class WebSite
         }
     }
     /**
-     * Starts a web session. This involves sending a HTTP cookie header
-     * with a unique value to identify the client. When this client returns
-     * the cookie, session data is looked up. When run in CLI mode session
-     * data is stored in RAM. When run under a different web server, this
-     * method defaults to PHP's built-in function session_start().
+     * Starts a web session. This involves sending an HTTP cookie
+     * header with a unique value to identify the client. When the
+     * client returns the cookie, session data is looked up. When
+     * run in CLI mode session data is stored in RAM. When run
+     * under a different web server, this method defaults to PHP's
+     * built-in function session_start().
      *
-     * @param array $options field that can be set are mainly related to the
-     *  session cookie: 'name' (for cookie name), 'cookie_path',
-     * 'cookie_lifetime' (in seconds from now), 'cookie_domain',
-     * 'cookie_secure', 'cookie_httponly'
+     * Session IDs are generated with random_bytes(32) hex-encoded
+     * for 256 bits of cryptographic entropy. Cookie-supplied
+     * session IDs are accepted only if they match the format and
+     * already exist in the in-memory session table; unknown IDs
+     * cause a fresh session to be created at a new random ID
+     * rather than the attacker-supplied value. This prevents
+     * session fixation attacks where an attacker plants a known
+     * cookie value and waits for the victim to authenticate.
+     *
+     * @param array $options fields that can be set are mainly
+     *      related to the session cookie: 'name' (for cookie
+     *      name), 'cookie_path', 'cookie_lifetime' (in seconds
+     *      from now), 'cookie_domain', 'cookie_secure',
+     *      'cookie_httponly'
      */
     public function sessionStart($options = [])
     {
@@ -698,27 +726,34 @@ class WebSite
                 }
             }
             $cookie_name = $options['name'];
-            $session_id = empty($_COOKIE[$cookie_name]) ? "" :
-                 $_COOKIE[$cookie_name];
+            $cookie_value = empty($_COOKIE[$cookie_name]) ? "" :
+                $_COOKIE[$cookie_name];
             $time = time();
             $lifetime = intval($options['cookie_lifetime']);
             $expires = max($time + $lifetime, 0);
             if ($lifetime <= 0) {
                 $lifetime = $time;
             }
-            if (empty($session_id)) {
-                $session_id = md5($cookie_name . microtime(true) .
-                    $this->default_server_globals['SERVER_SOFTWARE'] .
-                    $_SERVER['REMOTE_ADDR']);
+            /*
+                Only honor the cookie-supplied session id if it
+                matches our id format (64 hex chars) and the
+                session already exists server-side. Anything else
+                falls through to fresh session id generation. This
+                prevents session fixation where an attacker plants
+                a known id and tries to ride the victim's
+                authenticated session.
+             */
+            $session_id = "";
+            if ($cookie_value !== ""
+                && preg_match('/^[a-f0-9]{64}$/', $cookie_value)
+                && !empty($this->sessions[$cookie_value])) {
+                $session_id = $cookie_value;
+                $_SESSION = $this->sessions[$session_id]['DATA'];
+            } else {
+                $session_id = bin2hex(random_bytes(32));
                 $this->sessions[$session_id] = ['DATA' => []];
                 array_unshift($this->session_queue, $session_id);
                 $_SESSION = [];
-            } else {
-                if (empty($this->sessions[$session_id])) {
-                    $this->sessions[$session_id] = ['DATA' => []];
-                    array_unshift($this->session_queue, $session_id);
-                }
-                $_SESSION = $this->sessions[$session_id]['DATA'];
             }
             $this->sessions[$session_id]['TIME'] = $time;
             $last_time = count($this->session_queue) -1;

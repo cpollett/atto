@@ -55,13 +55,27 @@ $test->get('/', function() {
       run standalone from the command line.
     # The WebSite trigger() method can be used to invoke a different route
       Here if the file is not found we trigger a route to a file not found page
+
+    SECURITY: a route like /images/{file_name} captures everything after
+    /images/ into $_REQUEST['file_name'] including embedded slashes and
+    .. components. Naive concatenation of __DIR__ with the user-supplied
+    name would let a request for /images/../../../etc/passwd escape the
+    intended directory. We resolve the candidate path with realpath and
+    confirm the result is strictly inside the images base directory
+    before serving. The same containment pattern should be used in any
+    route that maps user-controlled path components onto disk.
  */
 $test->get('/images/{file_name}', function () use ($test) {
-        $file_name = __DIR__ .
-            "/../../images/" . urldecode($_REQUEST['file_name']);
-        if (file_exists($file_name)) {
-            $test->header("Content-Type: " . $test->mimeType($file_name));
-            echo $test->fileGetContents($file_name);
+        $base = realpath(__DIR__ . "/../../images");
+        $candidate = realpath($base . "/"
+            . urldecode($_REQUEST['file_name']));
+        $separator = DIRECTORY_SEPARATOR;
+        if ($base !== false && $candidate !== false
+            && strncmp($candidate, $base . $separator,
+                strlen($base) + 1) === 0
+            && is_file($candidate)) {
+            $test->header("Content-Type: " . $test->mimeType($candidate));
+            echo $test->fileGetContents($candidate);
         } else {
             $test->trigger("ERROR", "/404");
         }

@@ -32,13 +32,25 @@ $test->get('/', function()  use ($test) {
     </html>
 <?php
 });
+/*
+    SECURITY: see the matching note in examples/02 Serve Static Files.
+    The {file_name} capture pattern matches embedded slashes and .. so
+    the candidate path must be resolved with realpath and verified to
+    be inside the images directory before serving.
+ */
 $test->get('/{file_name}', function () use ($test) {
-        if(!empty($_REQUEST['file_name'])) {
-            $file_name = __DIR__ . "/../../images/".
-                urldecode($_REQUEST['file_name']);
-            if (file_exists($file_name)) {
-                $test->header("Content-Type: " . $test->mimeType($file_name));
-                echo $test->fileGetContents($file_name);
+        if (!empty($_REQUEST['file_name'])) {
+            $base = realpath(__DIR__ . "/../../images");
+            $candidate = realpath($base . "/"
+                . urldecode($_REQUEST['file_name']));
+            $separator = DIRECTORY_SEPARATOR;
+            if ($base !== false && $candidate !== false
+                && strncmp($candidate, $base . $separator,
+                    strlen($base) + 1) === 0
+                && is_file($candidate)) {
+                $test->header("Content-Type: "
+                    . $test->mimeType($candidate));
+                echo $test->fileGetContents($candidate);
             } else {
                 $test->trigger("ERROR", "/404");
             }

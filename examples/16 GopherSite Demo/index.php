@@ -67,19 +67,33 @@ Places to Visit:
     form /name.file_extension is called. Notice how the values
     that match these components are automatically mapped into PHP's
     $_REQUEST superglobal. In the case of our callback, we see if a
-    file with the give name exists in the current directory and if so
+    file with the given name exists in the current directory and if so
     return it. Otherwise, we trigger an error. To prevent the GopherSite
     server from trying to gopherize each line of the file, we add the
     argument true after the callback.
+
+    SECURITY: the {name} capture matches embedded slashes and ..
+    components, so a request like /../../etc/passwd.x would otherwise
+    let the client read arbitrary files on disk. Resolve the candidate
+    path with realpath and confirm it stays inside the example
+    directory before serving. The same containment idiom should be
+    used in any callback that maps user-controlled path components
+    onto disk.
  */
 $test->request('/{name}.{file_extension}', function() use ($test) {
-    $name = htmlspecialchars($_REQUEST["name"]);
-    $extension = htmlspecialchars($_REQUEST["file_extension"]);
-    $filename = "$name.$extension";
-    if (file_exists($filename)) {
-        echo $test->fileGetContents($filename);
+    $name = $_REQUEST["name"];
+    $extension = $_REQUEST["file_extension"];
+    $base = realpath(__DIR__);
+    $candidate = realpath($base . "/" . $name . "." . $extension);
+    $separator = DIRECTORY_SEPARATOR;
+    if ($base !== false && $candidate !== false
+        && strncmp($candidate, $base . $separator,
+            strlen($base) + 1) === 0
+        && is_file($candidate)) {
+        echo $test->fileGetContents($candidate);
     } else {
-        $test->trigger("ERROR", "/$name.$extension");
+        $test->trigger("ERROR", "/" . htmlspecialchars($name)
+            . "." . htmlspecialchars($extension));
     }
 }, true);
 /*

@@ -1145,6 +1145,7 @@ class WebSite
             "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
             "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
             "MAX_REQUEST_LEN" => 10000000, "MAX_SESSIONS" => 10000,
+            "MAX_INPUT_VARS" => 1000,
             "PATH" => $path,  "PHP_PATH" => "",
             "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
             "SERVER_SIGNATURE" => "",
@@ -2200,6 +2201,19 @@ class WebSite
         if (strpos($connection_lc, 'upgrade') === false) {
             return false;
         }
+        /*
+            RFC 6455 sec 4.1: Sec-WebSocket-Key is the base64
+            encoding of a 16-byte random value. That is exactly 24
+            characters ending with two padding characters '=='.
+            Reject anything that does not match the shape so we do
+            not feed garbage into sha1+base64 during the handshake
+            response computation.
+         */
+        $client_key = trim($context['HTTP_SEC_WEBSOCKET_KEY']);
+        if (!preg_match(
+                '/^[A-Za-z0-9+\/]{22}==$/', $client_key)) {
+            return false;
+        }
         return true;
     }
     /**
@@ -2221,6 +2235,27 @@ class WebSite
     protected function handleWebSocketUpgrade($key, $connection)
     {
         $context = $this->in_streams[self::CONTEXT][$key];
+        /*
+            RFC 6455 sec 4.4: if the version is missing or not 13
+            respond with 426 Upgrade Required and advertise the
+            supported version so a confused client can retry. We
+            send the response then close; the connection is not
+            kept alive for a renegotiation since Atto handles each
+            upgrade as a fresh request.
+         */
+        $version = trim(
+            $context['HTTP_SEC_WEBSOCKET_VERSION'] ?? '');
+        if ($version !== '13') {
+            $body = "WebSocket version 13 required";
+            $msg = "HTTP/1.1 426 Upgrade Required\r\n"
+                . "Sec-WebSocket-Version: 13\r\n"
+                . "Content-Type: text/plain\r\n"
+                . "Content-Length: " . strlen($body) . "\r\n\r\n"
+                . $body;
+            @fwrite($connection, $msg);
+            $this->shutdownHttpStream($key);
+            return true;
+        }
         if (!$this->checkWebSocketOrigin($context)) {
             $forbidden = "HTTP/1.1 403 Forbidden\r\n"
                 . "Content-Type: text/plain\r\n"
@@ -2524,25 +2559,64 @@ class WebSite
     {
         $connection = $this->in_streams[self::CONNECTION][$key];
         $remote_name = stream_socket_get_name($connection, true);
-        $remote_col = strrpos($remote_name, ":");
         $server_name = stream_socket_get_name($connection, false);
-        $server_col = strrpos($server_name, ":");
+        list($remote_addr, $remote_port) =
+            $this->splitAddressPort($remote_name);
+        list($server_addr, $server_port) =
+            $this->splitAddressPort($server_name);
         $this->in_streams[self::CONTEXT][$key] = array_merge(
             [
                 self::REQUEST_HEAD => false,
                 'REQUEST_METHOD' => false,
                 "CLIENT_HTTP" => "unknown",
-                "REMOTE_ADDR" => substr($remote_name, 0, $remote_col),
-                "REMOTE_PORT" => substr($remote_name, $remote_col + 1),
+                "REMOTE_ADDR" => $remote_addr,
+                "REMOTE_PORT" => $remote_port,
                 "REQUEST_TIME" => time(),
                 "REQUEST_TIME_FLOAT" => microtime(true),
-                "SERVER_ADDR" => substr($server_name, 0, $server_col),
-                "SERVER_PORT" => substr($server_name, $server_col + 1),
+                "SERVER_ADDR" => $server_addr,
+                "SERVER_PORT" => $server_port,
             ],
             $additional_context
         );
         $this->in_streams[self::DATA][$key] = "";
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
+    }
+    /**
+     * Splits a socket name string returned by stream_socket_get_name
+     * into separate address and port components. Handles IPv4 and
+     * hostname forms ("1.2.3.4:80", "host.example.com:80") as well
+     * as the bracketed IPv6 form ("[::1]:80"). For IPv6 the
+     * brackets are stripped from the address so downstream code that
+     * compares to bare addresses (inet_pton, allowlists) works
+     * uniformly across address families.
+     *
+     * @param string $name socket name as returned by
+     *      stream_socket_get_name
+     * @return array two-element list [address, port] with both
+     *      values as strings
+     */
+    protected function splitAddressPort($name)
+    {
+        if ($name === false || $name === null || $name === "") {
+            return ["", ""];
+        }
+        if (substr($name, 0, 1) === "[") {
+            $close = strpos($name, "]");
+            if ($close === false) {
+                return [$name, ""];
+            }
+            $addr = substr($name, 1, $close - 1);
+            $rest = substr($name, $close + 1);
+            $port = ($rest !== "" && $rest[0] === ":")
+                ? substr($rest, 1) : "";
+            return [$addr, $port];
+        }
+        $colon = strrpos($name, ":");
+        if ($colon === false) {
+            return [$name, ""];
+        }
+        return [substr($name, 0, $colon),
+            substr($name, $colon + 1)];
     }
     /**
      * Used to send response data to out stream for which responses have not
@@ -2748,6 +2822,19 @@ class WebSite
             $boundary = $matches[1];
             $raw_form_parts = preg_split("/-+$boundary/", $context['CONTENT']);
             array_pop($raw_form_parts);
+            /*
+                Cap the number of parts processed to MAX_INPUT_VARS
+                so a hostile multipart request with millions of
+                small parts cannot exhaust CPU or memory in this
+                loop. Parts past the cap are silently dropped; a
+                legitimate form will not approach this limit.
+             */
+            $max_input_vars = $this->default_server_globals[
+                'MAX_INPUT_VARS'] ?? 1000;
+            if (count($raw_form_parts) > $max_input_vars) {
+                $raw_form_parts = array_slice(
+                    $raw_form_parts, 0, $max_input_vars);
+            }
             foreach ($raw_form_parts as $raw_part) {
                 $head_content = explode("\x0D\x0A\x0D\x0A", $raw_part, 2);
                 if (count($head_content) != 2) {
@@ -2759,13 +2846,21 @@ class WebSite
                 $file_name = "";
                 $content_type = "";
                 foreach ($head_parts as $head_part) {
+                    /*
+                        Non-greedy capture so a multipart field name
+                        like 'evil"; injection="x' does not match
+                        past the first closing quote. The greedy
+                        (.*) version let attackers smuggle extra
+                        attributes into the parsed name.
+                     */
                     if(preg_match("/\s*Content-Disposition\:\s*form-data\;\s*" .
-                        "name\s*=\s*[\"\'](.*)[\"\']\s*\;\s*filename=".
-                        "\s*[\"\'](.*)[\"\']\s*/i", $head_part, $matches)) {
+                        "name\s*=\s*[\"\'](.*?)[\"\']\s*\;\s*filename=".
+                        "\s*[\"\'](.*?)[\"\']\s*/i", $head_part, $matches)) {
                         list(, $name, $file_name) = $matches;
                     } else if (preg_match(
                         "/\s*Content-Disposition\:\s*form-data\;\s*" .
-                        "name\s*=\s*[\"\'](.*)[\"\']/i", $head_part, $matches)){
+                        "name\s*=\s*[\"\'](.*?)[\"\']/i", $head_part,
+                        $matches)) {
                         $name = $matches[1];
                     }
                     if (preg_match( "/\s*Content-Type\:\s*([^\s]+)/i",
@@ -2794,8 +2889,25 @@ class WebSite
                     }
                     continue;
                 }
-                $file_array = ['name' => $file_name, 'tmp_name' => $file_name,
-                    'type' => $content_type, 'error' => 0, 'data' => $content,
+                /*
+                    tmp_name is conventionally a server-generated
+                    filesystem path that move_uploaded_file()
+                    validates. Atto keeps uploads in memory in the
+                    'data' field rather than writing temp files,
+                    so there is no real path to expose. Setting
+                    tmp_name to the client-supplied filename
+                    creates a footgun: code that does
+                    require($_FILES['x']['tmp_name']) or similar
+                    would dereference an attacker-controlled
+                    string. Use a synthetic non-path token
+                    instead so any such code fails obviously.
+                 */
+                $tmp_token = "atto-mem-upload-"
+                    . bin2hex(random_bytes(8));
+                $file_array = ['name' => $file_name,
+                    'tmp_name' => $tmp_token,
+                    'type' => $content_type, 'error' => 0,
+                    'data' => $content,
                     'size' => strlen($content)];
                 if (empty($_FILES[$name])) {
                     $_FILES[$name] = $file_array;
@@ -2817,7 +2929,14 @@ class WebSite
         if (!empty($_SERVER['HTTP_COOKIE'])) {
             $sent_cookies = explode(";", $_SERVER['HTTP_COOKIE']);
             foreach ($sent_cookies as  $cookie) {
-                $cookie_parts = explode("=", $cookie);
+                /*
+                    Split on only the first = so cookie values that
+                    contain = (commonly base64 padding) are preserved
+                    intact. RFC 6265 cookie-value may contain any
+                    octet except control chars, whitespace, and a
+                    handful of separators; = is allowed.
+                 */
+                $cookie_parts = explode("=", $cookie, 2);
                 if (count($cookie_parts) == 2) {
                     $_COOKIE[trim($cookie_parts[0])] = trim($cookie_parts[1]);
                 }
@@ -3675,14 +3794,34 @@ class WebSocket
      * The event loop will drain the buffer to the socket as it
      * becomes writable, handling partial writes transparently.
      *
+     * Outbound message frames (TEXT, BINARY, CONTINUATION) are
+     * capped at WebSite::WS_MAX_MESSAGE_SIZE so a buggy or
+     * malicious route handler cannot blast unbounded data at
+     * the client. Control frames (PING, PONG, CLOSE) are exempt
+     * from the cap since RFC 6455 sec 5.5 limits them to 125
+     * bytes anyway and this method does not enforce that limit
+     * (the caller is expected to comply).
+     *
      * @param int $opcode WS_OPCODE_* constant
      * @param string $payload binary payload bytes
      * @return bool true if queued, false if already closed and
-     *      the opcode is not CLOSE
+     *      the opcode is not CLOSE, or if the payload exceeds
+     *      WS_MAX_MESSAGE_SIZE for a message frame
      */
     public function enqueue($opcode, $payload)
     {
         if ($this->closed && $opcode !== WebSite::WS_OPCODE_CLOSE) {
+            return false;
+        }
+        if (($opcode === WebSite::WS_OPCODE_TEXT
+                || $opcode === WebSite::WS_OPCODE_BINARY
+                || $opcode === WebSite::WS_OPCODE_CONTINUATION)
+            && strlen($payload) > WebSite::WS_MAX_MESSAGE_SIZE) {
+            if ($this->on_error !== null) {
+                ($this->on_error)(
+                    "Outbound message exceeds WS_MAX_MESSAGE_SIZE",
+                    $this);
+            }
             return false;
         }
         $frame = WebSocketFrame::build($opcode, $payload);

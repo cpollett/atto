@@ -76,6 +76,17 @@ class WebSite
      */
     const H2_CLIENT_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     /*
+        Maximum permitted size of an inbound HTTP/2 frame payload
+        in bytes. Per RFC 7540 sec 6.5.2 the SETTINGS_MAX_FRAME_SIZE
+        default is 16384 (the value also advertised when the server
+        sends an empty SETTINGS). Frames larger than this are
+        rejected with FRAME_SIZE_ERROR and the connection is
+        torn down before the oversized payload is allocated, so
+        a malicious client cannot trigger memory exhaustion by
+        announcing huge frames.
+     */
+    const H2_MAX_FRAME_SIZE = 16384;
+    /*
         Magic GUID concatenated with the client-supplied
         Sec-WebSocket-Key during the WebSocket handshake to compute
         the Sec-WebSocket-Accept response header (RFC 6455 sec 4.2.2)
@@ -711,6 +722,15 @@ class WebSite
      * session fixation attacks where an attacker plants a known
      * cookie value and waits for the victim to authenticate.
      *
+     * Session table size is capped by MAX_SESSIONS (default
+     * 10000) in default_server_globals. Each request runs a
+     * soft cull of up to CULL_OLD_SESSION_NUM expired entries,
+     * and if the table is still over the cap a hard eviction
+     * pops oldest entries from the queue tail until the cap is
+     * met. This protects against memory exhaustion when a flood
+     * of cookie-less requests creates fresh sessions faster
+     * than the soft cull can clean them up.
+     *
      * @param array $options fields that can be set are mainly
      *      related to the session cookie: 'name' (for cookie
      *      name), 'cookie_path', 'cookie_lifetime' (in seconds
@@ -771,6 +791,32 @@ class WebSite
                         unset($this->sessions[$delete_id]);
                     }
                 }
+            }
+            /*
+                Hard cap on total session count. The soft cull
+                above only walks CULL_OLD_SESSION_NUM entries per
+                request, so a flood of cookie-less requests can
+                grow the session table faster than it shrinks.
+                If we are still over MAX_SESSIONS after the soft
+                cull, evict the oldest entries (the tail of
+                session_queue, since new IDs are array_unshift'd
+                onto the head) until we are back under the cap.
+                Reindex the queue at the end so the next soft
+                cull walks contiguous indices.
+             */
+            $max_sessions = $this->default_server_globals[
+                'MAX_SESSIONS'] ?? 10000;
+            if (count($this->sessions) > $max_sessions) {
+                $this->session_queue =
+                    array_values($this->session_queue);
+                while (count($this->sessions) > $max_sessions
+                    && !empty($this->session_queue)) {
+                    $oldest_id = array_pop($this->session_queue);
+                    unset($this->sessions[$oldest_id]);
+                }
+            } else {
+                $this->session_queue =
+                    array_values($this->session_queue);
             }
             $this->setCookie($cookie_name, $session_id, $expires,
                 $options['cookie_path'], $options['cookie_domain'],
@@ -1098,7 +1144,8 @@ class WebSite
             "DOCUMENT_ROOT" => getcwd(),
             "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
             "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
-            "MAX_REQUEST_LEN" => 10000000, "PATH" => $path,  "PHP_PATH" => "",
+            "MAX_REQUEST_LEN" => 10000000, "MAX_SESSIONS" => 10000,
+            "PATH" => $path,  "PHP_PATH" => "",
             "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
             "SERVER_SIGNATURE" => "",
             "USER" => empty($_SERVER['USER']) ? "" : $_SERVER['USER'],
@@ -1940,6 +1987,11 @@ class WebSite
             self::H2_FRAME_HEADER_LEN);
         [$client_settings, $settings_len] =
             Frame::parseFrameHeader($hdr);
+        if ($settings_len > self::H2_MAX_FRAME_SIZE) {
+            throw new \Exception(
+                "Initial SETTINGS frame exceeds max size: "
+                . $settings_len);
+        }
         if (!($client_settings instanceof SettingsFrame)) {
             throw new \Exception("Expected SETTINGS frame, got "
                 . get_class($client_settings));
@@ -1976,6 +2028,21 @@ class WebSite
             return false;
         }
         [$frame, $payload_len] = Frame::parseFrameHeader($hdr);
+        if ($payload_len > self::H2_MAX_FRAME_SIZE) {
+            /*
+                RFC 7540 sec 4.2: a frame size error is a connection
+                error. Send GOAWAY with FRAME_SIZE_ERROR (0x6) and
+                tear down before allocating the oversized payload.
+                We do not drain the announced payload because the
+                connection is being closed anyway and reading it
+                would defeat the purpose of the size check.
+             */
+            $goaway = new GoAwayFrame(0, 0, 0x6, "");
+            @fwrite($connection, $goaway->serialize());
+            stream_set_blocking($connection, false);
+            $this->shutdownHttpStream($key);
+            return false;
+        }
         $payload = $this->readExactly($connection, $payload_len);
         stream_set_blocking($connection, false);
         if ($frame instanceof GoAwayFrame) {
@@ -3382,16 +3449,52 @@ class WebSocketFrame
      * @return string|null binary string of length $count, or null
      *      on EOF
      */
-    private static function readExactly($connection, $count)
+    /**
+     * Reads exactly $count bytes from a connection. Returns the
+     * bytes on success, or null if the connection closed or the
+     * read deadline expired without enough data arriving.
+     *
+     * Uses stream_select with a 1-second slice when fread returns
+     * no data so a stalled client does not spin a CPU core. If no
+     * data arrives within $deadline_seconds total wall time the
+     * read aborts and the caller closes the connection.
+     *
+     * @param resource $connection client socket to read from
+     * @param int $count number of bytes to read
+     * @param int $deadline_seconds maximum wall-clock seconds to
+     *      wait for the full count to arrive before giving up
+     * @return string|null binary data of length $count, or null
+     *      on EOF or timeout
+     */
+    private static function readExactly($connection, $count,
+        $deadline_seconds = 30)
     {
         $data = '';
         $remaining = $count;
+        $deadline = time() + $deadline_seconds;
         while ($remaining > 0) {
             $chunk = @fread($connection, $remaining);
-            if ($chunk === false || $chunk === '') {
+            if ($chunk === false) {
+                return null;
+            }
+            if ($chunk === '') {
                 if (feof($connection)) {
                     return null;
                 }
+                if (time() >= $deadline) {
+                    return null;
+                }
+                /*
+                    Park on stream_select with a short timeout
+                    rather than busy-looping on fread. This pegs
+                    CPU usage at 0% on a stalled client instead
+                    of 100%. Bare list assignment with by-ref
+                    parameters is required by stream_select.
+                 */
+                $read = [$connection];
+                $write = null;
+                $except = null;
+                @stream_select($read, $write, $except, 1);
                 continue;
             }
             $data .= $chunk;
@@ -4817,9 +4920,12 @@ class HPack
             HPACK RFC 7541 section 6.2.1: incremental indexing always
             appends a new entry to the dynamic table. The name index
             only identifies which existing entry to copy the name
-            from and must never be overwritten.
+            from and must never be overwritten. addHeader applies
+            the same max-table-size eviction as the encoder so a
+            malicious peer cannot grow the per-connection table
+            without bound.
          */
-        $this->headers_table[] = [$name, $value];
+        $this->addHeader($name, $value);
         return [
             'decoded' => [$name => $value],
             'encoded' => [

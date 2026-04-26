@@ -750,10 +750,15 @@ class WebSite
                 $_COOKIE[$cookie_name];
             $time = time();
             $lifetime = intval($options['cookie_lifetime']);
-            $expires = max($time + $lifetime, 0);
-            if ($lifetime <= 0) {
-                $lifetime = $time;
-            }
+            $expires = ($lifetime > 0) ? $time + $lifetime : 0;
+            /*
+                For the in-memory session expiration math below we
+                need a non-zero "lifetime" so that recently-touched
+                sessions are not immediately culled when the cull
+                loop computes $item_time + $lifetime < $time. Use a
+                large default for session-scoped cookies.
+             */
+            $cull_lifetime = ($lifetime > 0) ? $lifetime : $time;
             /*
                 Only honor the cookie-supplied session id if it
                 matches our id format (64 hex chars) and the
@@ -786,7 +791,7 @@ class WebSite
                     unset($this->session_queue[$i]);
                 } else {
                     $item_time = $this->sessions[$delete_id]['TIME'];
-                    if ($item_time + $lifetime < $time) {
+                    if ($item_time + $cull_lifetime < $time) {
                         unset($this->session_queue[$i]);
                         unset($this->sessions[$delete_id]);
                     }

@@ -237,6 +237,14 @@ class WebSite
      */
     protected $listeners = [];
     /**
+     * Lazily-constructed ConnectionAcceptor that owns the
+     * accept-and-protocol-detect step. Created on first use by
+     * getConnectionAcceptor and reused for every accepted
+     * connection thereafter.
+     * @var ConnectionAcceptor|null
+     */
+    protected $connection_acceptor = null;
+    /**
      * List of acceptable Origin header values for WebSocket
      * upgrade requests, or empty array to accept any origin.
      * @var array
@@ -1448,7 +1456,6 @@ class WebSite
         }
         $out_data = ob_get_contents();
         ob_end_clean();
-
         if ($this->header_data == "UPGRADE") {
             $out_data = "";
             $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
@@ -1464,7 +1471,6 @@ class WebSite
             $this->sessions[$session_id]['DATA'] = $_SESSION;
         }
         $redirect = false;
-
         if (substr($this->header_data, 0, 5) != "HTTP/") {
             if (stristr($this->header_data, "Location") != false) {
                 $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
@@ -1703,12 +1709,13 @@ class WebSite
     }
     /**
      * Accepts a new incoming connection from a server socket and
-     * determines the HTTP protocol version. For TLS connections the
-     * H2 client magic string is read from the decrypted stream
-     * after the handshake completes. For cleartext connections the
-     * first bytes are peeked. H2 and h2c connections are handed to
-     * initH2Request. HTTP/1.1 and unknown connections are
-     * registered via initRequestStream for the normal event loop.
+     * determines the HTTP protocol version, then dispatches to the
+     * appropriate per-protocol initialization. The
+     * connection-and-detection details are handled by
+     * ConnectionAcceptor; this method is responsible for the
+     * post-detection wiring into the WebSite event loop and for
+     * dispatching to initH2Request or initRequestStream based on
+     * the detected client protocol.
      *
      * @param array $listener entry from $this->listeners with
      *      keys 'server' (the server resource), 'is_secure'
@@ -1718,8 +1725,6 @@ class WebSite
      */
     protected function processServerRequest($listener)
     {
-        $server = $listener['server'];
-        $is_secure = $listener['is_secure'];
         if ($this->timer_alarms->isEmpty()) {
             $timeout = ini_get("default_socket_timeout");
         } else {
@@ -1727,60 +1732,14 @@ class WebSite
             $timeout = max(min($next_alarm[0] - microtime(true),
                         ini_get("default_socket_timeout")), 0);
         }
-        if ($is_secure) {
-            stream_set_blocking($server, true);
-        }
-        $connection = stream_socket_accept($server, $timeout);
-        if ($is_secure) {
-            stream_set_blocking($server, false);
-        }
-        if (!$connection) {
-            echo "No connection accepted or timed out.\n";
+        $acceptor = $this->getConnectionAcceptor();
+        list($connection, $additional_context) =
+            $acceptor->accept($listener, $timeout);
+        if ($connection === null) {
             return;
         }
-        if ($is_secure) {
-            stream_set_blocking($connection, true);
-            if (!@stream_socket_enable_crypto(
-                    $connection, true,
-                    STREAM_CRYPTO_METHOD_TLS_SERVER)) {
-                $ssl_error = error_get_last();
-                echo "\n\nSSL Error: " . $ssl_error['message'];
-                fclose($connection);
-                return;
-            }
-            set_error_handler(null);
-            $custom_error_handler =
-                $this->default_server_globals[
-                "CUSTOM_ERROR_HANDLER"] ?? null;
-            set_error_handler($custom_error_handler);
-            /*
-                PHP does not expose the ALPN-negotiated protocol
-                so after the TLS handshake we read the decrypted
-                bytes while still in blocking mode. An H2 client
-                always sends the 24-byte magic string as its
-                first data.
-             */
-            $magic_len = strlen(self::H2_CLIENT_MAGIC);
-            $stream_start = fread($connection, $magic_len);
-            stream_set_blocking($connection, false);
-            if ($stream_start === self::H2_CLIENT_MAGIC) {
-                $additional_context =
-                    ["CLIENT_HTTP" => "HTTP/2.0"];
-            } else {
-                $additional_context =
-                    ["CLIENT_HTTP" => "HTTP/1.1",
-                    "LEFTOVER" => $stream_start];
-            }
-        } else {
-            /*
-                Cleartext: safe to peek since there is no TLS wrapping
-             */
-            $stream_start = stream_socket_recvfrom($connection, 512,
-                STREAM_PEEK);
-            $additional_context = !empty($stream_start)
-                ? $this->checkHttpType($stream_start)
-                : ["CLIENT_HTTP" => "unknown"];
-        }
+        $resource = $connection->resource();
+        $is_secure = $connection->is_secure;
         $additional_context['IS_SECURE'] = $is_secure;
         $additional_context['LISTENER_PORT'] =
             $listener['globals']['SERVER_PORT'] ?? '';
@@ -1794,16 +1753,16 @@ class WebSite
              */
             $additional_context['HTTPS'] = 'on';
         }
-        $key = (int) $connection;
-        $this->in_streams[self::CONNECTION][$key] = $connection;
+        $key = (int) $resource;
+        $this->in_streams[self::CONNECTION][$key] = $resource;
         $client_http = $additional_context["CLIENT_HTTP"];
         if ($client_http == "HTTP/2.0") {
             try {
                 /*
-                    TLS: magic was already consumed by fread
-                    during protocol detection
+                    TLS: magic was already consumed by the
+                    detection read in ConnectionAcceptor
                  */
-                $this->initH2Request($connection, false);
+                $this->initH2Request($resource, false);
                 $additional_context['HPACK_DECODE'] = new HPack();
                 $additional_context['HPACK_ENCODE'] = new HPack();
                 $this->initRequestStream($key,
@@ -1817,7 +1776,7 @@ class WebSite
                     Cleartext: STREAM_PEEK was used so the magic
                     is still in the buffer
                  */
-                $this->initH2Request($connection, true);
+                $this->initH2Request($resource, true);
                 $additional_context['HPACK_DECODE'] = new HPack();
                 $additional_context['HPACK_ENCODE'] = new HPack();
                 $this->initRequestStream($key,
@@ -1828,15 +1787,40 @@ class WebSite
         } else {
             $this->initRequestStream($key, $additional_context);
             /*
-                For TLS connections where the fread consumed bytes
-                that turned out to be HTTP/1.1, prepopulate the
-                stream data so parseRequest sees them.
+                For TLS connections where the detection read
+                consumed bytes that turned out to be HTTP/1.1,
+                prepopulate the stream data so parseRequest sees
+                them.
              */
             if (!empty($additional_context["LEFTOVER"])) {
                 $this->in_streams[self::DATA][$key] =
                     $additional_context["LEFTOVER"];
             }
         }
+    }
+    /**
+     * Lazily constructs the ConnectionAcceptor used by
+     * processServerRequest. The acceptor is wired with the H2
+     * client magic and with a callback that reinstalls our
+     * CUSTOM_ERROR_HANDLER after stream_socket_enable_crypto
+     * clears it.
+     *
+     * @return ConnectionAcceptor cached single instance
+     */
+    protected function getConnectionAcceptor()
+    {
+        if ($this->connection_acceptor === null) {
+            $site = $this;
+            $post_tls = function () use ($site) {
+                set_error_handler(null);
+                $custom = $site->default_server_globals[
+                    'CUSTOM_ERROR_HANDLER'] ?? null;
+                set_error_handler($custom);
+            };
+            $this->connection_acceptor = new ConnectionAcceptor(
+                self::H2_CLIENT_MAGIC, null, $post_tls);
+        }
+        return $this->connection_acceptor;
     }
     /**
      * Determines HTTP version from the ALPN protocol negotiated during
@@ -2887,6 +2871,350 @@ class WebSite
  */
 class WebException extends \Exception
 {
+}
+/**
+ * A thin wrapper around a single network connection. For HTTP/1.1
+ * and HTTP/2 connections this wraps a TCP stream resource (possibly
+ * with TLS enabled) and exposes one logical stream identified by
+ * stream id 0. The wrapper is deliberately small: it gives callers
+ * read/write/close methods that look the same regardless of the
+ * underlying transport, but for code that genuinely needs the raw
+ * resource (the H2 frame parser, stream_select in the event loop,
+ * stream_socket_get_name) the resource() method is available.
+ *
+ * The class is structured to admit a future Quic transport without
+ * requiring callers to be aware of which transport they are on. A
+ * QuicConnection subclass would override read/write to direct
+ * traffic to a specific QUIC stream and would override streamId()
+ * to return the QUIC stream id rather than 0.
+ */
+class Connection
+{
+    /**
+     * Underlying stream resource (TCP, possibly TLS-wrapped).
+     * @var resource
+     */
+    public $resource;
+    /**
+     * Whether this connection's transport is TLS-wrapped. Used by
+     * code paths that need to decide between cleartext and secure
+     * behavior independently of the listener that accepted it.
+     * @var bool
+     */
+    public $is_secure;
+    /**
+     * Constructs a Connection wrapping a stream resource.
+     *
+     * @param resource $resource open stream socket
+     * @param bool $is_secure whether the resource has had TLS
+     *      enabled via stream_socket_enable_crypto
+     */
+    public function __construct($resource, $is_secure = false)
+    {
+        $this->resource = $resource;
+        $this->is_secure = $is_secure;
+    }
+    /**
+     * Returns the underlying raw stream resource. Use this only
+     * when interacting with PHP stream functions that take a
+     * resource directly such as stream_select or
+     * stream_socket_get_name. Most data-flow paths should call
+     * read and write instead.
+     *
+     * @return resource the open stream resource
+     */
+    public function resource()
+    {
+        return $this->resource;
+    }
+    /**
+     * Returns the logical stream id for this connection. For TCP
+     * the entire connection is one byte stream so the stream id
+     * is always 0. A future QuicConnection would return the
+     * actual QUIC stream id here.
+     *
+     * @return int 0 for TCP-backed connections
+     */
+    public function streamId()
+    {
+        return 0;
+    }
+    /**
+     * Reads up to $max_bytes from the connection. Honors the
+     * current blocking mode of the underlying stream.
+     *
+     * @param int $max_bytes maximum bytes to read
+     * @return string|false bytes read, empty string at EOF or
+     *      when no data is available in non-blocking mode, or
+     *      false on error
+     */
+    public function read($max_bytes)
+    {
+        return @fread($this->resource, $max_bytes);
+    }
+    /**
+     * Writes $data to the connection.
+     *
+     * @param string $data bytes to write
+     * @return int|false number of bytes written, or false on
+     *      error. Callers must handle short writes by retrying
+     *      with the unwritten remainder.
+     */
+    public function write($data)
+    {
+        return @fwrite($this->resource, $data);
+    }
+    /**
+     * Sets blocking mode on the underlying stream.
+     *
+     * @param bool $blocking true for blocking, false for
+     *      non-blocking
+     */
+    public function setBlocking($blocking)
+    {
+        stream_set_blocking($this->resource, $blocking);
+    }
+    /**
+     * Returns whether the underlying stream has reached end of
+     * file (the peer closed the connection).
+     *
+     * @return bool true if EOF, false otherwise
+     */
+    public function isEof()
+    {
+        $meta = @stream_get_meta_data($this->resource);
+        return !empty($meta['eof']);
+    }
+    /**
+     * Returns stream metadata as reported by
+     * stream_get_meta_data, or an empty array if the stream is
+     * no longer open.
+     *
+     * @return array stream metadata
+     */
+    public function getMeta()
+    {
+        $meta = @stream_get_meta_data($this->resource);
+        return is_array($meta) ? $meta : [];
+    }
+    /**
+     * Returns the local or remote name of the stream as reported
+     * by stream_socket_get_name.
+     *
+     * @param bool $remote true for remote peer, false for local
+     *      bind name
+     * @return string|false name string, or false on failure
+     */
+    public function name($remote = true)
+    {
+        return @stream_socket_get_name($this->resource, $remote);
+    }
+    /**
+     * Closes the underlying stream resource and releases the
+     * connection. Safe to call more than once.
+     */
+    public function close()
+    {
+        if (is_resource($this->resource)) {
+            @fclose($this->resource);
+        }
+    }
+    /**
+     * Shuts down one or both halves of the underlying stream
+     * without fully closing the resource. Used for graceful
+     * close handshakes (e.g. send the response then half-close
+     * the write side to signal end-of-response).
+     *
+     * @param int $how one of STREAM_SHUT_RD, STREAM_SHUT_WR,
+     *      STREAM_SHUT_RDWR
+     * @return bool true on success
+     */
+    public function shutdown($how = STREAM_SHUT_RDWR)
+    {
+        if (is_resource($this->resource)) {
+            return @stream_socket_shutdown($this->resource, $how);
+        }
+        return false;
+    }
+}
+/**
+ * Encapsulates the protocol-detection portion of accepting a
+ * connection: handles stream_socket_accept, the optional TLS
+ * handshake, and the read of the first bytes that determines
+ * whether the client is speaking HTTP/2, HTTP/1.1, or h2c. Returns
+ * a Connection wrapping the accepted resource together with an
+ * additional_context array carrying CLIENT_HTTP, IS_SECURE, and
+ * any LEFTOVER bytes consumed during detection.
+ *
+ * Pulling this out of WebSite::processServerRequest gives the
+ * accept-and-detect step a single home and a clear contract.
+ * A future H3 transport would have a sibling class with the same
+ * accept method but different detection logic for QUIC packets.
+ */
+class ConnectionAcceptor
+{
+    /**
+     * The 24-byte HTTP/2 client connection preface from RFC 7540
+     * section 3.5. Cached as a string for fast comparison rather
+     * than recomputed each accept.
+     * @var string
+     */
+    protected $h2_magic;
+    /**
+     * Optional callback invoked with an error message when TLS
+     * handshake fails. If null the message is written to stdout.
+     * @var callable|null
+     */
+    protected $error_handler;
+    /**
+     * Optional callback invoked after a successful TLS handshake
+     * to restore the WebSite's custom error handler that
+     * stream_socket_enable_crypto temporarily clears.
+     * @var callable|null
+     */
+    protected $post_tls_callback;
+    /**
+     * Constructs a ConnectionAcceptor.
+     *
+     * @param string $h2_magic the H2 client preface bytes
+     * @param callable|null $error_handler invoked with a string
+     *      error message on TLS failure
+     * @param callable|null $post_tls_callback invoked after a
+     *      successful TLS handshake to let the caller reinstall
+     *      its custom error handler
+     */
+    public function __construct($h2_magic,
+        $error_handler = null, $post_tls_callback = null)
+    {
+        $this->h2_magic = $h2_magic;
+        $this->error_handler = $error_handler;
+        $this->post_tls_callback = $post_tls_callback;
+    }
+    /**
+     * Accepts a new connection from the given listener entry,
+     * runs the TLS handshake if the listener is secure, then
+     * inspects the first bytes to determine the HTTP protocol
+     * version. Returns a [Connection, additional_context] pair
+     * suitable for handing to WebSite's per-protocol init
+     * routines, or [null, null] if no connection was accepted.
+     *
+     * @param array $listener entry from WebSite's listeners with
+     *      keys 'server' (server resource) and 'is_secure'
+     * @param float $timeout maximum seconds to block waiting for
+     *      a connection
+     * @return array [Connection|null, array|null]
+     */
+    public function accept($listener, $timeout)
+    {
+        $server = $listener['server'];
+        $is_secure = !empty($listener['is_secure']);
+        if ($is_secure) {
+            stream_set_blocking($server, true);
+        }
+        $resource = @stream_socket_accept($server, $timeout);
+        if ($is_secure) {
+            stream_set_blocking($server, false);
+        }
+        if (!$resource) {
+            echo "No connection accepted or timed out.\n";
+            return [null, null];
+        }
+        $connection = new Connection($resource, $is_secure);
+        if ($is_secure) {
+            if (!$this->enableTls($connection)) {
+                $connection->close();
+                return [null, null];
+            }
+        }
+        $additional_context = $this->detectProtocol($connection);
+        return [$connection, $additional_context];
+    }
+    /**
+     * Enables TLS on a freshly accepted connection. Sets blocking
+     * mode for the duration of the handshake, then restores
+     * non-blocking on success. Reports failures through the
+     * error_handler if one was supplied. The post_tls_callback
+     * is invoked on success so the caller can reinstall its
+     * custom error handler that PHP clears as part of the TLS
+     * setup.
+     *
+     * @param Connection $connection freshly accepted connection
+     *      to wrap with TLS
+     * @return bool true on success, false if the handshake failed
+     */
+    protected function enableTls($connection)
+    {
+        $connection->setBlocking(true);
+        if (!@stream_socket_enable_crypto(
+                $connection->resource(), true,
+                STREAM_CRYPTO_METHOD_TLS_SERVER)) {
+            $ssl_error = error_get_last();
+            $message = "\n\nSSL Error: "
+                . ($ssl_error['message'] ?? 'unknown');
+            if ($this->error_handler) {
+                ($this->error_handler)($message);
+            } else {
+                echo $message;
+            }
+            return false;
+        }
+        if ($this->post_tls_callback) {
+            ($this->post_tls_callback)();
+        }
+        return true;
+    }
+    /**
+     * Inspects the first bytes of a connection to decide which
+     * HTTP version the client is speaking. For TLS connections
+     * we read 24 bytes (the H2 client magic length) while still
+     * in blocking mode and switch to non-blocking afterward; for
+     * cleartext we use STREAM_PEEK so the bytes remain in the
+     * receive buffer for the normal request parser. Returns an
+     * additional_context array for the connection.
+     *
+     * @param Connection $connection accepted connection, with
+     *      TLS already enabled if the listener was secure
+     * @return array context with CLIENT_HTTP and possibly
+     *      LEFTOVER keys
+     */
+    protected function detectProtocol($connection)
+    {
+        if ($connection->is_secure) {
+            /*
+                PHP does not expose the ALPN-negotiated protocol
+                so after the TLS handshake we read the decrypted
+                bytes while still in blocking mode. An H2 client
+                always sends the 24-byte magic string as its
+                first data.
+             */
+            $magic_len = strlen($this->h2_magic);
+            $stream_start = $connection->read($magic_len);
+            $connection->setBlocking(false);
+            if ($stream_start === $this->h2_magic) {
+                return ["CLIENT_HTTP" => "HTTP/2.0"];
+            }
+            return ["CLIENT_HTTP" => "HTTP/1.1",
+                "LEFTOVER" => $stream_start];
+        }
+        /*
+            Cleartext: safe to peek since there is no TLS wrapping
+         */
+        $stream_start = @stream_socket_recvfrom(
+            $connection->resource(), 512, STREAM_PEEK);
+        if (empty($stream_start)) {
+            return ["CLIENT_HTTP" => "unknown"];
+        }
+        if (strncmp($stream_start, $this->h2_magic,
+                strlen($this->h2_magic)) === 0) {
+            return ["CLIENT_HTTP" => "h2c"];
+        }
+        if (preg_match("/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|"
+                . "PATCH|TRACE|CONNECT) \S+ HTTP\/1\.1/",
+                $stream_start)) {
+            return ["CLIENT_HTTP" => "HTTP/1.1"];
+        }
+        return ["CLIENT_HTTP" => "unknown"];
+    }
 }
 /**
  * Static helpers for parsing and serializing WebSocket frames per

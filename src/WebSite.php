@@ -218,10 +218,24 @@ class WebSite
      */
     protected $is_cli;
     /**
-     * Whether https is being used
+     * Whether https is being used. For backward compatibility this
+     * is set to true if any listener has a TLS context. The
+     * per-connection secure flag lives in the connection's stream
+     * context entry instead.
      * @var bool
      */
     protected $is_secure = false;
+    /**
+     * Array of active listeners. Each entry is an associative
+     * array with keys 'server' (the stream resource returned by
+     * stream_socket_server), 'is_secure' (bool), and 'globals'
+     * (per-listener overrides for default_server_globals such as
+     * SERVER_NAME and SERVER_PORT). Indexed by (int)$server so
+     * processRequestStreams can match an incoming connection to
+     * its listener via the readable key returned by stream_select.
+     * @var array
+     */
+    protected $listeners = [];
     /**
      * List of acceptable Origin header values for WebSocket
      * upgrade requests, or empty array to accept any origin.
@@ -992,25 +1006,45 @@ class WebSite
         unset($this->timers[$timer_id]);
     }
     /**
-     * Starts an Atto Web Server listening at $address using the configuration
-     * values provided. It also has this server's event loop. As web requests
-     * come in $this->process is called to handle them. This input and output
-     * tcp streams used by this method are non-blocking. Detecting traffic is
-     * done using stream_select().  This maps to Unix-select calls, which
-     * seemed to be the most cross-platform compatible way to do things.
-     * Streaming methods could be easily re-written to support libevent
-     * (doesn't work yet PHP7) or more modern event library
+     * Starts an Atto Web Server listening on one or more addresses
+     * using the configuration values provided. Runs the event loop
+     * which dispatches incoming connections to the appropriate
+     * handler. The streams used are non-blocking; traffic detection
+     * uses stream_select which maps to Unix select calls and is
+     * widely portable.
      *
-     * @param int $address address and port to listen for web requests on
-     * @param mixed $config_array_or_ini_filename either an associative
-     *      array of configuration parameters or the filename of a .ini
-     *      with such parameters. Things that can be set are mainly fields
-     *      that might typically show up in the $_SERVER superglobal.
-     *      See the $default_server_globals variable below for some of them.
-     *      The SERVER_CONTENT field can be set to an array of stream
-     *      context field values and these can be used to configure
-     *      the server to handle SSL/TLS (one of the examples in the examples
-     *      folder.)
+     * The first argument can take three forms:
+     *
+     * 1. An int between 0 and 65535. The server binds to this
+     *    port on 0.0.0.0 (any IPv4) or "localhost" on Windows to
+     *    avoid the firewall prompt. Backwards-compatible single
+     *    listener form.
+     *
+     * 2. A string like "tcp://0.0.0.0:8080" or "tcp://[::1]:8080".
+     *    Supports both IPv4 and IPv6 addresses; IPv6 must use the
+     *    bracketed form per RFC 3986. Single listener form.
+     *
+     * 3. An array of listener specs for multi-port operation. Each
+     *    entry can be a plain int/string address (using the
+     *    same shared $config_array_or_ini_filename) or an
+     *    associative array with keys 'address' (required) and
+     *    'context' (optional, a per-listener stream context such
+     *    as ssl options that override the shared context). This
+     *    is how to bind both port 80 and port 443 from one Atto
+     *    process or to run a TLS listener and a cleartext
+     *    redirect listener side by side.
+     *
+     * @param mixed $address int port, string address, or array
+     *      of listener specs
+     * @param mixed $config_array_or_ini_filename either an
+     *      associative array of configuration parameters or the
+     *      filename of an .ini file with such parameters. Things
+     *      that can be set are mainly fields that might show up
+     *      in the $_SERVER superglobal. See the
+     *      $default_server_globals variable below for some of
+     *      them. The SERVER_CONTEXT field can be set to an array
+     *      of stream context field values, used to configure SSL
+     *      and other stream options.
      */
     public function listen($address, $config_array_or_ini_filename = false)
     {
@@ -1027,24 +1061,9 @@ class WebSite
             "USER" => empty($_SERVER['USER']) ? "" : $_SERVER['USER'],
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
         ];
-        $original_address = $address;
-        if ($address >= 0 && $address < 65535) {
-            /*
-             both work on windows, but localhost doesn't give windows defender
-             warning
-            */
-            $localhost = strstr(PHP_OS, "WIN") ? "localhost" : "0.0.0.0";
-            // 0 binds to any incoming ipv4 address
-            $port = $address;
-            $address = "tcp://$localhost:$address";
-            $server_globals = ["SERVER_NAME" => "localhost",
-                "SERVER_PORT" => $port];
-        } else {
-            $server_globals = ['SERVER_NAME' => substr($address, 0,
-                strrpos($address, ":")),
-                'SERVER_PORT' => substr($address, strrpos($address, ":"))];
-        }
-        $context = [];
+        $original_address = is_array($address) ? "multi" : $address;
+        $shared_context = [];
+        $shared_globals = [];
         if (is_array($config_array_or_ini_filename)) {
             if (!empty($config_array_or_ini_filename['SESSION_INFO'])) {
                 $this->sessions =
@@ -1055,57 +1074,64 @@ class WebSite
                 unset($config_array_or_ini_filename['SESSION_INFO']);
             }
             if (!empty($config_array_or_ini_filename['SERVER_CONTEXT'])) {
-                $context = $config_array_or_ini_filename['SERVER_CONTEXT'];
+                $shared_context =
+                    $config_array_or_ini_filename['SERVER_CONTEXT'];
                 unset($config_array_or_ini_filename['SERVER_CONTEXT']);
             }
-            $server_globals = array_merge($server_globals,
-                $config_array_or_ini_filename);
+            $shared_globals = $config_array_or_ini_filename;
         } else if (is_string($config_array_or_ini_filename) &&
             file_exists($config_array_or_ini_filename)) {
             $ini_data = parse_ini_file($config_array_or_ini_filename);
             if (!empty($ini_data['SERVER_CONTEXT'])) {
-                $context = $ini_data['SERVER_CONTEXT'];
+                $shared_context = $ini_data['SERVER_CONTEXT'];
                 unset($ini_data['SERVER_CONTEXT']);
             }
-            $server_globals = array_merge($server_globals, $ini_data);
+            $shared_globals = $ini_data;
         }
         foreach ($default_server_globals as $server_global =>
             $server_value) {
-            if (!empty($context[$server_global])) {
-                $server_globals[$server_global] =
-                    $context[$server_global];
-                unset($context[$server_global]);
+            if (!empty($shared_context[$server_global])) {
+                $shared_globals[$server_global] =
+                    $shared_context[$server_global];
+                unset($shared_context[$server_global]);
             }
         }
-        if (!empty($context['ssl'])) {
-            $this->is_secure = true;
-        } else if(!empty($_SERVER['HTTPS'])) {
-            $this->is_secure = true;
-            $context['ssl'] = [
-                "local_cert" => "server.crt",
-                "local_pk" => "server.key",
-                "verify_peer" => false,
-                "verify_peer_name" => false,
-                "allow_self_signed" => true,
-                "alpn_protocols" => "h2,http/1.1"
-            ];
+        $listener_specs = is_array($address) ? $address : [$address];
+        $opened = [];
+        foreach ($listener_specs as $spec) {
+            if (is_array($spec)) {
+                $spec_address = $spec['address'] ?? null;
+                $spec_context = $spec['context'] ?? [];
+            } else {
+                $spec_address = $spec;
+                $spec_context = [];
+            }
+            if ($spec_address === null) {
+                echo "Listener spec missing address; skipping\n";
+                continue;
+            }
+            $opened[] = $this->openListener($spec_address,
+                array_replace_recursive($shared_context, $spec_context));
         }
-        /* Raise the default queue size for connections from 5 to 200.
-           Depending on OS, this might help server handle more incoming
-           request at a time.
-         */
-        $context["socket"]["backlog"] = empty($context["socket"]["backlog"]) ?
-            200 : $context["socket"]["backlog"];
-        $server_context = stream_context_create($context);
-        $server = stream_socket_server($address, $errno, $errstr,
-            STREAM_SERVER_BIND|STREAM_SERVER_LISTEN, $server_context);
-        if (!$server) {
-            echo "Failed to bind address $address\nServer Stopping\n";
+        if (empty($opened)) {
+            echo "No listeners opened, server stopping\n";
             exit();
         }
-        stream_set_blocking($server, false);
+        /*
+            For backward compatibility set is_secure on the WebSite
+            if any listener is secure. Code paths that need to know
+            per-connection should consult the listener entry instead.
+         */
+        foreach ($opened as $entry) {
+            if ($entry['is_secure']) {
+                $this->is_secure = true;
+                break;
+            }
+        }
+        $primary = $opened[0];
+        $primary_globals = $primary['globals'];
         $this->default_server_globals = array_merge($_SERVER,
-            $default_server_globals, $server_globals);
+            $default_server_globals, $shared_globals, $primary_globals);
         $as_user = "";
         if (function_exists("posix_getuid") &&
             function_exists("posix_getpwuid") &&
@@ -1127,17 +1153,26 @@ class WebSite
                 }
             }
         }
-        $this->immortal_stream_keys[] = (int)$server;
-        $this->in_streams = [self::CONNECTION => [(int)$server => $server],
-            self::DATA => [""]];
+        $this->in_streams = [self::CONNECTION => [], self::DATA => [""]];
         $this->out_streams = [self::CONNECTION => [], self::DATA => []];
+        foreach ($opened as $entry) {
+            $server = $entry['server'];
+            $key = (int) $server;
+            $this->listeners[$key] = $entry;
+            $this->immortal_stream_keys[] = $key;
+            $this->in_streams[self::CONNECTION][$key] = $server;
+            echo "SERVER listening at " . $entry['address']
+                . ($entry['is_secure'] ? " (secure)" : "") . $as_user
+                . "\n";
+        }
         $excepts = null;
-        echo "SERVER listening at $address\n";
         $num_selected = 1;
         while (!$this->stop || $num_selected > 0) {
             if ($this->stop) {
                 $in_streams_with_data = $this->in_streams[self::CONNECTION];
-                unset($in_streams_with_data[(int)$server]);
+                foreach ($this->listeners as $key => $entry) {
+                    unset($in_streams_with_data[$key]);
+                }
                 if (count($in_streams_with_data) == 0) {
                     break;
                 }
@@ -1157,10 +1192,10 @@ class WebSite
             }
             $num_selected = stream_select($in_streams_with_data,
                 $out_streams_with_data, $excepts, $timeout, $micro_timeout);
-
             $this->processTimers();
             if ($num_selected > 0) {
-                $this->processRequestStreams($server, $in_streams_with_data);
+                $this->processRequestStreams(null,
+                    $in_streams_with_data);
                 $this->processResponseStreams($out_streams_with_data);
             }
             $this->cullDeadStreams();
@@ -1169,8 +1204,10 @@ class WebSite
             $session_path = substr($this->restart, strlen('restart') + 1);
             $php_path = $this->default_server_globals["PHP_PATH"] ?? "";
             $php = (empty($_ENV['HHVM'])) ? "$php_path/php" : "$php_path/hhvm";
+            $restart_arg = is_array($original_address)
+                ? "multi" : $original_address;
             $script = "$php " . $_SERVER['SCRIPT_NAME'] .
-                " " . $original_address . " 2 \"$session_path\"";
+                " " . $restart_arg . " 2 \"$session_path\"";
             if (strstr(PHP_OS, "WIN")) {
                 $script = str_replace("/", "\\", $script);
             }
@@ -1179,7 +1216,9 @@ class WebSite
                     @stream_socket_shutdown($stream, STREAM_SHUT_RDWR);
                 }
             }
-            fclose($server);
+            foreach ($this->listeners as $entry) {
+                @fclose($entry['server']);
+            }
             if (strstr(PHP_OS, "WIN")) {
                 $job = "start $script ";
             } else {
@@ -1187,6 +1226,115 @@ class WebSite
             }
             pclose(popen($job, "r"));
         }
+    }
+    /**
+     * Opens a single server listener at $address with the given
+     * stream context options. Returns an associative array with
+     * the bound stream resource, the canonical address string,
+     * the is_secure flag, and the per-listener server globals
+     * (SERVER_NAME and SERVER_PORT). Used by listen() to set up
+     * each listener spec.
+     *
+     * @param mixed $address int port, string "tcp://host:port",
+     *      or string "tcp://[ipv6]:port"
+     * @param array $context stream context options for this
+     *      listener (typically ssl settings); a default backlog
+     *      is added if not specified
+     * @return array entry suitable for adding to $this->listeners
+     */
+    protected function openListener($address, $context)
+    {
+        $parsed = $this->parseListenAddress($address);
+        $bind_address = $parsed['bind_address'];
+        $is_secure = !empty($context['ssl']);
+        if (empty($context['ssl']) && !empty($_SERVER['HTTPS'])
+            && empty($this->listeners)) {
+            /*
+                Legacy fallback: when invoked with HTTPS=1 in the
+                environment but no explicit ssl context, fall back
+                to the working directory's server.crt/server.key.
+                Only applies to the first listener for backward
+                compatibility with the old single-listen behavior.
+             */
+            $is_secure = true;
+            $context['ssl'] = [
+                "local_cert" => "server.crt",
+                "local_pk" => "server.key",
+                "verify_peer" => false,
+                "verify_peer_name" => false,
+                "allow_self_signed" => true,
+                "alpn_protocols" => "h2,http/1.1"
+            ];
+        }
+        $context["socket"]["backlog"] = empty($context["socket"]["backlog"])
+            ? 200 : $context["socket"]["backlog"];
+        $server_context = stream_context_create($context);
+        $server = stream_socket_server($bind_address, $errno, $errstr,
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $server_context);
+        if (!$server) {
+            echo "Failed to bind address $bind_address: $errstr\n";
+            return ['server' => null, 'address' => $bind_address,
+                'is_secure' => $is_secure, 'globals' => []];
+        }
+        stream_set_blocking($server, false);
+        return ['server' => $server, 'address' => $bind_address,
+            'is_secure' => $is_secure,
+            'globals' => ['SERVER_NAME' => $parsed['host'],
+                'SERVER_PORT' => $parsed['port']]];
+    }
+    /**
+     * Parses a listen address into its bind string, host and port
+     * components. Accepts plain integers (interpreted as IPv4
+     * ports), tcp://host:port URLs for IPv4 or hostnames, and
+     * tcp://[ipv6]:port URLs for IPv6 addresses per RFC 3986.
+     *
+     * @param mixed $address int port, string address, or
+     *      tcp://... URL
+     * @return array associative array with keys 'bind_address'
+     *      (suitable for stream_socket_server), 'host', and
+     *      'port'
+     */
+    protected function parseListenAddress($address)
+    {
+        if (is_int($address) || (is_string($address)
+            && ctype_digit($address))) {
+            $port = (int) $address;
+            $localhost = strstr(PHP_OS, "WIN") ? "localhost" : "0.0.0.0";
+            return ['bind_address' => "tcp://$localhost:$port",
+                'host' => $localhost, 'port' => (string) $port];
+        }
+        $stripped = $address;
+        if (strpos($stripped, "://") !== false) {
+            $stripped = substr($stripped,
+                strpos($stripped, "://") + 3);
+        }
+        if (substr($stripped, 0, 1) === "[") {
+            /*
+                Bracketed IPv6 form: [::1]:8080. The bracketed host
+                part is everything up to the closing bracket; the
+                port is whatever follows the colon after the
+                bracket.
+             */
+            $close = strpos($stripped, "]");
+            if ($close === false) {
+                return ['bind_address' => $address,
+                    'host' => $stripped, 'port' => ""];
+            }
+            $host = substr($stripped, 1, $close - 1);
+            $rest = substr($stripped, $close + 1);
+            $port = ($rest !== "" && $rest[0] === ":")
+                ? substr($rest, 1) : "";
+            return ['bind_address' => $address,
+                'host' => $host, 'port' => $port];
+        }
+        $colon = strrpos($stripped, ":");
+        if ($colon === false) {
+            return ['bind_address' => $address,
+                'host' => $stripped, 'port' => ""];
+        }
+        return ['bind_address' => $address,
+            'host' => substr($stripped, 0, $colon),
+            'port' => substr($stripped, $colon + 1)];
     }
     /**
      * Used to handle local web page/HTTP requests made from a running
@@ -1434,12 +1582,14 @@ class WebSite
     protected function processRequestStreams($server, $in_streams_with_data)
     {
         foreach ($in_streams_with_data as $in_stream) {
-            if ($in_stream == $server) {
-                $this->processServerRequest($server);
-                return;
+            $stream_key = (int) $in_stream;
+            if (isset($this->listeners[$stream_key])) {
+                $this->processServerRequest(
+                    $this->listeners[$stream_key]);
+                continue;
             }
             $meta = stream_get_meta_data($in_stream);
-            $key = (int)$in_stream;
+            $key = $stream_key;
             if ($meta['eof']) {
                 $this->shutdownHttpStream($key);
                 continue;
@@ -1516,7 +1666,27 @@ class WebSite
                     $out_data = $this->getResponseData();
                     if (empty($this->in_streams[self::CONTEXT][$key][
                             'BAD_RESPONSE'])) {
-                        $this->initRequestStream($key);
+                        /*
+                            Preserve per-connection state across the
+                            keep-alive reset. These keys depend only
+                            on which listener accepted the connection
+                            (and on the H2 HPACK decode/encode tables)
+                            so they apply to every request on this
+                            connection, not just the one we just
+                            processed.
+                         */
+                        $preserve = [];
+                        $current = $this->in_streams[self::CONTEXT][
+                            $key] ?? [];
+                        foreach (['IS_SECURE', 'LISTENER_PORT',
+                                'LISTENER_NAME', 'HTTPS', 'CLIENT_HTTP',
+                                'HPACK_DECODE', 'HPACK_ENCODE'] as
+                                $field) {
+                            if (isset($current[$field])) {
+                                $preserve[$field] = $current[$field];
+                            }
+                        }
+                        $this->initRequestStream($key, $preserve);
                     }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
                         $this->out_streams[self::CONNECTION][$key] =
@@ -1532,19 +1702,24 @@ class WebSite
         }
     }
     /**
-     * Accepts a new incoming connection from the server socket and
+     * Accepts a new incoming connection from a server socket and
      * determines the HTTP protocol version. For TLS connections the
-     * ALPN-negotiated protocol is read from the stream context after
-     * the handshake. For cleartext connections the first bytes are
-     * peeked. H2 and h2c connections are handed to initH2Request.
-     * HTTP/1.1 and unknown connections are registered via
-     * initRequestStream for the normal event loop.
+     * H2 client magic string is read from the decrypted stream
+     * after the handshake completes. For cleartext connections the
+     * first bytes are peeked. H2 and h2c connections are handed to
+     * initH2Request. HTTP/1.1 and unknown connections are
+     * registered via initRequestStream for the normal event loop.
      *
-     * @param resource $server socket server used to listen for
-     *      incoming connections
+     * @param array $listener entry from $this->listeners with
+     *      keys 'server' (the server resource), 'is_secure'
+     *      (whether TLS is enabled on this listener), and
+     *      'globals' (per-listener server globals such as
+     *      SERVER_NAME and SERVER_PORT)
      */
-    protected function processServerRequest($server)
+    protected function processServerRequest($listener)
     {
+        $server = $listener['server'];
+        $is_secure = $listener['is_secure'];
         if ($this->timer_alarms->isEmpty()) {
             $timeout = ini_get("default_socket_timeout");
         } else {
@@ -1552,18 +1727,18 @@ class WebSite
             $timeout = max(min($next_alarm[0] - microtime(true),
                         ini_get("default_socket_timeout")), 0);
         }
-        if ($this->is_secure) {
+        if ($is_secure) {
             stream_set_blocking($server, true);
         }
         $connection = stream_socket_accept($server, $timeout);
-        if ($this->is_secure) {
+        if ($is_secure) {
             stream_set_blocking($server, false);
         }
         if (!$connection) {
             echo "No connection accepted or timed out.\n";
             return;
         }
-        if ($this->is_secure) {
+        if ($is_secure) {
             stream_set_blocking($connection, true);
             if (!@stream_socket_enable_crypto(
                     $connection, true,
@@ -1605,6 +1780,19 @@ class WebSite
             $additional_context = !empty($stream_start)
                 ? $this->checkHttpType($stream_start)
                 : ["CLIENT_HTTP" => "unknown"];
+        }
+        $additional_context['IS_SECURE'] = $is_secure;
+        $additional_context['LISTENER_PORT'] =
+            $listener['globals']['SERVER_PORT'] ?? '';
+        $additional_context['LISTENER_NAME'] =
+            $listener['globals']['SERVER_NAME'] ?? '';
+        if ($is_secure) {
+            /*
+                Standard CGI HTTPS=on convention so generic PHP
+                code that checks $_SERVER['HTTPS'] sees the
+                expected value on TLS connections.
+             */
+            $additional_context['HTTPS'] = 'on';
         }
         $key = (int) $connection;
         $this->in_streams[self::CONNECTION][$key] = $connection;
@@ -1796,6 +1984,24 @@ class WebSite
         $hpack_encode = $this->in_streams[self::CONTEXT][$key][
             'HPACK_ENCODE'] ?? new HPack();
         $context = $frame->parseBody($payload, $hpack_decode);
+        /*
+            HeaderFrame::parseBody builds its context fresh from the
+            HEADERS frame and so does not see the per-connection
+            keys (IS_SECURE, LISTENER_PORT, LISTENER_NAME, HTTPS)
+            that processServerRequest stored in in_streams[CONTEXT].
+            Merge those in here, with the freshly-parsed request
+            keys winning on conflict.
+         */
+        $conn_context = $this->in_streams[self::CONTEXT][$key] ?? [];
+        $propagate = [];
+        foreach (['IS_SECURE', 'LISTENER_PORT', 'LISTENER_NAME',
+                'HTTPS', 'REMOTE_ADDR', 'REMOTE_PORT', 'SERVER_ADDR',
+                'SERVER_PORT'] as $field) {
+            if (isset($conn_context[$field])) {
+                $propagate[$field] = $conn_context[$field];
+            }
+        }
+        $context = array_merge($propagate, $context);
         $stream_id = $frame->stream_id;
         $_SESSION = [];
         $this->setGlobals($context);

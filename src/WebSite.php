@@ -677,7 +677,7 @@ class WebSite
         $path = "", $domain = "", $secure = false, $httponly = false)
     {
         if ($this->isCli()) {
-            if ($secure && !$_SERVER['HTTPS']) {
+            if ($secure && empty($_SERVER['HTTPS'])) {
                 return;
             }
             $out_cookie = "Set-Cookie: $name=$value";
@@ -2164,6 +2164,66 @@ class WebSite
             fwrite($connection, $ack->serialize());
             return false;
         }
+        if ($frame instanceof DataFrame) {
+            /*
+                RFC 7540 sec 6.1: DATA frames carry request body
+                bytes. Atto buffers them per-stream alongside the
+                request context that arrived with the HEADERS
+                frame, then dispatches the assembled request once
+                END_STREAM is seen. parseFrameHeader gives us the
+                frame shell with stream_id and flags; the body
+                bytes still need to be parsed out (handles padding
+                if the PADDED flag is set).
+             */
+            $frame->parseBody($payload);
+            $stream_id = $frame->stream_id;
+            $pending = $this->in_streams[self::CONTEXT][$key][
+                'H2_PENDING_STREAMS'][$stream_id] ?? null;
+            if ($pending === null) {
+                /*
+                    DATA frame for a stream we never saw HEADERS
+                    on, or one already dispatched. RFC 7540 sec
+                    5.1 says receiving DATA on a stream not in
+                    open or half-closed(local) state is a
+                    STREAM_ERROR. We close the connection; this
+                    is conservative but Atto's H2 path is
+                    synchronous so we never have many concurrent
+                    streams.
+                 */
+                $goaway = new GoAwayFrame(0,
+                    $this->in_streams[self::CONTEXT][$key][
+                        'H2_LAST_STREAM_ID'] ?? 0, 0x1, "");
+                @fwrite($connection, $goaway->serialize());
+                $this->shutdownHttpStream($key);
+                return false;
+            }
+            $pending['body'] .= $frame->data;
+            if (strlen($pending['body'])
+                    > $this->default_server_globals[
+                        'MAX_REQUEST_LEN']) {
+                /*
+                    Body bigger than MAX_REQUEST_LEN. Tear down
+                    rather than buffer further.
+                 */
+                $goaway = new GoAwayFrame(0,
+                    $this->in_streams[self::CONTEXT][$key][
+                        'H2_LAST_STREAM_ID'] ?? 0, 0xb, "");
+                @fwrite($connection, $goaway->serialize());
+                $this->shutdownHttpStream($key);
+                return false;
+            }
+            if ($frame->flags->contains('END_STREAM')) {
+                $context = $pending['context'];
+                $context['CONTENT'] = $pending['body'];
+                unset($this->in_streams[self::CONTEXT][$key][
+                    'H2_PENDING_STREAMS'][$stream_id]);
+                return $this->dispatchH2Request($key, $connection,
+                    $stream_id, $context);
+            }
+            $this->in_streams[self::CONTEXT][$key][
+                'H2_PENDING_STREAMS'][$stream_id] = $pending;
+            return false;
+        }
         if (!($frame instanceof HeaderFrame)) {
             return false;
         }
@@ -2211,7 +2271,44 @@ class WebSite
             }
         }
         $context = array_merge($propagate, $context);
-        $stream_id = $frame->stream_id;
+        if (!$frame->flags->contains('END_STREAM')) {
+            /*
+                HEADERS without END_STREAM means a request body is
+                arriving in subsequent DATA frames. Park the
+                context against the stream id; DATA frames will
+                accumulate the body and the eventual END_STREAM
+                will trigger dispatchH2Request.
+             */
+            $this->in_streams[self::CONTEXT][$key][
+                'H2_PENDING_STREAMS'][$client_stream_id] = [
+                    'context' => $context, 'body' => ''];
+            return false;
+        }
+        return $this->dispatchH2Request($key, $connection,
+            $client_stream_id, $context);
+    }
+    /**
+     * Dispatches a fully-assembled HTTP/2 request to the user
+     * route handler and writes the response back to the client.
+     * Called from parseH2Request once a stream has seen its full
+     * HEADERS plus optional DATA frames and the END_STREAM flag.
+     * Encapsulates the response generation and serialization that
+     * was previously inline in parseH2Request so that both the
+     * "request fits in HEADERS alone" and "request has a body"
+     * paths share the same response code.
+     *
+     * @param int $key connection key in $this->in_streams
+     * @param resource $connection client socket
+     * @param int $stream_id H2 stream id of the request
+     * @param array $context request context to install in $_SERVER
+     *      and friends; CONTENT key holds the request body if any
+     * @return bool true after the response has been written
+     */
+    protected function dispatchH2Request($key, $connection,
+        $stream_id, $context)
+    {
+        $hpack_encode = $this->in_streams[self::CONTEXT][$key][
+            'HPACK_ENCODE'] ?? new HPack();
         $_SESSION = [];
         $this->setGlobals($context);
         $body = $this->getResponseData(false);
@@ -4297,7 +4394,7 @@ class HeaderFrame extends Frame
                         && filter_var("http://$value",
                             FILTER_VALIDATE_URL)) {
                         $authority = $value;
-                    } else if ($key[0] ?? "" !== ':') {
+                    } else if (($key[0] ?? "") !== ':') {
                         $context['HTTP_' . strtoupper(
                             str_replace('-', '_', $key))] = $value;
                     }
@@ -4356,19 +4453,32 @@ class DataFrame extends Frame
         return $this->data;
     }
     /**
-     * Parses the binary data of the DATA frame and extracts the data payload.
+     * Parses the binary data of the DATA frame and extracts the
+     * data payload. Strips padding if the PADDED flag is set: the
+     * first byte is the pad length and that many trailing bytes
+     * are padding to be discarded.
+     *
      * @param string $data The binary data to parse.
      */
     public function parseBody($data)
     {
-        $padding_data_length = $this->parsePaddingData($data);
-        $this->data = substr($data, $padding_data_length,
-            strlen($data) - $this->pad_length);
         $this->payload_length = strlen($data);
-
-        if ($this->pad_length && $this->pad_length >= $this->payload_length) {
-            throw new InvalidPaddingException("Padding is too long.");
+        $offset = 0;
+        $padding = 0;
+        if ($this->flags->contains('PADDED')) {
+            if ($this->payload_length < 1) {
+                throw new InvalidPaddingException(
+                    "PADDED frame missing pad length byte.");
+            }
+            $padding = ord($data[0]);
+            $offset = 1;
+            if ($padding + $offset > $this->payload_length) {
+                throw new InvalidPaddingException(
+                    "Padding is too long.");
+            }
         }
+        $this->data = substr($data, $offset,
+            $this->payload_length - $offset - $padding);
     }
 }
 /*

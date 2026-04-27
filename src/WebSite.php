@@ -3075,6 +3075,15 @@ class WebSite
         $_SERVER = array_merge($this->default_server_globals, $context);
         parse_str($context['QUERY_STRING'], $_GET);
         $_POST = [];
+        /*
+            $_FILES is a process-global superglobal that PHP
+            does not auto-reset per request when running under
+            the CLI server, so wipe it here. Without this, a
+            previous request's uploaded file metadata leaks into
+            the next request's $_FILES even when the new request
+            has none of its own.
+         */
+        $_FILES = [];
         if (!empty($context['CONTENT']) &&
             !empty($context['CONTENT_TYPE']) &&
             strpos($context['CONTENT_TYPE'], "multipart/form-data") !== false) {
@@ -4436,8 +4445,26 @@ class HeaderFrame extends Frame
                             FILTER_VALIDATE_URL)) {
                         $authority = $value;
                     } else if (($key[0] ?? "") !== ':') {
-                        $http_key = 'HTTP_' . strtoupper(
-                            str_replace('-', '_', $key));
+                        $up = strtoupper(str_replace('-', '_', $key));
+                        /*
+                            CGI convention (and what setGlobals'
+                            multipart parser expects): the
+                            Content-Type and Content-Length request
+                            headers are exposed in $_SERVER WITHOUT
+                            the HTTP_ prefix that all other request
+                            headers receive. The H1.1 path in
+                            parseRequest already does this; H2 must
+                            match so that downstream code (multipart
+                            decoder, frameworks reading
+                            $_SERVER['CONTENT_TYPE']) sees these
+                            headers in the expected location.
+                         */
+                        if ($up === 'CONTENT_TYPE'
+                                || $up === 'CONTENT_LENGTH') {
+                            $context[$up] = $value;
+                            continue;
+                        }
+                        $http_key = 'HTTP_' . $up;
                         if ($http_key === 'HTTP_COOKIE'
                                 && isset($context[$http_key])) {
                             /*

@@ -131,6 +131,13 @@ class WebSite
      */
     public $stop;
     /**
+     * An associative array that can be used by routes to temporary
+     * store things like bad ips without having deprecation notions for
+     * defining fields not in class on the fly. See example 13.
+     * @var array
+     */
+    public $user_contexts = [];
+    /**
      * Default values to write into $_SERVER before processing a connection
      * request (in CLI mode)
      * @var array
@@ -2360,11 +2367,44 @@ class WebSite
         }
         $resp_headers = new HeaderFrame($stream_id, $resp_headers_data);
         $resp_headers->flags->add("END_HEADERS");
-        $resp_data = new DataFrame($stream_id, $body);
-        $resp_data->flags->add("END_STREAM");
-        fwrite($connection,
-            $resp_headers->serialize($hpack_encode)
-            . $resp_data->serialize());
+        $out = $resp_headers->serialize($hpack_encode);
+        /*
+            Split the response body into DATA frames each at most
+            H2_MAX_FRAME_SIZE bytes. RFC 7540 sec 4.2: any single
+            frame whose payload exceeds the peer's advertised
+            SETTINGS_MAX_FRAME_SIZE is a FRAME_SIZE_ERROR, which
+            causes curl/browsers to drop the response on the
+            floor (or close the connection). Default MAX_FRAME_SIZE
+            is 16384 and most clients keep it. A zero-length body
+            still gets one DATA frame so the END_STREAM flag has
+            a place to live. Flow control (RFC 7540 sec 5.2) is
+            not enforced here: clients (curl, Firefox, Chrome)
+            advertise multi-megabyte initial windows and grant
+            connection-level WINDOW_UPDATEs eagerly, so for the
+            synchronous request/response model Atto uses, the
+            window almost never bottlenecks. If a future use
+            case needs flow control, it can be added without
+            disturbing the splitting logic.
+         */
+        $body_len = strlen($body);
+        $max = self::H2_MAX_FRAME_SIZE;
+        if ($body_len === 0) {
+            $resp_data = new DataFrame($stream_id, "");
+            $resp_data->flags->add("END_STREAM");
+            $out .= $resp_data->serialize();
+        } else {
+            $offset = 0;
+            while ($offset < $body_len) {
+                $chunk = substr($body, $offset, $max);
+                $offset += strlen($chunk);
+                $frame = new DataFrame($stream_id, $chunk);
+                if ($offset >= $body_len) {
+                    $frame->flags->add("END_STREAM");
+                }
+                $out .= $frame->serialize();
+            }
+        }
+        fwrite($connection, $out);
         return true;
     }
     /**
@@ -5145,41 +5185,58 @@ class HPack
     {
         $size = max(0, (int) $size);
         $this->max_table_size = $size;
-        while (count($this->headers_table) - count(self::STATIC_TABLE)
+        while (count($this->headers_table) - count(self::STATIC_TABLE) - 1
                 > $this->max_table_size) {
             $this->evictEntry();
         }
     }
     /**
-     * Evicts the first entry in the table and shifts the rest of the entries.
-     * Ensures that the table maintains a size of $max_table_size.
+     * Evicts the oldest dynamic entry from the table per RFC 7541
+     * sec 2.3.3. The oldest entry sits at the highest dynamic
+     * index in our storage; pop it. No shifting needed since
+     * subsequent inserts always go at the lowest dynamic index
+     * via addHeader.
      */
     private function evictEntry()
     {
         $static_table_len = count(self::STATIC_TABLE);
         if (count($this->headers_table) > $static_table_len) {
-            foreach ($this->headers_table as $index => $header) {
-                if ($index > $static_table_len + 1) {
-                    $this->headers_table[$index - 1] = $header;
-                }
-            }
             array_pop($this->headers_table);
         }
     }
     /**
-     * Adds a header to the headers_table after checking the max table size.
+     * Adds a header to the dynamic table per RFC 7541 sec 2.3.3:
+     * the new entry is placed at the lowest dynamic index (just
+     * after the static table) and existing dynamic entries shift
+     * up by one. If the table would exceed max_table_size, the
+     * oldest entries are evicted from the highest index until
+     * there is room.
      *
      * @param string $name  The name of the header.
      * @param string $value The value of the header.
      */
     public function addHeader($name, $value)
     {
-        $current_size = count($this->headers_table);
-        while (($current_size + 1) > $this->max_table_size) {
+        $static_table_len = count(self::STATIC_TABLE);
+        /*
+            count(headers_table) includes a sentinel entry at key
+            0 plus the static-table entries (keys 1..static_len),
+            so dynamic count = total - static_len - 1.
+         */
+        while (count($this->headers_table) - $static_table_len - 1
+                >= $this->max_table_size) {
             $this->evictEntry();
-            $current_size = count($this->headers_table);
         }
-        $this->headers_table[] = [$name, $value];
+        /*
+            Shift existing dynamic entries up by one. Walk from
+            highest to lowest so a copy at index N+1 doesn't
+            clobber the value we still need at index N.
+         */
+        $highest = count($this->headers_table) - 1;
+        for ($i = $highest; $i > $static_table_len; $i--) {
+            $this->headers_table[$i + 1] = $this->headers_table[$i];
+        }
+        $this->headers_table[$static_table_len + 1] = [$name, $value];
     }
     /**
      * Decodes a header block fragment from hex.
@@ -5207,24 +5264,14 @@ class HPack
             } else if (($first_byte & 0xE0) === 0x20) {
                 /*
                     Dynamic table size update (RFC 7541 sec 6.3).
-                    Bit pattern 001xxxxx. The new max size is in the
-                    low 5 bits. If all 5 bits are set the size
-                    continues in subsequent bytes as a multi-byte
-                    integer. We parse past it but do not enforce
-                    eviction beyond the existing max_table_size.
+                    Bit pattern 001xxxxx with a 5-bit prefix
+                    integer. We parse the new size correctly (so
+                    later bytes are aligned) but do not actually
+                    shrink the decoder's table here; eviction is
+                    governed by max_table_size which the H2 layer
+                    can adjust via setMaxTableSize.
                  */
-                $new_size = $first_byte & 0x1F;
-                $offset += 2;
-                if ($new_size == 0x1F) {
-                    while ($offset < $input_length) {
-                        $next_byte = hexdec(
-                            substr($hex_input, $offset, 2));
-                        $offset += 2;
-                        if (($next_byte & 0x80) === 0) {
-                            break;
-                        }
-                    }
-                }
+                [, $offset] = $this->decodeInteger($hex_input, $offset, 5);
                 $header = ['decoded' => [], 'length' => 0];
                 continue;
             } else if (($first_byte & 0xF0) === 0x10) {
@@ -5257,10 +5304,13 @@ class HPack
                 "Invalid hex field: too short for an indexed header."
             );
         }
-        $byte_hex = substr($hex_field, 0, 2);
-        $byte = hexdec($byte_hex);
-        $index = $byte & 0x7F;
-        if ($index >= 1 && $index <= count($this->headers_table)) {
+        /*
+            Indexed header field: 1xxxxxxx with the index in the
+            low 7 bits, multi-byte continuation if all 7 are 1s.
+            RFC 7541 sec 6.1.
+         */
+        [$index, $new_offset] = $this->decodeInteger($hex_field, 0, 7);
+        if ($index >= 1 && $index <= count($this->headers_table) - 1) {
             [$name, $value] = $this->headers_table[$index];
         } else {
             // Invalid index
@@ -5269,7 +5319,7 @@ class HPack
         return [
             'decoded' => [$name => $value],
             'encoded' => ['name' => bin2hex($name),'value' => bin2hex($value)],
-            'length' => 2
+            'length' => $new_offset
         ];
     }
     /**
@@ -5278,24 +5328,18 @@ class HPack
      */
     public function decodeLiteralWithIncrementalIndexing($hex_field)
     {
-        $offset = 0;
-        $first_byte_hex = substr($hex_field, $offset, 2);
-        $first_byte = hexdec($first_byte_hex);
-        $offset += 2;
-        if (($first_byte & 0x3F) === 0x00) {
-            $name_length_hex = substr($hex_field, $offset, 2);
-            $name_length_byte = hexdec($name_length_hex);
-            $use_huffman = ($name_length_byte & 0x80) !== 0;
-            $name_length = $name_length_byte & 0x7F;
-            $offset += 2;
-            $name_hex = substr($hex_field, $offset, $name_length * 2);
-            $offset += $name_length * 2;
-            $name = $use_huffman ?
-                $this->huffmanDecode(hex2bin($name_hex)) : hex2bin($name_hex);
-
+        /*
+            Literal with incremental indexing: 01xxxxxx where the
+            6-bit prefix is the name index (0 = name as literal
+            string, 1+ = name from headers_table). Multi-byte
+            continuation if all 6 bits are 1s. RFC 7541 sec 6.2.1.
+         */
+        [$name_index, $offset] = $this->decodeInteger($hex_field, 0, 6);
+        if ($name_index === 0) {
+            [$name, $offset] = $this->decodeStringLiteral(
+                $hex_field, $offset);
         } else {
-            $name_index = $first_byte & 0x3F;
-            if ($name_index > 0 && $name_index < count($this->headers_table)) {
+            if ($name_index < count($this->headers_table)) {
                 $name = $this->headers_table[$name_index][0];
             } else {
                 throw new \Exception(
@@ -5303,15 +5347,8 @@ class HPack
                 );
             }
         }
-        $value_length_hex = substr($hex_field, $offset, 2);
-        $value_length_byte = hexdec($value_length_hex);
-        $use_huffman = ($value_length_byte & 0x80) !== 0;
-        $value_length = $value_length_byte & 0x7F;
-        $offset += 2;
-        $value_hex = substr($hex_field, $offset, $value_length * 2);
-        $offset += $value_length * 2;
-        $value = $use_huffman ?
-            $this->huffmanDecode(hex2bin($value_hex)) : hex2bin($value_hex);
+        [$value, $offset] = $this->decodeStringLiteral(
+            $hex_field, $offset);
         /*
             HPACK RFC 7541 section 6.2.1: incremental indexing always
             appends a new entry to the dynamic table. The name index
@@ -5332,42 +5369,51 @@ class HPack
         ];
     }
     /**
+     * Decodes a string literal at the given hex offset per RFC
+     * 7541 sec 5.2: a 7-bit prefix integer length with the high
+     * "Huffman" bit (0x80) on the first byte, followed by that
+     * many octets of (optionally Huffman-encoded) string data.
+     * Used by every literal header decoder for both name and
+     * value strings.
+     *
+     * @param string $hex_field hex-encoded field
+     * @param int $offset starting hex character offset
+     * @return array [string $decoded_string, int $new_offset]
+     */
+    private function decodeStringLiteral($hex_field, $offset)
+    {
+        $first_byte = hexdec(substr($hex_field, $offset, 2));
+        $use_huffman = ($first_byte & 0x80) !== 0;
+        [$length, $offset] = $this->decodeInteger($hex_field, $offset, 7);
+        $str_hex = substr($hex_field, $offset, $length * 2);
+        $offset += $length * 2;
+        $bin = hex2bin($str_hex);
+        $decoded = $use_huffman ? $this->huffmanDecode($bin) : $bin;
+        return [$decoded, $offset];
+    }
+    /**
      * Decodes a literal that will never be indexed.
      * @param string $hex_field Hexadecimal field to decode.
      */
     public function decodeLiteralWithoutIndexing($hex_field)
     {
-        $offset = 0;
-        $first_byte = hexdec(substr($hex_field, $offset, 2));
-        $offset += 2;
-        if (($first_byte & 0x0F) === 0x00) {
-            $name_length_hex = substr($hex_field, $offset, 2);
-            $name_length_byte = hexdec($name_length_hex);
-            $use_huffman = ($name_length_byte & 0x80) !== 0;
-            $name_length = $name_length_byte & 0x7F;
-            $offset += 2;
-            $name_hex = substr($hex_field, $offset, $name_length * 2);
-            $offset += $name_length * 2;
-            $name = $use_huffman ?
-                $this->huffmanDecode(hex2bin($name_hex)) : hex2bin($name_hex);
+        /*
+            Literal without indexing: 0000xxxx with a 4-bit name
+            index prefix. RFC 7541 sec 6.2.2.
+         */
+        [$name_index, $offset] = $this->decodeInteger($hex_field, 0, 4);
+        if ($name_index === 0) {
+            [$name, $offset] = $this->decodeStringLiteral(
+                $hex_field, $offset);
         } else {
-            $name_index = $first_byte & 0x0F;
-
-            if ($name_index > 0 && $name_index <= count($this->headers_table)) {
+            if ($name_index < count($this->headers_table)) {
                 $name = $this->headers_table[$name_index][0];
             } else {
                 throw new \Exception("Invalid name index: exceeds table size.");
             }
         }
-        $value_length_hex = substr($hex_field, $offset, 2);
-        $value_length_byte = hexdec($value_length_hex);
-        $use_huffman = ($value_length_byte & 0x80) !== 0;
-        $value_length = $value_length_byte & 0x7F;
-        $offset += 2;
-        $value_hex = substr($hex_field, $offset, $value_length * 2);
-        $offset += $value_length * 2;
-        $value = $use_huffman ?
-            $this->huffmanDecode(hex2bin($value_hex)) : hex2bin($value_hex);
+        [$value, $offset] = $this->decodeStringLiteral(
+            $hex_field, $offset);
         return [
             'decoded' => [$name => $value],
             'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
@@ -5381,40 +5427,105 @@ class HPack
      */
     public function decodeLiteralNeverIndexed($hex_field)
     {
-        $offset = 0;
-        $first_byte = hexdec(substr($hex_field, $offset, 2));
-        $offset += 2;
-        if (($first_byte & 0x0F) === 0x00) {
-            $name_length_byte = hexdec(substr($hex_field, $offset, 2));
-            $use_huffman = ($name_length_byte & 0x80) !== 0;
-            $name_length = $name_length_byte & 0x7F;
-            $offset += 2;
-            $name_hex = substr($hex_field, $offset, $name_length * 2);
-            $offset += $name_length * 2;
-            $name = $use_huffman ?
-                $this->huffmanDecode(hex2bin($name_hex)) : hex2bin($name_hex);
+        /*
+            Literal never indexed: 0001xxxx with a 4-bit name
+            index prefix. Caches name in never_index_list so it
+            won't be inserted into the dynamic table on later
+            sees. RFC 7541 sec 6.2.3.
+         */
+        [$name_index, $offset] = $this->decodeInteger($hex_field, 0, 4);
+        if ($name_index === 0) {
+            [$name, $offset] = $this->decodeStringLiteral(
+                $hex_field, $offset);
         } else {
-            $name_index = $first_byte & 0x0F;
-            if ($name_index > 0 && $name_index <= count($this->headers_table)) {
+            if ($name_index < count($this->headers_table)) {
                 $name = $this->headers_table[$name_index][0];
             } else {
                 throw new \Exception("Invalid name index: exceeds table size.");
             }
         }
-        $value_length_byte = hexdec(substr($hex_field, $offset, 2));
-        $use_huffman = ($value_length_byte & 0x80) !== 0;
-        $value_length = $value_length_byte & 0x7F;
-        $offset += 2;
-        $value_hex = substr($hex_field, $offset, $value_length * 2);
-        $offset += $value_length * 2;
-        $value = $use_huffman ?
-            $this->huffmanDecode(hex2bin($value_hex)) : hex2bin($value_hex);
+        [$value, $offset] = $this->decodeStringLiteral(
+            $hex_field, $offset);
         $this->never_index_list[] = $name;
         return [
             'decoded' => [$name => $value],
-            'encoded' => ['name' => bin2hex($name), 'value' => bin2hex($value)],
+            'encoded' => [
+                'name' => bin2hex($name),
+                'value' => bin2hex($value)
+            ],
             'length' => $offset
         ];
+    }
+    /**
+     * Encodes an integer per RFC 7541 sec 5.1 with the given prefix
+     * width. The high bits of the first byte (above the prefix
+     * width) belong to the caller; this method ORs the integer's
+     * encoding into the low $prefix_bits of the first byte and
+     * appends continuation bytes if the value exceeds the prefix
+     * capacity. Returns the binary string of encoded bytes; the
+     * caller must OR in any flag bits for the first byte.
+     *
+     * Example: encodeInteger(78, 7) returns chr(78) since 78 fits
+     * in 7 bits. encodeInteger(1337, 5) returns 3 bytes per the
+     * RFC's worked example.
+     *
+     * @param int $value non-negative integer to encode
+     * @param int $prefix_bits prefix width in bits (1-8)
+     * @return string binary bytes
+     */
+    private function encodeInteger($value, $prefix_bits)
+    {
+        $max_prefix = (1 << $prefix_bits) - 1;
+        if ($value < $max_prefix) {
+            return chr($value);
+        }
+        $out = chr($max_prefix);
+        $value -= $max_prefix;
+        while ($value >= 128) {
+            $out .= chr(($value & 0x7F) | 0x80);
+            $value >>= 7;
+        }
+        $out .= chr($value);
+        return $out;
+    }
+    /**
+     * Decodes an integer per RFC 7541 sec 5.1 from a hex-encoded
+     * field starting at $offset. The first byte's low $prefix_bits
+     * carry the integer (or signal continuation when all set).
+     * Returns [value, new_offset] where new_offset is the hex
+     * offset just past the decoded integer.
+     *
+     * @param string $hex_field hex-encoded field
+     * @param int $offset starting hex character offset
+     * @param int $prefix_bits prefix width in bits (1-8)
+     * @return array [int $value, int $new_offset]
+     */
+    private function decodeInteger($hex_field, $offset, $prefix_bits)
+    {
+        $max_prefix = (1 << $prefix_bits) - 1;
+        $first_byte = hexdec(substr($hex_field, $offset, 2));
+        $offset += 2;
+        $value = $first_byte & $max_prefix;
+        if ($value < $max_prefix) {
+            return [$value, $offset];
+        }
+        $shift = 0;
+        $hex_len = strlen($hex_field);
+        while ($offset < $hex_len) {
+            $byte = hexdec(substr($hex_field, $offset, 2));
+            $offset += 2;
+            $value += ($byte & 0x7F) << $shift;
+            $shift += 7;
+            if (($byte & 0x80) === 0) {
+                return [$value, $offset];
+            }
+            if ($shift > 28) {
+                throw new \Exception(
+                    "HPACK integer overflow during decode");
+            }
+        }
+        throw new \Exception(
+            "HPACK integer truncated: missing continuation byte");
     }
     /**
      * Encodes headers using the HPack format. If a header name is in
@@ -5448,7 +5559,15 @@ class HPack
             foreach ($this->headers_table as $i =>
                     [$header_name, $header_value]) {
                 if ($header_name === $name && $header_value === $value) {
-                    $encoded_header .= chr(0x80 | ($i & 0x7F));
+                    /*
+                        Indexed header field: 1xxxxxxx with the
+                        index in the low 7 bits, multi-byte if
+                        the index is >= 127. RFC 7541 sec 6.1.
+                     */
+                    $int_bytes = $this->encodeInteger($i, 7);
+                    $first = ord($int_bytes[0]) | 0x80;
+                    $encoded_header .= chr($first)
+                        . substr($int_bytes, 1);
                     $is_indexed = true;
                     break;
                 } elseif ($header_name === $name) {
@@ -5457,13 +5576,33 @@ class HPack
                 }
             }
             if (!$is_indexed && $name_only_match) {
-                $encoded_header .= chr(0x40 | ($matched_index & 0x3F));
+                /*
+                    Literal with incremental indexing, indexed
+                    name: 01xxxxxx with the name index in the low
+                    6 bits, multi-byte if >= 63. RFC 7541 sec
+                    6.2.1. Per spec, the receiver appends a new
+                    dynamic-table entry for this header, so we
+                    must add it on our side too or our encoder's
+                    view of the dynamic table will diverge from
+                    the decoder's.
+                 */
+                $int_bytes = $this->encodeInteger($matched_index, 6);
+                $first = ord($int_bytes[0]) | 0x40;
+                $encoded_header .= chr($first)
+                    . substr($int_bytes, 1);
                 $encoded_header .= $this->encodeString($value);
+                $this->addHeader($name, $value);
             }
             elseif (!$is_indexed && !$name_only_match) {
+                /*
+                    Literal with incremental indexing, new name:
+                    01000000 plus literal name plus literal value.
+                    Same dynamic-table sync requirement as above.
+                 */
                 $encoded_header .= chr(0x40);
                 $encoded_header .= $this->encodeString($name);
                 $encoded_header .= $this->encodeString($value);
+                $this->addHeader($name, $value);
             }
             $encoded .= $encoded_header;
         }
@@ -5479,9 +5618,17 @@ class HPack
     {
         $huffman = $this->huffmanEncode($str);
         if (strlen($huffman) < strlen($str)) {
-            return chr(0x80 | strlen($huffman)) . $huffman;
+            /*
+                Length is a 7-bit prefix integer with the high
+                "Huffman" bit (0x80) set. Multi-byte if length
+                >= 127. RFC 7541 sec 5.2.
+             */
+            $int_bytes = $this->encodeInteger(strlen($huffman), 7);
+            $first = ord($int_bytes[0]) | 0x80;
+            return chr($first) . substr($int_bytes, 1) . $huffman;
         } else {
-            return chr(strlen($str)) . $str;
+            $int_bytes = $this->encodeInteger(strlen($str), 7);
+            return $int_bytes . $str;
         }
     }
     /**

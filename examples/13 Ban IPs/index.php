@@ -16,10 +16,10 @@ $test = new WebSite();
  */
 $test->middleware(function () use ($test)
 {
-    if (empty($test->bad_ips)) {
-        $test->bad_ips = [];
+    if (empty($test->user_contexts['bad_ips'])) {
+        $test->user_contexts['bad_ips'] = [];
     }
-    if(in_array($_SERVER['REMOTE_ADDR'], $test->bad_ips)) {
+    if(in_array($_SERVER['REMOTE_ADDR'], $test->user_contexts['bad_ips'])) {
         $_SERVER['REQUEST_METHOD'] = "ERROR";
         $_SERVER['REQUEST_URI'] = $test->base_path . "/403";
     }
@@ -39,7 +39,7 @@ $test->get('/', function() use ($test) {
     }
     $_SESSION['COUNT']++;
     if ($_SESSION['COUNT'] >= 5) {
-        $test->bad_ips[] = $_SERVER['REMOTE_ADDR'];
+        $test->user_contexts['bad_ips'][] = $_SERVER['REMOTE_ADDR'];
     }
     ?><!DOCTYPE html>
     <html>

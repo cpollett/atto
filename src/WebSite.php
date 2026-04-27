@@ -3609,6 +3609,29 @@ class ConnectionAcceptor
             echo "No connection accepted or timed out.\n";
             return [null, null];
         }
+        if ($is_secure) {
+            /*
+                A listener configured for TLS may still receive
+                plaintext HTTP if the operator runs a single-port
+                setup where some local clients (yioop's Fetcher,
+                health checks, sidecars) speak HTTP. Peek the first
+                byte before invoking the TLS handshake. A TLS
+                ClientHello always starts with 0x16 (ContentType =
+                Handshake, RFC 8446 sec 5.1). Anything else is
+                treated as cleartext and the connection bypasses
+                TLS entirely. This matches the behavior of nginx
+                and similar servers that accept both protocols on
+                the same port.
+             */
+            $peek = @stream_socket_recvfrom($resource, 1, STREAM_PEEK);
+            if ($peek === false || $peek === '') {
+                @fclose($resource);
+                return [null, null];
+            }
+            if ($peek[0] !== "\x16") {
+                $is_secure = false;
+            }
+        }
         $connection = new Connection($resource, $is_secure);
         if ($is_secure) {
             if (!$this->enableTls($connection)) {

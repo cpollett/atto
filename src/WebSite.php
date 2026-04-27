@@ -4436,8 +4436,30 @@ class HeaderFrame extends Frame
                             FILTER_VALIDATE_URL)) {
                         $authority = $value;
                     } else if (($key[0] ?? "") !== ':') {
-                        $context['HTTP_' . strtoupper(
-                            str_replace('-', '_', $key))] = $value;
+                        $http_key = 'HTTP_' . strtoupper(
+                            str_replace('-', '_', $key));
+                        if ($http_key === 'HTTP_COOKIE'
+                                && isset($context[$http_key])) {
+                            /*
+                                RFC 7540 sec 8.1.2.5: H2 clients
+                                MAY split the Cookie header into
+                                separate header fields, one per
+                                cookie pair, for HPACK compression.
+                                When passing into a non-H2 context
+                                (the $_SERVER superglobal that
+                                downstream PHP code reads), the
+                                fields must be concatenated with
+                                "; " (the standard cookie-pair
+                                delimiter). Without this join,
+                                only the last cookie pair would
+                                survive and apps like yioop would
+                                see an empty session cookie even
+                                when the browser sent one.
+                             */
+                            $context[$http_key] .= '; ' . $value;
+                        } else {
+                            $context[$http_key] = $value;
+                        }
                     }
                 }
             }
@@ -4456,7 +4478,17 @@ class HeaderFrame extends Frame
         $context['HTTPS'] = 'on';
         $context['HTTP_HOST'] = $authority;
         $context['CONTENT']= '';
-        $context['REMOTE_ADDR'] = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+        /*
+            REMOTE_ADDR is a socket-level fact that HeaderFrame
+            cannot observe; it must come from the connection
+            context populated by initRequestStream. Do NOT set
+            it here, otherwise array_merge in parseH2Request
+            (which prefers freshly-parsed request keys over
+            propagated connection-level keys) would overwrite
+            the real client IP with this placeholder, breaking
+            session validity checks in apps like yioop that
+            verify $_SESSION['REMOTE_ADDR'] against the request.
+         */
         $context['SCRIPT_FILENAME']  = '';
         return $context;
     }

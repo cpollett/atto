@@ -131,12 +131,13 @@ class WebSite
      */
     public $stop;
     /**
-     * An associative array that can be used by routes to temporary
-     * store things like bad ips without having deprecation notions for
+     * A WebSite instance-wide associative array that can be used by routes to
+     * store things like bad ips without having deprecation notices for
      * defining fields not in class on the fly. See example 13.
+     * This could be a source of memory leaks so use with caution
      * @var array
      */
-    public $user_contexts = [];
+    public $storage = [];
     /**
      * Default values to write into $_SERVER before processing a connection
      * request (in CLI mode)

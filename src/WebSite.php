@@ -29,7 +29,7 @@
  * @filesource
  */
 
-namespace seekquarry\atto;
+ namespace seekquarry\atto;
 
 /**
  * A single file, low dependency, pure PHP web server and web routing engine
@@ -997,7 +997,7 @@ class WebSite
      *      extension rather than looking at the file
      * @return string mime type or unknown if can't be determined
      */
-    function mimeType($file_name, $use_extension = false)
+    public static function mimeType($file_name, $use_extension = false)
     {
         $mime_type = "unknown";
         $last_chars = "-1";
@@ -1027,6 +1027,7 @@ class WebSite
                 ".html" => 'text/html',
                 ".jpeg" => "image/jpeg",
                 ".jpg" => "image/jpeg",
+                ".js" => "text/javascript",
                 ".oga" => "audio/ogg",
                 ".ogg" => "audio/ogg",
                 ".opus" => "audio/opus",
@@ -1515,6 +1516,13 @@ class WebSite
         $this->content_type = $r["CONTENT_TYPE"];
         $this->current_session = $r["CURRENT_SESSION"];
         return $out_data;
+    }
+    /**
+     * Used to export info (but not change) about running sessions
+     */
+    public function getSessions()
+    {
+        return $this->sessions;
     }
     /**
      * Used  by usual and internal requests to compute response  string of the
@@ -3184,21 +3192,21 @@ class WebSite
             $this->out_streams[self::MODIFIED_TIME][$key]
         );
     }
-    /**
-     * Function to call instead of exit() to indicate that the script
-     * processing the current web page is done processing. Use this rather
-     * that exit(), as exit() will also terminate WebSite.
-     *
-     * @param string $err_msg error message to send on exiting
-     * @throws WebException
-     */
-    function webExit($err_msg = "")
-    {
-        if (php_sapi_name() == 'cli') {
-            throw new WebException($err_msg);
-        } else {
-            exit($err_msg);
-        }
+}
+/**
+ * Function to call instead of exit() to indicate that the script
+ * processing the current web page is done processing. Use this rather
+ * that exit(), as exit() will also terminate WebSite.
+ *
+ * @param string $err_msg error message to send on exiting
+ * @throws WebException
+ */
+function webExit($err_msg = "")
+{
+    if (php_sapi_name() == 'cli') {
+        throw new WebException($err_msg);
+    } else {
+        exit($err_msg);
     }
 }
 /**
@@ -4289,7 +4297,7 @@ class HeaderFrame extends Frame
                         && filter_var("http://$value",
                             FILTER_VALIDATE_URL)) {
                         $authority = $value;
-                    } else if ($key[0] !== ':') {
+                    } else if ($key[0] ?? "" !== ':') {
                         $context['HTTP_' . strtoupper(
                             str_replace('-', '_', $key))] = $value;
                     }

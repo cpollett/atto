@@ -93,6 +93,12 @@ Options:
     --iterations=N        per single-shot case (default 100)
     --concurrency=N       parallel requests for asset case
                           (default 50)
+    --latency-ms=N        simulate one-way network latency by
+                          spawning a TCP proxy in front of each
+                          port; round-trip is 2*N. Useful for
+                          showing how H2's multiplexing crushes
+                          H1+TLS at parallel work over a real
+                          network.
     --only=h1,h2,h3       run only the listed protocols
     --skip=case,case      skip the listed cases
                           (small,big,asset,headers,keepalive)
@@ -107,6 +113,7 @@ $tls_port = (int) ($opts['tls-port'] ?? 8443);
 $quic_port = (int) ($opts['quic-port'] ?? 8444);
 $iterations = (int) ($opts['iterations'] ?? 100);
 $concurrency = (int) ($opts['concurrency'] ?? 50);
+$latency_ms = (float) ($opts['latency-ms'] ?? 0);
 $only = isset($opts['only'])
     ? array_map('trim', explode(',', $opts['only'])) : [];
 $skip = isset($opts['skip'])
@@ -114,6 +121,110 @@ $skip = isset($opts['skip'])
 if (!extension_loaded('curl')) {
     fwrite(STDERR, "php-curl extension is required.\n");
     exit(1);
+}
+/*
+    --latency-ms support. Spawn a pair of proxy.php children that
+    sit in front of the plain and TLS ports and add a delay
+    each way. The transports below get rewritten to point at the
+    proxy ports instead of the original ports. Children are
+    detached (yioop's CrawlDaemon::execInOwnProcess pattern) so
+    the bench process doesn't have to manage them; they exit
+    automatically when the bench process exits because their
+    listening sockets close. We pick high random ports for the
+    proxy listeners so they don't collide with the real services.
+ */
+$proxy_children = [];
+if ($latency_ms > 0) {
+    $proxy_plain_port = $plain_port + 10000;
+    $proxy_tls_port = $tls_port + 10000;
+    $php = escapeshellarg(PHP_BINARY);
+    $script = escapeshellarg(__DIR__ . "/proxy.php");
+    foreach ([
+        [$proxy_plain_port, $host, $plain_port],
+        [$proxy_tls_port, $host, $tls_port],
+    ] as [$listen, $thost, $tport]) {
+        $cmd = "$php $script $listen " . escapeshellarg($thost) .
+            " $tport " . escapeshellarg((string) $latency_ms);
+        if (strstr(PHP_OS, "WIN")) {
+            $job = "start /B $cmd > NUL 2>&1";
+            pclose(popen($job, "r"));
+            /*
+                Windows: no straightforward way to capture the
+                child PID via popen. Proxies will linger after
+                bench exits; user can close the cmd window or
+                kill via Task Manager.
+             */
+        } else {
+            /*
+                Unix: wrap in a brace+exec so the shell's $!
+                refers to the proxy itself (not a transient
+                subshell), and echo it back through popen so
+                we can capture the PID for cleanup. The full
+                idiom { exec CMD; } & echo $! gives us a PID
+                that survives bench's exit.
+             */
+            $job = "{ exec $cmd; } < /dev/null > /dev/null " .
+                "2>&1 & echo PID=\$!";
+            $h = popen($job, "r");
+            if ($h) {
+                $line = stream_get_contents($h);
+                pclose($h);
+                if (preg_match('/PID=(\d+)/', $line, $m)) {
+                    $proxy_children[] = (int) $m[1];
+                }
+            }
+        }
+    }
+    /*
+        Register a shutdown handler to kill the proxy children
+        whether the bench finishes normally or aborts.
+        register_shutdown_function fires for normal completion,
+        die(), uncaught exceptions, and pcntl signals once we
+        bind them. Without this, repeated --latency-ms runs
+        would leak proxy processes.
+     */
+    register_shutdown_function(function () use (&$proxy_children) {
+        foreach ($proxy_children as $pid) {
+            if (function_exists('posix_kill')) {
+                @posix_kill($pid, 15);  // SIGTERM
+            }
+        }
+    });
+    if (function_exists('pcntl_signal')) {
+        pcntl_async_signals(true);
+        $sigh = function ($sig) use (&$proxy_children) {
+            foreach ($proxy_children as $pid) {
+                @posix_kill($pid, 15);
+            }
+            exit(128 + $sig);
+        };
+        pcntl_signal(SIGINT, $sigh);
+        pcntl_signal(SIGTERM, $sigh);
+    }
+    /*
+        Wait for the proxy listeners to be ready. A bare usleep
+        is racy when the host is loaded; instead poll by
+        attempting a short TCP connect to each proxy port until
+        both succeed or we time out. 2-second budget is plenty
+        for two PHP children to bind a socket.
+     */
+    $deadline = microtime(true) + 2.0;
+    foreach ([$proxy_plain_port, $proxy_tls_port] as $port) {
+        while (microtime(true) < $deadline) {
+            $probe = @stream_socket_client(
+                "tcp://{$host}:{$port}",
+                $perr, $pmsg, 0.5);
+            if ($probe) {
+                fclose($probe);
+                break;
+            }
+            usleep(50 * 1000);
+        }
+    }
+    $plain_port = $proxy_plain_port;
+    $tls_port = $proxy_tls_port;
+    fwrite(STDERR, "  latency: " . $latency_ms .
+        "ms each way (RTT " . (2 * $latency_ms) . "ms)\n");
 }
 /*
     Transport definitions. Each transport is what the runner
@@ -346,13 +457,20 @@ function parseArgs($argv)
  */
 function probe($url, $http_version, $strict = false)
 {
+    /*
+        Probe timeout is generous (5s) so it tolerates the
+        proxy used by --latency-ms without false negatives.
+        Real cold connection on localhost is sub-millisecond;
+        the timeout only matters when something is actually
+        wrong.
+     */
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL => $url,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_NOBODY => false,
-        CURLOPT_TIMEOUT => 2,
-        CURLOPT_CONNECTTIMEOUT => 2,
+        CURLOPT_TIMEOUT => 5,
+        CURLOPT_CONNECTTIMEOUT => 5,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => 0,
         CURLOPT_HTTP_VERSION => $http_version,

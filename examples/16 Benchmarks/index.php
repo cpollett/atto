@@ -110,7 +110,21 @@ $test->get('/', function () {
     Atto's single-threaded event loop &mdash; treat trends, not
     absolutes. <a href="/raw">Plain CLI output also available.</a>
 </p>
-<button id="start_btn">Run benchmark</button>
+<div id="controls">
+    <button id="start_btn">Run benchmark</button>
+    <label style="margin-left: 1em; font-size: 0.9em;
+        color: #555;">
+        Simulate network latency:
+        <select id="latency_sel" style="font-size: 0.9em;
+            padding: 0.3em;">
+            <option value="0">none (loopback)</option>
+            <option value="5">5ms each way (10ms RTT)</option>
+            <option value="25">25ms each way (50ms RTT)</option>
+            <option value="50">50ms each way (100ms RTT)</option>
+            <option value="100">100ms each way (200ms RTT)</option>
+        </select>
+    </label>
+</div>
 <div id="global_status"></div>
 <div id="results"></div>
 <p style="margin-top: 2em;">
@@ -285,7 +299,14 @@ btn.addEventListener('click', function () {
     status_el.textContent = 'Starting benchmark \u2026';
     seedCards();
     raw_el.textContent = '';
-    fetch('/run', {method: 'POST'}).then(function () {
+    var latency = document.getElementById('latency_sel').value;
+    var body = 'latency_ms=' + encodeURIComponent(latency);
+    fetch('/run', {
+        method: 'POST',
+        headers: {'Content-Type':
+            'application/x-www-form-urlencoded'},
+        body: body
+    }).then(function () {
         poll();
         poll_handle = setInterval(poll, 400);
     }).catch(function (e) {
@@ -311,10 +332,25 @@ $test->post('/run', function () use (
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__DIR__ . "/bench.php");
     $out = escapeshellarg($bench_out_file);
+    /*
+        The dashboard can post a latency value to simulate
+        network RTT. We forward it to bench.php via the
+        --latency-ms flag; bench will spawn proxy.php in front
+        of the plain and TLS ports for the duration of the run.
+        Validate the input as a non-negative number to keep
+        shell-injection at bay.
+     */
+    $extra = '';
+    $latency = $_POST['latency_ms'] ?? '0';
+    if (is_numeric($latency) && (float) $latency > 0) {
+        $latency_arg = (float) $latency;
+        $extra = ' --latency-ms=' . escapeshellarg(
+            (string) $latency_arg);
+    }
     if (strstr(PHP_OS, "WIN")) {
-        $job = "start /B $php $script > $out 2>&1";
+        $job = "start /B $php $script$extra > $out 2>&1";
     } else {
-        $job = "$php $script < /dev/null > $out 2>&1 &";
+        $job = "$php $script$extra < /dev/null > $out 2>&1 &";
     }
     pclose(popen($job, "r"));
     $test->header("Content-Type: application/json");

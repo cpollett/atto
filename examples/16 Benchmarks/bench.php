@@ -71,6 +71,15 @@
         is single-threaded).
  */
 
+if (php_sapi_name() !== 'cli') {
+    /*
+        Guardrail: bench.php is a CLI runner, never useful (or
+        safe) under a web server. Refuse to execute under any
+        non-CLI SAPI so a misconfigured webroot can't expose it.
+     */
+    exit();
+}
+
 $opts = parseArgs($argv);
 if (!empty($opts['help'])) {
     echo trim(<<<'TXT'
@@ -128,6 +137,29 @@ $TRANSPORTS = [
             CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
         ],
     ],
+    'h1s' => [
+        /*
+            HTTP/1.1 over TLS. Same TLS port as H2; ALPN selects
+            http/1.1 because we ask curl for HTTP/1.1
+            specifically. This is the apples-to-apples comparison
+            for H2: both pay TLS encryption + handshake cost,
+            so the remaining difference reflects the protocol
+            itself rather than transport security.
+         */
+        'name' => 'HTTP/1.1+TLS',
+        'available' => function () use ($host, $tls_port) {
+            return probe("https://{$host}:{$tls_port}/small",
+                CURL_HTTP_VERSION_1_1);
+        },
+        'endpoint' => function ($path) use ($host, $tls_port) {
+            return "https://{$host}:{$tls_port}{$path}";
+        },
+        'curl_opts' => [
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+        ],
+    ],
     'h2' => [
         'name' => 'HTTP/2',
         'available' => function () use ($host, $tls_port) {
@@ -183,9 +215,9 @@ $active = [];
 foreach ($TRANSPORTS as $key => $t) {
     if (($t['available'])()) {
         $active[$key] = $t;
-        echo sprintf("  %-10s available\n", $t['name']);
+        echo sprintf("  %-12s available\n", $t['name']);
     } else {
-        echo sprintf("  %-10s unavailable (skipping)\n",
+        echo sprintf("  %-12s unavailable (skipping)\n",
             $t['name']);
     }
 }
@@ -252,14 +284,14 @@ foreach ($cases as $case_name => $case_fn) {
         $result = $case_fn($t);
         if ($first) {
             echo "  " . $result['desc'] . "\n";
-            printf("  %-10s  %6s  %8s  %8s  %8s  %8s  %10s\n",
-                'protocol', 'iters', 'min ms', 'median',
+            printf("  %-12s  %6s  %8s  %8s  %8s  %8s  %10s\n",
+                'protocol', 'iters', 'min(ms)', 'median',
                 'p95', 'req/s', 'kB/s');
             $first = false;
         }
         $rps = ($result['median'] > 0)
             ? 1.0 / $result['median'] : 0.0;
-        printf("  %-10s  %6d  %8.2f  %8.2f  %8.2f  %8.0f  %10s\n",
+        printf("  %-12s  %6d  %8.2f  %8.2f  %8.2f  %8.0f  %10s\n",
             $t['name'],
             $result['iters'],
             $result['min'] * 1000,
@@ -270,6 +302,16 @@ foreach ($cases as $case_name => $case_fn) {
                 : number_format($result['kbps'], 1));
     }
     echo "\n";
+}
+/*
+    Sentinel marker for the dispatcher mode. Only emitted when
+    bench.php is invoked by index.php's auto-launch path (which
+    sets ATTO_BENCH_DISPATCH=1 in the child's environment).
+    Standalone "php bench.php" runs leave it off so the user
+    doesn't see noise after the report.
+ */
+if (getenv('ATTO_BENCH_DISPATCH')) {
+    echo "===BENCH_DONE===\n";
 }
 exit(0);
 

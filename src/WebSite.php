@@ -2083,10 +2083,10 @@ class WebSite
             0x04 => 65535,
             0x05 => self::H2_MAX_FRAME_SIZE,
         ]);
-        fwrite($connection, $server_settings->serialize());
+        @fwrite($connection, $server_settings->serialize());
         $ack = new SettingsFrame(0, []);
         $ack->flags->add('ACK');
-        fwrite($connection, $ack->serialize());
+        @fwrite($connection, $ack->serialize());
         stream_set_blocking($connection, false);
     }
     /**
@@ -2127,7 +2127,22 @@ class WebSite
             $this->shutdownHttpStream($key);
             return false;
         }
-        $payload = $this->readExactly($connection, $payload_len);
+        $payload = "";
+        if ($payload_len > 0) {
+            try {
+                $payload = $this->readExactly($connection, $payload_len);
+            } catch (\Exception $e) {
+                /*
+                    Peer closed connection between the frame header
+                    and its payload. Match the cleanup pattern of
+                    the header read above: drop the stream and
+                    return without touching the half-read frame.
+                 */
+                stream_set_blocking($connection, false);
+                $this->shutdownHttpStream($key);
+                return false;
+            }
+        }
         stream_set_blocking($connection, false);
         if ($frame instanceof GoAwayFrame) {
             $this->shutdownHttpStream($key);
@@ -2136,7 +2151,7 @@ class WebSite
         if ($frame instanceof PingFrame) {
             $pong = new PingFrame(0, $payload);
             $pong->flags->add('ACK');
-            fwrite($connection, $pong->serialize());
+            @fwrite($connection, $pong->serialize());
             return false;
         }
         if ($frame instanceof SettingsFrame
@@ -2169,7 +2184,7 @@ class WebSite
             }
             $ack = new SettingsFrame(0, []);
             $ack->flags->add('ACK');
-            fwrite($connection, $ack->serialize());
+            @fwrite($connection, $ack->serialize());
             return false;
         }
         if ($frame instanceof DataFrame) {
@@ -2433,7 +2448,19 @@ class WebSite
                 $out .= $frame->serialize();
             }
         }
-        fwrite($connection, $out);
+        /*
+            Suppress fwrite warning: clients (especially browsers
+            loading many subresources in parallel) routinely close
+            the connection before we finish writing the response,
+            e.g. when the user navigates away or when the browser
+            cancels in-flight requests. The resulting SIGPIPE /
+            broken-pipe / SSL "bad length" warnings are noise
+            rather than bugs. The connection has already been
+            closed by the peer; the server has nothing else to do
+            and the next event-loop iteration will drop the
+            half-closed stream cleanly.
+         */
+        @fwrite($connection, $out);
         return true;
     }
     /**
@@ -2453,7 +2480,14 @@ class WebSite
         $buffer = "";
         $remaining = $length;
         while ($remaining > 0) {
-            $chunk = fread($connection, $remaining);
+            /*
+                Suppress fread warning: the peer can close the
+                connection mid-read without warning. PHP would
+                otherwise emit a noisy SSL/broken-pipe warning
+                even though the throw below already signals the
+                condition cleanly to the caller's try/catch.
+             */
+            $chunk = @fread($connection, $remaining);
             if ($chunk === false || $chunk === "") {
                 throw new \Exception(
                     "Connection closed after reading "

@@ -413,26 +413,21 @@ class WebSite
     }
     /**
      * Restricts which Origin header values are accepted for
-     * WebSocket upgrade requests. By default all origins are
-     * accepted, which is appropriate for development and for
-     * services that intentionally expose themselves to any web
-     * page. For production deployments behind a known origin,
-     * pass an array of exact origin strings (scheme + host +
-     * optional port, no trailing slash).
-     *
-     * Example:
+     * WebSocket upgrade requests. Default: accept all origins
+     * (fine for dev / services that expose themselves to any web
+     * page). For production behind a known origin, pass exact
+     * origin strings (scheme + host + optional port, no trailing
+     * slash):
      *   $site->setAllowedOrigins(['https://example.com',
      *       'https://www.example.com']);
      *
-     * Requests whose Origin header is not in the list receive a
-     * 403 Forbidden during the WebSocket handshake. Requests
-     * lacking an Origin header (typically from non-browser
-     * clients like curl, native apps, or test scripts) are
-     * always allowed since the protection target is the browser
-     * same-origin model.
+     * Requests with an Origin not in the list get 403 during the
+     * handshake. Requests with no Origin header (curl, native
+     * apps, test scripts) are always allowed — the protection
+     * target is the browser same-origin model.
      *
-     * @param array $origins list of acceptable origin strings,
-     *      or empty array to allow all origins
+     * @param array $origins acceptable origin strings, or empty
+     *      to allow all
      */
     public function setAllowedOrigins(array $origins)
     {
@@ -505,15 +500,12 @@ class WebSite
             return;
         }
         // Handle Upgrade Header
-        if (isset($_SERVER['HTTP_UPGRADE']) &&
-            $_SERVER['HTTP_UPGRADE'] === 'HTTP/2') {
-            $this->header_data = "UPGRADE";
+        if (($_SERVER['HTTP_UPGRADE'] ?? '') === 'HTTP/2') {
             $this->header_data = "UPGRADE";
             // $this->handleUpgradeToHttp2();
             return;
         }
-        $method = empty($_SERVER['REQUEST_METHOD']) ? "ERROR" :
-            $_SERVER['REQUEST_METHOD'];
+        $method = $_SERVER['REQUEST_METHOD'] ?? "ERROR";
         if (empty($_SERVER['QUERY_STRING'])) {
             $this->request_script = rtrim(
                 substr(urldecode($_SERVER['REQUEST_URI']),
@@ -580,26 +572,18 @@ class WebSite
         return $handled;
     }
     /**
-     * Adds a new HTTP header to the list of headers that will be sent
-     * with the HTTP response. If the value of $header begins with
-     * HTTP/ then it is assumed that $header is the response message
-     * not a header. In this case, the value of $header will become
-     * the response message, replacing any existing messages if
-     * present. This function defaults to PHP's built-in header()
-     * function when this script is run from a non-CLI context.
+     * Adds an HTTP header to the response. If $header begins with
+     * "HTTP/" it's treated as the status line and replaces any
+     * existing one. In non-CLI mode defers to PHP's header().
      *
-     * Headers containing CR or LF are rejected to prevent CRLF
-     * (HTTP response splitting) injection. PHP's built-in header()
-     * has had this defense since 5.1.2; Atto matches that behavior
-     * for CLI mode where the header_data buffer is concatenated
-     * directly into the wire output. If a header is rejected this
-     * method writes a warning via trigger_error and returns false
-     * without modifying header_data.
+     * Headers with CR/LF are rejected (CRLF injection / HTTP
+     * response splitting). PHP's built-in header() has had this
+     * defense since 5.1.2; Atto matches it for CLI mode where
+     * header_data goes directly to the wire. Rejected headers
+     * trigger an E_USER_WARNING and return false.
      *
-     * @param string $header HTTP header or message to send with the
-     *      HTTP response
-     * @return bool true if the header was accepted, false if
-     *      rejected for containing CRLF
+     * @param string $header HTTP header or status line
+     * @return bool true if accepted, false if CRLF-rejected
      */
     public function header($header)
     {
@@ -613,7 +597,7 @@ class WebSite
                 if (strtolower(substr($this->header_data, 0, 5)) == 'http/') {
                     $header_parts = explode("\x0D\x0A", $this->header_data, 2);
                     $this->header_data = $header . "\x0D\x0A" .
-                        (empty($header_parts[1])? "" : $header_parts[1]);
+                        ($header_parts[1] ?? "");
                 } else {
                     $this->header_data = $header . "\x0D\x0A" .
                         $this->header_data;
@@ -654,22 +638,16 @@ class WebSite
         $this->header("Link: " . $link);
     }
     /**
-     * Sends an HTTP cookie header as part of the HTTP response. If this method
-     * is run from a non-CLI context then this function defaults to PHP's
-     * built-in function setcookie();
+     * Sends an HTTP cookie. In non-CLI mode defers to PHP's
+     * setcookie(). Returned cookies show up in $_COOKIE.
      *
-     * Cookies returned from a particular client will appear in the $_COOKIE
-     * superglobal.
-     *
-     * @param string $name name of cookie
-     * @param string $value value associated with cookie
-     * @param int $expire Unix timestamp for when the cookie expires
-     * @param string $path request path associated with the cookie
-     * @param string $domain request domain associated with the cookie
-     * @param string $secure whether the cookie should only be sent if HTTPS in
-     *      use
-     * @param bool $httponly whether or not the cookie is available only over
-     *      HTTP, and not available to client-side Javascript
+     * @param string $name cookie name
+     * @param string $value cookie value
+     * @param int $expire Unix expiry timestamp
+     * @param string $path request path scope
+     * @param string $domain request domain scope
+     * @param string $secure HTTPS-only cookie if true
+     * @param bool $httponly hide from client-side JavaScript
      */
     public function setCookie($name, $value = "", $expire = 0,
         $path = "", $domain = "", $secure = false, $httponly = false)
@@ -733,8 +711,7 @@ class WebSite
                 }
             }
             $cookie_name = $options['name'];
-            $cookie_value = empty($_COOKIE[$cookie_name]) ? "" :
-                $_COOKIE[$cookie_name];
+            $cookie_value = $_COOKIE[$cookie_name] ?? "";
             $time = time();
             $lifetime = intval($options['cookie_lifetime']);
             $expires = ($lifetime > 0) ? $time + $lifetime : 0;
@@ -785,16 +762,13 @@ class WebSite
                 }
             }
             /*
-                Hard cap on total session count. The soft cull
-                above only walks CULL_OLD_SESSION_NUM entries per
-                request, so a flood of cookie-less requests can
-                grow the session table faster than it shrinks.
-                If we are still over MAX_SESSIONS after the soft
-                cull, evict the oldest entries (the tail of
-                session_queue, since new IDs are array_unshift'd
-                onto the head) until we are back under the cap.
-                Reindex the queue at the end so the next soft
-                cull walks contiguous indices.
+                Hard cap on session count. The soft cull above
+                walks only CULL_OLD_SESSION_NUM per request, so a
+                flood of cookie-less hits can outgrow it. If still
+                over MAX_SESSIONS, evict oldest from the queue
+                tail (new IDs go on the head via array_unshift)
+                until back under cap. Reindex at end so the next
+                soft cull walks contiguous indices.
              */
             $max_sessions = $this->default_server_globals[
                 'MAX_SESSIONS'] ?? 10000;
@@ -1297,11 +1271,8 @@ class WebSite
             foreach ($this->listeners as $entry) {
                 @fclose($entry['server']);
             }
-            if (strstr(PHP_OS, "WIN")) {
-                $job = "start $script ";
-            } else {
-                $job = "$script < /dev/null > /dev/null &";
-            }
+            $job = strstr(PHP_OS, "WIN") ? "start $script "
+                : "$script < /dev/null > /dev/null &";
             pclose(popen($job, "r"));
         }
     }
@@ -1415,23 +1386,20 @@ class WebSite
             'port' => substr($stripped, $colon + 1)];
     }
     /**
-     * Used to handle local web page/HTTP requests made from a running
-     * WebSite script  back to itself. For example, if while processing a
-     * Website ROUTE, one wanted to do curl request for another local page.
-     * Since WebSite is single-threaded, such a request would block until the
-     * current page was done processing, but as the current page depends on the
-     * blocked request, this would cause a deadlock. To avoid this WebSite's
-     * should check if a request is local, and if so, call
-     * processInternalRequest in lieu of making a real web request, using
-     * curl, sockets, etc.
+     * Handles a local HTTP request from inside a running WebSite
+     * route back to itself. The single-threaded event loop makes
+     * a real curl/socket loopback deadlock; this short-circuits
+     * by invoking the route handler in-process. Routes that need
+     * loopback (yioop's FetchUrl) should detect "local" URLs and
+     * call this instead of curl.
      *
      * @param string $url local page url requested
-     * @param bool $include_headers whether to include HTTP response headers
-     *      in the returned results as if it had be a real web request
-     * @param array $post_data variables (if any) to be used in an internal
-     *      HTTP POST request.
-     * @return string web page that WebSite would have reqsponded with if
-     *      the request had been made as a usual web request.
+     * @param bool $include_headers include HTTP response headers
+     *      in the returned string
+     * @param array $post_data POST variables for the simulated
+     *      request, or null for GET
+     * @return string the route's response, as if it had come
+     *      back over the wire
      */
     public function processInternalRequest($url,
         $include_headers = false, $post_data = null)
@@ -2019,19 +1987,14 @@ class WebSite
         $client_settings->parseBody(
             $this->readExactly($connection, $settings_len));
         /*
-            Server-advertised settings. We send these explicitly so
-            the client knows our limits rather than relying on
-            protocol defaults.
-              MAX_CONCURRENT_STREAMS=100 caps how many requests a
-                single client can have in flight on this connection
-                so a misbehaving peer cannot exhaust resources by
-                opening millions of streams.
-              MAX_FRAME_SIZE=16384 matches the H2_MAX_FRAME_SIZE
-                check in parseH2Request so the client knows the
-                limit.
-              INITIAL_WINDOW_SIZE=65535 is the HTTP/2 default,
-                emitted explicitly so flow-control state on both
-                sides starts in agreement.
+            Server-advertised settings — sent explicitly so the
+            client doesn't have to assume defaults:
+              0x03 MAX_CONCURRENT_STREAMS=100 caps in-flight
+                requests per connection (resource exhaustion).
+              0x04 INITIAL_WINDOW_SIZE=65535 (the default, made
+                explicit so flow-control state starts in agreement).
+              0x05 MAX_FRAME_SIZE=16384 matches H2_MAX_FRAME_SIZE
+                guard in parseH2Request.
          */
         $server_settings = new SettingsFrame(0, [
             0x03 => 100,
@@ -2112,14 +2075,11 @@ class WebSite
         if ($frame instanceof SettingsFrame
             && !$frame->flags->contains('ACK')) {
             /*
-                Apply settings the peer sent us. We act on
-                HEADER_TABLE_SIZE (0x01) so the encoder honors the
-                decoder's table size. Other settings are accepted
-                but ignored: ENABLE_PUSH (we never push),
-                MAX_CONCURRENT_STREAMS (a hint for clients, not us),
-                INITIAL_WINDOW_SIZE and MAX_FRAME_SIZE (Atto's
-                synchronous response model does not benefit from
-                tracking these), MAX_HEADER_LIST_SIZE (best-effort).
+                Apply peer settings. Only HEADER_TABLE_SIZE (0x01)
+                affects us — encoder must honor decoder's table
+                size. Other settings (ENABLE_PUSH, MAX_CONCURRENT_
+                STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
+                MAX_HEADER_LIST_SIZE) are accepted but ignored.
              */
             $hpack_encode = $this->in_streams[self::CONTEXT][$key][
                 'HPACK_ENCODE'] ?? null;
@@ -2136,12 +2096,10 @@ class WebSite
             /*
                 RFC 7540 sec 6.1: DATA frames carry request body
                 bytes. Atto buffers them per-stream alongside the
-                request context that arrived with the HEADERS
-                frame, then dispatches the assembled request once
-                END_STREAM is seen. parseFrameHeader gives us the
-                frame shell with stream_id and flags; the body
-                bytes still need to be parsed out (handles padding
-                if the PADDED flag is set).
+                context from HEADERS, then dispatches the assembled
+                request when END_STREAM is seen. parseFrameHeader
+                gave us the frame shell; parseBody decodes the body
+                bytes (handles PADDED flag).
              */
             $frame->parseBody($payload);
             $stream_id = $frame->stream_id;
@@ -2149,14 +2107,12 @@ class WebSite
                 'H2_PENDING_STREAMS'][$stream_id] ?? null;
             if ($pending === null) {
                 /*
-                    DATA frame for a stream we never saw HEADERS
-                    on, or one already dispatched. RFC 7540 sec
-                    5.1 says receiving DATA on a stream not in
-                    open or half-closed(local) state is a
-                    STREAM_ERROR. We close the connection; this
-                    is conservative but Atto's H2 path is
-                    synchronous so we never have many concurrent
-                    streams.
+                    DATA on a stream we never saw HEADERS on, or
+                    one already dispatched. RFC 7540 sec 5.1: DATA
+                    on a stream not in open/half-closed(local) is
+                    a STREAM_ERROR. We tear down the connection —
+                    Atto's H2 path is synchronous so concurrent-
+                    stream loss is acceptable.
                  */
                 $goaway = new GoAwayFrame(0,
                     $this->in_streams[self::CONTEXT][$key][
@@ -2380,16 +2336,11 @@ class WebSite
             }
         }
         /*
-            Suppress fwrite warning: clients (especially browsers
-            loading many subresources in parallel) routinely close
-            the connection before we finish writing the response,
-            e.g. when the user navigates away or when the browser
-            cancels in-flight requests. The resulting SIGPIPE /
-            broken-pipe / SSL "bad length" warnings are noise
-            rather than bugs. The connection has already been
-            closed by the peer; the server has nothing else to do
-            and the next event-loop iteration will drop the
-            half-closed stream cleanly.
+            @fwrite: clients (especially browsers loading parallel
+            subresources) routinely close mid-response. The
+            resulting broken-pipe / SSL warnings are noise — the
+            peer is gone and the next event-loop pass drops the
+            stream cleanly.
          */
         @fwrite($connection, $out);
         return true;
@@ -2889,11 +2840,8 @@ class WebSite
             set_error_handler(null);
             $num_bytes = @fwrite($out_stream, $data);
             set_error_handler($custom_error_handler);
-            if ($num_bytes === false) {
-                $remaining_bytes = 0;
-            } else {
-                $remaining_bytes = max(0, strlen($data) - $num_bytes);
-            }
+            $remaining_bytes = ($num_bytes === false) ? 0
+                : max(0, strlen($data) - $num_bytes);
             if ($num_bytes > 0) {
                 $this->out_streams[self::DATA][$key] = substr($data,
                     $num_bytes);
@@ -3046,22 +2994,15 @@ class WebSite
         return true;
     }
     /**
-     * Used to initialize the superglobals before process() is called when
-     * WebSite is run in CLI-mode. The values for the globals come from the
-     * request streams context which has request headers. If the request
-     * had CONTENT, for example, from posted form data, this is parsed and
-     * $_POST, and $_FILES superglobals set up.
+     * Initializes superglobals before process() in CLI mode.
+     * Values come from the request stream's context (request
+     * headers etc). Posted form bodies are parsed into $_POST
+     * and $_FILES.
      *
-     * @param array $context associative array of information parsed from
-     *      a web request. The content portion of the request is not yet
-     *      parsed but headers are, each with a prefix field HTTP_ followed
-     *      by name of the header. For example the value of a header with name
-     *      Cookie should be in $context['HTTP_COOKIE']. The Content-Type
-     *      and Content-Length header do no get the prefix, so should be as
-     *      $context['CONTENT_TYPE'] and $context['CONTENT_LENGTH'].
-     *      The request method, query_string, also appear with the HTTP_ prefix.
-     *      Finally, the content of the request should be in
-     *      $context['CONTENT'].
+     * @param array $context request data. Request headers appear
+     *      with HTTP_ prefix (e.g. $context['HTTP_COOKIE']);
+     *      Content-Type and Content-Length without prefix
+     *      (CGI convention). Body is in $context['CONTENT'].
      */
     protected function setGlobals($context)
     {
@@ -3069,12 +3010,9 @@ class WebSite
         parse_str($context['QUERY_STRING'], $_GET);
         $_POST = [];
         /*
-            $_FILES is a process-global superglobal that PHP
-            does not auto-reset per request when running under
-            the CLI server, so wipe it here. Without this, a
-            previous request's uploaded file metadata leaks into
-            the next request's $_FILES even when the new request
-            has none of its own.
+            $_FILES is process-global; PHP doesn't auto-reset it
+            per request under the CLI server. Wipe to avoid the
+            previous request's metadata leaking into this one.
          */
         $_FILES = [];
         if (!empty($context['CONTENT']) &&
@@ -3085,11 +3023,9 @@ class WebSite
             $raw_form_parts = preg_split("/-+$boundary/", $context['CONTENT']);
             array_pop($raw_form_parts);
             /*
-                Cap the number of parts processed to MAX_INPUT_VARS
-                so a hostile multipart request with millions of
-                small parts cannot exhaust CPU or memory in this
-                loop. Parts past the cap are silently dropped; a
-                legitimate form will not approach this limit.
+                Cap parts at MAX_INPUT_VARS so a hostile multipart
+                with millions of tiny parts can't exhaust CPU or
+                memory. Legitimate forms never approach this.
              */
             $max_input_vars = $this->default_server_globals[
                 'MAX_INPUT_VARS'] ?? 1000;
@@ -3109,11 +3045,9 @@ class WebSite
                 $content_type = "";
                 foreach ($head_parts as $head_part) {
                     /*
-                        Non-greedy capture so a multipart field name
-                        like 'evil"; injection="x' does not match
-                        past the first closing quote. The greedy
-                        (.*) version let attackers smuggle extra
-                        attributes into the parsed name.
+                        Non-greedy capture so 'evil"; x="y' can't
+                        match past the first closing quote and
+                        smuggle extra attributes.
                      */
                     if(preg_match("/\s*Content-Disposition\:\s*form-data\;\s*" .
                         "name\s*=\s*[\"\'](.*?)[\"\']\s*\;\s*filename=".
@@ -3152,17 +3086,13 @@ class WebSite
                     continue;
                 }
                 /*
-                    tmp_name is conventionally a server-generated
-                    filesystem path that move_uploaded_file()
-                    validates. Atto keeps uploads in memory in the
-                    'data' field rather than writing temp files,
-                    so there is no real path to expose. Setting
-                    tmp_name to the client-supplied filename
-                    creates a footgun: code that does
-                    require($_FILES['x']['tmp_name']) or similar
-                    would dereference an attacker-controlled
-                    string. Use a synthetic non-path token
-                    instead so any such code fails obviously.
+                    tmp_name is conventionally a filesystem path
+                    move_uploaded_file() validates. Atto keeps
+                    uploads in memory ('data' field), so there's
+                    no real path. A synthetic non-path token
+                    avoids the footgun where unsuspecting code
+                    might require($_FILES[...]['tmp_name']) and
+                    dereference an attacker-controlled filename.
                  */
                 $tmp_token = "atto-mem-upload-"
                     . bin2hex(random_bytes(8));
@@ -3604,17 +3534,13 @@ class ConnectionAcceptor
         }
         if ($is_secure) {
             /*
-                A listener configured for TLS may still receive
-                plaintext HTTP if the operator runs a single-port
-                setup where some local clients (yioop's Fetcher,
-                health checks, sidecars) speak HTTP. Peek the first
-                byte before invoking the TLS handshake. A TLS
-                ClientHello always starts with 0x16 (ContentType =
-                Handshake, RFC 8446 sec 5.1). Anything else is
-                treated as cleartext and the connection bypasses
-                TLS entirely. This matches the behavior of nginx
-                and similar servers that accept both protocols on
-                the same port.
+                Peek first byte to auto-detect plaintext on a TLS
+                port. A TLS ClientHello starts with 0x16 (RFC 8446
+                sec 5.1 ContentType=Handshake); anything else is
+                cleartext and bypasses TLS. Lets local utilities
+                (yioop's Fetcher, sidecars, health checks) speak
+                HTTP to a TLS-configured port — same behavior as
+                nginx and Caddy.
              */
             $peek = @stream_socket_recvfrom($resource, 1, STREAM_PEEK);
             if ($peek === false || $peek === '') {
@@ -4061,24 +3987,19 @@ class WebSocket
         $this->enqueue(WebSite::WS_OPCODE_CLOSE, $payload);
     }
     /**
-     * Builds a frame for the given opcode and payload and appends
-     * it to the WebSite out_streams buffer for this connection.
-     * The event loop will drain the buffer to the socket as it
-     * becomes writable, handling partial writes transparently.
+     * Builds a frame for the opcode and payload and appends to
+     * the WebSite out_streams buffer. The event loop drains the
+     * buffer as the socket becomes writable.
      *
-     * Outbound message frames (TEXT, BINARY, CONTINUATION) are
-     * capped at WebSite::WS_MAX_MESSAGE_SIZE so a buggy or
-     * malicious route handler cannot blast unbounded data at
-     * the client. Control frames (PING, PONG, CLOSE) are exempt
-     * from the cap since RFC 6455 sec 5.5 limits them to 125
-     * bytes anyway and this method does not enforce that limit
-     * (the caller is expected to comply).
+     * Message frames (TEXT, BINARY, CONTINUATION) are capped at
+     * WS_MAX_MESSAGE_SIZE. Control frames (PING/PONG/CLOSE) are
+     * exempt — RFC 6455 sec 5.5 limits them to 125 bytes anyway
+     * and the caller is expected to comply.
      *
      * @param int $opcode WS_OPCODE_* constant
      * @param string $payload binary payload bytes
-     * @return bool true if queued, false if already closed and
-     *      the opcode is not CLOSE, or if the payload exceeds
-     *      WS_MAX_MESSAGE_SIZE for a message frame
+     * @return bool true if queued, false if closed (and not a
+     *      CLOSE) or if a message frame exceeds the size cap
      */
     public function enqueue($opcode, $payload)
     {
@@ -4498,15 +4419,12 @@ class HeaderFrame extends Frame
         $context['HTTP_HOST'] = $authority;
         $context['CONTENT']= '';
         /*
-            REMOTE_ADDR is a socket-level fact that HeaderFrame
-            cannot observe; it must come from the connection
-            context populated by initRequestStream. Do NOT set
-            it here, otherwise array_merge in parseH2Request
-            (which prefers freshly-parsed request keys over
-            propagated connection-level keys) would overwrite
-            the real client IP with this placeholder, breaking
-            session validity checks in apps like yioop that
-            verify $_SESSION['REMOTE_ADDR'] against the request.
+            REMOTE_ADDR is socket-level — it must come from the
+            connection context populated by initRequestStream. Do
+            NOT set it here: the array_merge in parseH2Request
+            prefers fresh keys, which would clobber the real IP
+            with a placeholder and break apps like yioop that
+            verify $_SESSION['REMOTE_ADDR'].
          */
         $context['SCRIPT_FILENAME']  = '';
         return $context;
@@ -5734,11 +5652,9 @@ class HPack
         if ($remainder !== 0) {
             $encoded .= str_repeat('1', 8 - $remainder);
         }
-        $output = '';
-        foreach (str_split($encoded, 8) as $byte) {
-            $output .= chr(bindec($byte));
-        }
-        return $output;
+        return implode('', array_map(
+            fn($b) => chr(bindec($b)),
+            str_split($encoded, 8)));
     }
     /**
      * Decodes a Huffman-encoded byte string into ASCII (RFC 7541

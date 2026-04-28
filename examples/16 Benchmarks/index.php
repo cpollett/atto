@@ -407,15 +407,22 @@ $test->get('/headers', function () use ($test) {
     echo "headers";
 });
 if ($test->isCli()) {
-    $cert = __DIR__ . "/cert.pem";
-    $key = __DIR__ . "/key.pem";
+    /*
+        Reuse the repository's self-signed cert (security/) so
+        every example with a TLS listener picks up the same
+        SAN-enabled localhost+127.0.0.1 certificate. Generated
+        once with security/san.cnf rather than per-run, which
+        also avoids the openssl progress dots polluting the
+        startup output.
+     */
+    $cert = __DIR__ . "/../../security/server.crt";
+    $key = __DIR__ . "/../../security/server.key";
     if (!file_exists($cert) || !file_exists($key)) {
-        echo "Generating self-signed cert for benchmarks...\n";
-        $cmd = "openssl req -x509 -newkey rsa:2048 -nodes -days 30 " .
-            "-keyout " . escapeshellarg($key) . " " .
-            "-out " . escapeshellarg($cert) . " " .
-            "-subj '/CN=localhost' 2>&1";
-        passthru($cmd);
+        echo "Cert not found at $cert / $key.\n";
+        echo "Run: cd security && openssl req -x509 -nodes " .
+            "-newkey rsa:4096 -keyout server.key -out " .
+            "server.crt -days 365 -config san.cnf\n";
+        exit(1);
     }
     echo "\n";
     echo "  Atto Benchmark Dashboard ready.\n";

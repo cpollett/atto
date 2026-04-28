@@ -224,6 +224,33 @@ class WebSite
      */
     protected $content_type;
     /**
+     * Streaming state: when a route calls $site->flush() its
+     * buffered output (and headers, on first flush) are written
+     * to the socket immediately rather than buffered until route
+     * return. Subsequent flushes write further chunks. The
+     * normal end-of-route response composition is bypassed in
+     * stream mode and a terminating chunk / END_STREAM frame is
+     * emitted instead.
+     * @var bool
+     */
+    protected $is_streaming = false;
+    /**
+     * Connection resource for the in-flight request, set by
+     * processRequestStreams (H1) or dispatchH2Request (H2)
+     * before calling the route. Used by flush() to write
+     * directly to the socket. Null outside a request.
+     * @var resource|null
+     */
+    protected $streaming_socket = null;
+    /**
+     * Per-request streaming context. For H1 contains
+     * ['protocol' => 'h1']; for H2 contains
+     * ['protocol' => 'h2', 'stream_id' => int,
+     *  'hpack_encode' => HPack].
+     * @var array
+     */
+    protected $streaming_context = [];
+    /**
      * Used to cache in RAM files which have been read or written by the
      * fileGetContents or filePutContents
      * @var array
@@ -612,6 +639,194 @@ class WebSite
             header($header);
         }
         return true;
+    }
+    /**
+     * Streams the buffered output to the client immediately
+     * instead of buffering until the route returns. Use to push
+     * Server-Sent Events, deliver large dynamic responses
+     * incrementally, or send headers + initial bytes before
+     * computing the rest.
+     *
+     * Behaviour:
+     *   First call: composes headers (using $this->header_data
+     *     plus Transfer-Encoding: chunked for H1, or a HEADERS
+     *     frame without END_STREAM for H2) and writes them with
+     *     the buffered output as the first chunk.
+     *   Subsequent calls: write only the new buffered output as
+     *     a chunk.
+     *   Route return: getResponseData detects stream mode and
+     *     emits a terminating chunk / END_STREAM frame.
+     *
+     * Streaming routes block the event loop while running, so
+     * avoid sleep() between flushes; instead structure routes
+     * to do bounded work per request and let the client
+     * reconnect (the EventSource auto-reconnect pattern).
+     *
+     * @return bool true if a flush happened, false if not in
+     *      a request context where streaming is supported
+     */
+    public function flush()
+    {
+        if (!$this->isCli()
+                || $this->streaming_socket === null
+                || empty($this->streaming_context)) {
+            return false;
+        }
+        $chunk = ob_get_clean();
+        ob_start();
+        $protocol = $this->streaming_context['protocol'] ?? null;
+        if (!$this->is_streaming) {
+            $this->is_streaming = true;
+            if ($protocol === 'h1') {
+                $this->writeStreamingHead_H1($chunk);
+            } else if ($protocol === 'h2') {
+                $this->writeStreamingHead_H2($chunk);
+            } else {
+                return false;
+            }
+            return true;
+        }
+        if ($chunk === '' || $chunk === false) {
+            return true;
+        }
+        if ($protocol === 'h1') {
+            $this->writeStreamingChunk_H1($chunk);
+        } else if ($protocol === 'h2') {
+            $this->writeStreamingChunk_H2($chunk);
+        }
+        return true;
+    }
+    /**
+     * Composes and writes the H1 response head plus first chunk
+     * for a streaming response. Forces Transfer-Encoding: chunked
+     * (no Content-Length, since the total length is unknown
+     * during streaming). Called from flush() on the first call.
+     */
+    protected function writeStreamingHead_H1($chunk)
+    {
+        if (substr($this->header_data, 0, 5) != "HTTP/") {
+            $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                " 200 OK\x0D\x0A" . $this->header_data;
+        }
+        if (!$this->content_type) {
+            $this->header_data .= "Content-Type: text/html\x0D\x0A";
+        }
+        $this->header_data .= "Transfer-Encoding: chunked\x0D\x0A";
+        $head = $this->header_data . "\x0D\x0A";
+        @fwrite($this->streaming_socket, $head);
+        if ($chunk !== '' && $chunk !== false) {
+            $this->writeStreamingChunk_H1($chunk);
+        }
+    }
+    /**
+     * Writes a single H1 chunked-transfer chunk. RFC 7230 sec 4.1
+     * format: <hex-length>\r\n<data>\r\n.
+     */
+    protected function writeStreamingChunk_H1($chunk)
+    {
+        @fwrite($this->streaming_socket,
+            dechex(strlen($chunk)) . "\x0D\x0A" . $chunk . "\x0D\x0A");
+    }
+    /**
+     * Composes and writes the H2 HEADERS frame (without
+     * END_STREAM) plus first DATA frame for a streaming response.
+     * Subsequent flushes are pure DATA frames. The terminating
+     * empty DATA with END_STREAM is sent by getResponseData.
+     */
+    protected function writeStreamingHead_H2($chunk)
+    {
+        $stream_id = $this->streaming_context['stream_id'];
+        $hpack_encode = $this->streaming_context['hpack_encode'];
+        $status = "200";
+        if (preg_match("/HTTP\/[\d.]+ (\d+)/",
+                $this->header_data, $matches)) {
+            $status = $matches[1];
+        }
+        $resp_headers_data = [[":status", $status]];
+        $forbidden = ["connection", "keep-alive", "proxy-connection",
+            "transfer-encoding", "upgrade", "content-length"];
+        $has_content_type = false;
+        $header_lines = explode("\r\n", $this->header_data);
+        /*
+            If header_data starts with an HTTP status line, drop
+            it (we already encoded :status above). In streaming
+            mode the route may not have sent a status line yet —
+            in that case the first entry is already a real header
+            and must be kept.
+         */
+        if (!empty($header_lines[0])
+                && substr($header_lines[0], 0, 5) === "HTTP/") {
+            array_shift($header_lines);
+        }
+        foreach ($header_lines as $line) {
+            $colon = strpos($line, ":");
+            if ($colon === false) {
+                continue;
+            }
+            $name = strtolower(trim(substr($line, 0, $colon)));
+            $value = trim(substr($line, $colon + 1));
+            if ($name === "" || $name[0] === ":"
+                || in_array($name, $forbidden)) {
+                continue;
+            }
+            if ($name === "content-type") {
+                $has_content_type = true;
+            }
+            $resp_headers_data[] = [$name, $value];
+        }
+        if (!$has_content_type) {
+            $resp_headers_data[] =
+                ["content-type", "text/html; charset=utf-8"];
+        }
+        $resp_headers = new HeaderFrame($stream_id, $resp_headers_data);
+        $resp_headers->flags->add("END_HEADERS");
+        @fwrite($this->streaming_socket,
+            $resp_headers->serialize($hpack_encode));
+        if ($chunk !== '' && $chunk !== false) {
+            $this->writeStreamingChunk_H2($chunk);
+        }
+    }
+    /**
+     * Writes one or more H2 DATA frames for a streaming chunk,
+     * splitting at H2_MAX_FRAME_SIZE per RFC 7540 sec 4.2.
+     * No END_STREAM is set; the terminator comes later.
+     */
+    protected function writeStreamingChunk_H2($chunk)
+    {
+        $stream_id = $this->streaming_context['stream_id'];
+        $body_len = strlen($chunk);
+        $max = self::H2_MAX_FRAME_SIZE;
+        $offset = 0;
+        $out = "";
+        while ($offset < $body_len) {
+            $piece = substr($chunk, $offset, $max);
+            $offset += strlen($piece);
+            $frame = new DataFrame($stream_id, $piece);
+            $out .= $frame->serialize();
+        }
+        @fwrite($this->streaming_socket, $out);
+    }
+    /**
+     * Closes a streaming response by sending the terminating
+     * frame (zero-length chunk for H1, empty DATA with END_STREAM
+     * for H2) and clearing streaming state. Called from
+     * getResponseData after the route returns when
+     * $is_streaming is true.
+     */
+    protected function endStreaming()
+    {
+        $protocol = $this->streaming_context['protocol'] ?? null;
+        if ($protocol === 'h1') {
+            @fwrite($this->streaming_socket, "0\x0D\x0A\x0D\x0A");
+        } else if ($protocol === 'h2') {
+            $stream_id = $this->streaming_context['stream_id'];
+            $end = new DataFrame($stream_id, "");
+            $end->flags->add("END_STREAM");
+            @fwrite($this->streaming_socket, $end->serialize());
+        }
+        $this->is_streaming = false;
+        $this->streaming_socket = null;
+        $this->streaming_context = [];
     }
     /**
      * Emits a Link: rel=preload response header telling browsers to
@@ -1501,6 +1716,26 @@ class WebSite
         }
         $out_data = ob_get_contents();
         ob_end_clean();
+        if ($this->is_streaming) {
+            /*
+                Route used $site->flush(). Headers and body
+                already went out the socket. Drain any final
+                bytes the route emitted after its last flush,
+                then send the terminating chunk / END_STREAM.
+                Return empty so the caller's normal write path
+                doesn't try to send the same response again.
+             */
+            if ($out_data !== '' && $out_data !== false) {
+                $protocol = $this->streaming_context['protocol'] ?? null;
+                if ($protocol === 'h1') {
+                    $this->writeStreamingChunk_H1($out_data);
+                } else if ($protocol === 'h2') {
+                    $this->writeStreamingChunk_H2($out_data);
+                }
+            }
+            $this->endStreaming();
+            return "";
+        }
         if ($this->header_data == "UPGRADE") {
             $out_data = "";
             $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
@@ -1739,7 +1974,18 @@ class WebSite
                         $this->in_streams[self::CONTEXT][$key][
                             'BAD_RESPONSE'] = true;
                     }
+                    /*
+                        Make the H1 connection available to
+                        $site->flush() so a route that opts into
+                        streaming can write to the socket directly.
+                        Cleared after dispatch regardless of whether
+                        the route streamed.
+                     */
+                    $this->streaming_socket = $in_stream;
+                    $this->streaming_context = ['protocol' => 'h1'];
                     $out_data = $this->getResponseData();
+                    $this->streaming_socket = null;
+                    $this->streaming_context = [];
                     if (empty($this->in_streams[self::CONTEXT][$key][
                             'BAD_RESPONSE'])) {
                         /*
@@ -2257,7 +2503,30 @@ class WebSite
             'HPACK_ENCODE'] ?? new HPack();
         $_SESSION = [];
         $this->setGlobals($context);
+        /*
+            Make the H2 connection + stream available to
+            $site->flush() so a route can stream a response by
+            writing HEADERS and DATA frames directly. Cleared
+            after dispatch.
+         */
+        $this->streaming_socket = $connection;
+        $this->streaming_context = [
+            'protocol' => 'h2',
+            'stream_id' => $stream_id,
+            'hpack_encode' => $hpack_encode,
+        ];
         $body = $this->getResponseData(false);
+        $was_streaming = ($body === "" && $this->streaming_socket === null);
+        $this->streaming_socket = null;
+        $this->streaming_context = [];
+        if ($was_streaming) {
+            /*
+                Route streamed via $site->flush(); response was
+                already written to the wire and terminated by
+                endStreaming(). Nothing more to send here.
+             */
+            return true;
+        }
         $status = "200";
         if (preg_match("/HTTP\/[\d.]+ (\d+)/",
                 $this->header_data, $matches)) {

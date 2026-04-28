@@ -172,6 +172,21 @@ class WebSite
      */
     protected $out_streams = [];
     /**
+     * Live Connection objects, keyed by (int)$resource. Created in
+     * processServerRequest after a successful accept and torn down
+     * by shutdownHttpStream. Per-connection protocol state (HPACK
+     * encoder/decoder, H2 stream registry, etc.) hangs off the
+     * Connection's protocolState property; existing in_streams /
+     * out_streams arrays still hold the I/O buffers and request
+     * context. Migrating state from those arrays into Connection
+     * is gradual: new code that needs typed access should fetch
+     * the Connection via $this->connection($key) and read its
+     * protocolState; old call sites that index in_streams
+     * directly continue to work unchanged.
+     * @var array<int,Connection>
+     */
+    protected $connections = [];
+    /**
      * Middle ware callbacks to run when processing a request
      * @var array
      */
@@ -1992,18 +2007,18 @@ class WebSite
                             Preserve per-connection state across the
                             keep-alive reset. These keys depend only
                             on which listener accepted the connection
-                            (and on the H2 HPACK decode/encode tables)
                             so they apply to every request on this
                             connection, not just the one we just
-                            processed.
+                            processed. H2 connection state lives on
+                            the Connection object (protocol_state)
+                            and survives this reset automatically.
                          */
                         $preserve = [];
                         $current = $this->in_streams[self::CONTEXT][
                             $key] ?? [];
                         foreach (['IS_SECURE', 'LISTENER_PORT',
-                                'LISTENER_NAME', 'HTTPS', 'CLIENT_HTTP',
-                                'HPACK_DECODE', 'HPACK_ENCODE'] as
-                                $field) {
+                                'LISTENER_NAME', 'HTTPS', 'CLIENT_HTTP'
+                                ] as $field) {
                             if (isset($current[$field])) {
                                 $preserve[$field] = $current[$field];
                             }
@@ -2072,6 +2087,21 @@ class WebSite
         $key = (int) $resource;
         $this->in_streams[self::CONNECTION][$key] = $resource;
         $client_http = $additional_context["CLIENT_HTTP"];
+        /*
+            Persist the Connection object for this stream key.
+            The Connection holds the I/O resource handle, the
+            negotiated protocol, and (for H2) per-connection
+            HPACK encoder/decoder and stream registry. Subsequent
+            code fetches the Connection via $this->connection($key)
+            and reads its protocol_state without indexing the
+            untyped in_streams[CONTEXT] for those fields.
+         */
+        if ($client_http == "HTTP/2.0" || $client_http == "h2c") {
+            $connection->protocol = 'h2';
+        } else {
+            $connection->protocol = 'h1';
+        }
+        $this->connections[$key] = $connection;
         if ($client_http == "HTTP/2.0") {
             try {
                 /*
@@ -2079,8 +2109,10 @@ class WebSite
                     detection read in ConnectionAcceptor
                  */
                 $this->initH2Request($resource, false);
-                $additional_context['HPACK_DECODE'] = new HPack();
-                $additional_context['HPACK_ENCODE'] = new HPack();
+                $connection->protocol_state['hpack_decode']
+                    = new HPack();
+                $connection->protocol_state['hpack_encode']
+                    = new HPack();
                 $this->initRequestStream($key,
                     $additional_context);
             } catch (\Exception $e) {
@@ -2093,8 +2125,10 @@ class WebSite
                     is still in the buffer
                  */
                 $this->initH2Request($resource, true);
-                $additional_context['HPACK_DECODE'] = new HPack();
-                $additional_context['HPACK_ENCODE'] = new HPack();
+                $connection->protocol_state['hpack_decode']
+                    = new HPack();
+                $connection->protocol_state['hpack_encode']
+                    = new HPack();
                 $this->initRequestStream($key,
                     $additional_context);
             } catch (\Exception $e) {
@@ -2266,6 +2300,23 @@ class WebSite
      */
     protected function parseH2Request($key, $connection)
     {
+        /*
+            Per-connection H2 state lives on the Connection object
+            (HPACK encoder/decoder, last-seen stream id, half-open
+            streams awaiting END_STREAM). Pre-fetch it here so the
+            rest of this method reads from the typed
+            protocol_state array rather than indexing the untyped
+            in_streams[CONTEXT]. The Connection is created by
+            processServerRequest right after accept; if it is
+            missing here, we are processing a frame for a stream
+            that has already been torn down and should bail.
+         */
+        $conn = $this->connection($key);
+        if ($conn === null) {
+            $this->shutdownHttpStream($key);
+            return false;
+        }
+        $state = &$conn->protocol_state;
         stream_set_blocking($connection, true);
         try {
             $hdr = $this->readExactly($connection,
@@ -2327,8 +2378,7 @@ class WebSite
                 STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
                 MAX_HEADER_LIST_SIZE) are accepted but ignored.
              */
-            $hpack_encode = $this->in_streams[self::CONTEXT][$key][
-                'HPACK_ENCODE'] ?? null;
+            $hpack_encode = $state['hpack_encode'] ?? null;
             if ($hpack_encode !== null
                 && isset($frame->settings[0x01])) {
                 $hpack_encode->setMaxTableSize($frame->settings[0x01]);
@@ -2349,8 +2399,7 @@ class WebSite
              */
             $frame->parseBody($payload);
             $stream_id = $frame->stream_id;
-            $pending = $this->in_streams[self::CONTEXT][$key][
-                'H2_PENDING_STREAMS'][$stream_id] ?? null;
+            $pending = $state['pending_streams'][$stream_id] ?? null;
             if ($pending === null) {
                 /*
                     DATA on a stream we never saw HEADERS on, or
@@ -2361,8 +2410,7 @@ class WebSite
                     stream loss is acceptable.
                  */
                 $goaway = new GoAwayFrame(0,
-                    $this->in_streams[self::CONTEXT][$key][
-                        'H2_LAST_STREAM_ID'] ?? 0, 0x1, "");
+                    $state['last_stream_id'] ?? 0, 0x1, "");
                 @fwrite($connection, $goaway->serialize());
                 $this->shutdownHttpStream($key);
                 return false;
@@ -2398,8 +2446,7 @@ class WebSite
                     rather than buffer further.
                  */
                 $goaway = new GoAwayFrame(0,
-                    $this->in_streams[self::CONTEXT][$key][
-                        'H2_LAST_STREAM_ID'] ?? 0, 0xb, "");
+                    $state['last_stream_id'] ?? 0, 0xb, "");
                 @fwrite($connection, $goaway->serialize());
                 $this->shutdownHttpStream($key);
                 return false;
@@ -2407,13 +2454,11 @@ class WebSite
             if ($frame->flags->contains('END_STREAM')) {
                 $context = $pending['context'];
                 $context['CONTENT'] = $pending['body'];
-                unset($this->in_streams[self::CONTEXT][$key][
-                    'H2_PENDING_STREAMS'][$stream_id]);
+                unset($state['pending_streams'][$stream_id]);
                 return $this->dispatchH2Request($key, $connection,
                     $stream_id, $context);
             }
-            $this->in_streams[self::CONTEXT][$key][
-                'H2_PENDING_STREAMS'][$stream_id] = $pending;
+            $state['pending_streams'][$stream_id] = $pending;
             return false;
         }
         if (!($frame instanceof HeaderFrame)) {
@@ -2430,20 +2475,16 @@ class WebSite
             against the same high-water mark.
          */
         $client_stream_id = $frame->stream_id;
-        $high_water = $this->in_streams[self::CONTEXT][$key][
-            'H2_LAST_STREAM_ID'] ?? 0;
+        $high_water = $state['last_stream_id'] ?? 0;
         if ($client_stream_id <= $high_water) {
             $goaway = new GoAwayFrame(0, $high_water, 0x1, "");
             @fwrite($connection, $goaway->serialize());
             $this->shutdownHttpStream($key);
             return false;
         }
-        $this->in_streams[self::CONTEXT][$key]['H2_LAST_STREAM_ID']
-            = $client_stream_id;
-        $hpack_decode = $this->in_streams[self::CONTEXT][$key][
-            'HPACK_DECODE'] ?? new HPack();
-        $hpack_encode = $this->in_streams[self::CONTEXT][$key][
-            'HPACK_ENCODE'] ?? new HPack();
+        $state['last_stream_id'] = $client_stream_id;
+        $hpack_decode = $state['hpack_decode'] ?? new HPack();
+        $hpack_encode = $state['hpack_encode'] ?? new HPack();
         $context = $frame->parseBody($payload, $hpack_decode);
         /*
             HeaderFrame::parseBody builds its context fresh from the
@@ -2471,9 +2512,8 @@ class WebSite
                 accumulate the body and the eventual END_STREAM
                 will trigger dispatchH2Request.
              */
-            $this->in_streams[self::CONTEXT][$key][
-                'H2_PENDING_STREAMS'][$client_stream_id] = [
-                    'context' => $context, 'body' => ''];
+            $state['pending_streams'][$client_stream_id] = [
+                'context' => $context, 'body' => ''];
             return false;
         }
         return $this->dispatchH2Request($key, $connection,
@@ -2499,8 +2539,11 @@ class WebSite
     protected function dispatchH2Request($key, $connection,
         $stream_id, $context)
     {
-        $hpack_encode = $this->in_streams[self::CONTEXT][$key][
-            'HPACK_ENCODE'] ?? new HPack();
+        $conn = $this->connection($key);
+        $hpack_encode = $conn !== null
+            ? ($conn->protocol_state['hpack_encode']
+                ?? new HPack())
+            : new HPack();
         $_SESSION = [];
         $this->setGlobals($context);
         /*
@@ -3489,6 +3532,23 @@ class WebSite
         }
     }
     /**
+     * Returns the live Connection object for the given stream key,
+     * or null if no Connection has been registered (or the
+     * connection has already been torn down). Code that needs
+     * typed per-connection state — protocol, HPACK encoders, H2
+     * stream registry — should fetch the Connection here and
+     * read its protocol_state instead of indexing into the
+     * untyped in_streams[CONTEXT] array.
+     *
+     * @param int $key id of stream to look up
+     * @return Connection|null connection object, or null if the
+     *      key is unknown
+     */
+    public function connection($key)
+    {
+        return $this->connections[$key] ?? null;
+    }
+    /**
      * Closes stream with id $key and removes it from in_streams and
      * outstreams arrays.
      *
@@ -3512,7 +3572,8 @@ class WebSite
             $this->out_streams[self::CONNECTION][$key],
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::DATA][$key],
-            $this->out_streams[self::MODIFIED_TIME][$key]
+            $this->out_streams[self::MODIFIED_TIME][$key],
+            $this->connections[$key]
         );
     }
     /**
@@ -3569,6 +3630,32 @@ class WebException extends \Exception
  * QuicConnection subclass would override read/write to direct
  * traffic to a specific QUIC stream and would override streamId()
  * to return the QUIC stream id rather than 0.
+ *
+ * Migration plan toward H3 support:
+ *   Phase 1 (done): Connection objects persist for the lifetime
+ *     of the connection in WebSite::$connections, tagged with a
+ *     protocol string and carrying protocol-specific state on
+ *     protocol_state. H2 HPACK encoder/decoder, last-stream-id,
+ *     and pending streams have been migrated off in_streams[
+ *     CONTEXT] and live here instead.
+ *   Phase 2: migrate the H1 read buffer, parsed-headers state,
+ *     and keep-alive bookkeeping off in_streams arrays into the
+ *     Connection. Same pattern: a typed home for state that
+ *     belongs to the connection rather than to a single request.
+ *   Phase 3: introduce a Listener class that owns a server
+ *     socket and its accept policy (TCP accept + TLS handshake
+ *     today; UDP recvfrom + QUIC handshake for H3). The current
+ *     ConnectionAcceptor becomes a method on Listener.
+ *   Phase 4: introduce Transport classes (H1Transport,
+ *     H2Transport, eventual H3Transport) that own protocol-
+ *     specific frame parsing and dispatch. WebSite's main loop
+ *     becomes a thin select-and-route shell.
+ *   Phase 5: H3. Subclass Connection as QuicConnection (with a
+ *     non-zero streamId), subclass Listener as QuicListener
+ *     (UDP socket, datagram demux), add an H3Transport. The
+ *     pure-PHP QUIC stack itself is enormous — this phase is
+ *     gated on either a native QUIC extension being available
+ *     or someone tackling that stack directly.
  */
 class Connection
 {
@@ -3584,6 +3671,32 @@ class Connection
      * @var bool
      */
     public $is_secure;
+    /**
+     * Application protocol negotiated for this connection. One of
+     * 'h1', 'h2', 'ws' for an upgraded WebSocket, or 'h3' once
+     * QUIC support lands. Set by processServerRequest after
+     * ConnectionAcceptor's protocol detection. Empty string until
+     * detected.
+     * @var string
+     */
+    public $protocol = '';
+    /**
+     * Protocol-specific state, indexed by short keys whose
+     * meaning depends on protocol. For 'h2' this currently holds:
+     *
+     *   'hpack_encode' => HPack instance for outgoing HEADERS
+     *   'hpack_decode' => HPack instance for inbound HEADERS
+     *   'last_stream_id' => highest seen client stream id
+     *   'pending_streams' => array of half-open client streams
+     *       awaiting END_STREAM (HEADERS + DATA accumulation)
+     *
+     * Storing these here, rather than in WebSite's
+     * in_streams[CONTEXT] array, keeps connection-lifetime state
+     * with the connection object itself and provides a single
+     * place a future H3Connection subclass can override.
+     * @var array
+     */
+    public $protocol_state = [];
     /**
      * Constructs a Connection wrapping a stream resource.
      *
@@ -4022,8 +4135,7 @@ class WebSocketFrame
     /**
      * Unmasks a WebSocket payload (RFC 6455 sec 5.3) by XORing each
      * byte with the corresponding byte of the rotating 4-byte mask
-     * key. Implemented via string-mode XOR over the whole payload
-     * for one C-level pass instead of a PHP loop.
+     * key.
      *
      * @param string $payload masked binary payload
      * @param string $mask_key 4-byte masking key
@@ -5369,15 +5481,10 @@ class HPack
      */
     private $headers_table = [];
     /**
-     * Encoder lookup hashes for the static table only. Built
-     * once in the constructor; never updated. Maps "name\0value"
+     * Encoder lookup hashes for the static table. Built once on
+     * the first HPack instance; never updated. Maps "name\0value"
      * to a static-table index for exact matches, and name to
-     * a static-table index for name-only matches. Dynamic
-     * entries are not indexed here: the encoder still emits
-     * compact forms for static-table hits (the common case for
-     * pseudo-headers and standard response headers), and falls
-     * through to "literal with new name" for everything else.
-     * Keeping these static avoids per-addHeader hash rebuild.
+     * a static-table index for name-only matches.
      * @var array<string,int>
      */
     private static $static_name_value_index = null;
@@ -5386,7 +5493,6 @@ class HPack
      * List of header names that have been encoded as
      * "Literal Never Indexed" and so must not be added to the
      * dynamic table by intermediaries (RFC 7541 sec 6.2.3).
-     * Stored as name => true so isset() lookups are O(1).
      * @var array<string,bool>
      */
     private $never_index_list = [];
@@ -5490,9 +5596,7 @@ class HPack
      * up by one. If the entry alone exceeds max_table_size, the
      * table is cleared and the entry is not added (RFC 7541 sec
      * 4.4). Otherwise oldest entries are evicted from the highest
-     * index until the new entry fits. Maintains the encoder
-     * lookup hashes (name_value_index, name_index) so encode()
-     * can find matches in O(1).
+     * index until the new entry fits.
      *
      * @param string $name  The name of the header.
      * @param string $value The value of the header.
@@ -5520,14 +5624,7 @@ class HPack
             array_splice with offset = static_table_len + 1
             inserts at the lowest dynamic index (62 for the
             initial table) and shifts existing dynamic entries
-            up by one. This is a single C-level memmove rather
-            than a PHP-level loop, which is ~7x faster for
-            tables with dozens of dynamic entries.
-
-            Existing dynamic entries' HPACK indices each rise
-            by 1, so we rebuild the lookup hashes for those
-            shifted entries. The static-table portion of the
-            hashes is unchanged.
+            up by one.
          */
         array_splice($this->headers_table,
             $static_table_len + 1, 0, [[$name, $value]]);
@@ -5884,11 +5981,10 @@ class HPack
             /*
                 Literal with incremental indexing, new name:
                 01000000 plus literal name plus literal value.
-                We do not consult the dynamic table for matches
-                — typical responses have unique custom-header
-                names so a dynamic-table scan rarely pays for
-                itself, and falling through to literal-with-
-                new-name is correct (just slightly less compact).
+                Falls through here for any header whose name is
+                not in the static table; the dynamic table is
+                not consulted, which is correct (just slightly
+                less compact than full HPACK).
              */
             $encoded .= chr(0x40);
             $encoded .= $this->encodeString($name);
@@ -5924,16 +6020,14 @@ class HPack
      * Per-byte Huffman code as [int $code, int $bit_len].
      * Lazily built from HUFFMAN_LOOKUP on first use. The integer
      * form lets the encoder shift bits into a 64-bit accumulator
-     * and flush bytes via pack(), avoiding per-byte string concat
-     * which dominated the original encode time.
+     * and flush bytes via pack().
      * @var array<int,array{int,int}>
      */
     private static $HUFFMAN_CODES = [];
     /**
      * Precomputed byte-to-8-bit-string table for huffmanDecode.
      * Indexed by 0..255; each entry is the corresponding 8-char
-     * '0'/'1' string. A single C-level array lookup per input
-     * byte is much faster than the bit-by-bit shift loop.
+     * '0'/'1' string.
      * @var array<int,string>
      */
     private static $BYTE_TO_BITS = [];
@@ -6004,9 +6098,7 @@ class HPack
      * Decodes a Huffman-encoded byte string into ASCII (RFC 7541
      * sec 5.2). Builds the bit string from the input bytes via a
      * 256-entry precomputed lookup, then walks the bits looking
-     * up each prefix-free code in HUFFMAN_LOOKUP. The bulk
-     * byte->bits conversion via implode+lookup beats a nested
-     * shift loop by ~1.5x.
+     * up each prefix-free code in HUFFMAN_LOOKUP.
      *
      * @param string $input binary Huffman-encoded byte string
      * @return string decoded ASCII string

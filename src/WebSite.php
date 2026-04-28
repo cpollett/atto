@@ -1927,12 +1927,18 @@ class WebSite
                 $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])) {
                 continue;
             }
-            $is_h2 = isset(
-                $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP'])
-                && $this->in_streams[self::CONTEXT][$key]['CLIENT_HTTP']
-                    == "HTTP/2.0";
-            $is_ws = !empty(
-                $this->in_streams[self::CONTEXT][$key]['IS_WEBSOCKET']);
+            /*
+                Per-iteration protocol routing. The Connection
+                object carries the negotiated protocol ('h1',
+                'h2', or 'ws' once an H1 connection has upgraded).
+                A missing Connection here means the stream was
+                torn down between select() and now; treat it as
+                H1 to fall through to the parser, which will
+                detect the missing state and clean up.
+             */
+            $conn = $this->connection($key);
+            $is_h2 = $conn !== null && $conn->protocol === 'h2';
+            $is_ws = $conn !== null && $conn->is_websocket;
             if ($is_ws) {
                 /*
                     Established WebSocket connection. parseWsRequest
@@ -2004,26 +2010,17 @@ class WebSite
                     if (empty($this->in_streams[self::CONTEXT][$key][
                             'BAD_RESPONSE'])) {
                         /*
-                            Preserve per-connection state across the
-                            keep-alive reset. These keys depend only
-                            on which listener accepted the connection
-                            so they apply to every request on this
-                            connection, not just the one we just
-                            processed. H2 connection state lives on
-                            the Connection object (protocol_state)
-                            and survives this reset automatically.
+                            Reset per-request context for the next
+                            keep-alive request. Listener-attached
+                            state (IS_SECURE, LISTENER_PORT,
+                            LISTENER_NAME, HTTPS, CLIENT_HTTP) and
+                            H2 protocol state live on the
+                            persistent Connection object and
+                            survive this reset automatically;
+                            setGlobals re-overlays them onto
+                            $_SERVER for the next request.
                          */
-                        $preserve = [];
-                        $current = $this->in_streams[self::CONTEXT][
-                            $key] ?? [];
-                        foreach (['IS_SECURE', 'LISTENER_PORT',
-                                'LISTENER_NAME', 'HTTPS', 'CLIENT_HTTP'
-                                ] as $field) {
-                            if (isset($current[$field])) {
-                                $preserve[$field] = $current[$field];
-                            }
-                        }
-                        $this->initRequestStream($key, $preserve);
+                        $this->initRequestStream($key);
                     }
                     if (empty($this->out_streams[self::CONNECTION][$key])) {
                         $this->out_streams[self::CONNECTION][$key] =
@@ -2071,36 +2068,54 @@ class WebSite
         }
         $resource = $connection->resource();
         $is_secure = $connection->is_secure;
-        $additional_context['IS_SECURE'] = $is_secure;
-        $additional_context['LISTENER_PORT'] =
-            $listener['globals']['SERVER_PORT'] ?? '';
-        $additional_context['LISTENER_NAME'] =
-            $listener['globals']['SERVER_NAME'] ?? '';
-        if ($is_secure) {
-            /*
-                Standard CGI HTTPS=on convention so generic PHP
-                code that checks $_SERVER['HTTPS'] sees the
-                expected value on TLS connections.
-             */
-            $additional_context['HTTPS'] = 'on';
-        }
         $key = (int) $resource;
         $this->in_streams[self::CONNECTION][$key] = $resource;
         $client_http = $additional_context["CLIENT_HTTP"];
         /*
             Persist the Connection object for this stream key.
             The Connection holds the I/O resource handle, the
-            negotiated protocol, and (for H2) per-connection
-            HPACK encoder/decoder and stream registry. Subsequent
-            code fetches the Connection via $this->connection($key)
-            and reads its protocol_state without indexing the
-            untyped in_streams[CONTEXT] for those fields.
+            negotiated protocol, the listener attributes
+            (listener_port, listener_name, https), the detailed
+            client-protocol string (client_http), and (for H2)
+            per-connection HPACK encoder/decoder and stream
+            registry. Subsequent code fetches the Connection via
+            $this->connection($key) and reads these fields
+            without indexing the untyped in_streams[CONTEXT].
          */
         if ($client_http == "HTTP/2.0" || $client_http == "h2c") {
             $connection->protocol = 'h2';
         } else {
             $connection->protocol = 'h1';
         }
+        $connection->client_http = $client_http;
+        $connection->listener_port =
+            $listener['globals']['SERVER_PORT'] ?? '';
+        $connection->listener_name =
+            $listener['globals']['SERVER_NAME'] ?? '';
+        if ($is_secure) {
+            /*
+                Standard CGI HTTPS=on convention so generic PHP
+                code that checks $_SERVER['HTTPS'] sees the
+                expected value on TLS connections. setGlobals
+                overlays this onto $_SERVER right before request
+                dispatch.
+             */
+            $connection->https = 'on';
+        }
+        /*
+            Resolve peer and local socket addresses once at accept
+            time and stash them on the Connection. initRequestStream
+            previously called stream_socket_get_name on every
+            keep-alive reset; pulling that out and reading from
+            the Connection saves the syscall and gives the values
+            a stable home.
+         */
+        $remote_name = stream_socket_get_name($resource, true);
+        $server_name = stream_socket_get_name($resource, false);
+        list($connection->remote_addr, $connection->remote_port) =
+            $this->splitAddressPort($remote_name);
+        list($connection->server_addr, $connection->server_port) =
+            $this->splitAddressPort($server_name);
         $this->connections[$key] = $connection;
         if ($client_http == "HTTP/2.0") {
             try {
@@ -2487,21 +2502,29 @@ class WebSite
         $hpack_encode = $state['hpack_encode'] ?? new HPack();
         $context = $frame->parseBody($payload, $hpack_decode);
         /*
-            HeaderFrame::parseBody builds its context fresh from the
-            HEADERS frame and so does not see the per-connection
-            keys (IS_SECURE, LISTENER_PORT, LISTENER_NAME, HTTPS)
-            that processServerRequest stored in in_streams[CONTEXT].
-            Merge those in here, with the freshly-parsed request
-            keys winning on conflict.
+            HeaderFrame::parseBody builds its context fresh from
+            the HEADERS frame and so does not see the
+            per-connection keys (IS_SECURE, LISTENER_PORT,
+            LISTENER_NAME, HTTPS) which now live on the Connection
+            object, or REMOTE_ADDR/REMOTE_PORT/SERVER_ADDR/
+            SERVER_PORT which initRequestStream populated in
+            in_streams[CONTEXT]. Pull both sources together here
+            so the per-stream context dispatched via
+            dispatchH2Request carries the full picture. The
+            freshly-parsed request keys win on conflict.
          */
-        $conn_context = $this->in_streams[self::CONTEXT][$key] ?? [];
-        $propagate = [];
-        foreach (['IS_SECURE', 'LISTENER_PORT', 'LISTENER_NAME',
-                'HTTPS', 'REMOTE_ADDR', 'REMOTE_PORT', 'SERVER_ADDR',
-                'SERVER_PORT'] as $field) {
-            if (isset($conn_context[$field])) {
-                $propagate[$field] = $conn_context[$field];
-            }
+        $propagate = [
+            'IS_SECURE' => $conn->is_secure,
+            'LISTENER_PORT' => $conn->listener_port,
+            'LISTENER_NAME' => $conn->listener_name,
+            'CLIENT_HTTP' => $conn->client_http,
+            'REMOTE_ADDR' => $conn->remote_addr,
+            'REMOTE_PORT' => $conn->remote_port,
+            'SERVER_ADDR' => $conn->server_addr,
+            'SERVER_PORT' => $conn->server_port,
+        ];
+        if ($conn->https !== '') {
+            $propagate['HTTPS'] = $conn->https;
         }
         $context = array_merge($propagate, $context);
         if (!$frame->flags->contains('END_STREAM')) {
@@ -2545,7 +2568,7 @@ class WebSite
                 ?? new HPack())
             : new HPack();
         $_SESSION = [];
-        $this->setGlobals($context);
+        $this->setGlobals($context, $conn);
         /*
             Make the H2 connection + stream available to
             $site->flush() so a route can stream a response by
@@ -2804,10 +2827,22 @@ class WebSite
             . "Connection: Upgrade\r\n"
             . "Sec-WebSocket-Accept: " . $accept . "\r\n"
             . "\r\n";
-        $this->in_streams[self::CONTEXT][$key]['IS_WEBSOCKET'] = true;
         $this->in_streams[self::DATA][$key] = "";
         $ws = new WebSocket($connection, $key, $this);
-        $this->in_streams[self::CONTEXT][$key]['WS'] = $ws;
+        /*
+            Record the WebSocket upgrade on the persistent
+            Connection object: protocol becomes 'ws',
+            is_websocket flips true, and the WebSocket instance
+            hangs off the Connection. The H1 dispatch loop,
+            wsKeepalivePass, parseWsRequest, the response-drain
+            path, and cullDeadStreams all read these here.
+         */
+        $conn_obj = $this->connection($key);
+        if ($conn_obj !== null) {
+            $conn_obj->protocol = 'ws';
+            $conn_obj->is_websocket = true;
+            $conn_obj->ws = $ws;
+        }
         $this->wsEnqueueWrite($key, $response);
         if (!$this->ws_keepalive_registered
             && $this->ws_keepalive_interval > 0) {
@@ -2862,8 +2897,14 @@ class WebSite
             $this->out_streams[self::CONNECTION][$key] =
                 $this->in_streams[self::CONNECTION][$key];
             $this->out_streams[self::DATA][$key] = $data;
-            $this->out_streams[self::CONTEXT][$key] =
-                ['IS_WEBSOCKET' => true];
+            /*
+                The drain code in processResponseStreams reads
+                the WebSocket flag from the Connection object,
+                so out_streams[CONTEXT] no longer needs an
+                IS_WEBSOCKET marker. An empty array is enough
+                to satisfy code that looks up the entry.
+             */
+            $this->out_streams[self::CONTEXT][$key] = [];
             $this->out_streams[self::MODIFIED_TIME][$key] = time();
         } else {
             $this->out_streams[self::DATA][$key] .= $data;
@@ -2894,13 +2935,11 @@ class WebSite
     protected function wsKeepalivePass()
     {
         $now = time();
-        $contexts = $this->in_streams[self::CONTEXT] ?? [];
-        foreach ($contexts as $key => $context) {
-            if (empty($context['IS_WEBSOCKET'])
-                || empty($context['WS'])) {
+        foreach ($this->connections as $key => $conn) {
+            if (!$conn->is_websocket || $conn->ws === null) {
                 continue;
             }
-            $ws = $context['WS'];
+            $ws = $conn->ws;
             if ($ws->closed) {
                 continue;
             }
@@ -2974,7 +3013,8 @@ class WebSite
         stream_set_blocking($connection, true);
         $frame = WebSocketFrame::read($connection);
         stream_set_blocking($connection, false);
-        $ws = $this->in_streams[self::CONTEXT][$key]['WS'] ?? null;
+        $conn = $this->connection($key);
+        $ws = $conn !== null ? $conn->ws : null;
         if ($frame === null) {
             if ($ws !== null && $ws->on_close !== null) {
                 ($ws->on_close)($ws);
@@ -3073,18 +3113,32 @@ class WebSite
      */
     protected function initRequestStream($key, $additional_context = [])
     {
-        $connection = $this->in_streams[self::CONNECTION][$key];
-        $remote_name = stream_socket_get_name($connection, true);
-        $server_name = stream_socket_get_name($connection, false);
-        list($remote_addr, $remote_port) =
-            $this->splitAddressPort($remote_name);
-        list($server_addr, $server_port) =
-            $this->splitAddressPort($server_name);
+        /*
+            Peer and local socket addresses live on the persistent
+            Connection (resolved once at accept). Falling back to
+            stream_socket_get_name here covers any legacy entry
+            point that calls initRequestStream without first
+            registering a Connection (none in tree, but defensive).
+         */
+        $conn = $this->connection($key);
+        if ($conn !== null) {
+            $remote_addr = $conn->remote_addr;
+            $remote_port = $conn->remote_port;
+            $server_addr = $conn->server_addr;
+            $server_port = $conn->server_port;
+        } else {
+            $resource = $this->in_streams[self::CONNECTION][$key];
+            $remote_name = stream_socket_get_name($resource, true);
+            $server_name = stream_socket_get_name($resource, false);
+            list($remote_addr, $remote_port) =
+                $this->splitAddressPort($remote_name);
+            list($server_addr, $server_port) =
+                $this->splitAddressPort($server_name);
+        }
         $this->in_streams[self::CONTEXT][$key] = array_merge(
             [
                 self::REQUEST_HEAD => false,
                 'REQUEST_METHOD' => false,
-                "CLIENT_HTTP" => "unknown",
                 "REMOTE_ADDR" => $remote_addr,
                 "REMOTE_PORT" => $remote_port,
                 "REQUEST_TIME" => time(),
@@ -3161,7 +3215,9 @@ class WebSite
             }
             if ($remaining_bytes == 0) {
                 $context = $this->out_streams[self::CONTEXT][$key];
-                if (!empty($context['IS_WEBSOCKET'])) {
+                $conn_obj = $this->connection($key);
+                $is_ws = $conn_obj !== null && $conn_obj->is_websocket;
+                if ($is_ws) {
                     /*
                         WebSocket: drain complete, but the
                         underlying connection stays open for
@@ -3172,8 +3228,7 @@ class WebSite
                         outbound CLOSE frame, so now it is safe
                         to tear down the connection.
                      */
-                    $ws = $this->in_streams[self::CONTEXT][$key]['WS']
-                        ?? null;
+                    $ws = $conn_obj->ws;
                     unset($this->out_streams[self::CONNECTION][$key],
                         $this->out_streams[self::DATA][$key],
                         $this->out_streams[self::CONTEXT][$key],
@@ -3287,7 +3342,7 @@ class WebSite
             $this->in_streams[self::CONTEXT][$key] = $context;
             if (empty($context['CONTENT_LENGTH'])) {
                 $context['CONTENT'] = "";
-                $this->setGlobals($context);
+                $this->setGlobals($context, $this->connection($key));
                 return true;
             } else if ($context['CONTENT_LENGTH'] >
                 $this->default_server_globals['MAX_REQUEST_LEN'] -
@@ -3302,7 +3357,7 @@ class WebSite
             return false;
         }
         $context['CONTENT'] = substr($data, $content_pos);
-        $this->setGlobals($context);
+        $this->setGlobals($context, $this->connection($key));
         return true;
     }
     /**
@@ -3316,8 +3371,26 @@ class WebSite
      *      Content-Type and Content-Length without prefix
      *      (CGI convention). Body is in $context['CONTENT'].
      */
-    protected function setGlobals($context)
+    protected function setGlobals($context, $conn = null)
     {
+        if ($conn !== null) {
+            /*
+                Overlay listener-attached connection fields onto
+                the request context so $_SERVER carries them.
+                Keeping these on the Connection (not in
+                in_streams[CONTEXT]) means a keep-alive reset
+                between H1 requests doesn't have to manually
+                preserve them; the Connection survives the
+                reset and the next setGlobals re-overlays them.
+             */
+            $context['IS_SECURE'] = $conn->is_secure;
+            $context['LISTENER_PORT'] = $conn->listener_port;
+            $context['LISTENER_NAME'] = $conn->listener_name;
+            $context['CLIENT_HTTP'] = $conn->client_http;
+            if ($conn->https !== '') {
+                $context['HTTPS'] = $conn->https;
+            }
+        }
         $_SERVER = array_merge($this->default_server_globals, $context);
         parse_str($context['QUERY_STRING'], $_GET);
         $_POST = [];
@@ -3506,8 +3579,8 @@ class WebSite
             }
             $meta = stream_get_meta_data(
                 $this->in_streams[self::CONNECTION][$key]);
-            if (!empty($this->in_streams[self::CONTEXT][$key][
-                    'IS_WEBSOCKET'])) {
+            $conn_obj = $this->connection($key);
+            if ($conn_obj !== null && $conn_obj->is_websocket) {
                 /*
                     WebSockets have their own keepalive timer in
                     wsKeepalivePass; do not close them based on
@@ -3638,10 +3711,15 @@ class WebException extends \Exception
  *     protocol_state. H2 HPACK encoder/decoder, last-stream-id,
  *     and pending streams have been migrated off in_streams[
  *     CONTEXT] and live here instead.
- *   Phase 2: migrate the H1 read buffer, parsed-headers state,
- *     and keep-alive bookkeeping off in_streams arrays into the
- *     Connection. Same pattern: a typed home for state that
- *     belongs to the connection rather than to a single request.
+ *   Phase 2 (done): listener-attached H1 state (is_secure,
+ *     client_http, listener_name, listener_port, https) and
+ *     peer/local socket addresses (remote_addr, remote_port,
+ *     server_addr, server_port) plus the WebSocket-upgrade
+ *     fields (is_websocket, ws) live on the Connection.
+ *     Keep-alive resets between H1 requests no longer need a
+ *     preserve-fields loop because the Connection itself
+ *     survives the reset. setGlobals overlays connection
+ *     fields onto $_SERVER on each dispatch.
  *   Phase 3: introduce a Listener class that owns a server
  *     socket and its accept policy (TCP accept + TLS handshake
  *     today; UDP recvfrom + QUIC handshake for H3). The current
@@ -3680,6 +3758,82 @@ class Connection
      * @var string
      */
     public $protocol = '';
+    /**
+     * Detailed client-protocol string from ConnectionAcceptor:
+     * 'HTTP/1.1', 'HTTP/2.0', 'h2c', or 'unknown'. Carried in
+     * addition to $protocol because some code paths need the
+     * literal version string (response status lines) while
+     * others only care about the family. Set once at accept
+     * time and never changed.
+     * @var string
+     */
+    public $client_http = '';
+    /**
+     * Bind name of the listener that accepted this connection
+     * (e.g. SERVER_NAME). Used to populate $_SERVER fields and
+     * for any routing logic that switches on hostname.
+     * @var string
+     */
+    public $listener_name = '';
+    /**
+     * TCP port of the listener that accepted this connection
+     * (e.g. 8080). Distinct from REMOTE_PORT (the peer port).
+     * @var string
+     */
+    public $listener_port = '';
+    /**
+     * Peer IP address as reported by stream_socket_get_name. IPv6
+     * addresses are stored without surrounding brackets so that
+     * inet_pton and address allowlist comparisons work uniformly.
+     * Set once at accept time and never changed for the lifetime
+     * of the connection.
+     * @var string
+     */
+    public $remote_addr = '';
+    /**
+     * Peer TCP port as reported by stream_socket_get_name. Set
+     * once at accept time and never changed.
+     * @var string
+     */
+    public $remote_port = '';
+    /**
+     * Local-side bind address as reported by stream_socket_get_name.
+     * Set once at accept time and never changed.
+     * @var string
+     */
+    public $server_addr = '';
+    /**
+     * Local-side TCP port as reported by stream_socket_get_name.
+     * Set once at accept time and never changed.
+     * @var string
+     */
+    public $server_port = '';
+    /**
+     * 'on' if this connection was accepted on a TLS-enabled
+     * listener and TLS handshake succeeded; empty string
+     * otherwise. Mirrors $_SERVER['HTTPS'] semantics so generic
+     * PHP code that expects that variable still works.
+     * @var string
+     */
+    public $https = '';
+    /**
+     * True once this H1 connection has been upgraded to a
+     * WebSocket via the Sec-WebSocket-Accept handshake. Once
+     * set, subsequent reads are dispatched to parseWsRequest
+     * rather than the H1 request parser. Connection::$protocol
+     * is also retagged to 'ws' at upgrade time.
+     * @var bool
+     */
+    public $is_websocket = false;
+    /**
+     * The WebSocket message handler/codec for an upgraded WS
+     * connection, or null on H1/H2 connections that never
+     * upgraded. Holds frame-decoding state and the user's
+     * onMessage / onClose callbacks; persists for the lifetime
+     * of the WS connection.
+     * @var WebSocket|null
+     */
+    public $ws = null;
     /**
      * Protocol-specific state, indexed by short keys whose
      * meaning depends on protocol. For 'h2' this currently holds:

@@ -329,27 +329,17 @@ class WebSite
         return $this->is_cli;
     }
     /**
-     * Magic method __call is called whenever an unknown method is called
-     * for this class. In this case, we check if the method name corresponds
-     * to a lower case HTTP command. In which case, we check that the arguments
-     * are a two element array with a route and a callback function and add
-     * the appropriate route to a routing table.
+     * __call traps unknown method calls. If the method name is a
+     * lowercase HTTP verb and the args are [route, callback], the
+     * route is registered.
      *
-     * @param string $method HTTP command to add $route_callack for in routing
-     *      table
-     * @param array $route_callback a two element array consisting of a routing
-     *      pattern and a callback function.
-     *      In the route pattern
-     *      * acts as a wildcare. {var_name} in a path can be used to set up
-     *      a $_GET field for the match.
-     *      Example $routes:
-     *      /foo match requests to /foo
-     *      /foo*goo matches against paths like /foogoo /foodgoo /footsygoo
-     *      /thread/{thread_num} would match /thread/5 and would set up
-     *          a variable $_GET['thread_num'] = 5 as well as
-     *          $_REQUEST['thread_num'] = 5
-     *      The second element of the $route_callback should be a callable
-     *      function to be called in the event that the route pattern is matched
+     * @param string $method HTTP verb to register the route under
+     * @param array $route_callback [pattern, callable]. Pattern
+     *      uses * as wildcard and {var_name} to capture a path
+     *      segment into $_GET[var_name] / $_REQUEST[var_name].
+     *      Examples: '/foo' matches /foo; '/foo*goo' matches
+     *      /foogoo, /foodgoo, /footsygoo; '/thread/{thread_num}'
+     *      matches /thread/5 and sets $_GET['thread_num'] = 5.
      */
     public function __call($method, $route_callback)
     {
@@ -714,36 +704,25 @@ class WebSite
         }
     }
     /**
-     * Starts a web session. This involves sending an HTTP cookie
-     * header with a unique value to identify the client. When the
-     * client returns the cookie, session data is looked up. When
-     * run in CLI mode session data is stored in RAM. When run
-     * under a different web server, this method defaults to PHP's
-     * built-in function session_start().
+     * Starts a web session by sending a cookie with a unique ID.
+     * When the client returns the cookie, session data is looked
+     * up. CLI mode stores session data in RAM; under another web
+     * server, defaults to session_start().
      *
-     * Session IDs are generated with random_bytes(32) hex-encoded
-     * for 256 bits of cryptographic entropy. Cookie-supplied
-     * session IDs are accepted only if they match the format and
-     * already exist in the in-memory session table; unknown IDs
-     * cause a fresh session to be created at a new random ID
-     * rather than the attacker-supplied value. This prevents
-     * session fixation attacks where an attacker plants a known
-     * cookie value and waits for the victim to authenticate.
+     * Session IDs are random_bytes(32) hex-encoded (256-bit
+     * entropy). Cookie-supplied IDs must match the format and
+     * already exist in the table; otherwise a fresh ID is
+     * generated. This prevents session fixation.
      *
-     * Session table size is capped by MAX_SESSIONS (default
-     * 10000) in default_server_globals. Each request runs a
-     * soft cull of up to CULL_OLD_SESSION_NUM expired entries,
-     * and if the table is still over the cap a hard eviction
-     * pops oldest entries from the queue tail until the cap is
-     * met. This protects against memory exhaustion when a flood
-     * of cookie-less requests creates fresh sessions faster
-     * than the soft cull can clean them up.
+     * Table size is capped by MAX_SESSIONS (default 10000). Each
+     * request runs a soft cull of up to CULL_OLD_SESSION_NUM
+     * expired entries; if still over cap, hard eviction pops the
+     * oldest. Protects against memory exhaustion under a flood
+     * of cookie-less requests.
      *
-     * @param array $options fields that can be set are mainly
-     *      related to the session cookie: 'name' (for cookie
-     *      name), 'cookie_path', 'cookie_lifetime' (in seconds
-     *      from now), 'cookie_domain', 'cookie_secure',
-     *      'cookie_httponly'
+     * @param array $options session cookie fields: 'name',
+     *      'cookie_path', 'cookie_lifetime' (seconds from now),
+     *      'cookie_domain', 'cookie_secure', 'cookie_httponly'
      */
     public function sessionStart($options = [])
     {
@@ -1109,50 +1088,34 @@ class WebSite
         unset($this->timers[$timer_id]);
     }
     /**
-     * Starts an Atto Web Server listening on one or more addresses
-     * using the configuration values provided. Runs the event loop
-     * which dispatches incoming connections to the appropriate
-     * handler. The streams used are non-blocking; traffic detection
-     * uses stream_select which maps to Unix select calls and is
-     * widely portable.
+     * Starts an Atto Web Server listening on one or more addresses,
+     * then runs the event loop. Streams are non-blocking and traffic
+     * detection uses stream_select (portable Unix select wrapper).
      *
-     * The first argument can take three forms:
+     * $address takes three forms:
+     *  1. int 0..65535: bind to that port on 0.0.0.0 (or "localhost"
+     *     on Windows to avoid the firewall prompt).
+     *  2. string "tcp://0.0.0.0:8080" or "tcp://[::1]:8080" (IPv6
+     *     must use bracket form per RFC 3986).
+     *  3. array of listener specs for multi-port operation. Each
+     *     entry is either a plain address (int/string, using the
+     *     shared config) or an assoc array with 'address' (required)
+     *     and 'context' (optional per-listener stream context, e.g.
+     *     ssl options that override the shared context). This is
+     *     how to bind both 80 and 443 from one Atto process.
      *
-     * 1. An int between 0 and 65535. The server binds to this
-     *    port on 0.0.0.0 (any IPv4) or "localhost" on Windows to
-     *    avoid the firewall prompt. Backwards-compatible single
-     *    listener form.
-     *
-     * 2. A string like "tcp://0.0.0.0:8080" or "tcp://[::1]:8080".
-     *    Supports both IPv4 and IPv6 addresses; IPv6 must use the
-     *    bracketed form per RFC 3986. Single listener form.
-     *
-     * 3. An array of listener specs for multi-port operation. Each
-     *    entry can be a plain int/string address (using the
-     *    same shared $config_array_or_ini_filename) or an
-     *    associative array with keys 'address' (required) and
-     *    'context' (optional, a per-listener stream context such
-     *    as ssl options that override the shared context). This
-     *    is how to bind both port 80 and port 443 from one Atto
-     *    process or to run a TLS listener and a cleartext
-     *    redirect listener side by side.
-     *
-     * @param mixed $address int port, string address, or array
-     *      of listener specs
-     * @param mixed $config_array_or_ini_filename either an
-     *      associative array of configuration parameters or the
-     *      filename of an .ini file with such parameters. Things
-     *      that can be set are mainly fields that might show up
-     *      in the $_SERVER superglobal. See the
-     *      $default_server_globals variable below for some of
-     *      them. The SERVER_CONTEXT field can be set to an array
-     *      of stream context field values, used to configure SSL
-     *      and other stream options.
+     * @param mixed $address int port, string address, or array of
+     *      listener specs (see above)
+     * @param mixed $config_array_or_ini_filename associative array
+     *      of configuration parameters, or the path to an .ini
+     *      file. Mainly sets fields that show up in the $_SERVER
+     *      superglobal (see $default_server_globals below).
+     *      SERVER_CONTEXT may be set to a stream-context array to
+     *      configure SSL and other stream options.
      */
     public function listen($address, $config_array_or_ini_filename = false)
     {
-        $path = (!empty($_SERVER['PATH'])) ? $_SERVER['PATH'] :
-            ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
+        $path = $_SERVER['PATH'] ?? $_SERVER['Path'] ?? ".";
         $default_server_globals = ["CONNECTION_TIMEOUT" => 20,
             "CULL_OLD_SESSION_NUM" => 5, "CUSTOM_ERROR_HANDLER" => null,
             "DOCUMENT_ROOT" => getcwd(),
@@ -1163,7 +1126,7 @@ class WebSite
             "PATH" => $path,  "PHP_PATH" => "",
             "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
             "SERVER_SIGNATURE" => "",
-            "USER" => empty($_SERVER['USER']) ? "" : $_SERVER['USER'],
+            "USER" => $_SERVER['USER'] ?? "",
             "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
         ];
         $original_address = is_array($address) ? "multi" : $address;
@@ -1611,29 +1574,21 @@ class WebSite
         return $out_data;
     }
     /**
-    /**
-     * Checks if a portion of a request uri path matches an Atto server
-     * route. A route may contain {variable} placeholders that capture
-     * a single path segment each (no embedded slashes), and may
-     * contain * wildcards that match any sequence of characters
-     * including slashes. The match is anchored: the request path
-     * must equal the route shape from start to end. Captured
-     * {variable} values are returned as an associative array.
+     * Checks whether a request URI path portion matches an Atto
+     * route. A route may contain {variable} placeholders (each
+     * capturing a single path segment, no slashes) and * wildcards
+     * (matching any text including slashes). Match is anchored:
+     * the path must equal the route shape end-to-end.
      *
-     * Anchoring example: a route '/foo/{bar}' matches '/foo/x' but
-     *      not '/wrap/foo/x' or '/foo/x/extra'.
-     * Segment-bounded example: a route '/files/{name}' matches
-     *      '/files/note' but not '/files/sub/note'. Use
-     *      '/files/*' if a multi-segment capture is wanted; the
-     *      captured text is then the request path tail starting
-     *      after the last fixed segment.
+     * Anchored: route '/foo/{bar}' matches '/foo/x' but not
+     * '/wrap/foo/x' or '/foo/x/extra'. Segment-bounded:
+     * '/files/{name}' matches '/files/note' but not
+     * '/files/sub/note'; use '/files/*' for multi-segment capture.
      *
-     * @param string $request_path part of a path portion of a
-     *      request uri
-     * @param string $route a route that might be handled by Atto
-     * @return array|bool associative array of captured variables on
-     *      a successful match (empty array if the route had no
-     *      captures), or false if the route does not match
+     * @param string $request_path part of the request URI path
+     * @param string $route route pattern to test
+     * @return array|bool captured variables on match (empty array
+     *      if no captures), or false if no match
      */
     protected function checkMatch($request_path, $route)
     {
@@ -2157,30 +2112,20 @@ class WebSite
         if ($frame instanceof SettingsFrame
             && !$frame->flags->contains('ACK')) {
             /*
-                Apply settings the peer sent us. Currently we only
-                act on HEADER_TABLE_SIZE (0x01) since the encoder
-                must honor the decoder's table size or the peer
-                will reject our responses. Other settings are
-                accepted but ignored: ENABLE_PUSH (we never push),
-                MAX_CONCURRENT_STREAMS (this is a server hint to
-                clients, not the other direction),
-                INITIAL_WINDOW_SIZE and MAX_FRAME_SIZE (Atto does
-                not currently process inbound DATA frames so flow
-                control is moot), MAX_HEADER_LIST_SIZE (best-effort
-                only).
+                Apply settings the peer sent us. We act on
+                HEADER_TABLE_SIZE (0x01) so the encoder honors the
+                decoder's table size. Other settings are accepted
+                but ignored: ENABLE_PUSH (we never push),
+                MAX_CONCURRENT_STREAMS (a hint for clients, not us),
+                INITIAL_WINDOW_SIZE and MAX_FRAME_SIZE (Atto's
+                synchronous response model does not benefit from
+                tracking these), MAX_HEADER_LIST_SIZE (best-effort).
              */
             $hpack_encode = $this->in_streams[self::CONTEXT][$key][
                 'HPACK_ENCODE'] ?? null;
             if ($hpack_encode !== null
                 && isset($frame->settings[0x01])) {
-                $octets = $frame->settings[0x01];
-                /*
-                    Atto's HPack tracks size in entries; convert
-                    the peer's octet-budget to a rough entry count
-                    using a conservative 40 bytes per entry.
-                 */
-                $entries = max(0, intdiv($octets, 40));
-                $hpack_encode->setMaxTableSize($entries);
+                $hpack_encode->setMaxTableSize($frame->settings[0x01]);
             }
             $ack = new SettingsFrame(0, []);
             $ack->flags->add('ACK');
@@ -2222,23 +2167,17 @@ class WebSite
             }
             $pending['body'] .= $frame->data;
             /*
-                RFC 7540 sec 6.9: each DATA frame consumes from
-                both the per-stream and the connection-level
-                receive window the peer is allowed to send. The
-                default initial window is 65535 bytes for both.
-                Once the peer has filled either window the peer
-                will stop sending DATA until the receiver issues
-                WINDOW_UPDATE frames returning credit. Atto
-                buffers the entire request body before dispatch
-                (no streaming), so we replenish the windows
-                immediately after consuming each DATA frame:
-                stream-level WINDOW_UPDATE for the stream-id and
-                connection-level WINDOW_UPDATE for stream-id 0,
-                each with an increment equal to the data payload
-                size. Without this, large H2 POST bodies (yioop
-                Fetcher's crawl uploads, multipart file uploads
-                from browsers) stall after the initial 65535
-                bytes until the client times out.
+                RFC 7540 sec 6.9: replenish the per-stream and
+                connection-level receive windows after each DATA
+                frame. Default initial window is 65535 bytes; once
+                filled, the peer stops sending DATA until we issue
+                WINDOW_UPDATE frames returning credit. Atto buffers
+                the whole body before dispatch (no streaming), so
+                we credit immediately for the consumed bytes:
+                stream-level update for the stream-id, connection-
+                level update for stream-id 0. Without this, H2
+                POSTs >65535 bytes (yioop Fetcher crawl uploads,
+                multipart file uploads) stall until client timeout.
              */
             $consumed = strlen($frame->data);
             if ($consumed > 0) {
@@ -2413,22 +2352,14 @@ class WebSite
         $resp_headers->flags->add("END_HEADERS");
         $out = $resp_headers->serialize($hpack_encode);
         /*
-            Split the response body into DATA frames each at most
-            H2_MAX_FRAME_SIZE bytes. RFC 7540 sec 4.2: any single
-            frame whose payload exceeds the peer's advertised
-            SETTINGS_MAX_FRAME_SIZE is a FRAME_SIZE_ERROR, which
-            causes curl/browsers to drop the response on the
-            floor (or close the connection). Default MAX_FRAME_SIZE
-            is 16384 and most clients keep it. A zero-length body
-            still gets one DATA frame so the END_STREAM flag has
-            a place to live. Flow control (RFC 7540 sec 5.2) is
-            not enforced here: clients (curl, Firefox, Chrome)
-            advertise multi-megabyte initial windows and grant
-            connection-level WINDOW_UPDATEs eagerly, so for the
-            synchronous request/response model Atto uses, the
-            window almost never bottlenecks. If a future use
-            case needs flow control, it can be added without
-            disturbing the splitting logic.
+            Split body into DATA frames of at most H2_MAX_FRAME_SIZE
+            bytes per RFC 7540 sec 4.2 (oversized frames are
+            FRAME_SIZE_ERROR and curl/browsers drop the response).
+            Default MAX_FRAME_SIZE is 16384; most clients keep it.
+            Empty bodies still emit one frame so END_STREAM has a
+            place to live. Outbound flow control (sec 5.2) is not
+            enforced: real clients grant huge windows eagerly so
+            it never bottlenecks Atto's synchronous model.
          */
         $body_len = strlen($body);
         $max = self::H2_MAX_FRAME_SIZE;
@@ -3894,10 +3825,10 @@ class WebSocketFrame
         return $header . $payload;
     }
     /**
-     * Unmasks a payload using the 4-byte masking key provided by
-     * the client. Per RFC 6455 sec 5.3, byte i of the unmasked
-     * payload is byte i of the masked payload XOR byte (i mod 4)
-     * of the masking key.
+     * Unmasks a WebSocket payload (RFC 6455 sec 5.3) by XORing each
+     * byte with the corresponding byte of the rotating 4-byte mask
+     * key. Implemented via string-mode XOR over the whole payload
+     * for one C-level pass instead of a PHP loop.
      *
      * @param string $payload masked binary payload
      * @param string $mask_key 4-byte masking key
@@ -3905,23 +3836,10 @@ class WebSocketFrame
      */
     private static function unmask($payload, $mask_key)
     {
-        $unmasked = '';
         $length = strlen($payload);
-        for ($i = 0; $i < $length; $i++) {
-            $unmasked .= $payload[$i] ^ $mask_key[$i % 4];
-        }
-        return $unmasked;
+        $key = str_repeat($mask_key, intdiv($length, 4) + 1);
+        return $payload ^ substr($key, 0, $length);
     }
-    /**
-     * Reads exactly $count bytes from a connection, blocking until
-     * all bytes are available. Returns null if the connection
-     * closes before enough data arrives.
-     *
-     * @param resource $connection client socket to read from
-     * @param int $count number of bytes to read
-     * @return string|null binary string of length $count, or null
-     *      on EOF
-     */
     /**
      * Reads exactly $count bytes from a connection. Returns the
      * bytes on success, or null if the connection closed or the
@@ -4532,17 +4450,13 @@ class HeaderFrame extends Frame
                     } else if (($key[0] ?? "") !== ':') {
                         $up = strtoupper(str_replace('-', '_', $key));
                         /*
-                            CGI convention (and what setGlobals'
-                            multipart parser expects): the
-                            Content-Type and Content-Length request
-                            headers are exposed in $_SERVER WITHOUT
-                            the HTTP_ prefix that all other request
-                            headers receive. The H1.1 path in
-                            parseRequest already does this; H2 must
-                            match so that downstream code (multipart
-                            decoder, frameworks reading
-                            $_SERVER['CONTENT_TYPE']) sees these
-                            headers in the expected location.
+                            CGI convention: Content-Type and
+                            Content-Length are exposed in $_SERVER
+                            WITHOUT the HTTP_ prefix that all other
+                            request headers receive. H1.1 path
+                            already does this; H2 must match so
+                            setGlobals' multipart decoder finds
+                            them at the expected key.
                          */
                         if ($up === 'CONTENT_TYPE'
                                 || $up === 'CONTENT_LENGTH') {
@@ -4554,19 +4468,12 @@ class HeaderFrame extends Frame
                                 && isset($context[$http_key])) {
                             /*
                                 RFC 7540 sec 8.1.2.5: H2 clients
-                                MAY split the Cookie header into
-                                separate header fields, one per
-                                cookie pair, for HPACK compression.
-                                When passing into a non-H2 context
-                                (the $_SERVER superglobal that
-                                downstream PHP code reads), the
-                                fields must be concatenated with
-                                "; " (the standard cookie-pair
-                                delimiter). Without this join,
-                                only the last cookie pair would
-                                survive and apps like yioop would
-                                see an empty session cookie even
-                                when the browser sent one.
+                                may split Cookie into multiple
+                                header fields for HPACK compression.
+                                Concatenate with "; " (the cookie-
+                                pair delimiter) when flattening to
+                                $_SERVER, otherwise only the last
+                                pair survives.
                              */
                             $context[$http_key] .= '; ' . $value;
                         } else {
@@ -5283,11 +5190,20 @@ class HPack
      */
     private $never_index_list = [];
     /**
-     * Maximum number of entries allowed in the dynamic table
-     * before the eviction algorithm runs.
+     * Maximum dynamic table size in octets. The RFC 7541 default
+     * is 4096; the peer can change this via SETTINGS_HEADER_TABLE_SIZE.
      * @var int
      */
-    private $max_table_size = 100;
+    private $max_table_size = 4096;
+    /**
+     * Running total of the dynamic table's current octet size,
+     * computed per RFC 7541 sec 4.1: sum over entries of
+     * length(name) + length(value) + 32. Maintained incrementally
+     * by addHeader / evictEntry to avoid a full table walk on
+     * every check.
+     * @var int
+     */
+    private $current_table_size = 0;
     /**
      * Constructs a new HPack instance with a fresh dynamic table
      * pre-populated with the static table entries from RFC 7541
@@ -5311,77 +5227,82 @@ class HPack
         return $this->headers_table;
     }
     /**
-     * Sets the maximum dynamic table size. Called by the H2 layer
-     * when the peer advertises a HEADER_TABLE_SIZE setting; the
-     * encoder needs to honor whatever upper bound the decoder will
+     * Sets the maximum dynamic table size in octets. Called by the
+     * H2 layer when the peer advertises a HEADER_TABLE_SIZE setting;
+     * the encoder must honor whatever upper bound the decoder will
      * accept so emitted incremental-indexing entries do not push
-     * the decoder past its limit.
+     * the decoder past its limit. Evicts oldest entries until the
+     * table fits within the new bound.
      *
-     * Note: the HPack class internally tracks the table by entry
-     * count rather than the RFC 7541 octet count, so the value
-     * passed in is loosely interpreted. A peer-supplied octet limit
-     * is divided by an estimated average entry size of 40 bytes to
-     * convert; for an exact translation of RFC behavior the table
-     * accounting would need to be octet-based.
-     *
-     * @param int $size new dynamic table size in entries
+     * @param int $size new max dynamic table size in octets
      */
     public function setMaxTableSize($size)
     {
-        $size = max(0, (int) $size);
-        $this->max_table_size = $size;
-        while (count($this->headers_table) - count(self::STATIC_TABLE) - 1
-                > $this->max_table_size) {
+        $this->max_table_size = max(0, (int) $size);
+        while ($this->current_table_size > $this->max_table_size
+                && count($this->headers_table) > count(self::STATIC_TABLE)) {
             $this->evictEntry();
         }
     }
     /**
      * Evicts the oldest dynamic entry from the table per RFC 7541
      * sec 2.3.3. The oldest entry sits at the highest dynamic
-     * index in our storage; pop it. No shifting needed since
-     * subsequent inserts always go at the lowest dynamic index
-     * via addHeader.
+     * index in our storage; pop it and decrement the running size
+     * by length(name) + length(value) + 32 (RFC 7541 sec 4.1).
      */
     private function evictEntry()
     {
-        $static_table_len = count(self::STATIC_TABLE);
-        if (count($this->headers_table) > $static_table_len) {
-            array_pop($this->headers_table);
+        if (count($this->headers_table) > count(self::STATIC_TABLE)) {
+            $entry = array_pop($this->headers_table);
+            $this->current_table_size -=
+                strlen($entry[0]) + strlen($entry[1]) + 32;
+            if ($this->current_table_size < 0) {
+                $this->current_table_size = 0;
+            }
         }
     }
     /**
      * Adds a header to the dynamic table per RFC 7541 sec 2.3.3:
      * the new entry is placed at the lowest dynamic index (just
      * after the static table) and existing dynamic entries shift
-     * up by one. If the table would exceed max_table_size, the
-     * oldest entries are evicted from the highest index until
-     * there is room.
+     * up by one. If the entry alone exceeds max_table_size, the
+     * table is cleared and the entry is not added (RFC 7541 sec
+     * 4.4). Otherwise oldest entries are evicted from the highest
+     * index until the new entry fits.
      *
      * @param string $name  The name of the header.
      * @param string $value The value of the header.
      */
     public function addHeader($name, $value)
     {
-        $static_table_len = count(self::STATIC_TABLE);
-        /*
-            count(headers_table) includes a sentinel entry at key
-            0 plus the static-table entries (keys 1..static_len),
-            so dynamic count = total - static_len - 1.
-         */
-        while (count($this->headers_table) - $static_table_len - 1
-                >= $this->max_table_size) {
+        $entry_size = strlen($name) + strlen($value) + 32;
+        if ($entry_size > $this->max_table_size) {
+            /*
+                RFC 7541 sec 4.4: an entry larger than the maximum
+                size causes the table to be emptied without the
+                entry being inserted.
+             */
+            while (count($this->headers_table) > count(self::STATIC_TABLE)) {
+                $this->evictEntry();
+            }
+            return;
+        }
+        while ($this->current_table_size + $entry_size
+                > $this->max_table_size) {
             $this->evictEntry();
         }
+        $static_table_len = count(self::STATIC_TABLE);
         /*
             Shift existing dynamic entries up by one. Walk from
             highest to lowest so a copy at index N+1 doesn't
             clobber the value we still need at index N.
          */
-        $highest = count($this->headers_table) - 1;
-        for ($i = $highest; $i > $static_table_len; $i--) {
+        for ($i = count($this->headers_table) - 1; $i > $static_table_len;
+                $i--) {
             $this->headers_table[$i + 1] = $this->headers_table[$i];
         }
         $this->headers_table[$static_table_len + 1] = [$name, $value];
+        $this->current_table_size += $entry_size;
     }
     /**
      * Decodes a header block fragment from hex.
@@ -5777,47 +5698,52 @@ class HPack
         }
     }
     /**
-     * Encodes an ASCII input string using HPACK Huffman encoding.
-     * Looks each character up in the HUFFMAN_CODES table to get its
-     * variable-length bit code, concatenates all codes into a bit
-     * string, pads to a byte boundary with 1-bits (per RFC 7541
-     * section 5.2), then packs the bit string into binary bytes.
+     * Inverse of HUFFMAN_LOOKUP: maps each ASCII byte to its
+     * Huffman bit string. Lazily built from HUFFMAN_LOOKUP on
+     * first use to avoid maintaining a second hand-written table.
+     * @var array<int,string>
+     */
+    private static $HUFFMAN_BITS = [];
+    /**
+     * Encodes an ASCII string with HPACK Huffman coding (RFC 7541
+     * sec 5.2). Pads incomplete final byte with 1-bits from the
+     * EOS symbol (all-ones).
      *
      * @param string $input ASCII string to encode
      * @return string binary Huffman-encoded byte string
      */
     public function huffmanEncode($input)
     {
-        $encoded = '';
-        foreach (str_split($input) as $char) {
-            if (isset(self::$HUFFMAN_CODES[$char])) {
-                $huffman_code = self::$HUFFMAN_CODES[$char]['bin'];
-                $encoded .= $huffman_code;
-            } else {
-                throw new \Exception(
-                    "Character not found in Huffman table: $char");
+        if (empty(self::$HUFFMAN_BITS)) {
+            foreach (self::$HUFFMAN_LOOKUP as $bits => $ascii) {
+                self::$HUFFMAN_BITS[$ascii] = (string) $bits;
             }
         }
-        /*
-            Padding is done with the MSBs of the End-Of-String
-            symbol which in RFC 7541 is encoded as 11111111111111
-         */
-        if (strlen($encoded) % 8 !== 0) {
-            $padding = 8 - (strlen($encoded) % 8);
-            $encoded .= str_repeat('1', $padding);
+        $encoded = '';
+        $len = strlen($input);
+        for ($i = 0; $i < $len; $i++) {
+            $ascii = ord($input[$i]);
+            if (!isset(self::$HUFFMAN_BITS[$ascii])) {
+                throw new \Exception(
+                    "Character not in Huffman table: " . $input[$i]);
+            }
+            $encoded .= self::$HUFFMAN_BITS[$ascii];
+        }
+        $bit_len = strlen($encoded);
+        $remainder = $bit_len & 7;
+        if ($remainder !== 0) {
+            $encoded .= str_repeat('1', 8 - $remainder);
         }
         $output = '';
         foreach (str_split($encoded, 8) as $byte) {
-            $byteValue = chr(bindec($byte));
-            $output .= $byteValue;
+            $output .= chr(bindec($byte));
         }
         return $output;
     }
     /**
-     * Decodes Huffman-encoded binary input using the HPACK Huffman
-     * code table defined in $HUFFMAN_LOOKUP. Walks bits one at a time
-     * from each byte using bit shifts, building up a bit-string
-     * buffer that is looked up in the prefix-free code table.
+     * Decodes a Huffman-encoded byte string into ASCII (RFC 7541
+     * sec 5.2). Walks bits one at a time, looking up the bit
+     * buffer in the prefix-free code table.
      *
      * @param string $input binary Huffman-encoded byte string
      * @return string decoded ASCII string
@@ -5839,7 +5765,6 @@ class HPack
         }
         return $decoded;
     }
-
     private static $HUFFMAN_LOOKUP = [
         '010100' => 32,           '1111111000' => 33,       '1111111001' => 34,
         '111111111010' => 35,     '1111111111001' => 36,    '010101' => 37,
@@ -5877,102 +5802,5 @@ class HPack
         '1111011' => 122,         '111111111111110' => 123,
         '11111111100' => 124,
         '11111111111101' => 125,  '1111111111101' => 126
-    ];
-    private static $HUFFMAN_CODES = [
-        ' ' => ['ascii' => 32,  'bin' => '010100'],
-        '!' => ['ascii' => 33,  'bin' => '1111111000'],
-        '"' => ['ascii' => 34,  'bin' => '1111111001'],
-        '#' => ['ascii' => 35,  'bin' => '111111111010'],
-        '$' => ['ascii' => 36,  'bin' => '1111111111001'],
-        '%' => ['ascii' => 37,  'bin' => '010101'],
-        '&' => ['ascii' => 38,  'bin' => '11111000'],
-        "'" => ['ascii' => 39,  'bin' => '11111111010'],
-        '(' => ['ascii' => 40,  'bin' => '1111111010'],
-        ')' => ['ascii' => 41,  'bin' => '1111111011'],
-        '*' => ['ascii' => 42,  'bin' => '11111001'],
-        '+' => ['ascii' => 43,  'bin' => '11111111011'],
-        ',' => ['ascii' => 44,  'bin' => '11111010'],
-        '-' => ['ascii' => 45,  'bin' => '010110'],
-        '.' => ['ascii' => 46,  'bin' => '010111'],
-        '/' => ['ascii' => 47,  'bin' => '011000'],
-        '0' => ['ascii' => 48,  'bin' => '00000'],
-        '1' => ['ascii' => 49,  'bin' => '00001'],
-        '2' => ['ascii' => 50,  'bin' => '00010'],
-        '3' => ['ascii' => 51,  'bin' => '011001'],
-        '4' => ['ascii' => 52,  'bin' => '011010'],
-        '5' => ['ascii' => 53,  'bin' => '011011'],
-        '6' => ['ascii' => 54,  'bin' => '011100'],
-        '7' => ['ascii' => 55,  'bin' => '011101'],
-        '8' => ['ascii' => 56,  'bin' => '011110'],
-        '9' => ['ascii' => 57,  'bin' => '011111'],
-        ':' => ['ascii' => 58,  'bin' => '1011100'],
-        ';' => ['ascii' => 59,  'bin' => '11111011'],
-        '<' => ['ascii' => 60,  'bin' => '111111111111100'],
-        '=' => ['ascii' => 61,  'bin' => '100000'],
-        '>' => ['ascii' => 62,  'bin' => '111111111011'],
-        '?' => ['ascii' => 63,  'bin' => '1111111100'],
-        '@' => ['ascii' => 64,  'bin' => '1111111111010'],
-        'A' => ['ascii' => 65,  'bin' => '100001'],
-        'B' => ['ascii' => 66,  'bin' => '1011101'],
-        'C' => ['ascii' => 67,  'bin' => '1011110'],
-        'D' => ['ascii' => 68,  'bin' => '1011111'],
-        'E' => ['ascii' => 69,  'bin' => '1100000'],
-        'F' => ['ascii' => 70,  'bin' => '1100001'],
-        'G' => ['ascii' => 71,  'bin' => '1100010'],
-        'H' => ['ascii' => 72,  'bin' => '1100011'],
-        'I' => ['ascii' => 73,  'bin' => '1100100'],
-        'J' => ['ascii' => 74,  'bin' => '1100101'],
-        'K' => ['ascii' => 75,  'bin' => '1100110'],
-        'L' => ['ascii' => 76,  'bin' => '1100111'],
-        'M' => ['ascii' => 77,  'bin' => '1101000'],
-        'N' => ['ascii' => 78,  'bin' => '1101001'],
-        'O' => ['ascii' => 79,  'bin' => '1101010'],
-        'P' => ['ascii' => 80,  'bin' => '1101011'],
-        'Q' => ['ascii' => 81,  'bin' => '1101100'],
-        'R' => ['ascii' => 82,  'bin' => '1101101'],
-        'S' => ['ascii' => 83,  'bin' => '1101110'],
-        'T' => ['ascii' => 84,  'bin' => '1101111'],
-        'U' => ['ascii' => 85,  'bin' => '1110000'],
-        'V' => ['ascii' => 86,  'bin' => '1110001'],
-        'W' => ['ascii' => 87,  'bin' => '1110010'],
-        'X' => ['ascii' => 88,  'bin' => '11111100'],
-        'Y' => ['ascii' => 89,  'bin' => '1110011'],
-        'Z' => ['ascii' => 90,  'bin' => '11111101'],
-        '[' => ['ascii' => 91,  'bin' => '1111111111011'],
-        '\\' => ['ascii' => 92,  'bin' => '1111111111111110000'],
-        ']' => ['ascii' => 93,  'bin' => '1111111111100'],
-        '^' => ['ascii' => 94,  'bin' => '11111111111100'],
-        '_' => ['ascii' => 95,  'bin' => '100010'],
-        '`' => ['ascii' => 96,  'bin' => '111111111111101'],
-        'a' => ['ascii' => 97,  'bin' => '00011'],
-        'b' => ['ascii' => 98,  'bin' => '100011'],
-        'c' => ['ascii' => 99,  'bin' => '00100'],
-        'd' => ['ascii' => 100, 'bin' => '100100'],
-        'e' => ['ascii' => 101, 'bin' => '00101'],
-        'f' => ['ascii' => 102, 'bin' => '100101'],
-        'g' => ['ascii' => 103, 'bin' => '100110'],
-        'h' => ['ascii' => 104, 'bin' => '100111'],
-        'i' => ['ascii' => 105, 'bin' => '00110'],
-        'j' => ['ascii' => 106, 'bin' => '1110100'],
-        'k' => ['ascii' => 107, 'bin' => '1110101'],
-        'l' => ['ascii' => 108, 'bin' => '101000'],
-        'm' => ['ascii' => 109, 'bin' => '101001'],
-        'n' => ['ascii' => 110, 'bin' => '101010'],
-        'o' => ['ascii' => 111, 'bin' => '00111'],
-        'p' => ['ascii' => 112, 'bin' => '101011'],
-        'q' => ['ascii' => 113, 'bin' => '1110110'],
-        'r' => ['ascii' => 114, 'bin' => '101100'],
-        's' => ['ascii' => 115, 'bin' => '01000'],
-        't' => ['ascii' => 116, 'bin' => '01001'],
-        'u' => ['ascii' => 117, 'bin' => '101101'],
-        'v' => ['ascii' => 118, 'bin' => '1110111'],
-        'w' => ['ascii' => 119, 'bin' => '1111000'],
-        'x' => ['ascii' => 120, 'bin' => '1111001'],
-        'y' => ['ascii' => 121, 'bin' => '1111010'],
-        'z' => ['ascii' => 122, 'bin' => '1111011'],
-        '{' => ['ascii' => 123, 'bin' => '111111111111110'],
-        '|' => ['ascii' => 124, 'bin' => '11111111100'],
-        '}' => ['ascii' => 125, 'bin' => '11111111111101'],
-        '~' => ['ascii' => 126, 'bin' => '1111111111101']
     ];
 }

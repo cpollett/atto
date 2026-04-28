@@ -2206,6 +2206,34 @@ class WebSite
                 return false;
             }
             $pending['body'] .= $frame->data;
+            /*
+                RFC 7540 sec 6.9: each DATA frame consumes from
+                both the per-stream and the connection-level
+                receive window the peer is allowed to send. The
+                default initial window is 65535 bytes for both.
+                Once the peer has filled either window the peer
+                will stop sending DATA until the receiver issues
+                WINDOW_UPDATE frames returning credit. Atto
+                buffers the entire request body before dispatch
+                (no streaming), so we replenish the windows
+                immediately after consuming each DATA frame:
+                stream-level WINDOW_UPDATE for the stream-id and
+                connection-level WINDOW_UPDATE for stream-id 0,
+                each with an increment equal to the data payload
+                size. Without this, large H2 POST bodies (yioop
+                Fetcher's crawl uploads, multipart file uploads
+                from browsers) stall after the initial 65535
+                bytes until the client times out.
+             */
+            $consumed = strlen($frame->data);
+            if ($consumed > 0) {
+                $stream_update = new WindowUpdateFrame(
+                    $stream_id, $consumed);
+                $conn_update = new WindowUpdateFrame(
+                    0, $consumed);
+                @fwrite($connection, $stream_update->serialize()
+                    . $conn_update->serialize());
+            }
             if (strlen($pending['body'])
                     > $this->default_server_globals[
                         'MAX_REQUEST_LEN']) {

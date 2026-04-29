@@ -60,7 +60,6 @@ class WebSite
     const DATA = 1;
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
-    const REQUEST_HEAD = 4;
     /*
       CONNECT OPTIONS and the longest named HTTP method. It has length 7
      */
@@ -287,14 +286,12 @@ class WebSite
      */
     protected $is_secure = false;
     /**
-     * Array of active listeners. Each entry is an associative
-     * array with keys 'server' (the stream resource returned by
-     * stream_socket_server), 'is_secure' (bool), and 'globals'
-     * (per-listener overrides for default_server_globals such as
-     * SERVER_NAME and SERVER_PORT). Indexed by (int)$server so
-     * processRequestStreams can match an incoming connection to
-     * its listener via the readable key returned by stream_select.
-     * @var array
+     * Active Listener instances, indexed by (int)$server resource
+     * so processRequestStreams can match an incoming readable
+     * stream key to the listener that owns it. Each Listener
+     * carries its server resource, bind address, TLS flag, and
+     * per-listener server globals (SERVER_NAME, SERVER_PORT).
+     * @var array<int,Listener>
      */
     protected $listeners = [];
     /**
@@ -1395,13 +1392,13 @@ class WebSite
             per-connection should consult the listener entry instead.
          */
         foreach ($opened as $entry) {
-            if ($entry['is_secure']) {
+            if ($entry->is_secure) {
                 $this->is_secure = true;
                 break;
             }
         }
         $primary = $opened[0];
-        $primary_globals = $primary['globals'];
+        $primary_globals = $primary->globals;
         $this->default_server_globals = array_merge($_SERVER,
             $default_server_globals, $shared_globals, $primary_globals);
         $as_user = "";
@@ -1428,13 +1425,16 @@ class WebSite
         $this->in_streams = [self::CONNECTION => [], self::DATA => [""]];
         $this->out_streams = [self::CONNECTION => [], self::DATA => []];
         foreach ($opened as $entry) {
-            $server = $entry['server'];
+            $server = $entry->server;
+            if ($server === null) {
+                continue;
+            }
             $key = (int) $server;
             $this->listeners[$key] = $entry;
             $this->immortal_stream_keys[] = $key;
             $this->in_streams[self::CONNECTION][$key] = $server;
-            echo "SERVER listening at " . $entry['address']
-                . ($entry['is_secure'] ? " (secure)" : "") . $as_user
+            echo "SERVER listening at " . $entry->address
+                . ($entry->is_secure ? " (secure)" : "") . $as_user
                 . "\n";
         }
         $excepts = null;
@@ -1499,7 +1499,7 @@ class WebSite
                 }
             }
             foreach ($this->listeners as $entry) {
-                @fclose($entry['server']);
+                $entry->close();
             }
             $job = strstr(PHP_OS, "WIN") ? "start $script "
                 : "$script < /dev/null > /dev/null &";
@@ -1552,14 +1552,13 @@ class WebSite
             STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $server_context);
         if (!$server) {
             echo "Failed to bind address $bind_address: $errstr\n";
-            return ['server' => null, 'address' => $bind_address,
-                'is_secure' => $is_secure, 'globals' => []];
+            return new Listener(null, $bind_address, $is_secure, []);
         }
         stream_set_blocking($server, false);
-        return ['server' => $server, 'address' => $bind_address,
-            'is_secure' => $is_secure,
-            'globals' => ['SERVER_NAME' => $parsed['host'],
-                'SERVER_PORT' => $parsed['port']]];
+        return new Listener($server, $bind_address, $is_secure, [
+            'SERVER_NAME' => $parsed['host'],
+            'SERVER_PORT' => $parsed['port'],
+        ]);
     }
     /**
      * Parses a listen address into its bind string, host and port
@@ -2045,11 +2044,8 @@ class WebSite
      * dispatching to initH2Request or initRequestStream based on
      * the detected client protocol.
      *
-     * @param array $listener entry from $this->listeners with
-     *      keys 'server' (the server resource), 'is_secure'
-     *      (whether TLS is enabled on this listener), and
-     *      'globals' (per-listener server globals such as
-     *      SERVER_NAME and SERVER_PORT)
+     * @param Listener $listener Listener instance whose server
+     *      socket reported readable
      */
     protected function processServerRequest($listener)
     {
@@ -2062,7 +2058,7 @@ class WebSite
         }
         $acceptor = $this->getConnectionAcceptor();
         list($connection, $additional_context) =
-            $acceptor->accept($listener, $timeout);
+            $listener->accept($acceptor, $timeout);
         if ($connection === null) {
             return;
         }
@@ -2089,9 +2085,9 @@ class WebSite
         }
         $connection->client_http = $client_http;
         $connection->listener_port =
-            $listener['globals']['SERVER_PORT'] ?? '';
+            $listener->globals['SERVER_PORT'] ?? '';
         $connection->listener_name =
-            $listener['globals']['SERVER_NAME'] ?? '';
+            $listener->globals['SERVER_NAME'] ?? '';
         if ($is_secure) {
             /*
                 Standard CGI HTTPS=on convention so generic PHP
@@ -3137,7 +3133,7 @@ class WebSite
         }
         $this->in_streams[self::CONTEXT][$key] = array_merge(
             [
-                self::REQUEST_HEAD => false,
+                'REQUEST_HEAD_PARSED' => false,
                 'REQUEST_METHOD' => false,
                 "REMOTE_ADDR" => $remote_addr,
                 "REMOTE_PORT" => $remote_port,
@@ -3266,8 +3262,8 @@ class WebSite
             return false;
         }
         $context = $this->in_streams[self::CONTEXT][$key];
-        if (!isset($context[self::REQUEST_HEAD]))
-            $context[self::REQUEST_HEAD] = false;
+        if (!isset($context['REQUEST_HEAD_PARSED']))
+            $context['REQUEST_HEAD_PARSED'] = false;
         if (!$context['REQUEST_METHOD']) {
             $request_start = substr($this->in_streams[self::DATA][$key], 0,
                 self::LEN_LONGEST_HTTP_METHOD + 1);
@@ -3284,7 +3280,7 @@ class WebSite
             spec says use CRLF, but hard to type as human on Mac or Linux
             so relax spec for inputs. (Follow spec exactly for output)
         */
-        if (!$context[self::REQUEST_HEAD]) {
+        if (!$context['REQUEST_HEAD_PARSED']) {
             if (strpos($data, "\x0D\x0A\x0D\x0A") === false &&
                 strpos($data, "\x0D\x0D") === false) {
                 return false;
@@ -3293,7 +3289,7 @@ class WebSite
                 $eol = \PHP_EOL;
                 $end_head_pos = strpos($data, "$eol$eol");
             }
-            $context[self::REQUEST_HEAD] = true;
+            $context['REQUEST_HEAD_PARSED'] = true;
             $next_line_pos = strpos($data, $eol);
             $first_line = substr($this->in_streams[self::DATA][$key], 0,
                 $next_line_pos);
@@ -3720,10 +3716,13 @@ class WebException extends \Exception
  *     preserve-fields loop because the Connection itself
  *     survives the reset. setGlobals overlays connection
  *     fields onto $_SERVER on each dispatch.
- *   Phase 3: introduce a Listener class that owns a server
- *     socket and its accept policy (TCP accept + TLS handshake
- *     today; UDP recvfrom + QUIC handshake for H3). The current
- *     ConnectionAcceptor becomes a method on Listener.
+ *   Phase 3 (done): the Listener class encapsulates a bound
+ *     server socket, its address, TLS flag, and per-listener
+ *     globals; openListener returns Listener instances and
+ *     processServerRequest calls Listener::accept which
+ *     delegates to ConnectionAcceptor for TCP+TLS today. A
+ *     future H3Listener subclass would override accept to do
+ *     UDP recvfrom and demux QUIC datagrams.
  *   Phase 4: introduce Transport classes (H1Transport,
  *     H2Transport, eventual H3Transport) that own protocol-
  *     specific frame parsing and dispatch. WebSite's main loop
@@ -4047,16 +4046,17 @@ class ConnectionAcceptor
      * suitable for handing to WebSite's per-protocol init
      * routines, or [null, null] if no connection was accepted.
      *
-     * @param array $listener entry from WebSite's listeners with
-     *      keys 'server' (server resource) and 'is_secure'
+     * @param Listener $listener listener whose server socket is
+     *      ready to accept; supplies the server resource and the
+     *      is_secure flag
      * @param float $timeout maximum seconds to block waiting for
      *      a connection
      * @return array [Connection|null, array|null]
      */
     public function accept($listener, $timeout)
     {
-        $server = $listener['server'];
-        $is_secure = !empty($listener['is_secure']);
+        $server = $listener->server;
+        $is_secure = !empty($listener->is_secure);
         if ($is_secure) {
             stream_set_blocking($server, true);
         }
@@ -4182,6 +4182,116 @@ class ConnectionAcceptor
             return ["CLIENT_HTTP" => "HTTP/1.1"];
         }
         return ["CLIENT_HTTP" => "unknown"];
+    }
+}
+/**
+ * A bound server socket plus its accept policy. WebSite holds one
+ * Listener per address it is configured to listen on (e.g. one
+ * for plain HTTP on 8080, another for TLS on 8443). The Listener
+ * owns the server resource, the bind address, whether it is TLS,
+ * and the per-listener server globals overrides (SERVER_NAME,
+ * SERVER_PORT) that are stamped onto every Connection accepted
+ * from it.
+ *
+ * Listeners are created by WebSite::openListener and registered
+ * in WebSite::$listeners. The main event loop pulls the server
+ * resource via Listener::resource() and adds it to the array
+ * passed to stream_select; when select reports a server socket
+ * readable, processRequestStreams looks up the Listener by
+ * stream key and calls processServerRequest, which calls
+ * Listener::accept() to produce a Connection.
+ *
+ * The class is designed to admit a future H3Listener subclass
+ * for QUIC over UDP. That subclass would override accept() to
+ * call stream_socket_recvfrom and demux the resulting datagram
+ * to (or create) the QUIC connection identified by its
+ * connection-id, returning a QuicConnection wrapping that
+ * stream rather than a TCP-backed Connection.
+ */
+class Listener
+{
+    /**
+     * Stream resource returned by stream_socket_server, or null
+     * if the bind failed (callers should check before adding to
+     * a select set).
+     * @var resource|null
+     */
+    public $server;
+    /**
+     * The bind address as understood by stream_socket_server,
+     * e.g. 'tcp://0.0.0.0:8080'. Used in startup logging and to
+     * recreate the same listener after a restart.
+     * @var string
+     */
+    public $address;
+    /**
+     * True if this listener was opened with a TLS context. The
+     * accept policy uses this to decide whether to run the TLS
+     * handshake on freshly accepted connections, and the dispatch
+     * code uses it to set HTTPS=on on the Connection.
+     * @var bool
+     */
+    public $is_secure;
+    /**
+     * Per-listener overrides for default_server_globals. Currently
+     * holds SERVER_NAME and SERVER_PORT so a multi-listener server
+     * can stamp the right host and port onto each accepted
+     * Connection regardless of which listener accepted it.
+     * @var array
+     */
+    public $globals;
+    /**
+     * Constructs a Listener.
+     *
+     * @param resource|null $server the server socket resource
+     * @param string $address bind address used by openListener
+     * @param bool $is_secure whether TLS is enabled
+     * @param array $globals per-listener server globals overrides
+     */
+    public function __construct($server, $address,
+        $is_secure = false, $globals = [])
+    {
+        $this->server = $server;
+        $this->address = $address;
+        $this->is_secure = $is_secure;
+        $this->globals = $globals;
+    }
+    /**
+     * Returns the underlying server stream resource so the event
+     * loop can include it in stream_select sets.
+     *
+     * @return resource|null the server socket
+     */
+    public function resource()
+    {
+        return $this->server;
+    }
+    /**
+     * Closes the underlying server socket. Used during a graceful
+     * restart so the child process can rebind the same port.
+     */
+    public function close()
+    {
+        if (is_resource($this->server)) {
+            @fclose($this->server);
+        }
+    }
+    /**
+     * Accepts a new connection from this listener. For TCP this
+     * delegates to ConnectionAcceptor which handles the TLS
+     * handshake and protocol detection. A future H3Listener
+     * subclass would override this method to implement UDP
+     * recvfrom and QUIC connection demuxing instead.
+     *
+     * @param ConnectionAcceptor $acceptor accept-and-detect helper
+     * @param float $timeout maximum seconds to block waiting
+     * @return array [Connection|null, array|null] freshly built
+     *      Connection plus an additional_context dict, or
+     *      [null, null] if no connection was accepted
+     */
+    public function accept($acceptor, $timeout)
+    {
+        return $acceptor->accept($this, $timeout);
     }
 }
 /**

@@ -2685,13 +2685,34 @@ class WebSite
             }
         }
         /*
-            @fwrite: clients (especially browsers loading parallel
-            subresources) routinely close mid-response. The
-            resulting broken-pipe / SSL warnings are noise — the
-            peer is gone and the next event-loop pass drops the
-            stream cleanly.
+            Queue the response on out_streams so processResponseStreams
+            drains it asynchronously, looping fwrite across event-loop
+            iterations until the full buffer is delivered. A single
+            non-blocking fwrite of a multi-megabyte response can be
+            partially accepted by the kernel TCP send buffer (~1 MiB
+            on Linux, smaller under load) — the rest is silently
+            dropped, the client sees a truncated response. Using the
+            same async-drain path as H1 fixes truncation while keeping
+            H2's flow-control semantics: a single H2 connection
+            multiplexes many streams, so finishing one response never
+            closes the connection. processResponseStreams' is_h2
+            branch recognizes that and clears only the out_streams
+            entry, leaving the connection in_streams for the next
+            frame.
+
+            Append rather than overwrite so concurrent streams on the
+            same connection (parallel ASSET requests) get their
+            HEADERS+DATA frames serialized in dispatch order into the
+            same outbound buffer.
          */
-        @fwrite($connection, $out);
+        if (!empty($this->out_streams[self::CONNECTION][$key])) {
+            $this->out_streams[self::DATA][$key] .= $out;
+        } else {
+            $this->out_streams[self::CONNECTION][$key] = $connection;
+            $this->out_streams[self::DATA][$key] = $out;
+            $this->out_streams[self::CONTEXT][$key] = [];
+        }
+        $this->out_streams[self::MODIFIED_TIME][$key] = time();
         return true;
     }
     /**
@@ -3231,6 +3252,7 @@ class WebSite
                 $context = $this->out_streams[self::CONTEXT][$key];
                 $conn_obj = $this->connection($key);
                 $is_ws = $conn_obj !== null && $conn_obj->is_websocket;
+                $is_h2 = $conn_obj !== null && $conn_obj->protocol === 'h2';
                 if ($is_ws) {
                     /*
                         WebSocket: drain complete, but the
@@ -3250,6 +3272,15 @@ class WebSite
                     if ($ws !== null && $ws->closed) {
                         $this->shutdownHttpStream($key);
                     }
+                } else if ($is_h2) {
+                    /*
+                        H2: a single connection multiplexes many
+                        streams, so finishing one response never
+                        means closing the connection. Clear the
+                        out_streams entry; in_streams keeps the
+                        connection alive for the next frame.
+                     */
+                    $this->shutdownHttpWriteStream($key);
                 } else if ((!empty($context['HTTP_CONNECTION']) &&
                     strtolower($context['HTTP_CONNECTION']) == 'close') ||
                     empty($context['SERVER_PROTOCOL']) ||

@@ -303,6 +303,17 @@ class WebSite
      */
     protected $connection_acceptor = null;
     /**
+     * Transport instances keyed by protocol string ('h1', 'h2',
+     * 'ws'; 'h3' once QUIC support lands). Each Transport owns
+     * the readable-event handling for connections of that
+     * protocol; processRequestStreams looks up the Transport via
+     * the Connection's $protocol field and calls onReadable. New
+     * protocols slot in by adding an entry here. Initialized on
+     * first run of the event loop.
+     * @var array<string,Transport>
+     */
+    protected $transports = [];
+    /**
      * List of acceptable Origin header values for WebSocket
      * upgrade requests, or empty array to accept any origin.
      * @var array
@@ -1424,6 +1435,18 @@ class WebSite
         }
         $this->in_streams = [self::CONNECTION => [], self::DATA => [""]];
         $this->out_streams = [self::CONNECTION => [], self::DATA => []];
+        /*
+            Wire up the per-protocol Transports. Each Transport
+            owns the readable-event handling for its protocol;
+            processRequestStreams routes via Connection->protocol.
+            Order doesn't matter — keys are looked up directly.
+            A future H3Transport entry would slot in here.
+         */
+        $this->transports = [
+            'h1' => new H1Transport($this),
+            'h2' => new H2Transport($this),
+            'ws' => new WsTransport($this),
+        ];
         foreach ($opened as $entry) {
             $server = $entry->server;
             if ($server === null) {
@@ -1927,111 +1950,106 @@ class WebSite
                 continue;
             }
             /*
-                Per-iteration protocol routing. The Connection
-                object carries the negotiated protocol ('h1',
-                'h2', or 'ws' once an H1 connection has upgraded).
+                Per-iteration protocol routing. Look up the
+                Transport for this Connection's negotiated
+                protocol and let it handle the readable event.
                 A missing Connection here means the stream was
-                torn down between select() and now; treat it as
-                H1 to fall through to the parser, which will
-                detect the missing state and clean up.
+                torn down between select() and now; fall through
+                to H1Transport, whose parseH1Request detects the
+                missing state and cleans up.
              */
             $conn = $this->connection($key);
-            $is_h2 = $conn !== null && $conn->protocol === 'h2';
-            $is_ws = $conn !== null && $conn->is_websocket;
-            if ($is_ws) {
-                /*
-                    Established WebSocket connection. parseWsRequest
-                    reads one frame, dispatches text/binary messages
-                    to the registered onMessage callback, and answers
-                    pings or close frames inline.
-                 */
-                $this->parseWsRequest($key,
-                    $this->in_streams[self::CONNECTION][$key]);
-            } else if ($is_h2) {
-                /*
-                    H2 connections bypass the chunk-read and out_streams
-                    async write path entirely. parseH2Request does its own
-                    blocking frame read and writes the response directly,
-                    the same way initH2Request handled the preface.
-                 */
-                if ($too_long) {
-                    $this->shutdownHttpStream($key);
-                } else {
-                    $this->parseH2Request($key,
-                        $this->in_streams[self::CONNECTION][$key]);
-                }
-            } else {
-                if (!$too_long) {
-                    stream_set_blocking($in_stream, false);
-                    $data = stream_get_contents($in_stream, min(
-                        $this->default_server_globals['MAX_IO_LEN'],
-                        $max_len - $len));
-                } else {
-                    $data = "";
-                    $this->initializeBadRequestResponse($key);
-                }
-                if ($too_long || $this->parseRequest($key, $data)) {
-                    /*
-                        Detect WebSocket upgrade requests after
-                        parseRequest has populated the HTTP_*
-                        headers. If the client requested an
-                        upgrade and we have a matching ws() route,
-                        complete the handshake and switch the
-                        connection to WebSocket mode instead of
-                        producing a normal HTTP response.
-                     */
-                    if (empty($this->in_streams[self::CONTEXT][$key][
-                            'BAD_RESPONSE'])
-                        && $this->isWebSocketUpgrade($key)
-                        && $this->handleWebSocketUpgrade($key,
-                            $in_stream)) {
-                        $this->in_streams[self::MODIFIED_TIME][$key]
-                            = time();
-                        continue;
-                    }
-                    if (!empty($this->in_streams[self::CONTEXT][$key][
-                            'PRE_BAD_RESPONSE'])) {
-                        $this->in_streams[self::CONTEXT][$key][
-                            'BAD_RESPONSE'] = true;
-                    }
-                    /*
-                        Make the H1 connection available to
-                        $site->flush() so a route that opts into
-                        streaming can write to the socket directly.
-                        Cleared after dispatch regardless of whether
-                        the route streamed.
-                     */
-                    $this->streaming_socket = $in_stream;
-                    $this->streaming_context = ['protocol' => 'h1'];
-                    $out_data = $this->getResponseData();
-                    $this->streaming_socket = null;
-                    $this->streaming_context = [];
-                    if (empty($this->in_streams[self::CONTEXT][$key][
-                            'BAD_RESPONSE'])) {
-                        /*
-                            Reset per-request context for the next
-                            keep-alive request. Listener-attached
-                            state (IS_SECURE, LISTENER_PORT,
-                            LISTENER_NAME, HTTPS, CLIENT_HTTP) and
-                            H2 protocol state live on the
-                            persistent Connection object and
-                            survive this reset automatically;
-                            setGlobals re-overlays them onto
-                            $_SERVER for the next request.
-                         */
-                        $this->initRequestStream($key);
-                    }
-                    if (empty($this->out_streams[self::CONNECTION][$key])) {
-                        $this->out_streams[self::CONNECTION][$key] =
-                            $in_stream;
-                        $this->out_streams[self::DATA][$key] = $out_data;
-                        $this->out_streams[self::CONTEXT][$key] = $_SERVER;
-                        $this->out_streams[self::MODIFIED_TIME][$key] =
-                            time();
-                    }
-                }
+            $proto = $conn !== null ? $conn->protocol : 'h1';
+            if (!isset($this->transports[$proto])) {
+                $proto = 'h1';
             }
+            $this->transports[$proto]->onReadable($key, $conn,
+                $in_stream, $too_long);
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        }
+    }
+    /**
+     * Reads, parses, and dispatches one H1 request iteration on
+     * the connection identified by $key. Pulls up to MAX_IO_LEN
+     * bytes off the socket, hands them to parseRequest to assemble
+     * the full request head and body, and on a complete request
+     * either upgrades the connection to WebSocket (if the route
+     * matches and the headers ask for it) or generates the HTTP
+     * response, queueing it on out_streams for async drain.
+     *
+     * Public entry point because H1Transport calls it from outside
+     * the class.
+     *
+     * @param int $key stream key for the connection
+     * @param resource $in_stream readable socket resource
+     * @param bool $too_long true if buffered data already exceeds
+     *      MAX_REQUEST_LEN; in that case skip the read and force a
+     *      413 response
+     */
+    public function parseH1Request($key, $in_stream, $too_long)
+    {
+        $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
+        $len = strlen($this->in_streams[self::DATA][$key]);
+        if (!$too_long) {
+            stream_set_blocking($in_stream, false);
+            $data = stream_get_contents($in_stream, min(
+                $this->default_server_globals['MAX_IO_LEN'],
+                $max_len - $len));
+        } else {
+            $data = "";
+            $this->initializeBadRequestResponse($key);
+        }
+        if (!$too_long && !$this->parseRequest($key, $data)) {
+            return;
+        }
+        /*
+            Detect WebSocket upgrade requests after parseRequest
+            has populated the HTTP_* headers. If the client
+            requested an upgrade and we have a matching ws()
+            route, complete the handshake and switch the
+            connection to WebSocket mode instead of producing a
+            normal HTTP response.
+         */
+        if (empty($this->in_streams[self::CONTEXT][$key][
+                'BAD_RESPONSE'])
+            && $this->isWebSocketUpgrade($key)
+            && $this->handleWebSocketUpgrade($key, $in_stream)) {
+            $this->in_streams[self::MODIFIED_TIME][$key] = time();
+            return;
+        }
+        if (!empty($this->in_streams[self::CONTEXT][$key][
+                'PRE_BAD_RESPONSE'])) {
+            $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE']
+                = true;
+        }
+        /*
+            Make the H1 connection available to $site->flush() so
+            a route that opts into streaming can write to the
+            socket directly. Cleared after dispatch regardless of
+            whether the route streamed.
+         */
+        $this->streaming_socket = $in_stream;
+        $this->streaming_context = ['protocol' => 'h1'];
+        $out_data = $this->getResponseData();
+        $this->streaming_socket = null;
+        $this->streaming_context = [];
+        if (empty($this->in_streams[self::CONTEXT][$key][
+                'BAD_RESPONSE'])) {
+            /*
+                Reset per-request context for the next keep-alive
+                request. Listener-attached state and H2 protocol
+                state live on the persistent Connection object
+                and survive this reset automatically; setGlobals
+                re-overlays them onto $_SERVER for the next
+                request.
+             */
+            $this->initRequestStream($key);
+        }
+        if (empty($this->out_streams[self::CONNECTION][$key])) {
+            $this->out_streams[self::CONNECTION][$key] = $in_stream;
+            $this->out_streams[self::DATA][$key] = $out_data;
+            $this->out_streams[self::CONTEXT][$key] = $_SERVER;
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
         }
     }
     /**
@@ -2309,7 +2327,7 @@ class WebSite
      * @param resource $connection the client socket
      * @return bool true if a response was written, false otherwise
      */
-    protected function parseH2Request($key, $connection)
+    public function parseH2Request($key, $connection)
     {
         /*
             Per-connection H2 state lives on the Connection object
@@ -3004,7 +3022,7 @@ class WebSite
      * @param int $key connection key in in_streams
      * @param resource $connection client socket to read from
      */
-    protected function parseWsRequest($key, $connection)
+    public function parseWsRequest($key, $connection)
     {
         stream_set_blocking($connection, true);
         $frame = WebSocketFrame::read($connection);
@@ -3623,7 +3641,7 @@ class WebSite
      *
      * @param int $key id of stream to delete
      */
-    protected function shutdownHttpStream($key)
+    public function shutdownHttpStream($key)
     {
         if (!empty($this->in_streams[self::CONNECTION][$key])) {
             set_error_handler(null);
@@ -3723,10 +3741,13 @@ class WebException extends \Exception
  *     delegates to ConnectionAcceptor for TCP+TLS today. A
  *     future H3Listener subclass would override accept to do
  *     UDP recvfrom and demux QUIC datagrams.
- *   Phase 4: introduce Transport classes (H1Transport,
- *     H2Transport, eventual H3Transport) that own protocol-
- *     specific frame parsing and dispatch. WebSite's main loop
- *     becomes a thin select-and-route shell.
+ *   Phase 4 (done): Transport classes (H1Transport, H2Transport,
+ *     WsTransport) sit between the event loop and per-protocol
+ *     parsers. processRequestStreams looks up the Transport by
+ *     Connection->protocol and calls onReadable; each Transport
+ *     delegates back to a public WebSite parser method so the
+ *     dispatcher carries no protocol switch. Adding a Transport
+ *     for a new protocol is a one-entry change.
  *   Phase 5: H3. Subclass Connection as QuicConnection (with a
  *     non-zero streamId), subclass Listener as QuicListener
  *     (UDP socket, datagram demux), add an H3Transport. The
@@ -4292,6 +4313,102 @@ class Listener
     public function accept($acceptor, $timeout)
     {
         return $acceptor->accept($this, $timeout);
+    }
+}
+/**
+ * Per-protocol readable-event handler. WebSite holds one Transport
+ * instance per supported protocol ('h1', 'h2', 'ws', eventually
+ * 'h3') and routes each incoming readable event to the Transport
+ * matching the Connection's negotiated protocol. Transports are
+ * thin: they call back into WebSite for the actual parser work.
+ * Their job is to encapsulate which parser handles which protocol
+ * so adding a new protocol means adding a Transport, not editing
+ * a switch in the dispatcher.
+ *
+ * For H3 (Phase 5, gated on QUIC library availability), a new
+ * H3Transport would handle UDP datagrams demuxed to QUIC streams,
+ * each carrying H3 frames analogous to H2's HEADERS/DATA. The
+ * dispatcher loop in processRequestStreams stays unchanged.
+ */
+abstract class Transport
+{
+    /**
+     * Back-reference to the WebSite the Transport is wired into.
+     * Used to call into the existing parsers and to access
+     * shared state (in_streams, default_server_globals).
+     * @var WebSite
+     */
+    protected $site;
+    /**
+     * Constructs a Transport bound to the given WebSite.
+     *
+     * @param WebSite $site site this Transport is part of
+     */
+    public function __construct($site)
+    {
+        $this->site = $site;
+    }
+    /**
+     * Called by WebSite::processRequestStreams when stream_select
+     * reports the connection's socket as readable. Implementations
+     * should consume one chunk of inbound data and either dispatch
+     * a complete request or buffer for the next iteration.
+     *
+     * @param int $key stream key of the readable connection
+     * @param Connection|null $conn connection object, or null if
+     *      torn down between select and dispatch
+     * @param resource $in_stream the readable socket resource
+     * @param bool $too_long true if buffered request data already
+     *      exceeds MAX_REQUEST_LEN
+     */
+    abstract public function onReadable($key, $conn, $in_stream,
+        $too_long);
+}
+/**
+ * Transport for HTTP/1.x connections. Delegates to
+ * WebSite::parseH1Request which handles the chunk read, parser
+ * call, optional WebSocket upgrade, and response queueing onto
+ * out_streams for the async write path.
+ */
+class H1Transport extends Transport
+{
+    public function onReadable($key, $conn, $in_stream, $too_long)
+    {
+        $this->site->parseH1Request($key, $in_stream, $too_long);
+    }
+}
+/**
+ * Transport for HTTP/2 connections. H2 bypasses the chunk-read +
+ * out_streams async write path because H2 framing handles its own
+ * flow control: parseH2Request does its own blocking frame read
+ * and writes the response directly. If the client somehow buffered
+ * more than MAX_REQUEST_LEN unparsed bytes (e.g. an in-flight
+ * partial frame larger than the limit), tear the connection down
+ * rather than parse it.
+ */
+class H2Transport extends Transport
+{
+    public function onReadable($key, $conn, $in_stream, $too_long)
+    {
+        if ($too_long) {
+            $this->site->shutdownHttpStream($key);
+            return;
+        }
+        $this->site->parseH2Request($key, $in_stream);
+    }
+}
+/**
+ * Transport for established WebSocket connections. parseWsRequest
+ * reads one frame, dispatches text or binary messages to the
+ * registered onMessage callback, and answers ping or close frames
+ * inline. WebSocket framing has its own length limits so the
+ * generic too-long flag is not consulted here.
+ */
+class WsTransport extends Transport
+{
+    public function onReadable($key, $conn, $in_stream, $too_long)
+    {
+        $this->site->parseWsRequest($key, $in_stream);
     }
 }
 /**

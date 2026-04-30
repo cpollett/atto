@@ -80,6 +80,14 @@ if (php_sapi_name() !== 'cli') {
     exit();
 }
 
+/*
+    Silence deprecation notices so bench output stays clean for
+    the dashboard parser. PHP 8.5 deprecates a number of curl
+    functions that have been no-ops since 8.0; we don't call them
+    anymore but third-party extensions may.
+ */
+error_reporting(E_ALL & ~E_DEPRECATED & ~E_STRICT);
+
 $opts = parseArgs($argv);
 if (!empty($opts['help'])) {
     echo trim(<<<'TXT'
@@ -478,7 +486,6 @@ function probe($url, $http_version, $strict = false)
     curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $negotiated = curl_getinfo($ch, CURLINFO_HTTP_VERSION);
-    curl_close($ch);
     if ($code < 200 || $code >= 400) {
         return false;
     }
@@ -509,7 +516,6 @@ function singleShot($url, $opts, $iters, $desc)
         $body = curl_exec($ch);
         $time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
         $size = curl_getinfo($ch, CURLINFO_SIZE_DOWNLOAD);
-        curl_close($ch);
         if ($body === false) {
             continue;
         }
@@ -552,7 +558,6 @@ function keepAliveShot($url, $opts, $iters, $desc)
         $bytes = curl_getinfo($ch, CURLINFO_SIZE_DOWNLOAD);
         $times[] = $time;
     }
-    curl_close($ch);
     $stats = stats($times);
     $stats['desc'] = $desc;
     $stats['kbps'] = ($bytes > 0 && $stats['median'] > 0)
@@ -618,7 +623,6 @@ function parallelShot($urls, $opts, $desc)
         $bytes += (int) curl_getinfo($ch,
             CURLINFO_SIZE_DOWNLOAD);
         curl_multi_remove_handle($mh, $ch);
-        curl_close($ch);
     }
     curl_multi_close($mh);
     return [

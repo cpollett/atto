@@ -1361,8 +1361,7 @@ class H3Transport extends Transport
             }
             return 0;
         };
-        $cb_cdata = $q->cast('quiche_h3_header_cb', $cb);
-        $q->quiche_h3_event_for_each_header($ev, $cb_cdata, null);
+        $q->quiche_h3_event_for_each_header($ev, $cb, null);
     }
     /**
      * Reads any available request-body bytes off the given stream

@@ -306,6 +306,15 @@ class WebSite
      */
     public $transports = [];
     /**
+     * UDP port on which an H3 listener was opened, or 0 if no
+     * H3 listener was bound. When non-zero, getResponseData
+     * automatically prepends an Alt-Svc header to H1/H2
+     * responses so browsers learn that this origin also speaks
+     * HTTP/3 and can race a QUIC connection on the next request.
+     * @var int
+     */
+    protected $h3_advertise_port = 0;
+    /**
      * List of acceptable Origin header values for WebSocket
      * upgrade requests, or empty array to accept any origin.
      * @var array
@@ -1420,6 +1429,10 @@ class WebSite
                 if ($h3 !== null) {
                     $h3->site = $this;
                     $opened[] = $h3;
+                    if ($this->h3_advertise_port === 0) {
+                        $this->h3_advertise_port =
+                            (int) $parsed['port'];
+                    }
                 }
                 continue;
             }
@@ -1830,6 +1843,22 @@ class WebSite
         }
         if (!$this->content_type && !$redirect) {
             $this->header_data .= "Content-Type: text/html\x0D\x0A";
+        }
+        if ($this->h3_advertise_port > 0
+            && ($_SERVER['SERVER_PROTOCOL'] ?? '') !== 'HTTP/3'
+            && stripos($this->header_data, "\nAlt-Svc:") === false
+            && stripos($this->header_data, "\rAlt-Svc:") === false) {
+            /*
+                Tell the client that this origin also speaks H3
+                on the listener's UDP port. The client races H3
+                against the current TCP connection on the next
+                request and remembers the result for ma seconds.
+                Skip if the route already set its own Alt-Svc
+                or if this response is itself going out over H3.
+             */
+            $this->header_data .= 'Alt-Svc: h3=":'
+                . $this->h3_advertise_port . '"; ma=86400'
+                . "\x0D\x0A";
         }
         if ($include_headers) {
             $out_data = $this->header_data .

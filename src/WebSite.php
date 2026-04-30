@@ -3764,48 +3764,9 @@ class WebException extends \Exception
  * resource (the H2 frame parser, stream_select in the event loop,
  * stream_socket_get_name) the resource() method is available.
  *
- * The class is structured to admit a future Quic transport without
- * requiring callers to be aware of which transport they are on. A
- * QuicConnection subclass would override read/write to direct
- * traffic to a specific QUIC stream and would override streamId()
- * to return the QUIC stream id rather than 0.
- *
- * Migration plan toward H3 support:
- *   Phase 1 (done): Connection objects persist for the lifetime
- *     of the connection in WebSite::$connections, tagged with a
- *     protocol string and carrying protocol-specific state on
- *     protocol_state. H2 HPACK encoder/decoder, last-stream-id,
- *     and pending streams have been migrated off in_streams[
- *     CONTEXT] and live here instead.
- *   Phase 2 (done): listener-attached H1 state (is_secure,
- *     client_http, listener_name, listener_port, https) and
- *     peer/local socket addresses (remote_addr, remote_port,
- *     server_addr, server_port) plus the WebSocket-upgrade
- *     fields (is_websocket, ws) live on the Connection.
- *     Keep-alive resets between H1 requests no longer need a
- *     preserve-fields loop because the Connection itself
- *     survives the reset. setGlobals overlays connection
- *     fields onto $_SERVER on each dispatch.
- *   Phase 3 (done): the Listener class encapsulates a bound
- *     server socket, its address, TLS flag, and per-listener
- *     globals; openListener returns Listener instances and
- *     processServerRequest calls Listener::accept which
- *     delegates to ConnectionAcceptor for TCP+TLS today. A
- *     future H3Listener subclass would override accept to do
- *     UDP recvfrom and demux QUIC datagrams.
- *   Phase 4 (done): Transport classes (H1Transport, H2Transport,
- *     WsTransport) sit between the event loop and per-protocol
- *     parsers. processRequestStreams looks up the Transport by
- *     Connection->protocol and calls onReadable; each Transport
- *     delegates back to a public WebSite parser method so the
- *     dispatcher carries no protocol switch. Adding a Transport
- *     for a new protocol is a one-entry change.
- *   Phase 5: H3. Subclass Connection as QuicConnection (with a
- *     non-zero streamId), subclass Listener as QuicListener
- *     (UDP socket, datagram demux), add an H3Transport. The
- *     pure-PHP QUIC stack itself is enormous — this phase is
- *     gated on either a native QUIC extension being available
- *     or someone tackling that stack directly.
+ * Subclasses extend this for transports that do not map cleanly to
+ * a single TCP stream. H3Connection wraps a quiche_conn pointer
+ * and overrides protocol/state semantics for QUIC streams.
  */
 class Connection
 {
@@ -4171,13 +4132,18 @@ class ConnectionAcceptor
         return [$connection, $additional_context];
     }
     /**
-     * Enables TLS on a freshly accepted connection. Sets blocking
-     * mode for the duration of the handshake, then restores
-     * non-blocking on success. Reports failures through the
-     * error_handler if one was supplied. The post_tls_callback
-     * is invoked on success so the caller can reinstall its
-     * custom error handler that PHP clears as part of the TLS
-     * setup.
+     * Wraps a freshly accepted connection in TLS by calling
+     * stream_socket_enable_crypto. Returns true if the TLS
+     * handshake succeeded, false otherwise; on failure the
+     * error message captured from the underlying call is
+     * reported via the configured error_handler or, if none is
+     * set, echoed to standard output.
+     *
+     * Failures with no PHP-level error message attached (the
+     * common case when a peer simply closes the TCP connection
+     * mid-handshake) are silent: there is no useful diagnostic
+     * to report and emitting "SSL Error: unknown" once per
+     * aborted connection floods the log under load.
      *
      * @param Connection $connection freshly accepted connection
      *      to wrap with TLS
@@ -4186,17 +4152,6 @@ class ConnectionAcceptor
     protected function enableTls($connection)
     {
         $connection->setBlocking(true);
-        /*
-            Install a temporary error handler around the
-            stream_socket_enable_crypto call so we capture
-            exactly the message PHP raised for this handshake,
-            not whatever happened to be the last suppressed
-            warning anywhere in the process. error_get_last is
-            unreliable here: an earlier @unlink, @file_get_contents,
-            or any other suppressed-warning callsite poisons it,
-            and the resulting "SSL Error: <unrelated message>"
-            is misleading.
-         */
         $captured = '';
         set_error_handler(function ($errno, $errstr) use (&$captured) {
             $captured = $errstr;
@@ -4207,8 +4162,17 @@ class ConnectionAcceptor
             STREAM_CRYPTO_METHOD_TLS_SERVER);
         restore_error_handler();
         if (!$ok) {
-            $message = "\n\nSSL Error: "
-                . ($captured !== '' ? $captured : 'unknown');
+            if ($captured === '') {
+                /*
+                    No PHP-level error attached: peer most likely
+                    closed the TCP connection mid-handshake. Stay
+                    silent rather than emit a meaningless "SSL
+                    Error: unknown" line for every aborted
+                    connection.
+                 */
+                return false;
+            }
+            $message = "\n\nSSL Error: " . $captured;
             if ($this->error_handler) {
                 ($this->error_handler)($message);
             } else {
@@ -4386,18 +4350,13 @@ class Listener
 }
 /**
  * Per-protocol readable-event handler. WebSite holds one Transport
- * instance per supported protocol ('h1', 'h2', 'ws', eventually
- * 'h3') and routes each incoming readable event to the Transport
- * matching the Connection's negotiated protocol. Transports are
- * thin: they call back into WebSite for the actual parser work.
- * Their job is to encapsulate which parser handles which protocol
- * so adding a new protocol means adding a Transport, not editing
- * a switch in the dispatcher.
- *
- * For H3 (Phase 5, gated on QUIC library availability), a new
- * H3Transport would handle UDP datagrams demuxed to QUIC streams,
- * each carrying H3 frames analogous to H2's HEADERS/DATA. The
- * dispatcher loop in processRequestStreams stays unchanged.
+ * instance per supported protocol ('h1', 'h2', 'ws', 'h3') and
+ * routes each incoming readable event to the Transport matching
+ * the Connection's negotiated protocol. Transports are thin: they
+ * call back into WebSite for the actual parser work. Their job is
+ * to encapsulate which parser handles which protocol so adding a
+ * new protocol means adding a Transport, not editing a switch in
+ * the dispatcher.
  */
 abstract class Transport
 {

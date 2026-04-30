@@ -470,12 +470,6 @@ class H3Connection extends Connection
  * and the connection table. Configuration (cert path, ALPN,
  * idle timeout, flow-control limits) is applied at tryOpen
  * time and stays for the listener's lifetime.
- *
- * Phase 5 part 1 — this class: socket open, config init,
- * skeletal accept that demuxes by CID. Phase 5 part 2 —
- * H3Transport: reads HEADERS/DATA frames off established
- * connections, dispatches to WebSite's route handlers,
- * writes responses back via quiche_conn_stream_send.
  */
 class H3Listener extends Listener
 {
@@ -751,20 +745,11 @@ class H3Listener extends Listener
         parent::close();
     }
     /**
-     * Accepts: reads one UDP datagram from the server socket,
-     * peeks at the QUIC header, and either returns a freshly-
-     * created H3Connection (for a new Initial packet that
-     * matches no existing CID) or routes the datagram to an
-     * existing H3Connection's quiche_conn_recv.
-     *
-     * Phase 5 part 1: minimal skeleton. We bind, read a packet,
-     * extract version/type/CID via quiche_header_info, and log
-     * the result. Connection creation via quiche_accept and
-     * datagram routing are stubbed for now and will be filled
-     * in alongside H3Transport.
-     *
-     * The signature matches Listener::accept: returns
-     * [Connection|null, additional_context|null].
+     * Reads one UDP datagram from the server socket and either
+     * returns a freshly-created H3Connection (for a new Initial
+     * packet matching no existing CID) or routes the datagram to
+     * an existing H3Connection's quiche_conn_recv. Returns
+     * [null, null] if no datagram is available.
      *
      * @param ConnectionAcceptor $acceptor unused for H3; the
      *      TCP-accept-and-TLS-handshake helper has no analogue
@@ -775,37 +760,16 @@ class H3Listener extends Listener
      */
     public function accept($acceptor, $timeout)
     {
-        $buf = '';
         $peer = '';
-        /*
-            stream_socket_recvfrom is the PHP wrapper for recvfrom
-            on a UDP socket. Returns false if there's nothing to
-            read (the socket was non-blocking; this is the
-            select-said-readable-but-data-already-consumed race),
-            or a string with up to $length bytes. $peer is filled
-            with the "host:port" string of the sender.
-         */
         $buf = stream_socket_recvfrom($this->server, 65535, 0, $peer);
         if ($buf === false || $buf === '') {
             return [null, null];
         }
         /*
-            Phase 5 part 1 stops here. The next phase, alongside
-            H3Transport, will:
-              - quiche_header_info to extract version + DCID + SCID
-              - look up DCID in $this->connections; if found,
-                  call quiche_conn_recv on that connection
-              - if not found and packet is an Initial, mint a
-                  fresh SCID, call quiche_accept, register the
-                  new H3Connection, and return it
-              - if version unsupported, write a version
-                  negotiation packet via quiche_negotiate_version
-                  and stream_socket_sendto
-              - call quiche_conn_send for outgoing data on every
-                  connection that has data to send
-            For now we just return null so this listener exists
-            but does no real work; the H1/H2 listeners on
-            sibling ports continue to serve requests normally.
+            Connection creation via quiche_accept and per-CID
+            datagram routing land alongside H3Transport. Until
+            then this listener silently absorbs incoming datagrams
+            so the UDP port behaves as a no-op.
          */
         return [null, null];
     }

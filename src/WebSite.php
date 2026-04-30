@@ -278,14 +278,6 @@ class WebSite
      */
     protected $is_cli;
     /**
-     * Whether https is being used. For backward compatibility this
-     * is set to true if any listener has a TLS context. The
-     * per-connection secure flag lives in the connection's stream
-     * context entry instead.
-     * @var bool
-     */
-    protected $is_secure = false;
-    /**
      * Active Listener instances, indexed by (int)$server resource
      * so processRequestStreams can match an incoming readable
      * stream key to the listener that owns it. Each Listener
@@ -359,9 +351,6 @@ class WebSite
             $base_path = "";
         }
         $this->is_cli = (php_sapi_name() == 'cli');
-        if(!empty($_SERVER['HTTPS'])) {
-            $this->is_secure = true;
-        }
         $this->base_path = $base_path;
         $this->stop = false;
         $this->restart = false;
@@ -1382,31 +1371,63 @@ class WebSite
             if (is_array($spec)) {
                 $spec_address = $spec['address'] ?? null;
                 $spec_context = $spec['context'] ?? [];
+                $spec_protocol = $spec['protocol'] ?? null;
             } else {
                 $spec_address = $spec;
                 $spec_context = [];
+                $spec_protocol = null;
             }
             if ($spec_address === null) {
                 echo "Listener spec missing address; skipping\n";
                 continue;
             }
+            $merged_context = array_replace_recursive($shared_context,
+                $spec_context);
+            if ($spec_protocol === 'h3') {
+                /*
+                    H3 listener: load the optional H3Listener module
+                    on first request and let it open a UDP socket
+                    via libquiche. If the module is unavailable
+                    (FFI extension not loaded, libquiche not
+                    installed, or cert/key missing), tryOpen
+                    returns null and we silently skip the H3
+                    listener while keeping any sibling H1/H2
+                    listeners. The server stays usable as
+                    H1/H2-only with no extra ceremony — opt-in
+                    H3 with graceful degradation.
+                 */
+                if (!class_exists(
+                        '\seekquarry\atto\H3Listener', false)) {
+                    $h3_path = __DIR__ . '/H3Listener.php';
+                    if (is_file($h3_path)) {
+                        require_once $h3_path;
+                    }
+                }
+                if (!class_exists(
+                        '\seekquarry\atto\H3Listener', false)) {
+                    echo "H3 listener requested for $spec_address "
+                        . "but src/H3Listener.php is missing; "
+                        . "skipping\n";
+                    continue;
+                }
+                $parsed = $this->parseListenAddress($spec_address);
+                $h3_globals = [
+                    'SERVER_NAME' => $parsed['host'],
+                    'SERVER_PORT' => $parsed['port'],
+                ];
+                $h3 = H3Listener::tryOpen($parsed['bind_address'],
+                    $merged_context, $h3_globals);
+                if ($h3 !== null) {
+                    $opened[] = $h3;
+                }
+                continue;
+            }
             $opened[] = $this->openListener($spec_address,
-                array_replace_recursive($shared_context, $spec_context));
+                $merged_context);
         }
         if (empty($opened)) {
             echo "No listeners opened, server stopping\n";
             exit();
-        }
-        /*
-            For backward compatibility set is_secure on the WebSite
-            if any listener is secure. Code paths that need to know
-            per-connection should consult the listener entry instead.
-         */
-        foreach ($opened as $entry) {
-            if ($entry->is_secure) {
-                $this->is_secure = true;
-                break;
-            }
         }
         $primary = $opened[0];
         $primary_globals = $primary->globals;
@@ -4165,12 +4186,29 @@ class ConnectionAcceptor
     protected function enableTls($connection)
     {
         $connection->setBlocking(true);
-        if (!@stream_socket_enable_crypto(
-                $connection->resource(), true,
-                STREAM_CRYPTO_METHOD_TLS_SERVER)) {
-            $ssl_error = error_get_last();
+        /*
+            Install a temporary error handler around the
+            stream_socket_enable_crypto call so we capture
+            exactly the message PHP raised for this handshake,
+            not whatever happened to be the last suppressed
+            warning anywhere in the process. error_get_last is
+            unreliable here: an earlier @unlink, @file_get_contents,
+            or any other suppressed-warning callsite poisons it,
+            and the resulting "SSL Error: <unrelated message>"
+            is misleading.
+         */
+        $captured = '';
+        set_error_handler(function ($errno, $errstr) use (&$captured) {
+            $captured = $errstr;
+            return true;
+        });
+        $ok = @stream_socket_enable_crypto(
+            $connection->resource(), true,
+            STREAM_CRYPTO_METHOD_TLS_SERVER);
+        restore_error_handler();
+        if (!$ok) {
             $message = "\n\nSSL Error: "
-                . ($ssl_error['message'] ?? 'unknown');
+                . ($captured !== '' ? $captured : 'unknown');
             if ($this->error_handler) {
                 ($this->error_handler)($message);
             } else {

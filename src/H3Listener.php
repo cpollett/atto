@@ -1275,11 +1275,10 @@ class H3Transport extends Transport
             if ($stream_id < 0) {
                 break;
             }
-            $ev = $event_ptr->cdata;
-            $type = $q->quiche_h3_event_type($ev);
-            $this->handleEvent($listener, $conn, $stream_id, $ev,
-                $type);
-            $q->quiche_h3_event_free($ev);
+            $type = $q->quiche_h3_event_type($event_ptr);
+            $this->handleEvent($listener, $conn, $stream_id,
+                $event_ptr, $type);
+            $q->quiche_h3_event_free($event_ptr);
         }
     }
     /**

@@ -29,17 +29,35 @@ if (!defined("seekquarry\\atto\\RUN")) {
     H3 is also bound on 8443/UDP and the page shows the version.
  */
 $test = new WebSite();
-$cert = realpath(__DIR__ . "/../../security/server.crt");
-$key  = realpath(__DIR__ . "/../../security/server.key");
+/*
+    Prefer the CA-signed leaf cert produced by
+    security/make-local-ca.sh if it exists; that's the cert the
+    user can fully trust in their browser by importing
+    local-ca.crt into the authority store. Without it, fall back
+    to the self-signed server.crt — atto still serves correctly
+    over H1/H2/H3, but browsers won't promote H2 connections to
+    H3 via Alt-Svc until the cert is fully trusted.
+ */
+$ca_signed_cert = __DIR__ . "/../../security/localhost.crt";
+$ca_signed_key  = __DIR__ . "/../../security/localhost.key";
+if (is_file($ca_signed_cert) && is_file($ca_signed_key)) {
+    $cert = realpath($ca_signed_cert);
+    $key  = realpath($ca_signed_key);
+    $cert_kind = 'ca-signed';
+} else {
+    $cert = realpath(__DIR__ . "/../../security/server.crt");
+    $key  = realpath(__DIR__ . "/../../security/server.key");
+    $cert_kind = 'self-signed';
+}
 
-$test->get('/', function () use ($test) {
+$test->get('/', function () use ($test, $cert_kind) {
     $checks = collectH3Diagnostics();
     $all_ok = true;
     foreach ($checks as $c) {
         if (!$c['ok']) { $all_ok = false; break; }
     }
     $test->header('Content-Type: text/html; charset=utf-8');
-    renderDiagnosticPage($checks, $all_ok);
+    renderDiagnosticPage($checks, $all_ok, $cert_kind);
 });
 
 if ($test->isCli()) {
@@ -181,7 +199,7 @@ function collectH3Diagnostics()
  * whether all checks passed: success body with "try it" hints,
  * or instructions body with platform-specific install steps.
  */
-function renderDiagnosticPage($checks, $all_ok)
+function renderDiagnosticPage($checks, $all_ok, $cert_kind = 'self-signed')
 {
     $os = strtolower(PHP_OS);
     ?>
@@ -274,11 +292,150 @@ they are listed top-down by dependency.</p>
 <?php if ($all_ok) { ?>
 <h3>Verify with curl</h3>
 <p>Use a curl built with HTTP/3 support (curl 7.66+ with the
---http3 flag) to confirm a real HTTP/3 connection:</p>
-<pre>curl -vk --http3 https://localhost:8443/</pre>
+--http3 or --http3-only flag) to confirm a real HTTP/3
+connection:</p>
+<pre>curl -vk --http3-only https://localhost:8443/</pre>
 <p>If your curl was not built with HTTP/3, the request will
 silently fall back to HTTP/2 over TCP. The server-side log will
 show a UDP read in either case.</p>
+
+<h3>Why does my browser still show HTTP/2?</h3>
+<p>Browsers don't try HTTP/3 first. They open an HTTP/2
+connection over TCP, see the <code>Alt-Svc</code> response
+header advertising H3, and only then race a QUIC connection
+in the background for use on the next request. atto sends
+this header on every H1 and H2 response when an H3 listener
+is bound, e.g. <code>alt-svc: h3=":8443"; ma=86400</code>,
+which you can verify in your browser's network panel.</p>
+
+<p>The catch: browsers will only race H3 against a server
+whose certificate is fully trusted. Self-signed leaf
+certificates accepted via "Accept the Risk and Continue"
+don't qualify; Firefox and Safari refuse to import them as
+authorities (they require <code>CA:TRUE</code>). The fix is
+to generate a real local CA and a leaf cert signed by it,
+then import the CA root into your browser's authority
+store.</p>
+
+<?php if ($cert_kind === 'self-signed') { ?>
+<p><strong>This server is currently using
+<code>security/server.crt</code>, which is a self-signed leaf
+cert.</strong> Browsers will not promote H2 to H3 against it.
+To fix this, run the helper script bundled with atto:</p>
+<pre>cd security/
+./make-local-ca.sh</pre>
+<p>This generates <code>local-ca.crt</code> (a proper CA
+root) plus <code>localhost.crt</code> + <code>localhost.key</code>
+(a leaf cert signed by that CA). Restart this example after
+running it; it will auto-detect <code>localhost.crt</code>
+and use it instead of <code>server.crt</code>. Then import
+<code>local-ca.crt</code> into your browser following the
+script's printed instructions.</p>
+<?php } else { ?>
+<p><strong>This server is using <code>security/localhost.crt</code>,
+which is signed by <code>security/local-ca.crt</code>.</strong>
+For browsers to fully trust it, import <code>local-ca.crt</code>
+into your authority store:</p>
+<ul>
+<li><strong>Firefox:</strong> Settings &rarr; Privacy &amp;
+Security &rarr; Certificates &rarr; View Certificates &rarr;
+Authorities &rarr; Import. Select <code>local-ca.crt</code>
+and check <em>Trust this CA to identify websites</em>.</li>
+<li><strong>Safari (macOS):</strong> Open Keychain Access,
+drop <code>local-ca.crt</code> onto the <em>login</em>
+keychain, right-click the new entry &rarr; Get Info &rarr;
+Trust &rarr; <em>Always Trust</em> for SSL.</li>
+<li><strong>Chrome / Edge (macOS):</strong> uses the same
+Keychain steps as Safari.</li>
+<li><strong>Chrome / Edge (Linux):</strong>
+<code>certutil -d sql:$HOME/.pki/nssdb -A -t 'CT,c,c'
+-n 'Atto Local Development CA' -i local-ca.crt</code></li>
+</ul>
+<?php } ?>
+
+<p>After the cert is trusted: reload this page once over H2
+to receive the Alt-Svc header, then reload again. The browser
+should race H3 in the background and switch on the second
+load. A hard reload (Ctrl/Cmd+Shift+R) clears Alt-Svc cache
+and forces H2 again, so use a normal reload to test.</p>
+
+<h3>Browser still showing HTTP/2 even after CA import?</h3>
+
+<p><strong>Firefox: the issue is almost certainly the
+third-party-roots block.</strong> Firefox refuses to use
+HTTP/3 against any server whose certificate chain includes a
+root CA that isn't shipped in the Mozilla built-in trust
+store. Your imported <code>local-ca.crt</code> IS a
+third-party root, so this block kicks in. The block exists
+to defeat TLS-inspecting middleboxes (corporate MITM proxies)
+that often install their own CAs into user trust stores; a
+side effect is that local development CAs are also blocked.
+The fix is to disable the block in <code>about:config</code>:</p>
+
+<pre>network.http.http3.disable_when_third_party_roots_found = false</pre>
+
+<p>Restart Firefox after changing it. With that pref off,
+Firefox accepts your imported CA for H3 just like it does for
+H2. The Alt-Svc race then succeeds and subsequent requests
+use HTTP/3.</p>
+
+<p><strong>Other things to check if H3 still won't switch
+after that pref is off:</strong></p>
+
+<ol>
+<li><strong>Firefox H3 exclusion list.</strong> Earlier
+failed handshakes (when the cert wasn't trusted yet) likely
+added <code>localhost</code> to Firefox's per-session H3
+deny-list. Visit <code>about:networking#http3</code> to see;
+if <code>localhost</code> appears with state <em>http2</em>
+or <em>excluded</em>, fully quit Firefox (Cmd+Q on macOS,
+not just close the window) and reopen.</li>
+
+<li><strong>The 50ms fast-fallback timer.</strong> If H2 has
+an open keepalive when the H3 race starts, the timer expires
+before H3 can attach. Set
+<code>network.dns.httpssvc.http3_fast_fallback_timeout</code>
+to <code>0</code> to disable the timer.</li>
+
+<li><strong>Bypass the race entirely (testing mode).</strong>
+Useful for confirming the H3 path works end-to-end without
+involving Alt-Svc:
+<ul>
+<li><code>network.http.http3.alt-svc-mapping-for-testing</code>
+= <code>localhost;h3=:8443</code></li>
+<li><code>network.http.http3.force-use-alt-svc-mapping-for-testing</code>
+= <code>true</code></li>
+</ul>
+Restart Firefox; H3 will be tried directly without any
+Alt-Svc handshake.</li>
+</ol>
+
+<p><strong>Diagnostic checklist:</strong></p>
+<ul>
+<li><code>about:networking#http3</code> shows the actual H3
+connection state. <em>http2</em> = Firefox tried H3 and
+fell back. No entry = race never started. <em>http3</em> =
+working.</li>
+<li>Open the Network panel, enable the <em>Protocol</em>
+column, reload normally (not Ctrl/Cmd+Shift+R) twice. First
+reload picks up Alt-Svc, second should show HTTP/3.</li>
+<li>Run <code>curl -vk --http3-only https://localhost:8443/</code>
+in parallel. If curl gets H3 but the browser doesn't,
+browser-side cert validation is the blocker.</li>
+</ul>
+
+<p><strong>Safari: H3 to localhost is unreliable.</strong>
+macOS Network Framework (which Safari uses) treats loopback
+addresses specially and frequently doesn't race HTTP/3 against
+them at all, even with a fully trusted cert. There is no
+public toggle for this. Test Safari H3 against a real domain
+on the LAN or internet instead. curl over QUIC continues to
+work as confirmation that atto's H3 stack is functional.</p>
+
+<p><strong>Chrome / Edge:</strong> launch with
+<code>--origin-to-force-quic-on=localhost:8443</code>.
+Chrome doesn't have the third-party-roots block and respects
+imported CAs from the OS keychain.</p>
 <?php } else {
     renderInstallInstructions($os);
 } ?>

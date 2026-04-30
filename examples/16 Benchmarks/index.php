@@ -328,7 +328,19 @@ btn.addEventListener('click', function () {
  */
 $test->post('/run', function () use (
     $test, $bench_out_file) {
-    @unlink($bench_out_file);
+    /*
+        is_file check before unlink so we don't poison the
+        process-wide error_get_last() with a "No such file"
+        warning on first run. PHP's @ operator still updates
+        error_get_last even when it suppresses output, and any
+        later code paths that call error_get_last for their own
+        diagnostics (notably enableTls's old SSL Error reporter)
+        would mis-attribute the unlink message as the cause of
+        whatever they were trying to report.
+     */
+    if (is_file($bench_out_file)) {
+        unlink($bench_out_file);
+    }
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__DIR__ . "/bench.php");
     $out = escapeshellarg($bench_out_file);

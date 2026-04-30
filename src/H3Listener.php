@@ -132,11 +132,7 @@ class H3FFI
             unsigned int to_len;
         } quiche_recv_info;
         typedef struct {
-            char from[128];
-            unsigned int from_len;
-            char to[128];
-            unsigned int to_len;
-            char at[16];
+            char opaque[320];
         } quiche_send_info;
         const char *quiche_version(void);
         quiche_config *quiche_config_new(uint32_t version);
@@ -232,10 +228,11 @@ class H3FFI
         int64_t quiche_h3_conn_poll(quiche_h3_conn *h3,
             quiche_conn *quic_conn, quiche_h3_event **ev);
         int quiche_h3_event_type(quiche_h3_event *ev);
-        int quiche_h3_event_for_each_header(quiche_h3_event *ev,
-            int (*cb)(uint8_t *name, size_t name_len,
-                uint8_t *value, size_t value_len, void *argp),
+        typedef int (*quiche_h3_header_cb)(uint8_t *name,
+            size_t name_len, uint8_t *value, size_t value_len,
             void *argp);
+        int quiche_h3_event_for_each_header(quiche_h3_event *ev,
+            quiche_h3_header_cb cb, void *argp);
         void quiche_h3_event_free(quiche_h3_event *ev);
         ssize_t quiche_h3_send_response(quiche_h3_conn *h3,
             quiche_conn *quic_conn, uint64_t stream_id,
@@ -382,7 +379,16 @@ class H3FFI
         if ($this->ffi === null) {
             return 'unknown';
         }
-        return \FFI::string($this->ffi->quiche_version());
+        $ret = $this->ffi->quiche_version();
+        /*
+            Some PHP FFI builds auto-marshal const char* return
+            values to PHP strings while others return CData.
+            Handle both.
+         */
+        if (is_string($ret)) {
+            return $ret;
+        }
+        return \FFI::string($ret);
     }
 }
 /**
@@ -805,7 +811,7 @@ class H3Listener extends Listener
         if ($len === 0) {
             return null;
         }
-        $buf = \FFI::new("uint8_t[$len]", false);
+        $buf = $ffi->ffi->new("uint8_t[$len]");
         \FFI::memcpy($buf, $s, $len);
         return $buf;
     }
@@ -871,18 +877,18 @@ class H3Listener extends Listener
             and DCID/SCID. quiche_header_info needs PHP-side
             buffers for each output.
          */
-        $version_ptr = \FFI::new('uint32_t');
-        $type_ptr = \FFI::new('uint8_t');
-        $scid_buf = \FFI::new('uint8_t[' . H3FFI::QUICHE_MAX_CONN_ID_LEN
+        $version_ptr = $q->new('uint32_t');
+        $type_ptr = $q->new('uint8_t');
+        $scid_buf = $q->new('uint8_t[' . H3FFI::QUICHE_MAX_CONN_ID_LEN
             . ']');
-        $scid_len_ptr = \FFI::new('size_t');
+        $scid_len_ptr = $q->new('size_t');
         $scid_len_ptr->cdata = H3FFI::QUICHE_MAX_CONN_ID_LEN;
-        $dcid_buf = \FFI::new('uint8_t[' . H3FFI::QUICHE_MAX_CONN_ID_LEN
+        $dcid_buf = $q->new('uint8_t[' . H3FFI::QUICHE_MAX_CONN_ID_LEN
             . ']');
-        $dcid_len_ptr = \FFI::new('size_t');
+        $dcid_len_ptr = $q->new('size_t');
         $dcid_len_ptr->cdata = H3FFI::QUICHE_MAX_CONN_ID_LEN;
-        $token_buf = \FFI::new('uint8_t[256]');
-        $token_len_ptr = \FFI::new('size_t');
+        $token_buf = $q->new('uint8_t[256]');
+        $token_len_ptr = $q->new('size_t');
         $token_len_ptr->cdata = 256;
         $rc = $q->quiche_header_info($buf_cdata, $buf_len,
             H3FFI::QUICHE_MAX_CONN_ID_LEN,
@@ -929,9 +935,10 @@ class H3Listener extends Listener
         $local_scid = random_bytes(H3FFI::QUICHE_MAX_CONN_ID_LEN);
         $local_scid_hex = bin2hex($local_scid);
         $local_scid_buf = self::stringToCData($this->ffi, $local_scid);
-        $peer_sock = self::peerToSockaddr($peer, $peer_len);
-        $local_sock = self::peerToSockaddr($this->localAddr(),
-            $local_len);
+        $peer_sock = self::peerToSockaddr($this->ffi, $peer,
+            $peer_len);
+        $local_sock = self::peerToSockaddr($this->ffi,
+            $this->localAddr(), $local_len);
         if ($peer_sock === null || $local_sock === null) {
             return [null, null];
         }
@@ -988,16 +995,17 @@ class H3Listener extends Listener
     protected function feedPacket($conn, $buf_cdata, $buf_len, $peer)
     {
         $q = $this->ffi->ffi;
-        $peer_sock = self::peerToSockaddr($peer, $peer_len);
-        $local_sock = self::peerToSockaddr($this->localAddr(),
-            $local_len);
+        $peer_sock = self::peerToSockaddr($this->ffi, $peer,
+            $peer_len);
+        $local_sock = self::peerToSockaddr($this->ffi,
+            $this->localAddr(), $local_len);
         if ($peer_sock === null || $local_sock === null) {
             return;
         }
-        $info = $this->ffi->ffi->new('quiche_recv_info');
-        $info->from = \FFI::cast('void*', $peer_sock);
+        $info = $q->new('quiche_recv_info');
+        $info->from = $q->cast('void*', \FFI::addr($peer_sock[0]));
         $info->from_len = $peer_len;
-        $info->to = \FFI::cast('void*', $local_sock);
+        $info->to = $q->cast('void*', \FFI::addr($local_sock[0]));
         $info->to_len = $local_len;
         $q->quiche_conn_recv($conn->quiche_conn, $buf_cdata,
             $buf_len, \FFI::addr($info));
@@ -1016,8 +1024,8 @@ class H3Listener extends Listener
     public function drainConnection($conn)
     {
         $q = $this->ffi->ffi;
-        $out = \FFI::new('uint8_t[1500]');
-        $send_info = $this->ffi->ffi->new('quiche_send_info');
+        $out = $q->new('uint8_t[1500]');
+        $send_info = $q->new('quiche_send_info');
         $max = 64; /* safety bound on packets per drain */
         while ($max-- > 0) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
@@ -1062,7 +1070,7 @@ class H3Listener extends Listener
         $dcid_buf, $dcid_len, $peer)
     {
         $q = $this->ffi->ffi;
-        $out = \FFI::new('uint8_t[1500]');
+        $out = $q->new('uint8_t[1500]');
         $written = $q->quiche_negotiate_version($scid_buf, $scid_len,
             $dcid_buf, $dcid_len, $out, 1500);
         if ($written <= 0) {
@@ -1106,11 +1114,12 @@ class H3Listener extends Listener
      * the caller; lives only as long as the PHP variable holding
      * it.
      *
+     * @param H3FFI $ffi the libquiche wrapper
      * @param string $address "host:port" or "[ipv6]:port"
      * @param int $out_len output: byte length of the buffer
      * @return \FFI\CData|null packed sockaddr buffer
      */
-    public static function peerToSockaddr($address, &$out_len)
+    public static function peerToSockaddr($ffi, $address, &$out_len)
     {
         if (strpos($address, '[') === 0) {
             $end = strpos($address, ']');
@@ -1176,7 +1185,7 @@ class H3Listener extends Listener
             $out_len = 16;
         }
         $len = strlen($bytes);
-        $buf = \FFI::new("uint8_t[$len]", false);
+        $buf = $ffi->ffi->new("uint8_t[$len]");
         \FFI::memcpy($buf, $bytes, $len);
         return $buf;
     }
@@ -1331,8 +1340,6 @@ class H3Transport extends Transport
             ];
         }
         $stream = &$conn->streams[$stream_id];
-        $cb_type = 'int (*)(uint8_t *name, size_t name_len, '
-            . 'uint8_t *value, size_t value_len, void *argp)';
         $cb = function ($name, $name_len, $value, $value_len,
             $argp) use (&$stream) {
             $n = \FFI::string($name, $name_len);
@@ -1355,7 +1362,7 @@ class H3Transport extends Transport
             }
             return 0;
         };
-        $cb_cdata = \FFI::cast($cb_type, $cb);
+        $cb_cdata = $q->cast('quiche_h3_header_cb', $cb);
         $q->quiche_h3_event_for_each_header($ev, $cb_cdata, null);
     }
     /**
@@ -1372,7 +1379,7 @@ class H3Transport extends Transport
             return;
         }
         $q = $this->ffi->ffi;
-        $buf = \FFI::new('uint8_t[16384]');
+        $buf = $q->new('uint8_t[16384]');
         while (true) {
             $n = $q->quiche_h3_recv_body($conn->h3_conn,
                 $conn->quiche_conn, $stream_id, $buf, 16384);
@@ -1533,7 +1540,7 @@ class H3Transport extends Transport
             $h3_headers[] = [$name, $value];
         }
         $count = count($h3_headers);
-        $arr = $this->ffi->ffi->new("quiche_h3_header[$count]");
+        $arr = $q->new("quiche_h3_header[$count]");
         $name_bufs = [];
         $value_bufs = [];
         foreach ($h3_headers as $i => $pair) {
@@ -1542,9 +1549,11 @@ class H3Transport extends Transport
             $v_buf = H3Listener::stringToCData($this->ffi, $v);
             $name_bufs[] = $n_buf;
             $value_bufs[] = $v_buf;
-            $arr[$i]->name = \FFI::cast('uint8_t*', $n_buf);
+            $arr[$i]->name = $q->cast('uint8_t*',
+                \FFI::addr($n_buf[0]));
             $arr[$i]->name_len = strlen($n);
-            $arr[$i]->value = \FFI::cast('uint8_t*', $v_buf);
+            $arr[$i]->value = $q->cast('uint8_t*',
+                \FFI::addr($v_buf[0]));
             $arr[$i]->value_len = strlen($v);
         }
         $body_len = strlen($body);

@@ -478,11 +478,15 @@ if ($test->isCli()) {
     echo "  'Run benchmark'. Press Ctrl+C to stop.\n";
     echo "\n";
     /*
-        Listen on both plain HTTP and TLS. The TLS listener
-        advertises h2 + http/1.1 via ALPN so clients can
-        negotiate either over the same port. The runner uses
-        plain HTTP for H1-only tests and TLS for H1+TLS / H2
-        tests (since H2 is only widely supported over TLS).
+        Listen on plain HTTP, TLS, and (if libquiche is
+        available) QUIC. The TLS listener advertises h2 +
+        http/1.1 via ALPN so clients can negotiate either over
+        the same TCP port. The H3 listener binds the same port
+        number as TLS but on UDP; it is silently skipped when
+        libquiche/PHP FFI is unavailable. The runner uses plain
+        HTTP for H1-only tests, TLS for H1+TLS / H2 tests, and
+        QUIC for H3 tests (the runner probes each protocol's
+        endpoint and skips the row when no server answers).
      */
     $test->listen([
         8080,
@@ -493,6 +497,11 @@ if ($test->isCli()) {
             'verify_peer' => false,
             'alpn_protocols' => 'h2,http/1.1',
         ]]],
+        ['address' => 8443, 'protocol' => 'h3',
+            'context' => ['ssl' => [
+                'local_cert' => $cert,
+                'local_pk' => $key,
+            ]]],
     ]);
 } else {
     $test->process();

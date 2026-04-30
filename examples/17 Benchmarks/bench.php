@@ -22,10 +22,11 @@
         HTTP/1.1   plain TCP, port 8080
         HTTP/2     TLS+ALPN, port 8443 (requires curl built with
                    --enable-http2, libcurl >= 7.43)
-        HTTP/3     TLS+QUIC, port 8443+1 by convention (requires
-                   curl built with HTTP/3 support and a server
-                   that speaks QUIC; Atto does not yet, so this
-                   is shown as "unavailable" until added)
+        HTTP/3     TLS+QUIC, port 8443/UDP (same port as H2 but
+                   over UDP; requires curl built with HTTP/3
+                   support and atto's H3 listener which is opt-in
+                   via libquiche/PHP FFI; reported as
+                   "unavailable" if either piece is missing)
 
     EXTENDING TO NEW PROTOCOLS:
         Add a new entry to $TRANSPORTS below. Each entry is an
@@ -97,7 +98,9 @@ Options:
     --host=HOST           default 127.0.0.1
     --plain-port=PORT     default 8080
     --tls-port=PORT       default 8443
-    --quic-port=PORT      default 8444 (HTTP/3, when available)
+    --quic-port=PORT      default same as --tls-port (HTTP/3 over
+                          QUIC binds the same port number as H2,
+                          but on UDP rather than TCP)
     --iterations=N        per single-shot case (default 100)
     --concurrency=N       parallel requests for asset case
                           (default 50)
@@ -106,7 +109,9 @@ Options:
                           port; round-trip is 2*N. Useful for
                           showing how H2's multiplexing crushes
                           H1+TLS at parallel work over a real
-                          network.
+                          network. HTTP/3 is skipped when
+                          latency-ms > 0 because the proxy is
+                          TCP-only.
     --only=h1,h2,h3       run only the listed protocols
     --skip=case,case      skip the listed cases
                           (small,big,asset,headers,keepalive)
@@ -118,7 +123,7 @@ TXT);
 $host = $opts['host'] ?? '127.0.0.1';
 $plain_port = (int) ($opts['plain-port'] ?? 8080);
 $tls_port = (int) ($opts['tls-port'] ?? 8443);
-$quic_port = (int) ($opts['quic-port'] ?? 8444);
+$quic_port = (int) ($opts['quic-port'] ?? $tls_port);
 $iterations = (int) ($opts['iterations'] ?? 100);
 $concurrency = (int) ($opts['concurrency'] ?? 50);
 $latency_ms = (float) ($opts['latency-ms'] ?? 0);
@@ -237,9 +242,8 @@ if ($latency_ms > 0) {
 /*
     Transport definitions. Each transport is what the runner
     asks for protocol-specific behavior (URL scheme, port, curl
-    options). Adding a new transport (e.g. HTTP/3 once Atto
-    supports it) is a matter of appending another entry here
-    and writing its available() probe.
+    options). Adding a new transport is a matter of appending
+    another entry here and writing its available() probe.
  */
 $TRANSPORTS = [
     'h1' => [
@@ -300,14 +304,25 @@ $TRANSPORTS = [
     ],
     'h3' => [
         'name' => 'HTTP/3',
-        'available' => function () use ($host, $quic_port) {
+        'available' => function () use (
+            $host, $quic_port, $latency_ms) {
+            /*
+                Skip H3 entirely when --latency-ms > 0 because
+                the simulator (proxy.php) only forwards TCP. H3
+                rides UDP and would bypass the latency proxy,
+                producing misleading "no slowdown" numbers in
+                the report.
+             */
+            if ($latency_ms > 0) {
+                return false;
+            }
             /*
                 Probe both: that libcurl knows about HTTP/3,
                 and that something is actually answering on the
-                QUIC port. Atto does not yet speak QUIC so this
-                will normally report unavailable; the entry is
-                kept so the report layout stays stable when H3
-                is added.
+                QUIC port. The H3 listener is opt-in (requires
+                libquiche via PHP FFI) so it may legitimately
+                not be running even though atto and libcurl
+                both support H3.
              */
             if (!defined('CURL_HTTP_VERSION_3')) {
                 return false;

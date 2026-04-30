@@ -782,13 +782,25 @@ class H3Listener extends Listener
         $q->quiche_config_set_max_idle_timeout($config, 30000);
         $q->quiche_config_set_max_recv_udp_payload_size($config, 1350);
         $q->quiche_config_set_max_send_udp_payload_size($config, 1350);
-        $q->quiche_config_set_initial_max_data($config, 10485760);
+        /*
+            Connection-level send window. 256 MiB is high enough
+            that no realistic single response (file, JSON blob,
+            HTML page) will trip it on localhost, while still
+            being far below typical RAM. Per-stream window is
+            16 MiB which gives big-body responses room to fill
+            before the client has to send a window update; this
+            avoids round-trip stalls during 1+ MiB bodies. The
+            previous 1 MiB stream window was off-by-the-DATA-
+            frame-header for exactly-1-MiB bodies and produced
+            visible hangs in the bench /big case.
+         */
+        $q->quiche_config_set_initial_max_data($config, 268435456);
         $q->quiche_config_set_initial_max_stream_data_bidi_local(
-            $config, 1048576);
+            $config, 16777216);
         $q->quiche_config_set_initial_max_stream_data_bidi_remote(
-            $config, 1048576);
+            $config, 16777216);
         $q->quiche_config_set_initial_max_stream_data_uni(
-            $config, 1048576);
+            $config, 16777216);
         $q->quiche_config_set_initial_max_streams_bidi($config, 100);
         $q->quiche_config_set_initial_max_streams_uni($config, 100);
         $q->quiche_config_set_disable_active_migration($config, true);
@@ -1026,7 +1038,16 @@ class H3Listener extends Listener
         $q = $this->ffi->ffi;
         $out = $q->new('uint8_t[1500]');
         $send_info = $q->new('quiche_send_info');
-        $max = 64; /* safety bound on packets per drain */
+        /*
+            Drain bound. A 1 MiB body at ~1350 bytes per QUIC
+            packet needs ~777 packets; 4096 gives generous
+            headroom for a single response while still bounding
+            the loop in case quiche misbehaves. In practice the
+            loop exits via QUICHE_ERR_DONE long before hitting
+            this cap because the peer's flow-control window
+            naturally throttles us.
+         */
+        $max = 4096;
         while ($max-- > 0) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
                 $out, 1500, \FFI::addr($send_info));
@@ -1280,6 +1301,13 @@ class H3Transport extends Transport
                 $event_ptr, $type);
             $q->quiche_h3_event_free($event_ptr);
         }
+        /*
+            Resume any partial body sends that are waiting on
+            flow-control credit. Each ACK from the peer opens
+            the window; on the next inbound packet driveH3 fires
+            again and we get to push more here.
+         */
+        $this->flushAllPendingBodies($conn);
     }
     /**
      * Dispatches an individual H3 event by type. HEADERS captures
@@ -1336,6 +1364,7 @@ class H3Transport extends Transport
                 'method' => 'GET', 'path' => '/', 'authority' => '',
                 'scheme' => 'https', 'headers' => [], 'body' => '',
                 'fin' => false, 'dispatched' => false,
+                'pending_body' => '',
             ];
         }
         $stream = &$conn->streams[$stream_id];
@@ -1560,12 +1589,92 @@ class H3Transport extends Transport
             $conn->quiche_conn, $stream_id, $arr, $count,
             $fin_with_headers);
         if ($body_len > 0) {
-            $body_buf = H3Listener::stringToCData($this->ffi, $body);
-            $q->quiche_h3_send_body($conn->h3_conn,
-                $conn->quiche_conn, $stream_id, $body_buf,
-                $body_len, true);
+            /*
+                Stash the full body as pending and try to push it.
+                quiche_h3_send_body returns the number of bytes
+                accepted, which may be smaller than what we asked
+                to send if the stream's flow-control window is
+                exhausted. The unaccepted tail stays in
+                pending_body and is retried by flushPendingBodies
+                on every drive cycle as the peer sends ACKs and
+                grants more credit.
+             */
+            if (!isset($conn->streams[$stream_id])) {
+                $conn->streams[$stream_id] = [];
+            }
+            $conn->streams[$stream_id]['pending_body'] = $body;
+            $this->flushPendingBody($conn, $stream_id);
         }
         $listener->drainConnection($conn);
+    }
+    /**
+     * Pushes as many bytes as libquiche will accept from the
+     * stream's pending_body buffer onto the QUIC stream, marking
+     * FIN once all bytes are accepted. If quiche_h3_send_body
+     * returns fewer bytes than offered, the remainder stays in
+     * pending_body for the next attempt; the QUIC stack will
+     * have to receive ACKs from the peer (which open the
+     * flow-control window) before more bytes can be accepted.
+     *
+     * @param H3Connection $conn the connection
+     * @param int $stream_id stream id whose pending_body to push
+     * @return bool true if anything was written, false otherwise
+     */
+    protected function flushPendingBody($conn, $stream_id)
+    {
+        if (!isset($conn->streams[$stream_id])) {
+            return false;
+        }
+        $pending = $conn->streams[$stream_id]['pending_body'] ?? '';
+        if ($pending === '') {
+            return false;
+        }
+        $q = $this->ffi->ffi;
+        $len = strlen($pending);
+        $body_buf = H3Listener::stringToCData($this->ffi, $pending);
+        $written = $q->quiche_h3_send_body($conn->h3_conn,
+            $conn->quiche_conn, $stream_id, $body_buf, $len, true);
+        if ($written <= 0) {
+            /*
+                QUICHE_H3_ERR_DONE / QUICHE_ERR_DONE means the
+                stream is currently flow-control-blocked. Keep
+                pending_body intact and retry later; a fatal
+                error (anything else negative) just drops the
+                remainder since the stream is gone.
+             */
+            if ($written !== H3FFI::QUICHE_ERR_DONE) {
+                $conn->streams[$stream_id]['pending_body'] = '';
+            }
+            return false;
+        }
+        if ($written >= $len) {
+            $conn->streams[$stream_id]['pending_body'] = '';
+        } else {
+            $conn->streams[$stream_id]['pending_body']
+                = substr($pending, $written);
+        }
+        return true;
+    }
+    /**
+     * Re-attempts the pending_body push on every stream of a
+     * connection. Called from the drive cycle so progress
+     * resumes whenever the peer ACKs and grants more
+     * flow-control credit. No-op for streams without a backlog.
+     *
+     * @param H3Connection $conn the connection
+     * @return bool true if any stream made progress
+     */
+    public function flushAllPendingBodies($conn)
+    {
+        $progress = false;
+        foreach ($conn->streams as $sid => $stream) {
+            if (($stream['pending_body'] ?? '') !== '') {
+                if ($this->flushPendingBody($conn, $sid)) {
+                    $progress = true;
+                }
+            }
+        }
+        return $progress;
     }
     /**
      * Sends a bare-bones error response when request dispatch

@@ -142,7 +142,7 @@ class WebSite
      * request (in CLI mode)
      * @var array
      */
-    protected $default_server_globals;
+    public $default_server_globals;
     /**
      * Associative array http_method => array of how to handle paths for
      *  that method
@@ -230,7 +230,7 @@ class WebSite
      * Holds the header portion so far of the HTTP response
      * @var string
      */
-    protected $header_data;
+    public $header_data;
     /**
      * Whether the current response already has declared a Content-Type.
      * If not, WebSite will default to adding a text/html header
@@ -304,7 +304,7 @@ class WebSite
      * first run of the event loop.
      * @var array<string,Transport>
      */
-    protected $transports = [];
+    public $transports = [];
     /**
      * List of acceptable Origin header values for WebSocket
      * upgrade requests, or empty array to accept any origin.
@@ -1418,6 +1418,7 @@ class WebSite
                 $h3 = H3Listener::tryOpen($parsed['bind_address'],
                     $merged_context, $h3_globals);
                 if ($h3 !== null) {
+                    $h3->site = $this;
                     $opened[] = $h3;
                 }
                 continue;
@@ -1468,6 +1469,9 @@ class WebSite
             'h2' => new H2Transport($this),
             'ws' => new WsTransport($this),
         ];
+        if (class_exists('\seekquarry\atto\H3Transport', false)) {
+            $this->transports['h3'] = new H3Transport($this);
+        }
         foreach ($opened as $entry) {
             $server = $entry->server;
             if ($server === null) {
@@ -1746,7 +1750,7 @@ class WebSite
      *      of response
      * @return string HTTP response to web client request
      */
-    protected function getResponseData($include_headers = true)
+    public function getResponseData($include_headers = true)
     {
         $this->header_data = "";
         $this->current_session = "";
@@ -2099,6 +2103,17 @@ class WebSite
         list($connection, $additional_context) =
             $listener->accept($acceptor, $timeout);
         if ($connection === null) {
+            return;
+        }
+        if ($connection->protocol === 'h3') {
+            /*
+                H3 connections have no PHP stream resource; the
+                listener's UDP socket carries traffic for all of
+                them. The H3Listener already registered this
+                connection in its own CID-keyed map and drove the
+                first packet through quiche_conn_recv. Nothing
+                more to do at the WebSite event-loop level.
+             */
             return;
         }
         $resource = $connection->resource();
@@ -3437,7 +3452,7 @@ class WebSite
      *      Content-Type and Content-Length without prefix
      *      (CGI convention). Body is in $context['CONTENT'].
      */
-    protected function setGlobals($context, $conn = null)
+    public function setGlobals($context, $conn = null)
     {
         if ($conn !== null) {
             /*

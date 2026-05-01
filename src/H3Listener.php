@@ -981,7 +981,17 @@ class H3Listener extends Listener
             call dominates per-packet PHP overhead on large
             responses; hoisting to the listener turns a hot
             path allocation into a stable pointer.
+
+            The send_buf is sized at 65535 (max UDP datagram)
+            rather than 1500. Quiche emits one QUIC packet per
+            quiche_conn_send call, but in some configurations
+            it may pack a coalesced UDP datagram (Initial+
+            Handshake or short-header packets sharing a
+            datagram). The larger buffer lets quiche return any
+            datagram size up to the IPv6 max without us having
+            to handle a BUFFER_TOO_SHORT error path.
          */
+        $listener->send_buf = $ffi->ffi->new('uint8_t[65535]');
         $local_addr = @stream_socket_get_name($server, false);
         if ($local_addr !== false && $local_addr !== '') {
             $local_len = 0;
@@ -992,7 +1002,6 @@ class H3Listener extends Listener
                 $listener->local_sockaddr_len = $local_len;
             }
         }
-        $listener->send_buf = $ffi->ffi->new('uint8_t[1500]');
         $listener->send_info = $ffi->ffi->new('quiche_send_info');
         $listener->recv_info = $ffi->ffi->new('quiche_recv_info');
         return $listener;
@@ -1599,7 +1608,7 @@ class H3Listener extends Listener
         $exit_code = 0;
         while (true) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
-                $out, 1500, \FFI::addr($send_info));
+                $out, 65535, \FFI::addr($send_info));
             if ($written === H3FFI::QUICHE_ERR_DONE
                 || $written <= 0) {
                 $exit_code = $written;

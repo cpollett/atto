@@ -114,7 +114,7 @@ Options:
                           TCP-only.
     --only=h1,h2,h3       run only the listed protocols
     --skip=case,case      skip the listed cases
-                          (small,big,asset,headers,keepalive)
+                          (small,big,asset,headers,keepalive,post)
     --help                this message
 TXT);
     echo "\n";
@@ -408,6 +408,19 @@ $cases['keepalive'] = function ($t) use ($iterations) {
     return keepAliveShot($url, $t['curl_opts'], $iterations,
         "{$iterations} sequential requests on one connection");
 };
+$cases['post'] = function ($t) use ($iterations) {
+    /*
+        Round-trip POST with a 64 KiB payload. The runner
+        verifies the response body matches the request body
+        byte-for-byte; iterations that mismatch are dropped
+        so a silently-truncating server reports zero iters
+        rather than a bogus throughput number.
+     */
+    $url = ($t['endpoint'])('/echo-post');
+    $body = str_repeat('x', 65536);
+    return postShot($url, $t['curl_opts'], $body, $iterations,
+        '64 KiB POST round-trip with body verification');
+};
 foreach ($skip as $s) {
     unset($cases[$s]);
 }
@@ -541,6 +554,54 @@ function singleShot($url, $opts, $iters, $desc)
     $stats['desc'] = $desc;
     $stats['kbps'] = ($bytes > 0 && $stats['median'] > 0)
         ? ($bytes / 1024) / $stats['median']
+        : null;
+    return $stats;
+}
+/**
+ * Runs N POST requests with a fixed body, verifying the
+ * response equals the request body byte-for-byte each
+ * iteration. Mismatches are dropped (treated like errors)
+ * so the timing stats only reflect successful round-trips.
+ * The kbps figure is computed from upload + download bytes
+ * since the test exercises both directions.
+ */
+function postShot($url, $opts, $body, $iters, $desc)
+{
+    $body_len = strlen($body);
+    $times = [];
+    for ($i = 0; $i < $iters; $i++) {
+        $ch = curl_init();
+        curl_setopt_array($ch, $opts + [
+            CURLOPT_URL => $url,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $body,
+            CURLOPT_HTTPHEADER => [
+                'Content-Type: application/octet-stream',
+                'Content-Length: ' . $body_len,
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 30,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+        ]);
+        $resp = curl_exec($ch);
+        $time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
+        if ($resp === false || $resp !== $body) {
+            continue;
+        }
+        $times[] = $time;
+    }
+    $stats = stats($times);
+    $stats['desc'] = $desc;
+    /*
+        kB/s reported here is one-way (download) since that is
+        what the other cases also report; the bench is comparing
+        protocols on the same metric. Upload bytes are roughly
+        equal in this case.
+     */
+    $stats['kbps'] = ($body_len > 0 && $stats['median'] > 0)
+        ? ($body_len / 1024) / $stats['median']
         : null;
     return $stats;
 }

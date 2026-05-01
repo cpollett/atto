@@ -43,6 +43,7 @@ $test = new WebSite();
         /big          1 MiB response — sustained throughput
         /asset/{n}    indexed small response — parallel-fetch
         /headers      100 custom headers — HPack vs plaintext
+        /echo-post    echoes POST body — request-body round-trip
 
     The server listens on both plain HTTP (8080) and TLS (8443)
     so the runner can compare protocols on the same code path:
@@ -155,6 +156,7 @@ var KNOWN_CASES = [
     {key: 'ASSET',     label: '/asset (parallel multiplex)'},
     {key: 'HEADERS',   label: '/headers (HPack vs plain)'},
     {key: 'KEEPALIVE', label: '/small over one connection'},
+    {key: 'POST',      label: '/echo-post (round-trip body)'},
 ];
 var raw_el = document.getElementById('raw_block');
 var results_el = document.getElementById('results');
@@ -453,6 +455,20 @@ $test->get('/headers', function () use ($test) {
     }
     $test->header("Content-Type: text/plain");
     echo "headers";
+});
+$test->post('/echo-post', function () use ($test) {
+    /*
+        Echoes the raw POST body back. Used by the runner's
+        post case to verify request bodies survive intact.
+        The runner POSTs a known payload and checks the
+        response equals what it sent. Reads from the atto
+        convention $_SERVER['CONTENT'] (raw body) rather
+        than $_POST so binary payloads work.
+     */
+    $body = $_SERVER['CONTENT'] ?? '';
+    $test->header("Content-Type: application/octet-stream");
+    $test->header("Content-Length: " . strlen($body));
+    echo $body;
 });
 if ($test->isCli()) {
     /*

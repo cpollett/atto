@@ -1528,9 +1528,10 @@ class H3Transport extends Transport
         if (!isset($conn->streams[$stream_id])) {
             $conn->streams[$stream_id] = [
                 'method' => 'GET', 'path' => '/', 'authority' => '',
-                'scheme' => 'https', 'headers' => [], 'body' => '',
+                'scheme' => 'https', 'headers' => [],
+                'body_chunks' => [], 'body_len' => 0,
                 'fin' => false, 'dispatched' => false,
-                'pending_body' => '',
+                'pending_body' => '', 'oversized' => false,
             ];
         }
         $stream = &$conn->streams[$stream_id];
@@ -1563,6 +1564,19 @@ class H3Transport extends Transport
      * and appends them to the per-stream body buffer. Called when
      * a DATA event fires.
      *
+     * Bytes are accumulated into body_chunks (an array of strings)
+     * rather than concatenated onto a single string. PHP string
+     * concatenation in a loop is O(N^2) because the running buffer
+     * is reallocated on every .= ; for a multi-MiB body this
+     * dominates the request cost. The chunks are imploded once at
+     * dispatch time, which is O(N).
+     *
+     * Total body size is capped at MAX_REQUEST_LEN (the same cap
+     * the H1 path enforces). Once the cap is exceeded the stream
+     * is marked oversized; further DATA bytes are dropped, and
+     * dispatchRequest sends a 413 instead of running the app
+     * handler.
+     *
      * @param H3Connection $conn the connection
      * @param int $stream_id the stream that has new body data
      */
@@ -1571,6 +1585,23 @@ class H3Transport extends Transport
         if (!isset($conn->streams[$stream_id])) {
             return;
         }
+        $stream = &$conn->streams[$stream_id];
+        if (!empty($stream['oversized'])) {
+            /*
+                Drain quiche's recv buffer to keep its flow-control
+                window opening; we just discard the bytes since
+                dispatchRequest will short-circuit to 413.
+             */
+            $q = $this->ffi->ffi;
+            $sink = $q->new('uint8_t[16384]');
+            while ($q->quiche_h3_recv_body($conn->h3_conn,
+                $conn->quiche_conn, $stream_id, $sink, 16384) > 0) {
+                /* drop */
+            }
+            return;
+        }
+        $max_len = $this->site->default_server_globals[
+            'MAX_REQUEST_LEN'] ?? 10000000;
         $q = $this->ffi->ffi;
         $buf = $q->new('uint8_t[16384]');
         while (true) {
@@ -1579,8 +1610,20 @@ class H3Transport extends Transport
             if ($n <= 0) {
                 break;
             }
-            $conn->streams[$stream_id]['body']
-                .= \FFI::string($buf, $n);
+            if ($stream['body_len'] + $n > $max_len) {
+                $stream['oversized'] = true;
+                $stream['body_chunks'] = [];
+                $stream['body_len'] = 0;
+                /* Drain remaining bytes; see comment at top. */
+                while ($q->quiche_h3_recv_body($conn->h3_conn,
+                    $conn->quiche_conn, $stream_id, $buf, 16384)
+                    > 0) {
+                    /* drop */
+                }
+                return;
+            }
+            $stream['body_chunks'][] = \FFI::string($buf, $n);
+            $stream['body_len'] += $n;
         }
     }
     /**
@@ -1607,6 +1650,23 @@ class H3Transport extends Transport
             return;
         }
         $conn->streams[$stream_id]['dispatched'] = true;
+        if (!empty($stream['oversized'])) {
+            /*
+                Request body exceeded MAX_REQUEST_LEN. Return 413
+                Payload Too Large without invoking the app
+                handler, mirroring what parseH1Request does for
+                the same condition.
+             */
+            $this->sendResponse($listener, $conn, $stream_id, 413,
+                ['Content-Type: text/plain'],
+                "Payload too large\n");
+            if (isset($conn->streams[$stream_id])
+                && ($conn->streams[$stream_id]['pending_body']
+                    ?? '') === '') {
+                unset($conn->streams[$stream_id]);
+            }
+            return;
+        }
         $context = $this->buildContext($listener, $conn, $stream);
         $this->site->setGlobals($context, $conn);
         try {
@@ -1714,6 +1774,16 @@ class H3Transport extends Transport
                 "http://$candidate", FILTER_VALIDATE_URL)) {
             $authority = $candidate;
         }
+        /*
+            Implode the body chunks into a single string for the
+            CONTENT field. Done once at dispatch rather than via
+            repeated .= appends in captureData. The actual byte
+            length wins over any client-provided content-length
+            header to keep CONTENT_LENGTH and CONTENT consistent
+            for downstream apps that read both.
+         */
+        $body = empty($stream['body_chunks']) ? ''
+            : implode('', $stream['body_chunks']);
         $context = [
             'REQUEST_METHOD' => $stream['method'],
             'REQUEST_URI' => $stream['path'],
@@ -1727,7 +1797,7 @@ class H3Transport extends Transport
             'REMOTE_ADDR' => $remote_addr,
             'REMOTE_PORT' => $remote_port,
             'HTTPS' => 'on',
-            'CONTENT' => $stream['body'],
+            'CONTENT' => $body,
         ];
         foreach ($stream['headers'] as $name => $value) {
             /*
@@ -1748,10 +1818,7 @@ class H3Transport extends Transport
             $context['CONTENT_TYPE'] = $stream['headers'][
                 'content-type'];
         }
-        if (isset($stream['headers']['content-length'])) {
-            $context['CONTENT_LENGTH'] = $stream['headers'][
-                'content-length'];
-        }
+        $context['CONTENT_LENGTH'] = (string) strlen($body);
         return $context;
     }
     /**

@@ -695,6 +695,7 @@ class H3Listener extends Listener
             return null;
         }
         stream_set_blocking($server, false);
+        self::tuneSocketBuffers($server);
         try {
             $ffi = new H3FFI();
         } catch (\Throwable $e) {
@@ -713,6 +714,42 @@ class H3Listener extends Listener
         $listener->cert_path = $cert_path;
         $listener->key_path = $key_path;
         return $listener;
+    }
+    /**
+     * Bumps the UDP socket's SO_SNDBUF and SO_RCVBUF where the
+     * runtime allows. The default kernel UDP buffer sizes
+     * (commonly ~256 KiB on Linux) are sized for chatty small-
+     * datagram traffic; H3 servers regularly want bursts of
+     * outbound packets and bursts of inbound ACKs that fit in
+     * a single socket read. A 4 MiB buffer comfortably holds
+     * a 1 MiB body's packets and the corresponding ACK flood.
+     *
+     * Best-effort: requires the sockets extension AND
+     * socket_import_stream (POSIX-only in PHP). On Windows or
+     * builds without sockets, the call is silently skipped and
+     * the listener works at default buffer sizes — this is also
+     * why drainConnection caps per-call emissions defensively.
+     *
+     * The kernel may clamp the requested size to its sysctl
+     * (net.core.rmem_max / wmem_max on Linux). If the operator
+     * needs larger buffers than the system allows they should
+     * raise those sysctls.
+     *
+     * @param resource $server the UDP server stream
+     */
+    protected static function tuneSocketBuffers($server)
+    {
+        if (!function_exists('socket_import_stream')
+            || !function_exists('socket_set_option')) {
+            return;
+        }
+        $sock = @socket_import_stream($server);
+        if ($sock === false || $sock === null) {
+            return;
+        }
+        $size = 4194304; /* 4 MiB */
+        @socket_set_option($sock, SOL_SOCKET, SO_RCVBUF, $size);
+        @socket_set_option($sock, SOL_SOCKET, SO_SNDBUF, $size);
     }
     /**
      * Builds and returns a quiche_config* configured with the
@@ -1079,8 +1116,24 @@ class H3Listener extends Listener
      * calling quiche_conn_send in a loop and writing each
      * resulting datagram to the UDP socket via
      * stream_socket_sendto. Stops when libquiche reports
-     * QUICHE_ERR_DONE (no more packets to send) or when
-     * sendto returns less than expected.
+     * QUICHE_ERR_DONE (no more packets to send), when sendto
+     * indicates the kernel UDP send buffer is full, or when
+     * the per-call packet bound is reached.
+     *
+     * The packet bound matters: a single drain that floods
+     * packets faster than the kernel can drain them to the wire
+     * causes silent drops. quiche thinks those packets are in
+     * flight, awaits ACKs that never come (because the client
+     * never received them), and the connection stalls until
+     * quiche's RTO fires. Capping per-drain emissions at a
+     * value comfortably below the kernel UDP send buffer
+     * (typically 256 KiB ~ 190 packets) lets the kernel push
+     * what we wrote to the wire before the next drain queues
+     * more.
+     *
+     * Subsequent drains, triggered by inbound ACKs, pick up
+     * where this one left off because quiche keeps the body in
+     * its internal stream buffer until the peer acknowledges.
      *
      * @param H3Connection $conn connection whose egress queue
      *      to drain
@@ -1091,15 +1144,15 @@ class H3Listener extends Listener
         $out = $q->new('uint8_t[1500]');
         $send_info = $q->new('quiche_send_info');
         /*
-            Drain bound. A 1 MiB body at ~1350 bytes per QUIC
-            packet needs ~777 packets; 4096 gives generous
-            headroom for a single response while still bounding
-            the loop in case quiche misbehaves. In practice the
-            loop exits via QUICHE_ERR_DONE long before hitting
-            this cap because the peer's flow-control window
-            naturally throttles us.
+            64 packets per drain ~ 86 KiB which sits well below
+            the kernel UDP send buffer on every supported
+            platform. tryOpen also bumps SO_SNDBUF where it can,
+            but we still cap here as defense-in-depth: even with
+            a larger socket buffer, blasting all of quiche's
+            queued packets in one drain regardless of how full
+            the kernel buffer is invites silent drops.
          */
-        $max = 4096;
+        $max = 64;
         while ($max-- > 0) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
                 $out, 1500, \FFI::addr($send_info));
@@ -1108,8 +1161,19 @@ class H3Listener extends Listener
                 break;
             }
             $bytes = \FFI::string($out, $written);
-            @stream_socket_sendto($this->server, $bytes, 0,
+            $sent = @stream_socket_sendto($this->server, $bytes, 0,
                 $conn->peer_address);
+            if ($sent === false || $sent < $written) {
+                /*
+                    Kernel UDP send buffer is full or the route
+                    is unreachable. Stop draining and let the
+                    next ACK-triggered drain pick up where we
+                    left off; quiche keeps the unsent body in
+                    its internal buffer until the peer ACKs the
+                    packets that did make it out.
+                 */
+                break;
+            }
         }
     }
     /**

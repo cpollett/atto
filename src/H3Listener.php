@@ -219,6 +219,7 @@ class H3FFI
             quiche_config *config, uint64_t v);
         void quiche_config_set_disable_active_migration(
             quiche_config *config, bool v);
+        void quiche_config_enable_early_data(quiche_config *config);
         void quiche_config_free(quiche_config *config);
         int quiche_header_info(const uint8_t *buf, size_t buf_len,
             size_t dcil, uint32_t *version, uint8_t *type,
@@ -1015,6 +1016,19 @@ class H3Listener extends Listener
         $q->quiche_config_set_initial_max_streams_bidi($config, 100);
         $q->quiche_config_set_initial_max_streams_uni($config, 100);
         $q->quiche_config_set_disable_active_migration($config, true);
+        /*
+            Enable 0-RTT (early data). Lets a returning client
+            send request bytes alongside its first handshake
+            packet, eliminating one round-trip on connection
+            resumption. The TLS session ticket carries enough
+            state for the client to encrypt the early data; the
+            server validates and replies. This is the single
+            biggest latency win for short-lived H3 connections
+            on high-RTT paths: bench's SMALL/HEADERS cases drop
+            from 4-RTT-equivalent to 2-RTT-equivalent on iters
+            after the first.
+         */
+        $q->quiche_config_enable_early_data($config);
         $q->quiche_config_verify_peer($config, false);
         return $config;
     }
@@ -1408,19 +1422,23 @@ class H3Listener extends Listener
         $out = $this->send_buf;
         $send_info = $this->send_info;
         /*
-            64 packets per drain (~86 KiB) is conservative
-            relative to the kernel UDP send buffer (which
-            tryOpen bumps to 4 MiB) and gives the kernel time
-            to push what we wrote to the wire before the next
-            drain queues more. The sendto short-write check
-            below catches any kernel buffer pressure regardless
-            of cap. Empirically larger caps (we tried 2048) do
-            not improve big-body throughput on this codepath:
-            quiche's cwnd is the natural throttle long before
-            the application-level cap matters.
+            Drain every packet quiche has ready in one pass. The
+            previous 64-packet cap was a hedge against kernel
+            UDP send buffer overflow, but tryOpen bumps the
+            buffer to 4 MiB (~3000 packets) and the short-write
+            check below catches any pressure regardless. Capping
+            here measurably hurts high-RTT transfers: each cap
+            return forces an ACK round-trip before the next
+            drain pass, so a 1 MiB transfer (800 packets / 13
+            batches) pays 13 RTTs of cumulative latency on top
+            of the natural cwnd ramp. Letting quiche produce
+            everything its congestion controller permits in one
+            pass collapses that to a single RTT-limited fill.
+            Quiche's cwnd is the real throttle; quiche_conn_send
+            returns DONE when cwnd is exhausted, so the loop
+            exits naturally without our help.
          */
-        $max = 64;
-        while ($max-- > 0) {
+        while (true) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
                 $out, 1500, \FFI::addr($send_info));
             if ($written === H3FFI::QUICHE_ERR_DONE

@@ -1679,13 +1679,38 @@ class H3Transport extends Transport
                     $conn->peer_address, $colon + 1);
             }
         }
+        /*
+            Resolve the request authority. Priority mirrors the
+            H2 path in WebSite::parseH2Request: prefer :authority
+            when it is syntactically a valid URL host; fall back
+            to the Host header if a client sent one (RFC 9114
+            sec 4.3.1 permits Host alongside :authority); fall
+            back to 'localhost' otherwise. The validation step
+            wraps the candidate in "http://" so FILTER_VALIDATE_URL
+            checks both the host and any port suffix. Atto does
+            not match the authority against SERVER_NAME or any
+            cert SAN; that mirrors the H1/H2 paths which are also
+            permissive about Host. Apps that need strict virtual-
+            host routing should check $_SERVER['HTTP_HOST'] in
+            their own dispatcher.
+         */
+        $authority = 'localhost';
+        $candidate = trim($stream['authority'] ?? '');
+        if ($candidate === ''
+            && isset($stream['headers']['host'])) {
+            $candidate = trim($stream['headers']['host']);
+        }
+        if ($candidate !== '' && filter_var(
+                "http://$candidate", FILTER_VALIDATE_URL)) {
+            $authority = $candidate;
+        }
         $context = [
             'REQUEST_METHOD' => $stream['method'],
             'REQUEST_URI' => $stream['path'],
             'QUERY_STRING' => $query,
             'PATH_INFO' => $path_only,
             'SCRIPT_NAME' => '',
-            'HTTP_HOST' => $stream['authority'],
+            'HTTP_HOST' => $authority,
             'SERVER_PROTOCOL' => 'HTTP/3',
             'SERVER_NAME' => $listener->globals['SERVER_NAME'] ?? '',
             'SERVER_PORT' => $listener->globals['SERVER_PORT'] ?? '',
@@ -1695,6 +1720,17 @@ class H3Transport extends Transport
             'CONTENT' => $stream['body'],
         ];
         foreach ($stream['headers'] as $name => $value) {
+            /*
+                Skip 'host': it was already considered above when
+                resolving $authority. Letting it through would
+                clobber HTTP_HOST with the unvalidated raw value
+                whenever the request includes a Host header
+                alongside :authority, defeating the validation
+                step.
+             */
+            if ($name === 'host') {
+                continue;
+            }
             $key = 'HTTP_' . strtoupper(str_replace('-', '_', $name));
             $context[$key] = $value;
         }

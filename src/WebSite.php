@@ -874,6 +874,274 @@ class WebSite
         $this->header("Link: " . $link);
     }
     /**
+     * Initiates an HTTP/2 server-pushed response for the given
+     * resource URL. The server announces a new stream to the
+     * client via PUSH_PROMISE on the original request stream,
+     * dispatches the resource through the same route table the
+     * client would have hit, and writes the synthesized response
+     * (HEADERS plus DATA frames with END_STREAM) on the new
+     * stream. From the client's perspective the resource shows
+     * up in cache without a roundtrip; for stylesheets, scripts,
+     * and fonts this can shave one full RTT off page load.
+     *
+     * No-op if not running under HTTP/2, if streaming context is
+     * not active (call this from inside a route, before the route
+     * returns), or if the client has set SETTINGS_ENABLE_PUSH=0
+     * (RFC 7540 sec 6.5.2; some clients disable push). Limited
+     * to GET requests; POST/PUT/DELETE pushes have no defined
+     * caching semantics.
+     *
+     * Returns true if a push was queued, false otherwise. Returns
+     * false silently for non-HTTP/2 paths so callers can drop a
+     * push() in any route without protocol-checking; HTTP/1.1 and
+     * HTTP/3 clients fall back to normal in-page resource loads.
+     *
+     * @param string $url path or absolute URL of the resource to
+     *      push (e.g. /styles.css). Same-origin only; cross-
+     *      origin URLs are silently dropped per sec 8.2.
+     * @return bool true if a PUSH_PROMISE plus response was
+     *      queued for the client, false if push was unavailable
+     */
+    public function push($url)
+    {
+        if (empty($this->streaming_context)
+            || ($this->streaming_context['protocol'] ?? null)
+                !== 'h2') {
+            return false;
+        }
+        $key = $this->streaming_context['key'] ?? null;
+        $orig_stream_id =
+            $this->streaming_context['stream_id'] ?? 0;
+        $hpack_encode =
+            $this->streaming_context['hpack_encode'] ?? null;
+        $socket = $this->streaming_socket;
+        if ($key === null || $orig_stream_id === 0
+            || $hpack_encode === null || $socket === null) {
+            return false;
+        }
+        $conn = $this->connection($key);
+        if ($conn === null) {
+            return false;
+        }
+        $state = &$conn->protocol_state;
+        if (empty($state['enable_push'])) {
+            return false;
+        }
+        /*
+            Parse the URL into a same-origin path. Reject schemes
+            and hosts that don't match the request: cross-origin
+            push is a security boundary (a hostile route handler
+            should not be able to seed the client's cache for
+            another domain) and is forbidden by RFC 7540 sec 8.2.
+         */
+        $parts = parse_url($url);
+        if ($parts === false) {
+            return false;
+        }
+        if (!empty($parts['host'])
+            && isset($_SERVER['HTTP_HOST'])
+            && strcasecmp($parts['host'],
+                $_SERVER['HTTP_HOST']) !== 0) {
+            return false;
+        }
+        $path = $parts['path'] ?? '/';
+        if ($path === '' || $path[0] !== '/') {
+            return false;
+        }
+        $query = $parts['query'] ?? '';
+        $request_uri = $path;
+        if ($query !== '') {
+            $request_uri .= '?' . $query;
+        }
+        /*
+            Allocate the next server-initiated stream id (sec
+            5.1.1: even-numbered, server picks). Bump by 2 so
+            consecutive pushes don't collide.
+         */
+        $promised_id = $state['next_push_stream_id'];
+        $state['next_push_stream_id'] += 2;
+        /*
+            Build the PUSH_PROMISE pseudo-request headers. RFC
+            7540 sec 8.2.1: a PUSH_PROMISE carries a complete
+            request header set as if the client had asked for
+            this URL: :method, :scheme, :authority, :path are
+            mandatory. Authority and scheme inherit from the
+            current request so cross-origin sneaking is impossible
+            (parse_url above already rejected explicit cross-
+            origin URLs but the fallback default seals the
+            same-origin invariant).
+         */
+        $scheme = !empty($_SERVER['HTTPS']) ? 'https' : 'http';
+        $authority = $_SERVER['HTTP_HOST']
+            ?? ($_SERVER['SERVER_NAME'] ?? 'localhost');
+        $promise_headers = [
+            [':method', 'GET'],
+            [':scheme', $scheme],
+            [':authority', $authority],
+            [':path', $request_uri],
+        ];
+        $promise_block = $hpack_encode->encode($promise_headers,
+            4096);
+        if (strlen($promise_block) + 4 > self::H2_MAX_FRAME_SIZE) {
+            /*
+                The PUSH_PROMISE payload (4-byte promised stream
+                id plus header block fragment) must fit in one
+                frame; sending CONTINUATION for promises is
+                possible but unimplemented here. Drop overlong
+                pushes silently rather than splitting incorrectly.
+             */
+            return false;
+        }
+        $promise_frame = new PushPromiseFrame($orig_stream_id,
+            $promised_id, $promise_block);
+        $promise_frame->flags->add('END_HEADERS');
+        $out = $promise_frame->serialize();
+        /*
+            Recursively dispatch the synthesized GET. Save and
+            restore every superglobal and route-state field that
+            setGlobals/getResponseData touch so the original
+            request's state is unaffected on return. streaming_
+            socket and streaming_context are temporarily cleared
+            so the pushed route can't $site->flush() onto the
+            wrong stream; any flush() inside the pushed route
+            simply returns false.
+         */
+        $saved = [
+            'SERVER' => $_SERVER,
+            'GET' => $_GET,
+            'POST' => $_POST,
+            'REQUEST' => $_REQUEST,
+            'COOKIE' => $_COOKIE,
+            'SESSION' => $_SESSION,
+            'FILES' => $_FILES,
+            'header_data' => $this->header_data,
+            'content_type' => $this->content_type,
+            'current_session' => $this->current_session,
+            'streaming_socket' => $this->streaming_socket,
+            'streaming_context' => $this->streaming_context,
+            'is_streaming' => $this->is_streaming,
+            'request_script' => $this->request_script,
+        ];
+        $context = [
+            'REQUEST_METHOD' => 'GET',
+            'SERVER_PROTOCOL' => 'HTTP/2.0',
+            'REQUEST_URI' => $request_uri,
+            'PHP_SELF' => $path,
+            'QUERY_STRING' => $query,
+            'REMOTE_ADDR' => $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0',
+            'HTTP_HOST' => $authority,
+            'CONTENT' => '',
+        ];
+        $this->streaming_socket = null;
+        $this->streaming_context = [];
+        $this->is_streaming = false;
+        $this->setGlobals($context, $conn);
+        $body = $this->getResponseData(false);
+        $pushed_header_data = $this->header_data;
+        $_SERVER = $saved['SERVER'];
+        $_GET = $saved['GET'];
+        $_POST = $saved['POST'];
+        $_REQUEST = $saved['REQUEST'];
+        $_COOKIE = $saved['COOKIE'];
+        $_SESSION = $saved['SESSION'];
+        $_FILES = $saved['FILES'];
+        $this->header_data = $saved['header_data'];
+        $this->content_type = $saved['content_type'];
+        $this->current_session = $saved['current_session'];
+        $this->streaming_socket = $saved['streaming_socket'];
+        $this->streaming_context = $saved['streaming_context'];
+        $this->is_streaming = $saved['is_streaming'];
+        $this->request_script = $saved['request_script'];
+        /*
+            Compose response HEADERS for the promised stream
+            from the pushed dispatch's header_data. Mirror the
+            forbidden-headers and content-type defaults from
+            dispatchH2Request so the wire format matches what a
+            normal H2 response would look like.
+         */
+        $status = "200";
+        if (preg_match("/HTTP\/[\d.]+ (\d+)/",
+                $pushed_header_data, $matches)) {
+            $status = $matches[1];
+        }
+        $resp_headers_data = [[':status', $status]];
+        $forbidden = ['connection', 'keep-alive',
+            'proxy-connection', 'transfer-encoding', 'upgrade'];
+        $has_content_type = false;
+        $has_content_length = false;
+        $header_lines = explode("\r\n", $pushed_header_data);
+        if (!empty($header_lines[0])
+            && substr($header_lines[0], 0, 5) === 'HTTP/') {
+            array_shift($header_lines);
+        }
+        foreach ($header_lines as $line) {
+            $colon = strpos($line, ':');
+            if ($colon === false) {
+                continue;
+            }
+            $name = strtolower(trim(substr($line, 0, $colon)));
+            $value = trim(substr($line, $colon + 1));
+            if ($name === '' || $name[0] === ':'
+                || in_array($name, $forbidden)) {
+                continue;
+            }
+            if ($name === 'content-type') {
+                $has_content_type = true;
+            }
+            if ($name === 'content-length') {
+                $has_content_length = true;
+            }
+            $resp_headers_data[] = [$name, $value];
+        }
+        if (!$has_content_type) {
+            $resp_headers_data[] =
+                ['content-type', 'text/html; charset=utf-8'];
+        }
+        if (!$has_content_length) {
+            $resp_headers_data[] =
+                ['content-length', (string) strlen($body)];
+        }
+        $resp_headers = new HeaderFrame($promised_id,
+            $resp_headers_data);
+        $resp_headers->flags->add('END_HEADERS');
+        $out .= $resp_headers->serialize($hpack_encode);
+        $body_len = strlen($body);
+        $max = self::H2_MAX_FRAME_SIZE;
+        if ($body_len === 0) {
+            $resp_data = new DataFrame($promised_id, '');
+            $resp_data->flags->add('END_STREAM');
+            $out .= $resp_data->serialize();
+        } else {
+            $offset = 0;
+            while ($offset < $body_len) {
+                $chunk = substr($body, $offset, $max);
+                $offset += strlen($chunk);
+                $frame = new DataFrame($promised_id, $chunk);
+                if ($offset >= $body_len) {
+                    $frame->flags->add('END_STREAM');
+                }
+                $out .= $frame->serialize();
+            }
+        }
+        /*
+            Queue on the same out_streams entry as the parent
+            response so all PUSH_PROMISE / HEADERS / DATA frames
+            share one async-drain buffer. Wire order matches
+            HPACK encoding order which is critical for HPACK's
+            stateful dynamic table; if frames were reordered the
+            client's decoder would get wrong header values.
+         */
+        if (!empty($this->out_streams[self::CONNECTION][$key])) {
+            $this->out_streams[self::DATA][$key] .= $out;
+        } else {
+            $this->out_streams[self::CONNECTION][$key] = $socket;
+            $this->out_streams[self::DATA][$key] = $out;
+            $this->out_streams[self::CONTEXT][$key] = [];
+        }
+        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        return true;
+    }
+    /**
      * Sends an HTTP cookie. In non-CLI mode defers to PHP's
      * setcookie(). Returned cookies show up in $_COOKIE.
      *
@@ -2268,11 +2536,38 @@ class WebSite
                     TLS: magic was already consumed by the
                     detection read in ConnectionAcceptor
                  */
-                $this->initH2Request($resource, false);
+                $client_settings = $this->initH2Request(
+                    $resource, false);
                 $connection->protocol_state['hpack_decode']
                     = new HPack();
                 $connection->protocol_state['hpack_encode']
                     = new HPack();
+                /*
+                    Server push state. enable_push starts true
+                    (RFC 7540 sec 6.5.2 default for SETTINGS_
+                    ENABLE_PUSH is 1) and is flipped to false if
+                    the client sends ENABLE_PUSH=0 in its
+                    SETTINGS frame. next_push_stream_id is the
+                    next even server-initiated stream id to
+                    allocate when WebSite::push is called.
+                    Server-initiated streams are even (sec
+                    5.1.1); start at 2.
+
+                    The initial SETTINGS may already disable
+                    push: nghttp2 clients run with --no-push
+                    advertise ENABLE_PUSH=0 in the very first
+                    frame, before any application code calls
+                    push(). Apply that now so push() returns
+                    false from the start of the connection.
+                 */
+                $enable_push = true;
+                if (isset($client_settings[0x02])) {
+                    $enable_push = ($client_settings[0x02] === 1);
+                }
+                $connection->protocol_state['enable_push']
+                    = $enable_push;
+                $connection->protocol_state['next_push_stream_id']
+                    = 2;
                 $this->initRequestStream($key,
                     $additional_context);
             } catch (\Exception $e) {
@@ -2284,11 +2579,20 @@ class WebSite
                     Cleartext: STREAM_PEEK was used so the magic
                     is still in the buffer
                  */
-                $this->initH2Request($resource, true);
+                $client_settings = $this->initH2Request(
+                    $resource, true);
                 $connection->protocol_state['hpack_decode']
                     = new HPack();
                 $connection->protocol_state['hpack_encode']
                     = new HPack();
+                $enable_push = true;
+                if (isset($client_settings[0x02])) {
+                    $enable_push = ($client_settings[0x02] === 1);
+                }
+                $connection->protocol_state['enable_push']
+                    = $enable_push;
+                $connection->protocol_state['next_push_stream_id']
+                    = 2;
                 $this->initRequestStream($key,
                     $additional_context);
             } catch (\Exception $e) {
@@ -2446,6 +2750,7 @@ class WebSite
         $ack->flags->add('ACK');
         @fwrite($connection, $ack->serialize());
         stream_set_blocking($connection, false);
+        return $client_settings->settings;
     }
     /**
      * Processes one incoming HTTP/2 frame on an established connection.
@@ -2532,16 +2837,24 @@ class WebSite
         if ($frame instanceof SettingsFrame
             && !$frame->flags->contains('ACK')) {
             /*
-                Apply peer settings. Only HEADER_TABLE_SIZE (0x01)
-                affects us — encoder must honor decoder's table
-                size. Other settings (ENABLE_PUSH, MAX_CONCURRENT_
-                STREAMS, INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE,
-                MAX_HEADER_LIST_SIZE) are accepted but ignored.
+                Apply peer settings. HEADER_TABLE_SIZE (0x01)
+                tunes the HPACK encoder's table to whatever the
+                decoder advertised. ENABLE_PUSH (0x02) is the
+                client telling us whether to use PUSH_PROMISE
+                (sec 6.5.2: 0 disables, 1 enables, anything else
+                is a PROTOCOL_ERROR; default 1). The other
+                advertised settings (MAX_CONCURRENT_STREAMS,
+                INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_HEADER_
+                LIST_SIZE) are accepted but ignored.
              */
             $hpack_encode = $state['hpack_encode'] ?? null;
             if ($hpack_encode !== null
                 && isset($frame->settings[0x01])) {
                 $hpack_encode->setMaxTableSize($frame->settings[0x01]);
+            }
+            if (isset($frame->settings[0x02])) {
+                $state['enable_push'] =
+                    ($frame->settings[0x02] === 1);
             }
             $ack = new SettingsFrame(0, []);
             $ack->flags->add('ACK');
@@ -2725,6 +3038,7 @@ class WebSite
             'protocol' => 'h2',
             'stream_id' => $stream_id,
             'hpack_encode' => $hpack_encode,
+            'key' => $key,
         ];
         $body = $this->getResponseData(false);
         $was_streaming = ($body === "" && $this->streaming_socket === null);
@@ -5105,7 +5419,14 @@ class SettingsFrame extends Frame
         0x06 => 'MAX_HEADER_LIST_SIZE',
         0x08 => 'ENABLE_CONNECT_PROTOCOL',
     ];
-    protected $settings = [];
+    /*
+        Public so callers (initH2Request, parseH2Request) can
+        read the parsed settings dictionary directly off the
+        frame after parseBody, without needing a getter. Frames
+        are always constructed inside this file so the broader
+        class-encapsulation cost is nil.
+     */
+    public $settings = [];
     /**
      * Constructor to create a new SettingsFrame object.
      * @param int $stream_id The stream ID for this frame
@@ -5522,8 +5843,19 @@ class PushPromiseFrame extends Frame
     }
     /**
      * Serializes the PUSH_PROMISE frame body into binary format.
-     * The body is padding length (if PADDED), promised stream id,
-     * the header block fragment, then padding bytes.
+     * Layout (RFC 7540 sec 6.6, non-padded form): the 4-byte
+     * promised stream id (high bit reserved zero) followed by
+     * the HPACK-encoded header block fragment. Atto never sets
+     * the PADDED flag for emitted PUSH_PROMISE frames so the
+     * Pad Length and Padding fields are omitted entirely.
+     *
+     * The header block bytes are passed in pre-encoded by the
+     * caller (WebSite::push) rather than encoded here. This is
+     * because the connection-wide HPack encoder is owned by the
+     * Connection's protocol_state and the caller already has
+     * a reference to it; passing the encoded bytes through as
+     * $this->data avoids threading the encoder reference into
+     * every Frame instance.
      *
      * @param object $hpack unused, present for signature compatibility
      *      with HeaderFrame::serializeBody
@@ -5531,34 +5863,33 @@ class PushPromiseFrame extends Frame
      */
     public function serializeBody($hpack = null)
     {
-        $padding_data = $this->serializePaddingData();
-        $padding = str_repeat("\0", $this->pad_length);
-        $data = pack('N', $this->promised_stream_id);
-        return $padding_data . $data . $this->data . $padding;
+        return pack('N',
+            $this->promised_stream_id & 0x7FFFFFFF) . $this->data;
     }
     /**
-     * Parses the binary data of the PUSH_PROMISE frame.
+     * Parses the binary data of an inbound PUSH_PROMISE frame.
+     * Atto is a server and does not initiate connections, so it
+     * never receives PUSH_PROMISE frames in practice (clients
+     * MUST NOT send PUSH_PROMISE per RFC 7540 sec 8.2). The
+     * parser is kept for completeness and symmetry with the
+     * other Frame subclasses but only handles the non-padded
+     * form; PADDED-flagged inbound promises will misparse.
+     *
      * @param string $data The binary data to parse.
      */
     public function parseBody($data)
     {
-        $padding_data_length = $this->parsePaddingData($data);
-        if (strlen($data) < $padding_data_length + 4) {
-            throw new InvalidFrameException("Invalid PUSH_PROMISE body");
+        if (strlen($data) < 4) {
+            throw new \Exception("Invalid PUSH_PROMISE body");
         }
         $this->promised_stream_id =
-            unpack('N', substr($data, $padding_data_length, 4))[1];
-        $this->data =
-            substr($data, $padding_data_length + 4, -$this->pad_length);
-
+            unpack('N', substr($data, 0, 4))[1] & 0x7FFFFFFF;
+        $this->data = substr($data, 4);
         if ($this->promised_stream_id == 0
             || $this->promised_stream_id % 2 != 0) {
-            throw new InvalidDataException(
-                "Invalid PUSH_PROMISE promised stream id:
-                    $this->promised_stream_id");
-        }
-        if ($this->pad_length && $this->pad_length >= strlen($data)) {
-            throw new InvalidPaddingException("Padding is too long.");
+            throw new \Exception(
+                "Invalid PUSH_PROMISE promised stream id: " .
+                $this->promised_stream_id);
         }
         $this->payload_length = strlen($data);
     }

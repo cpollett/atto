@@ -105,13 +105,13 @@ Options:
     --concurrency=N       parallel requests for asset case
                           (default 50)
     --latency-ms=N        simulate one-way network latency by
-                          spawning a TCP proxy in front of each
-                          port; round-trip is 2*N. Useful for
+                          spawning a proxy in front of each
+                          port (TCP for H1/H1+TLS/H2, UDP for
+                          H3); round-trip is 2*N. Useful for
                           showing how H2's multiplexing crushes
                           H1+TLS at parallel work over a real
-                          network. HTTP/3 is skipped when
-                          latency-ms > 0 because the proxy is
-                          TCP-only.
+                          network, and how H3's 0-RTT
+                          handshake wins back time at high RTT.
     --only=h1,h2,h3       run only the listed protocols
     --skip=case,case      skip the listed cases
                           (small,big,asset,headers,keepalive,post)
@@ -150,14 +150,32 @@ $proxy_children = [];
 if ($latency_ms > 0) {
     $proxy_plain_port = $plain_port + 10000;
     $proxy_tls_port = $tls_port + 10000;
+    /*
+        H3 proxy uses a separate offset (+20000 instead of
+        +10000) because QUIC reuses the same port number as
+        H2/TLS but on UDP. Without the different offset, both
+        proxies would try to advertise the same listen port to
+        the bench client even though TCP/UDP namespaces are
+        independent at the kernel level. The bench client
+        cannot reach two services on the same port with
+        different protocols transparently because curl picks
+        URL host:port first and decides protocol by ALPN /
+        --http3 flag separately, and our --quic-port option is
+        a single integer. Different ports keep the wiring
+        unambiguous.
+     */
+    $proxy_quic_port = $quic_port + 20000;
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__DIR__ . "/proxy.php");
     foreach ([
-        [$proxy_plain_port, $host, $plain_port],
-        [$proxy_tls_port, $host, $tls_port],
-    ] as [$listen, $thost, $tport]) {
+        [$proxy_plain_port, $host, $plain_port, 'tcp'],
+        [$proxy_tls_port, $host, $tls_port, 'tcp'],
+        [$proxy_quic_port, $host, $quic_port, 'udp'],
+    ] as $proxy_spec) {
+        list($listen, $thost, $tport, $proto) = $proxy_spec;
         $cmd = "$php $script $listen " . escapeshellarg($thost) .
-            " $tport " . escapeshellarg((string) $latency_ms);
+            " $tport " . escapeshellarg((string) $latency_ms) .
+            " " . escapeshellarg($proto);
         if (strstr(PHP_OS, "WIN")) {
             $job = "start /B $cmd > NUL 2>&1";
             pclose(popen($job, "r"));
@@ -217,9 +235,12 @@ if ($latency_ms > 0) {
     /*
         Wait for the proxy listeners to be ready. A bare usleep
         is racy when the host is loaded; instead poll by
-        attempting a short TCP connect to each proxy port until
-        both succeed or we time out. 2-second budget is plenty
-        for two PHP children to bind a socket.
+        attempting a short TCP connect to each TCP proxy port
+        until both succeed or we time out. The UDP proxy can't
+        be probed the same way (UDP has no connect handshake)
+        so we just wait for it via a short fixed sleep after
+        the TCP probes complete. 2-second budget is plenty for
+        three PHP children to bind a socket.
      */
     $deadline = microtime(true) + 2.0;
     foreach ([$proxy_plain_port, $proxy_tls_port] as $port) {
@@ -234,8 +255,16 @@ if ($latency_ms > 0) {
             usleep(50 * 1000);
         }
     }
+    /*
+        Brief grace period for the UDP proxy to bind. We can't
+        usefully probe it (a UDP recvfrom that times out vs. an
+        unbound port look the same from PHP) so a short sleep
+        is the simplest reliable wait.
+     */
+    usleep(100 * 1000);
     $plain_port = $proxy_plain_port;
     $tls_port = $proxy_tls_port;
+    $quic_port = $proxy_quic_port;
     fwrite(STDERR, "  latency: " . $latency_ms .
         "ms each way (RTT " . (2 * $latency_ms) . "ms)\n");
 }
@@ -307,22 +336,15 @@ $TRANSPORTS = [
         'available' => function () use (
             $host, $quic_port, $latency_ms) {
             /*
-                Skip H3 entirely when --latency-ms > 0 because
-                the simulator (proxy.php) only forwards TCP. H3
-                rides UDP and would bypass the latency proxy,
-                producing misleading "no slowdown" numbers in
-                the report.
-             */
-            if ($latency_ms > 0) {
-                return false;
-            }
-            /*
                 Probe both: that libcurl knows about HTTP/3,
                 and that something is actually answering on the
                 QUIC port. The H3 listener is opt-in (requires
                 libquiche via PHP FFI) so it may legitimately
                 not be running even though atto and libcurl
-                both support H3.
+                both support H3. When --latency-ms > 0, the
+                $quic_port has already been rewritten to point
+                at the UDP proxy, so the probe traverses the
+                same path the bench cases will use.
              */
             if (!defined('CURL_HTTP_VERSION_3')) {
                 return false;

@@ -219,11 +219,6 @@ class H3FFI
             quiche_config *config, uint64_t v);
         void quiche_config_set_disable_active_migration(
             quiche_config *config, bool v);
-        void quiche_config_enable_early_data(quiche_config *config);
-        void quiche_config_enable_pacing(quiche_config *config,
-            bool v);
-        void quiche_config_set_initial_congestion_window_packets(
-            quiche_config *config, size_t packets);
         void quiche_config_free(quiche_config *config);
         int quiche_header_info(const uint8_t *buf, size_t buf_len,
             size_t dcil, uint32_t *version, uint8_t *type,
@@ -1132,54 +1127,6 @@ class H3Listener extends Listener
         $q->quiche_config_set_initial_max_streams_bidi($config, 100);
         $q->quiche_config_set_initial_max_streams_uni($config, 100);
         $q->quiche_config_set_disable_active_migration($config, true);
-        /*
-            Enable 0-RTT (early data). Lets a returning client
-            send request bytes alongside its first handshake
-            packet, eliminating one round-trip on connection
-            resumption. The TLS session ticket carries enough
-            state for the client to encrypt the early data; the
-            server validates and replies. This is the single
-            biggest latency win for short-lived H3 connections
-            on high-RTT paths: bench's SMALL/HEADERS cases drop
-            from 4-RTT-equivalent to 2-RTT-equivalent on iters
-            after the first.
-         */
-        $q->quiche_config_enable_early_data($config);
-        /*
-            Disable application-level pacing. Quiche's default
-            pacer schedules each outbound packet at a future
-            timestamp via the SendInfo.at field; quiche_conn_send
-            returns DONE before that deadline, even when there is
-            data and credit to send. We do not honor the at hint
-            (no SO_TXTIME on stream sockets), so the practical
-            effect is that quiche emits packets one-at-a-time
-            spaced by the paced rate even though we are draining
-            in a tight loop. Disabling pacing lets quiche produce
-            the full cwnd-allowed burst in one drain pass, which
-            is what the H1/H2 paths effectively do (TCP pacing on
-            localhost is disabled at the kernel level by default).
-            On real high-bandwidth WAN paths an operator may want
-            pacing back; expose it as a future config knob if the
-            need arises.
-         */
-        $q->quiche_config_enable_pacing($config, false);
-        /*
-            Larger initial congestion window. RFC 6928 specifies
-            10 packets as the default initial cwnd; quiche follows
-            that. For cold connections fetching a 1 MiB body, that
-            is 10 -> 20 -> 40 -> 80 -> 160 -> 320 -> 640 -> 1024
-            packets across 7 RTT-doublings before slow start can
-            fit the full body. Under 20 ms RTT that compounds to
-            140 ms before the body is even on the wire. 32 packets
-            is a moderate bump matching what some major CDNs
-            advertise as their default; it gets cold connections
-            past the first few cwnd doublings without overcommit-
-            ing on real lossy links. On localhost loss is zero so
-            even 100 would be fine, but 32 is the conservative
-            choice that should also help over real WAN.
-         */
-        $q->quiche_config_set_initial_congestion_window_packets(
-            $config, 32);
         $q->quiche_config_verify_peer($config, false);
         return $config;
     }

@@ -74,23 +74,20 @@ Places to Visit:
 
     SECURITY: the {name} capture matches embedded slashes and ..
     components, so a request like /../../etc/passwd.x would otherwise
-    let the client read arbitrary files on disk. Resolve the candidate
-    path with realpath and confirm it stays inside the example
-    directory before serving. The same containment idiom should be
-    used in any callback that maps user-controlled path components
-    onto disk.
+    let the client read arbitrary files on disk. The safeFile helper
+    resolves the candidate path with realpath and verifies it lives
+    inside the trusted base directory; it returns false on any
+    traversal attempt, missing file, or unresolvable base. Use this
+    idiom (or call safeFile directly) in any route that maps a
+    user-controlled segment onto a file on disk.
  */
 $test->request('/{name}.{file_extension}', function() use ($test) {
     $name = $_REQUEST["name"];
     $extension = $_REQUEST["file_extension"];
-    $base = realpath(__DIR__);
-    $candidate = realpath($base . "/" . $name . "." . $extension);
-    $separator = DIRECTORY_SEPARATOR;
-    if ($base !== false && $candidate !== false
-        && strncmp($candidate, $base . $separator,
-            strlen($base) + 1) === 0
-        && is_file($candidate)) {
-        echo $test->fileGetContents($candidate);
+    $candidate = __DIR__ . "/" . $name . "." . $extension;
+    $resolved = $test->safeFile($candidate, __DIR__);
+    if ($resolved !== false && is_file($resolved)) {
+        echo $test->fileGetContents($resolved);
     } else {
         $test->trigger("ERROR", "/" . htmlspecialchars($name)
             . "." . htmlspecialchars($extension));

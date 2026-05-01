@@ -51,6 +51,20 @@ class GopherSite
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
     /**
+     * Single-character item type codes recognized as the leading byte
+     * of a Gopher menu line. Includes the canonical RFC 1436 set
+     * (0-9, +, g, I, M, T) plus the de-facto extensions h (HTML link),
+     * i (info text), s (sound). When gopherize encounters a line whose
+     * first character is in this set AND that contains a tab, it
+     * treats the line as already framed; otherwise the line is wrapped
+     * as a type-i info line. The link helper uses the same set to
+     * detect when a path begins with /<type>/... so it can extract
+     * the type prefix.
+     * @var array
+     */
+    const LINE_STARTS = ['0', '1', '2', '3', '4', '5', '6', '7', '8',
+        '9', '+', 'g', 'I', 'M', 'T', 'h', 'i', 's'];
+    /**
      * Keys of stream that won't disappear (for example the server socket)
      * @var array
      */
@@ -455,7 +469,6 @@ class GopherSite
             }
         }
         $num_bytes = file_put_contents($filename, $data);
-        chmod($filename, 0777);
         return $num_bytes;
     }
     /**
@@ -464,6 +477,58 @@ class GopherSite
     public function clearFileCache()
     {
         $this->file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
+    }
+    /**
+     * Resolves a user-influenced relative or absolute path against
+     * a trusted base directory and returns the canonical absolute
+     * path only if the candidate is contained within the base.
+     * Returns false otherwise.
+     *
+     * Use this in any route that maps a captured selector segment
+     * onto a file on disk. Without containment a request like
+     *      gopher://host/0/..%2f..%2fetc%2fpasswd
+     * would let the client read arbitrary files outside the
+     * intended document root. The {var} captures in the route
+     * pattern do not bound segment shapes, so the safety check has
+     * to be done by the route. This helper centralizes the
+     * realpath-then-prefix-check idiom so routes do not have to
+     * reinvent it.
+     *
+     * Mechanics: realpath collapses .. components and resolves
+     * symlinks. We then verify the resulting absolute path begins
+     * with the base path's absolute form plus a trailing directory
+     * separator. The trailing-separator check matters: a base
+     * /var/wwwroot would otherwise also accept /var/wwwroot-evil
+     * as a valid prefix.
+     *
+     * @param string $candidate the candidate file path, typically
+     *      built from a route capture
+     * @param string $base the trusted base directory the candidate
+     *      must live inside; defaults to the listener's
+     *      DOCUMENT_ROOT
+     * @return string|false canonical absolute path if contained,
+     *      false otherwise (path missing, escapes base, or base
+     *      itself is unresolvable)
+     */
+    public function safeFile($candidate, $base = "")
+    {
+        if ($base === "") {
+            $base = $this->default_server_globals['DOCUMENT_ROOT']
+                ?? "";
+        }
+        if ($base === "") {
+            return false;
+        }
+        $real_base = realpath($base);
+        $real_candidate = realpath($candidate);
+        if ($real_base === false || $real_candidate === false) {
+            return false;
+        }
+        $needle = $real_base . DIRECTORY_SEPARATOR;
+        if (strncmp($real_candidate, $needle, strlen($needle)) !== 0) {
+            return false;
+        }
+        return $real_candidate;
     }
     /**
      * Returns the mime type of the provided file name if it can be determined.
@@ -655,6 +720,25 @@ class GopherSite
                 $user_info =
                     posix_getpwnam($this->default_server_globals['USER']);
                 if (!empty($user_info['uid'])) {
+                    /*
+                        Drop the group id BEFORE the user id. Once
+                        posix_setuid has demoted the process from
+                        root, posix_setgid is no longer permitted, so
+                        the gid would stay at whatever the elevated
+                        process started with (typically root). That
+                        defeats the point of dropping privilege: a
+                        compromised process running as nobody:root
+                        can still write to root-group-owned files.
+                        function_exists guards posix_setgid because
+                        it's bundled with the same posix extension as
+                        the others above but we list it explicitly so
+                        the check fails closed if a build omits just
+                        that one.
+                     */
+                    if (!empty($user_info['gid']) &&
+                        function_exists("posix_setgid")) {
+                        posix_setgid($user_info['gid']);
+                    }
                     posix_setuid($user_info['uid']);
                     $uid = posix_getuid();
                     if ($uid == $user_info['uid']) {
@@ -734,12 +818,10 @@ class GopherSite
             array_pop($lines);
         }
         $out = "";
-        $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8',
-            '9', '+', 'g', 'I', 'M', 'T', 'h', 'i', 's'];
         $strip = ["\t" => " ", "\r" => " ", "\n" => " ", "\0" => ""];
         foreach ($lines as $line) {
             $first = (empty($line)) ? "\0" : $line[0];
-            if (!in_array($first, $line_starts) ||
+            if (!in_array($first, self::LINE_STARTS) ||
                 strpos($line, "\x09") === false) {
                 $safe_line = strtr($line, $strip);
                 $out .= "i" . $safe_line .
@@ -1072,7 +1154,6 @@ class GopherSite
     {
         $_SERVER = array_merge($this->default_server_globals, $context);
         parse_str($context['QUERY_STRING'], $_GET);
-        $_SERVER = array_merge($this->default_server_globals, $context);
         $_REQUEST = $_GET;
     }
     /**
@@ -1237,8 +1318,6 @@ class GopherSite
  */
 function link($uri, $link_text)
 {
-    $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        '+', 'g', 'I', 'M', 'T', 'h', 'i', 's'];
     $uri_parts = parse_url($uri);
     $link_type = '1';
     if (empty($uri_parts['path'])) {
@@ -1246,7 +1325,7 @@ function link($uri, $link_text)
     } else {
         $path = $uri_parts['path'];
         if (strlen($path) >= 3 && $path[0] == '/' && $path[2] == '/' &&
-            in_array($path[1], $line_starts)) {
+            in_array($path[1], GopherSite::LINE_STARTS)) {
             $link_type = $path[1];
             $path = substr($path, 2);
         }

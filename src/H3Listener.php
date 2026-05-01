@@ -607,6 +607,40 @@ class H3Listener extends Listener
      */
     public $site;
     /**
+     * Cached packed sockaddr buffer for this listener's local
+     * address. Allocated once in tryOpen rather than on every
+     * inbound packet. The local address never changes for a
+     * bound socket so the buffer is reused for the lifetime of
+     * the listener.
+     * @var \FFI\CData|null
+     */
+    public $local_sockaddr;
+    /**
+     * Length in bytes of $local_sockaddr.
+     * @var int
+     */
+    public $local_sockaddr_len = 0;
+    /**
+     * Reusable 1500-byte output buffer for drainConnection's
+     * quiche_conn_send call. Allocated once per listener so the
+     * inner loop does not pay an FFI::new cost per packet on a
+     * 1+ MiB body which packetizes to 700+ datagrams.
+     * @var \FFI\CData|null
+     */
+    public $send_buf;
+    /**
+     * Reusable quiche_send_info struct paired with $send_buf.
+     * @var \FFI\CData|null
+     */
+    public $send_info;
+    /**
+     * Reusable quiche_recv_info struct for feedPacket. Same
+     * lifetime hygiene as $send_info: allocate once per
+     * listener, repopulate on every call.
+     * @var \FFI\CData|null
+     */
+    public $recv_info;
+    /**
      * Constructs an H3Listener. Most callers should use
      * H3Listener::tryOpen() which handles config setup and
      * applies sensible defaults; the constructor itself just
@@ -713,6 +747,26 @@ class H3Listener extends Listener
             $ffi, $config);
         $listener->cert_path = $cert_path;
         $listener->key_path = $key_path;
+        /*
+            Pre-allocate packet buffers and FFI structs reused
+            on every drain and feed call. Allocating these per
+            call dominates per-packet PHP overhead on large
+            responses; hoisting to the listener turns a hot
+            path allocation into a stable pointer.
+         */
+        $local_addr = @stream_socket_get_name($server, false);
+        if ($local_addr !== false && $local_addr !== '') {
+            $local_len = 0;
+            $local_buf = self::peerToSockaddr($ffi, $local_addr,
+                $local_len);
+            if ($local_buf !== null) {
+                $listener->local_sockaddr = $local_buf;
+                $listener->local_sockaddr_len = $local_len;
+            }
+        }
+        $listener->send_buf = $ffi->ffi->new('uint8_t[1500]');
+        $listener->send_info = $ffi->ffi->new('quiche_send_info');
+        $listener->recv_info = $ffi->ffi->new('quiche_recv_info');
         return $listener;
     }
     /**
@@ -1038,14 +1092,13 @@ class H3Listener extends Listener
         $local_scid_buf = self::stringToCData($this->ffi, $local_scid);
         $peer_sock = self::peerToSockaddr($this->ffi, $peer,
             $peer_len);
-        $local_sock = self::peerToSockaddr($this->ffi,
-            $this->localAddr(), $local_len);
-        if ($peer_sock === null || $local_sock === null) {
+        if ($peer_sock === null
+            || $this->local_sockaddr === null) {
             return [null, null];
         }
         $quiche_conn = $q->quiche_accept($local_scid_buf,
             H3FFI::QUICHE_MAX_CONN_ID_LEN, null, 0,
-            $local_sock, $local_len,
+            $this->local_sockaddr, $this->local_sockaddr_len,
             $peer_sock, $peer_len, $this->quiche_config);
         if (\FFI::isNull($quiche_conn)) {
             return [null, null];
@@ -1096,18 +1149,36 @@ class H3Listener extends Listener
     protected function feedPacket($conn, $buf_cdata, $buf_len, $peer)
     {
         $q = $this->ffi->ffi;
-        $peer_sock = self::peerToSockaddr($this->ffi, $peer,
-            $peer_len);
-        $local_sock = self::peerToSockaddr($this->ffi,
-            $this->localAddr(), $local_len);
-        if ($peer_sock === null || $local_sock === null) {
-            return;
+        /*
+            Use the connection's cached peer sockaddr (set when
+            the connection was created) and the listener's cached
+            local sockaddr (set in tryOpen). Allocating fresh
+            sockaddr buffers per inbound packet was a measurable
+            cost during 1+ MiB responses where a burst of ACKs
+            triggers many feedPacket calls in quick succession.
+            Falls back to the slow path (re-pack from $peer) if
+            the connection somehow lacks a cached peer sockaddr.
+         */
+        if ($conn->peer_sockaddr === null
+            || $this->local_sockaddr === null) {
+            $peer_sock = self::peerToSockaddr($this->ffi, $peer,
+                $peer_len);
+            if ($peer_sock === null
+                || $this->local_sockaddr === null) {
+                return;
+            }
+            $peer_buf = $peer_sock;
+            $peer_buf_len = $peer_len;
+        } else {
+            $peer_buf = $conn->peer_sockaddr;
+            $peer_buf_len = $conn->peer_sockaddr_len;
         }
-        $info = $q->new('quiche_recv_info');
-        $info->from = $q->cast('void*', \FFI::addr($peer_sock[0]));
-        $info->from_len = $peer_len;
-        $info->to = $q->cast('void*', \FFI::addr($local_sock[0]));
-        $info->to_len = $local_len;
+        $info = $this->recv_info;
+        $info->from = $q->cast('void*', \FFI::addr($peer_buf[0]));
+        $info->from_len = $peer_buf_len;
+        $info->to = $q->cast('void*',
+            \FFI::addr($this->local_sockaddr[0]));
+        $info->to_len = $this->local_sockaddr_len;
         $q->quiche_conn_recv($conn->quiche_conn, $buf_cdata,
             $buf_len, \FFI::addr($info));
     }
@@ -1141,8 +1212,8 @@ class H3Listener extends Listener
     public function drainConnection($conn)
     {
         $q = $this->ffi->ffi;
-        $out = $q->new('uint8_t[1500]');
-        $send_info = $q->new('quiche_send_info');
+        $out = $this->send_buf;
+        $send_info = $this->send_info;
         /*
             64 packets per drain ~ 86 KiB which sits well below
             the kernel UDP send buffer on every supported
@@ -1216,30 +1287,6 @@ class H3Listener extends Listener
         $bytes = \FFI::string($out, $written);
         @stream_socket_sendto($this->server, $bytes, 0, $peer);
     }
-    /**
-     * Returns this listener's local "host:port" string suitable
-     * for peerToSockaddr. Reads it lazily from the underlying
-     * UDP socket on first call and caches the result; subsequent
-     * calls are a memoized lookup.
-     *
-     * @return string local "host:port" string
-     */
-    protected function localAddr()
-    {
-        if ($this->local_addr_cached !== null) {
-            return $this->local_addr_cached;
-        }
-        $name = @stream_socket_get_name($this->server, false);
-        $this->local_addr_cached = $name === false ? '0.0.0.0:0'
-            : $name;
-        return $this->local_addr_cached;
-    }
-    /**
-     * Memoized local "host:port" string used for the to-address
-     * field of inbound recv_info. Set on first localAddr() call.
-     * @var string|null
-     */
-    protected $local_addr_cached = null;
     /**
      * Packs a "host:port" address string into a sockaddr_in or
      * sockaddr_in6 byte buffer suitable for passing to libquiche

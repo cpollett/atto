@@ -1577,11 +1577,13 @@ class H3Listener extends Listener
          */
         $packets = 0;
         $bytes = 0;
+        $exit_code = 0;
         while (true) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
                 $out, 1500, \FFI::addr($send_info));
             if ($written === H3FFI::QUICHE_ERR_DONE
                 || $written <= 0) {
+                $exit_code = $written;
                 break;
             }
             $bytes_str = \FFI::string($out, $written);
@@ -1596,17 +1598,22 @@ class H3Listener extends Listener
                     its internal buffer until the peer ACKs the
                     packets that did make it out.
                  */
+                $exit_code = -100;
                 break;
             }
             $packets++;
             $bytes += $written;
         }
-        if ($packets > 0) {
+        if ($packets > 0 || $exit_code !== H3FFI::QUICHE_ERR_DONE) {
             self::trace('DRAIN', [
                 'cid' => substr($conn->scid_hex, 0, 8),
                 'pkts' => $packets,
                 'bytes' => $bytes,
+                'exit' => $exit_code,
                 'estab' => $conn->isEstablished() ? 1 : 0,
+                'timeout_ms' =>
+                    (int) $q->quiche_conn_timeout_as_millis(
+                        $conn->quiche_conn),
             ]);
         }
     }

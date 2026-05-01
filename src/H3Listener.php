@@ -1102,18 +1102,16 @@ class H3Listener extends Listener
     public function accept($acceptor, $timeout)
     {
         /*
-            Drive idle timers on every wake-up. Connections that
-            received no packet this cycle (e.g. handshake stragglers
-            curl abandoned during HappyEyeballs racing) need
-            quiche_conn_on_timeout called periodically to advance
-            their internal state machine. Without this, abandoned
-            handshakes sit in the connection map forever because
-            they never become draining or closed via the packet-
-            driven path. tickAllConnections is cheap (one quiche
-            call per connection) and runs once per UDP wake-up
-            rather than per datagram.
+            DIAGNOSTIC: tickAllConnections temporarily disabled
+            while we isolate whether it's responsible for the H3
+            handshake regression. With this disabled, the only
+            connection cleanup is via reapIfClosed in
+            processDatagram (orderly close / drain / idle-timeout
+            on connections that receive packets) and the
+            CID-map-leaks-orphans behavior we previously had.
+            Re-enable once the root cause is found.
          */
-        $this->tickAllConnections();
+        /* $this->tickAllConnections(); */
         $first_new = null;
         $first_context = null;
         /*

@@ -34,8 +34,8 @@ if [ ! -x "$CURL" ]; then
     exit 1
 fi
 
-if ! "$CURL" -k --http3-only -s -o /dev/null \
-        --max-time 5 "$H3_BASE/small"; then
+if ! "$CURL" -k --http3-only -v -o /dev/null \
+        --max-time 5 "$H3_BASE/small" 2>&1 | tail -20; then
     echo "Error: H3 request failed. Is the server running?"
     echo "Start with: php index.php (in 'examples/17 Benchmarks/')"
     exit 1
@@ -62,7 +62,13 @@ drive_h3() {
     path="$2"
     echo
     echo ">>> driving H3 request: $path  ($label)"
-    "$CURL" -k --http3-only -s -o /dev/null "$H3_BASE$path"
+    fmt='  curl http=%{http_code} time=%{time_total}s'
+    fmt="$fmt downloaded=%{size_download}B\n"
+    "$CURL" -k --http3-only -w "$fmt" -s -o /dev/null \
+        --max-time 5 "$H3_BASE$path"
+    if [ $? -ne 0 ]; then
+        echo "  *** curl FAILED ***"
+    fi
 }
 
 echo
@@ -81,7 +87,10 @@ snapshot "stats after /big (live + reaped)" yes
 
 echo ">>> driving 10 sequential /big requests to let cwnd ramp"
 for i in 1 2 3 4 5 6 7 8 9 10; do
-    "$CURL" -k --http3-only -s -o /dev/null "$H3_BASE/big"
+    fmt="  big[$i]: http=%{http_code} time=%{time_total}s"
+    fmt="$fmt downloaded=%{size_download}B\n"
+    "$CURL" -k --http3-only -w "$fmt" -s -o /dev/null \
+        --max-time 5 "$H3_BASE/big"
 done
 sleep 0.5
 snapshot "stats after 10x /big (live + reaped)" yes

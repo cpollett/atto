@@ -131,7 +131,17 @@ $test->get('/', function () {
             (sent / recv / lost / retrans / RTT / cwnd) for
             every active H3 connection. Empty when libquiche
             is missing or no H3 traffic has hit the server
-            yet. To populate: open
+            yet. Add <code>?keep=1</code>
+            (<a href="/h3stats?keep=1" target="_blank">try it</a>)
+            to also include the post-mortem stats ring buffer
+            for connections that have already been reaped, or
+            <code>?snapshot=1</code>
+            (<a href="/h3stats?snapshot=1" target="_blank"
+            >try it</a>) to also push every live connection's
+            current stats into the ring buffer first &mdash;
+            useful for capturing connections that completed
+            their work but were left dangling by a client that
+            kept them in its pool. To populate: open
             <a href="https://localhost:8443/" target="_blank">
             https://localhost:8443/</a> in a browser that
             speaks H3, then refresh /h3stats.</li>
@@ -515,20 +525,53 @@ $test->get('/h3stats', function () use ($test) {
         bench's observed throughput, or look for non-zero lost
         / retrans counters. This route is GET so it can be hit
         from any browser / curl / dashboard fetch.
+
+        Query parameters:
+        - ?keep=1: include the listener's ring buffer of stats
+          from connections that have already been reaped. Each
+          entry has a 'reason' field ('closed' for orderly
+          shutdown, 'stale_handshake' for forced reap of an
+          abandoned handshake, 'forced_snapshot' for a snapshot
+          taken via ?snapshot=1) and a 'reaped_at' microtime
+          float.
+        - ?snapshot=1: before snapshotting, capture every live
+          connection's current stats into the ring buffer. Lets
+          you see the final state of a connection that
+          completed its work but was kept alive by the client
+          (e.g. curl --http3 leaves the QUIC connection in its
+          pool and never sends CONNECTION_CLOSE before exiting,
+          so the server won't reap it until the 30-second idle
+          timeout fires). Implies ?keep=1.
      */
     $test->header("Content-Type: application/json");
     $stats = [];
+    $reaped = [];
+    $force_snapshot = !empty($_GET['snapshot']);
+    $include_reaped = !empty($_GET['keep']) || $force_snapshot;
     foreach ($test->listeners() as $listener) {
         if ($listener instanceof seekquarry\atto\H3Listener) {
+            if ($force_snapshot) {
+                $listener->forceSnapshotAll();
+            }
             foreach ($listener->snapshotAllStats() as $row) {
                 $stats[] = $row;
             }
+            if ($include_reaped) {
+                foreach ($listener->snapshotReapedStats() as $row) {
+                    $reaped[] = $row;
+                }
+            }
         }
     }
-    echo json_encode([
+    $out = [
         'connections' => count($stats),
         'stats' => $stats,
-    ], JSON_PRETTY_PRINT);
+    ];
+    if ($include_reaped) {
+        $out['reaped_count'] = count($reaped);
+        $out['reaped'] = $reaped;
+    }
+    echo json_encode($out, JSON_PRETTY_PRINT);
 });
 if ($test->isCli()) {
     /*

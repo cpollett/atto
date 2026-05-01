@@ -34,8 +34,8 @@ if [ ! -x "$CURL" ]; then
     exit 1
 fi
 
-if ! "$CURL" -k --http3-only -v -o /dev/null \
-        --max-time 5 "$H3_BASE/small" 2>&1 | tail -20; then
+if ! "$CURL" -k --http3-only -s -o /dev/null \
+        --max-time 5 "$H3_BASE/small"; then
     echo "Error: H3 request failed. Is the server running?"
     echo "Start with: php index.php (in 'examples/17 Benchmarks/')"
     exit 1
@@ -46,7 +46,7 @@ snapshot() {
     keep="$2"
     url="$ADMIN_BASE/h3stats"
     if [ "$keep" = "yes" ]; then
-        url="$url?keep=1"
+        url="$url?snapshot=1"
     fi
     echo "===================================================="
     echo "  $label"
@@ -96,14 +96,22 @@ sleep 0.5
 snapshot "stats after 10x /big (live + reaped)" yes
 
 echo "===================================================="
-echo "Done. The 'reaped' arrays in the ?keep=1 responses"
-echo "show the final stats of each completed connection."
-echo "Look at:"
+echo "Done. The 'reaped' arrays show captured stats from"
+echo "?snapshot=1 (live connections frozen at snapshot"
+echo "time) plus actually-reaped post-mortems."
+echo
+echo "Each curl invocation produces TWO connections: one"
+echo "established connection that completes the request"
+echo "(IPv6 or IPv4 winner of curl's HappyEyeballs QUIC"
+echo "race), plus one orphan in pre-handshake state from"
+echo "the abandoned race loser. The orphan has recv=1,"
+echo "sent=1, recv_bytes=1200, sent_bytes=72."
+echo
+echo "For the ESTABLISHED connections (state=='established'"
+echo "with reason 'forced_snapshot'), look at:"
 echo "  - cwnd: should grow to MB-scale on a long transfer"
 echo "  - rtt_ms: should be sub-millisecond on localhost"
 echo "  - delivery_rate: bytes/sec quiche measured"
-echo "  - lost / retrans: should be 0 on localhost"
-echo "  - state == 'closed' or 'draining': orderly shutdown"
-echo "  - state == 'pending' with reason 'stale_handshake':"
-echo "    abandoned curl race candidate (expected, harmless)"
+echo "  - lost / retrans: ideally 0 on localhost"
+echo "  - sent_bytes: ~ size of response delivered"
 echo "===================================================="

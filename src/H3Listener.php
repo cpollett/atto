@@ -1102,16 +1102,17 @@ class H3Listener extends Listener
     public function accept($acceptor, $timeout)
     {
         /*
-            DIAGNOSTIC: tickAllConnections temporarily disabled
-            while we isolate whether it's responsible for the H3
-            handshake regression. With this disabled, the only
-            connection cleanup is via reapIfClosed in
-            processDatagram (orderly close / drain / idle-timeout
-            on connections that receive packets) and the
-            CID-map-leaks-orphans behavior we previously had.
-            Re-enable once the root cause is found.
+            Drive idle timers and reap stale handshakes on every
+            UDP wake-up. Pre-handshake stragglers from curl's
+            HappyEyeballs racing (one orphan per curl invocation
+            because curl opens parallel IPv6/IPv4 QUIC handshakes
+            and silently abandons the loser) need an active
+            sweeper because they receive no further packets and
+            their idle timer never starts. tickAllConnections is
+            cheap (one quiche call per connection) and runs once
+            per UDP wake-up rather than per datagram.
          */
-        /* $this->tickAllConnections(); */
+        $this->tickAllConnections();
         $first_new = null;
         $first_context = null;
         /*
@@ -1611,6 +1612,27 @@ class H3Listener extends Listener
     public function snapshotReapedStats()
     {
         return $this->reaped_stats;
+    }
+    /**
+     * Captures current stats for every tracked connection into
+     * the reaped_stats ring with reason 'forced_snapshot', then
+     * lets normal reaping proceed. Connections that completed
+     * their work but were never closed by the client (e.g. curl
+     * keeps the QUIC connection in its pool and never sends
+     * CONNECTION_CLOSE before its process exits) sit in
+     * established state until the 30-second idle timeout fires;
+     * forceSnapshotAll lets diagnostic endpoints capture their
+     * stats without waiting that long. Does NOT free or close
+     * the connections, only captures.
+     */
+    public function forceSnapshotAll()
+    {
+        foreach ($this->connections as $conn) {
+            if ($conn->quiche_conn === null) {
+                continue;
+            }
+            $this->captureReapedStats($conn, 'forced_snapshot');
+        }
     }
     /**
      * Sends a Version Negotiation packet to the peer when an

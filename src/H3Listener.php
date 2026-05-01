@@ -538,6 +538,18 @@ class H3Connection extends Connection
      */
     public $ffi;
     /**
+     * Wall-clock timestamp (microtime float) when this connection
+     * was constructed. Used by H3Listener::tickAllConnections to
+     * forcibly reap stuck-pre-handshake connections that some
+     * clients leave behind during connection-racing (HappyEyeballs
+     * or 0-RTT probes). quiche's max_idle_timeout only fires AFTER
+     * the handshake completes; pre-handshake stragglers would
+     * otherwise sit in the connection map for the full handshake
+     * timeout (default 30s in quiche).
+     * @var float
+     */
+    public $created_at = 0.0;
+    /**
      * Constructs an H3Connection wrapping an already-created
      * quiche_conn. The resource argument from the parent class
      * is set to null because H3 connections do not have a PHP
@@ -556,6 +568,7 @@ class H3Connection extends Connection
         $this->quiche_conn = $quiche_conn;
         $this->scid_hex = $scid_hex;
         $this->h3_conn = null;
+        $this->created_at = microtime(true);
     }
     /**
      * Returns true if the QUIC handshake has completed. Until
@@ -647,6 +660,14 @@ class H3Connection extends Connection
 class H3Listener extends Listener
 {
     /**
+     * Wall-clock seconds a connection is permitted to stay in
+     * pre-handshake state before tickAllConnections forcibly
+     * reaps it. Catches orphans left behind by clients that race
+     * multiple Initial packets (curl HappyEyeballs, browser 0-RTT
+     * probes) and only complete the handshake on one of them.
+     */
+    const STALE_HANDSHAKE_SECS = 5.0;
+    /**
      * The H3FFI instance shared across all H3 listeners and
      * connections in this process. Held so accept() can call
      * quiche_accept and the connection objects can call into
@@ -668,6 +689,23 @@ class H3Listener extends Listener
      * @var array<string, H3Connection>
      */
     public $connections = [];
+    /**
+     * Ring buffer of stats snapshots taken at reap time, capped at
+     * REAPED_STATS_RING. Populated by reapIfClosed just before it
+     * frees the connection, then exposed by snapshotAllStats so
+     * diagnostic endpoints like /h3stats?keep=1 can inspect what
+     * happened on connections that have already gone away. Each
+     * entry has the same shape as getConnectionStats output, plus
+     * a 'reaped_at' microtime float and a 'reason' string.
+     * @var array
+     */
+    public $reaped_stats = [];
+    /**
+     * Maximum entries kept in $reaped_stats. Old entries fall off
+     * the front when this is exceeded. 64 is enough to span a
+     * full bench run while staying small.
+     */
+    const REAPED_STATS_RING = 64;
     /**
      * Path to the TLS certificate chain PEM file. Stored for
      * diagnostic and lifetime reasons.
@@ -1111,16 +1149,40 @@ class H3Listener extends Listener
      * mid-handshake (orphans from client connection-racing) and
      * connections whose idle timer just expired but never received
      * a triggering packet.
+     *
+     * Also forcibly reaps connections that have been alive for
+     * more than STALE_HANDSHAKE_SECS without completing the QUIC
+     * handshake. Some clients (curl with HappyEyeballs, browsers
+     * doing 0-RTT probes) open multiple Initial packets in
+     * parallel and silently abandon all but one. quiche's idle
+     * timer only starts after the handshake completes, so without
+     * this fallback those orphans would linger until the handshake
+     * timeout (default 30s). Five seconds is generous enough for
+     * a real handshake on a high-latency link while keeping the
+     * connection map small under load.
      */
     protected function tickAllConnections()
     {
         $q = $this->ffi->ffi;
-        foreach ($this->connections as $conn) {
+        $now = microtime(true);
+        foreach ($this->connections as $scid_hex => $conn) {
             if ($conn->quiche_conn === null) {
+                unset($this->connections[$scid_hex]);
                 continue;
             }
             $q->quiche_conn_on_timeout($conn->quiche_conn);
             $this->reapIfClosed($conn);
+            if (!isset($this->connections[$scid_hex])) {
+                continue;
+            }
+            $age = $now - $conn->created_at;
+            if ($age > self::STALE_HANDSHAKE_SECS
+                && !(bool) $q->quiche_conn_is_established(
+                    $conn->quiche_conn)) {
+                $this->captureReapedStats($conn, 'stale_handshake');
+                unset($this->connections[$scid_hex]);
+                $conn->close();
+            }
         }
     }
     /**
@@ -1370,6 +1432,11 @@ class H3Listener extends Listener
      * closed state. Called after every recv/drain cycle so
      * idle-timed-out and peer-closed connections don't leak.
      *
+     * Before freeing, snapshots the connection's final stats into
+     * the reaped_stats ring buffer so diagnostic endpoints can
+     * inspect what happened on connections that have already gone
+     * away.
+     *
      * @param H3Connection $conn connection to check and reap
      */
     protected function reapIfClosed($conn)
@@ -1377,8 +1444,36 @@ class H3Listener extends Listener
         if (!$conn->isClosed()) {
             return;
         }
+        $this->captureReapedStats($conn, 'closed');
         unset($this->connections[$conn->scid_hex]);
         $conn->close();
+    }
+    /**
+     * Pushes the connection's current stats snapshot into the
+     * reaped_stats ring buffer with a reason tag. Old entries are
+     * trimmed from the front once the ring exceeds
+     * REAPED_STATS_RING. Used by reapIfClosed and the
+     * stale-handshake force-reap path so /h3stats?keep=1 can
+     * surface what happened on already-freed connections.
+     *
+     * @param H3Connection $conn the connection about to be freed
+     * @param string $reason one of 'closed', 'stale_handshake'
+     */
+    protected function captureReapedStats($conn, $reason)
+    {
+        $stats = $this->getConnectionStats($conn);
+        if ($stats === null) {
+            return;
+        }
+        $stats['reaped_at'] = microtime(true);
+        $stats['reason'] = $reason;
+        $this->reaped_stats[] = $stats;
+        $overflow = count($this->reaped_stats)
+            - self::REAPED_STATS_RING;
+        if ($overflow > 0) {
+            $this->reaped_stats = array_slice(
+                $this->reaped_stats, $overflow);
+        }
     }
     /**
      * Returns a snapshot of libquiche's transport-level counters
@@ -1485,6 +1580,21 @@ class H3Listener extends Listener
             }
         }
         return $out;
+    }
+    /**
+     * Returns the ring buffer of stats snapshots taken at reap
+     * time, oldest first. Each entry has the same fields as
+     * getConnectionStats output plus a 'reaped_at' microtime
+     * float and a 'reason' string ('closed' or
+     * 'stale_handshake'). Used by /h3stats?keep=1 to surface
+     * post-mortem stats for connections that have already gone
+     * away.
+     *
+     * @return array list of stats snapshots, oldest first
+     */
+    public function snapshotReapedStats()
+    {
+        return $this->reaped_stats;
     }
     /**
      * Sends a Version Negotiation packet to the peer when an

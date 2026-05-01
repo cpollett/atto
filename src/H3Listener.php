@@ -138,34 +138,56 @@ class H3FFI
             size_t recv;
             size_t sent;
             size_t lost;
+            size_t spurious_lost;
             size_t retrans;
             uint64_t sent_bytes;
             uint64_t recv_bytes;
+            uint64_t acked_bytes;
             uint64_t lost_bytes;
             uint64_t stream_retrans_bytes;
+            size_t dgram_recv;
+            size_t dgram_sent;
             size_t paths_count;
             uint64_t reset_stream_count_local;
             uint64_t stopped_stream_count_local;
             uint64_t reset_stream_count_remote;
             uint64_t stopped_stream_count_remote;
+            uint64_t data_blocked_sent_count;
+            uint64_t stream_data_blocked_sent_count;
+            uint64_t data_blocked_recv_count;
+            uint64_t stream_data_blocked_recv_count;
+            uint64_t streams_blocked_bidi_recv_count;
+            uint64_t streams_blocked_uni_recv_count;
+            uint64_t path_challenge_rx_count;
+            uint64_t bytes_in_flight_duration_msec;
+            bool tx_buffered_inconsistent;
+            char tx_buf_pad[7];
         } quiche_stats;
         typedef struct {
             char addr_opaque[272];
-            uint64_t validation_state;
+            int64_t validation_state;
             bool active;
             char active_pad[7];
             size_t recv;
             size_t sent;
             size_t lost;
             size_t retrans;
+            size_t total_pto_count;
+            size_t dgram_recv;
+            size_t dgram_sent;
             uint64_t rtt;
+            uint64_t min_rtt;
+            uint64_t max_rtt;
+            uint64_t rttvar;
             size_t cwnd;
             uint64_t sent_bytes;
             uint64_t recv_bytes;
             uint64_t lost_bytes;
             uint64_t stream_retrans_bytes;
-            uint64_t pmtu;
+            size_t pmtu;
             uint64_t delivery_rate;
+            uint64_t max_bandwidth;
+            uint64_t startup_exit_cwnd;
         } quiche_path_stats;
         const char *quiche_version(void);
         quiche_config *quiche_config_new(uint32_t version);
@@ -549,16 +571,39 @@ class H3Connection extends Connection
             ->quiche_conn_is_established($this->quiche_conn);
     }
     /**
-     * Returns true if the connection is closed (peer closed,
-     * idle-timed-out, or local close has been processed).
-     * H3Listener's accept loop reaps these.
+     * Returns true when the connection is no longer doing useful
+     * work and can be reaped from the listener's CID map. That
+     * covers three quiche states:
      *
-     * @return bool whether the connection is closed
+     *  1. is_closed: the close handshake completed and the 3xPTO
+     *     drain timer fired. The connection has fully exited.
+     *  2. is_draining: a CONNECTION_CLOSE was sent or received.
+     *     The connection is in the drain period before close. We
+     *     reap eagerly here because no further H3 streams will
+     *     open on a draining connection; sticking around just to
+     *     match late retransmits would leak memory under load.
+     *  3. is_timed_out: the idle timer expired. quiche will
+     *     never deliver another event on this connection.
+     *
+     * Reaping in draining state is safe because by the time this
+     * is checked (after drainConnection in accept), any
+     * CONNECTION_CLOSE response is already on the wire. The peer
+     * may still retransmit its CONNECTION_CLOSE; those packets
+     * will hit the unrecognized-CID path and get dropped, which
+     * is what RFC 9000 sec 10.2.2 calls for.
+     *
+     * @return bool whether the connection is reapable
      */
     public function isClosed()
     {
-        return (bool) $this->ffi->ffi
-            ->quiche_conn_is_closed($this->quiche_conn);
+        $q = $this->ffi->ffi;
+        if ($this->quiche_conn === null) {
+            return true;
+        }
+        return (bool) $q->quiche_conn_is_closed($this->quiche_conn)
+            || (bool) $q->quiche_conn_is_draining($this->quiche_conn)
+            || (bool) $q->quiche_conn_is_timed_out(
+                $this->quiche_conn);
     }
     /**
      * Releases the underlying quiche_conn and any attached
@@ -1018,6 +1063,19 @@ class H3Listener extends Listener
      */
     public function accept($acceptor, $timeout)
     {
+        /*
+            Drive idle timers on every wake-up. Connections that
+            received no packet this cycle (e.g. handshake stragglers
+            curl abandoned during HappyEyeballs racing) need
+            quiche_conn_on_timeout called periodically to advance
+            their internal state machine. Without this, abandoned
+            handshakes sit in the connection map forever because
+            they never become draining or closed via the packet-
+            driven path. tickAllConnections is cheap (one quiche
+            call per connection) and runs once per UDP wake-up
+            rather than per datagram.
+         */
+        $this->tickAllConnections();
         $first_new = null;
         $first_context = null;
         /*
@@ -1045,6 +1103,25 @@ class H3Listener extends Listener
             return [$first_new, $first_context];
         }
         return [null, null];
+    }
+    /**
+     * Calls quiche_conn_on_timeout on every tracked connection,
+     * then reaps any that have transitioned to closed / draining /
+     * timed-out as a result. Catches connections that are stuck
+     * mid-handshake (orphans from client connection-racing) and
+     * connections whose idle timer just expired but never received
+     * a triggering packet.
+     */
+    protected function tickAllConnections()
+    {
+        $q = $this->ffi->ffi;
+        foreach ($this->connections as $conn) {
+            if ($conn->quiche_conn === null) {
+                continue;
+            }
+            $q->quiche_conn_on_timeout($conn->quiche_conn);
+            $this->reapIfClosed($conn);
+        }
     }
     /**
      * Processes a single UDP datagram by parsing its QUIC header,

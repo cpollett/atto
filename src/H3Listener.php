@@ -1215,15 +1215,22 @@ class H3Listener extends Listener
         $out = $this->send_buf;
         $send_info = $this->send_info;
         /*
-            64 packets per drain ~ 86 KiB which sits well below
-            the kernel UDP send buffer on every supported
-            platform. tryOpen also bumps SO_SNDBUF where it can,
-            but we still cap here as defense-in-depth: even with
-            a larger socket buffer, blasting all of quiche's
-            queued packets in one drain regardless of how full
-            the kernel buffer is invites silent drops.
+            Drain bound. Earlier iterations capped at 64 packets
+            (~86 KiB) to defend against the kernel UDP send buffer
+            silently dropping excess packets, which would deadlock
+            the connection because quiche thinks the dropped
+            packets are in flight. Now that tryOpen bumps
+            SO_SNDBUF to 4 MiB, ~3000 packets fit comfortably and
+            we can drain larger bursts per call. The win is real
+            on big responses: with cap=64 a 1 MiB body needs ~12
+            event-loop round trips (each gated by an ACK) to
+            fully transmit; with a higher cap quiche's pacing
+            and congestion control are the natural throttle, not
+            our application-level cap. The sendto short-write
+            check below remains the actual safety net regardless
+            of cap.
          */
-        $max = 64;
+        $max = 2048;
         while ($max-- > 0) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
                 $out, 1500, \FFI::addr($send_info));

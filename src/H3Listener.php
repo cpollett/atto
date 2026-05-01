@@ -766,6 +766,90 @@ class H3Listener extends Listener
      */
     public $recv_info;
     /**
+     * Diagnostic trace file handle. When non-null, accept,
+     * processDatagram, driveH3, and drainConnection emit a
+     * one-line-per-event timing record for hunting down latency
+     * issues in the H3 path under simulated RTT injection. Lines
+     * have a fixed prefix so they can be grepped:
+     *
+     *   H3TRACE   12.345 RECV cid=ab12cd34 bytes=1200
+     *   H3TRACE   12.347 DRAIN cid=ab12cd34 pkts=2 bytes=1280
+     *
+     * Activation and deactivation go through traceTo / traceOff;
+     * the trace function itself short-circuits on a null handle,
+     * so unconfigured servers pay only one isset check per event.
+     * @var resource|null
+     */
+    protected static $trace_handle;
+    /**
+     * Process start time captured the first time tracing fires;
+     * trace timestamps are relative to this. microtime float.
+     * @var float
+     */
+    protected static $trace_start;
+    /**
+     * Activates H3 tracing to the given file path. The file is
+     * opened in append mode so multiple runs accumulate. Subsequent
+     * trace() calls write one line per event to this handle. Does
+     * nothing if the file cannot be opened (silent fall-through is
+     * deliberate; tracing is diagnostic and should never break the
+     * server).
+     *
+     * Pair with traceOff to flush and close the handle. Reentrant:
+     * if tracing is already on, this rotates to the new file.
+     *
+     * @param string $path file path to append trace lines to
+     * @return bool true if tracing was activated
+     */
+    public static function traceTo($path)
+    {
+        if (self::$trace_handle !== null) {
+            @fclose(self::$trace_handle);
+            self::$trace_handle = null;
+        }
+        $fh = @fopen($path, 'a');
+        if ($fh === false) {
+            return false;
+        }
+        self::$trace_handle = $fh;
+        self::$trace_start = microtime(true);
+        return true;
+    }
+    /**
+     * Deactivates H3 tracing. Flushes and closes the trace file
+     * handle. Safe to call when tracing is already off.
+     */
+    public static function traceOff()
+    {
+        if (self::$trace_handle !== null) {
+            @fclose(self::$trace_handle);
+            self::$trace_handle = null;
+        }
+    }
+    /**
+     * Emits a trace line in the canonical format
+     * H3TRACE <ms.fff> <event> <key=value>... where the ms is
+     * the wall-clock offset since traceTo was first called.
+     * No-op if tracing is disabled (single isset check).
+     *
+     * @param string $event short event tag (RECV / DRAIN / etc.)
+     * @param array $kv key/value pairs to log
+     */
+    public static function trace($event, $kv = [])
+    {
+        if (self::$trace_handle === null) {
+            return;
+        }
+        $offset = (microtime(true) - self::$trace_start) * 1000;
+        $parts = [];
+        foreach ($kv as $k => $v) {
+            $parts[] = "$k=$v";
+        }
+        @fwrite(self::$trace_handle, sprintf(
+            "H3TRACE %8.3f %s %s\n",
+            $offset, $event, implode(' ', $parts)));
+    }
+    /**
      * Constructs an H3Listener. Most callers should use
      * H3Listener::tryOpen() which handles config setup and
      * applies sensible defaults; the constructor itself just
@@ -1312,6 +1396,11 @@ class H3Listener extends Listener
          */
         if (isset($this->connections[$dcid_hex])) {
             $conn = $this->connections[$dcid_hex];
+            self::trace('RECV', [
+                'cid' => substr($conn->scid_hex, 0, 8),
+                'bytes' => $buf_len,
+                'estab' => $conn->isEstablished() ? 1 : 0,
+            ]);
             $this->feedPacket($conn, $buf_cdata, $buf_len, $peer);
             $this->driveH3($conn);
             $this->drainConnection($conn);
@@ -1355,6 +1444,15 @@ class H3Listener extends Listener
         $h3_conn->peer_sockaddr = $peer_sock;
         $h3_conn->peer_sockaddr_len = $peer_len;
         $this->connections[$local_scid_hex] = $h3_conn;
+        self::trace('NEW', [
+            'cid' => substr($local_scid_hex, 0, 8),
+            'peer' => $peer,
+        ]);
+        self::trace('RECV', [
+            'cid' => substr($local_scid_hex, 0, 8),
+            'bytes' => $buf_len,
+            'estab' => 0,
+        ]);
         $this->feedPacket($h3_conn, $buf_cdata, $buf_len, $peer);
         $this->driveH3($h3_conn);
         $this->drainConnection($h3_conn);
@@ -1477,6 +1575,8 @@ class H3Listener extends Listener
             returns DONE when cwnd is exhausted, so the loop
             exits naturally without our help.
          */
+        $packets = 0;
+        $bytes = 0;
         while (true) {
             $written = $q->quiche_conn_send($conn->quiche_conn,
                 $out, 1500, \FFI::addr($send_info));
@@ -1484,9 +1584,9 @@ class H3Listener extends Listener
                 || $written <= 0) {
                 break;
             }
-            $bytes = \FFI::string($out, $written);
-            $sent = @stream_socket_sendto($this->server, $bytes, 0,
-                $conn->peer_address);
+            $bytes_str = \FFI::string($out, $written);
+            $sent = @stream_socket_sendto($this->server, $bytes_str,
+                0, $conn->peer_address);
             if ($sent === false || $sent < $written) {
                 /*
                     Kernel UDP send buffer is full or the route
@@ -1498,6 +1598,16 @@ class H3Listener extends Listener
                  */
                 break;
             }
+            $packets++;
+            $bytes += $written;
+        }
+        if ($packets > 0) {
+            self::trace('DRAIN', [
+                'cid' => substr($conn->scid_hex, 0, 8),
+                'pkts' => $packets,
+                'bytes' => $bytes,
+                'estab' => $conn->isEstablished() ? 1 : 0,
+            ]);
         }
     }
     /**
@@ -2161,6 +2271,13 @@ class H3Transport extends Transport
             return;
         }
         $context = $this->buildContext($listener, $conn, $stream);
+        H3Listener::trace('DISPATCH', [
+            'cid' => substr($conn->scid_hex, 0, 8),
+            'stream' => $stream_id,
+            'method' => $stream['method'],
+            'path' => $stream['path'],
+            'body_len' => $stream['body_len'],
+        ]);
         $this->site->setGlobals($context, $conn);
         try {
             $body = $this->site->getResponseData(false);

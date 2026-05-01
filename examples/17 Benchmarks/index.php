@@ -3,9 +3,18 @@ require '../../src/WebSite.php';
 
 use seekquarry\atto\WebSite;
 
-if (!defined("seekquarry\\atto\\RUN")) {
-    exit(); /* you need to comment this line to be able to run this example.
-               under a web server */
+/*
+    The RUN guard prevents this file from executing when a web
+    server happens to serve the examples directory directly. Atto
+    apps run under their own listener, not under another HTTP
+    server, so a request that lands here in a web-server context
+    is almost always a misconfiguration. CLI invocations are
+    permitted unconditionally so plain `php index.php [flags]`
+    works without commenting anything out.
+ */
+if (php_sapi_name() !== 'cli'
+    && !defined("seekquarry\\atto\\RUN")) {
+    exit();
 }
 $test = new WebSite();
 
@@ -574,6 +583,44 @@ $test->get('/h3stats', function () use ($test) {
     echo json_encode($out, JSON_PRETTY_PRINT);
 });
 if ($test->isCli()) {
+    /*
+        Optional --trace=path flag: when present, the H3 listener
+        emits a one-line-per-event timing record to the named
+        file. Each line is prefixed H3TRACE so it can be grepped
+        out of the bench dashboard's stdout if both happen to
+        land in the same place. Off by default; the trace check
+        is a single isset() per event when off.
+     */
+    $trace_path = '';
+    foreach (array_slice($argv, 1) as $arg) {
+        if (strncmp($arg, '--trace=', 8) === 0) {
+            $trace_path = substr($arg, 8);
+        } else if ($arg === '--help' || $arg === '-h') {
+            echo "Usage: php index.php [--trace=path]\n";
+            echo "  --trace=path   Append H3 listener trace lines\n";
+            echo "                 to the given file. Useful for\n";
+            echo "                 diagnosing latency under bench's\n";
+            echo "                 --latency-ms run.\n";
+            exit(0);
+        }
+    }
+    if ($trace_path !== '') {
+        if (!class_exists(
+                '\seekquarry\atto\H3Listener', false)) {
+            $h3_path = __DIR__ . "/../../src/H3Listener.php";
+            if (is_file($h3_path)) {
+                require_once $h3_path;
+            }
+        }
+        if (class_exists(
+                '\seekquarry\atto\H3Listener', false)
+            && seekquarry\atto\H3Listener::traceTo($trace_path)) {
+            echo "  H3 trace -> $trace_path\n";
+        } else {
+            echo "  WARNING: could not open trace file " .
+                "$trace_path\n";
+        }
+    }
     /*
         Reuse the repository's self-signed cert (security/) so
         every example with a TLS listener picks up the same

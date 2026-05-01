@@ -1537,9 +1537,61 @@ class WebSite
                 $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
             }
+            /*
+                Clamp the stream_select wake-up by the next
+                quiche-internal timer across every H3 listener
+                so timer-driven retransmits, idle timeouts, and
+                stale-handshake reaps fire at the right moment
+                instead of waiting for the next inbound packet.
+                Without this clamp, a connection sitting on a
+                PTO with no incoming traffic would never get its
+                quiche_conn_on_timeout call and the retransmit
+                would never go out. The minimum is taken across
+                listeners; if any listener wants a sooner wake,
+                its value wins. The clamp is a no-op on servers
+                without an H3 listener.
+             */
+            $h3_min_ms = null;
+            foreach ($this->listeners as $listener_entry) {
+                if ($listener_entry instanceof H3Listener) {
+                    $candidate = $listener_entry->nextTimeoutMillis();
+                    if ($candidate !== null
+                        && ($h3_min_ms === null
+                            || $candidate < $h3_min_ms)) {
+                        $h3_min_ms = $candidate;
+                    }
+                }
+            }
+            if ($h3_min_ms !== null) {
+                $h3_secs = $h3_min_ms / 1000.0;
+                if ($timeout === null
+                    || $h3_secs < $timeout + $micro_timeout / 1000000.0) {
+                    $timeout = (int) floor($h3_secs);
+                    $micro_timeout = (int) (($h3_secs - $timeout)
+                        * 1000000);
+                }
+            }
             $num_selected = stream_select($in_streams_with_data,
                 $out_streams_with_data, $excepts, $timeout, $micro_timeout);
             $this->processTimers();
+            /*
+                Drive H3 listener internal timers regardless of
+                whether the listener showed up in the readable
+                set. stream_select wakes us either because a
+                packet arrived (in which case accept will tick
+                via its own call) or because the H3 timeout we
+                clamped above expired (in which case nothing
+                else would tick). Calling tickAllConnections
+                here covers both cases; the duplicated call from
+                accept is cheap because tickAllConnections
+                internally gates quiche_conn_on_timeout on the
+                timeout_as_millis check.
+             */
+            foreach ($this->listeners as $listener_entry) {
+                if ($listener_entry instanceof H3Listener) {
+                    $listener_entry->tickAllConnections();
+                }
+            }
             if ($num_selected > 0) {
                 $this->processRequestStreams(null,
                     $in_streams_with_data);

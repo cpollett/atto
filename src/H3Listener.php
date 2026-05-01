@@ -1173,7 +1173,7 @@ class H3Listener extends Listener
      * a real handshake on a high-latency link while keeping the
      * connection map small under load.
      */
-    protected function tickAllConnections()
+    public function tickAllConnections()
     {
         $q = $this->ffi->ffi;
         $now = microtime(true);
@@ -1633,6 +1633,74 @@ class H3Listener extends Listener
             }
             $this->captureReapedStats($conn, 'forced_snapshot');
         }
+    }
+    /**
+     * Returns the smallest quiche-internal timer expiry across
+     * every tracked connection, in milliseconds from now, so the
+     * event loop can clamp its stream_select timeout and wake up
+     * exactly when a connection needs servicing. Returns null if
+     * no connection has a pending timer (an empty connection map
+     * or every connection's timer is UINT64_MAX, meaning quiet
+     * forever).
+     *
+     * Pre-handshake stragglers from curl HappyEyeballs racing are
+     * also reflected here via STALE_HANDSHAKE_SECS: this method
+     * returns the time until the next stale-handshake reap if no
+     * other timer fires sooner. That way tickAllConnections gets
+     * woken at the right moment to clean up orphans even on a
+     * server with no other inbound traffic.
+     *
+     * The UINT64_MAX sentinel from libquiche shows up in PHP as
+     * a very large positive integer (or float on 32-bit PHP);
+     * any value above one hour is treated as "no timer" since
+     * realistic QUIC timers are sub-second.
+     *
+     * @return int|null milliseconds until the next wake-up, or
+     *     null if nothing needs waking
+     */
+    public function nextTimeoutMillis()
+    {
+        $q = $this->ffi->ffi;
+        $now = microtime(true);
+        $best = null;
+        foreach ($this->connections as $conn) {
+            if ($conn->quiche_conn === null) {
+                continue;
+            }
+            $millis = (int) $q->quiche_conn_timeout_as_millis(
+                $conn->quiche_conn);
+            /*
+                quiche returns UINT64_MAX when no timer is
+                pending. Treat anything beyond an hour as the
+                sentinel; real QUIC PTO/idle/loss-detection
+                timers are all sub-second on healthy paths.
+             */
+            if ($millis >= 0 && $millis < 3600000) {
+                if ($best === null || $millis < $best) {
+                    $best = $millis;
+                }
+            }
+            /*
+                Wake-up window for the stale-handshake reaper.
+                A connection in pre-handshake state for more
+                than STALE_HANDSHAKE_SECS gets force-closed by
+                tickAllConnections; we need to be woken at
+                that moment if no other timer fires first.
+             */
+            if (!(bool) $q->quiche_conn_is_established(
+                    $conn->quiche_conn)) {
+                $age = $now - $conn->created_at;
+                $remaining = self::STALE_HANDSHAKE_SECS - $age;
+                if ($remaining < 0) {
+                    $remaining = 0;
+                }
+                $stale_ms = (int) ($remaining * 1000);
+                if ($best === null || $stale_ms < $best) {
+                    $best = $stale_ms;
+                }
+            }
+        }
+        return $best;
     }
     /**
      * Sends a Version Negotiation packet to the peer when an

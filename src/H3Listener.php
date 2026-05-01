@@ -857,30 +857,82 @@ class H3Listener extends Listener
         parent::close();
     }
     /**
-     * Reads one UDP datagram from the server socket and either
-     * returns a freshly-created H3Connection (for a new Initial
-     * packet matching no existing CID) or routes the datagram to
-     * an existing H3Connection's quiche_conn_recv. Returns
-     * [null, null] if no datagram is available, or if the
-     * datagram is for an existing connection (no new connection
-     * to surface to the event loop). New connections are also
-     * registered in $this->connections by CID.
+     * Drains all pending UDP datagrams from the server socket
+     * in one event-loop pass. Each datagram is dispatched via
+     * processDatagram, which routes to an existing H3Connection
+     * by DCID or creates a new one for an Initial packet. The
+     * first new connection created during the drain is surfaced
+     * to the caller so processServerRequest can register it;
+     * any subsequent new connections during the same drain stay
+     * in the listener's CID-keyed map and surface on the next
+     * event-loop pass via their existing-connection branch.
+     *
+     * Without this drain loop, atto would round-trip through
+     * stream_select once per inbound datagram. For a 1 MiB
+     * download that triggers tens of ACKs in quick succession,
+     * that adds up to noticeable latency since congestion
+     * control can only open the window when ACKs are processed
+     * and the kernel UDP recv buffer fills before we read it
+     * fast enough, causing drops and retransmits. Draining all
+     * pending datagrams in one pass lets the QUIC stack see
+     * them as a batch and respond with the next outbound burst
+     * in the same accept call.
      *
      * @param ConnectionAcceptor $acceptor unused for H3; the
      *      TCP-accept-and-TLS-handshake helper has no analogue
      *      in the QUIC datagram path
      * @param float $timeout maximum seconds to block (unused
      *      since the UDP socket is non-blocking)
-     * @return array [H3Connection|null, array|null]
+     * @return array [H3Connection|null, array|null] the first
+     *      new connection created during the drain, or null/null
+     *      if all datagrams were for existing connections (or
+     *      none were available)
      */
     public function accept($acceptor, $timeout)
     {
-        $peer = '';
-        $buf = @stream_socket_recvfrom($this->server, 65535, 0,
-            $peer);
-        if ($buf === false || $buf === '') {
-            return [null, null];
+        $first_new = null;
+        $first_context = null;
+        /*
+            Safety bound on datagrams per drain. A 1 MiB body
+            triggers tens of ACKs in burst; 4096 gives generous
+            headroom while preventing a pathologically chatty
+            client from monopolizing the event loop.
+         */
+        $max = 4096;
+        while ($max-- > 0) {
+            $peer = '';
+            $buf = @stream_socket_recvfrom($this->server, 65535, 0,
+                $peer);
+            if ($buf === false || $buf === '') {
+                break;
+            }
+            list($conn, $context) = $this->processDatagram($buf,
+                $peer);
+            if ($conn !== null && $first_new === null) {
+                $first_new = $conn;
+                $first_context = $context;
+            }
         }
+        if ($first_new !== null) {
+            return [$first_new, $first_context];
+        }
+        return [null, null];
+    }
+    /**
+     * Processes a single UDP datagram by parsing its QUIC header,
+     * routing it to an existing H3Connection if the DCID matches
+     * or creating a new H3Connection if the packet is an Initial
+     * for an unknown CID. Returns the new connection (and its
+     * context array) on the new-connection path; returns
+     * [null, null] for existing-connection traffic and for
+     * dropped or malformed datagrams.
+     *
+     * @param string $buf packet bytes
+     * @param string $peer peer "host:port" from recvfrom
+     * @return array [H3Connection|null, array|null]
+     */
+    protected function processDatagram($buf, $peer)
+    {
         $q = $this->ffi->ffi;
         $buf_len = strlen($buf);
         $buf_cdata = self::stringToCData($this->ffi, $buf);

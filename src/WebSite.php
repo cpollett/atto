@@ -1298,6 +1298,20 @@ class WebSite
         unset($this->timers[$timer_id]);
     }
     /**
+     * Returns the array of bound Listener objects so app code can
+     * introspect listener state (e.g. example 17's H3 stats route
+     * iterates the connection map on the H3 listener). Useful for
+     * diagnostic and admin endpoints; production apps generally
+     * do not need to touch this. The returned array is the live
+     * internal storage — callers should not mutate it.
+     *
+     * @return array<int,Listener> bound listeners
+     */
+    public function listeners()
+    {
+        return $this->listeners;
+    }
+    /**
      * Starts an Atto Web Server listening on one or more addresses,
      * then runs the event loop. Streams are non-blocking and traffic
      * detection uses stream_select (portable Unix select wrapper).

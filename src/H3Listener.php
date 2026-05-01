@@ -134,6 +134,39 @@ class H3FFI
         typedef struct {
             char opaque[320];
         } quiche_send_info;
+        typedef struct {
+            size_t recv;
+            size_t sent;
+            size_t lost;
+            size_t retrans;
+            uint64_t sent_bytes;
+            uint64_t recv_bytes;
+            uint64_t lost_bytes;
+            uint64_t stream_retrans_bytes;
+            size_t paths_count;
+            uint64_t reset_stream_count_local;
+            uint64_t stopped_stream_count_local;
+            uint64_t reset_stream_count_remote;
+            uint64_t stopped_stream_count_remote;
+        } quiche_stats;
+        typedef struct {
+            char addr_opaque[272];
+            uint64_t validation_state;
+            bool active;
+            char active_pad[7];
+            size_t recv;
+            size_t sent;
+            size_t lost;
+            size_t retrans;
+            uint64_t rtt;
+            size_t cwnd;
+            uint64_t sent_bytes;
+            uint64_t recv_bytes;
+            uint64_t lost_bytes;
+            uint64_t stream_retrans_bytes;
+            uint64_t pmtu;
+            uint64_t delivery_rate;
+        } quiche_path_stats;
         const char *quiche_version(void);
         quiche_config *quiche_config_new(uint32_t version);
         int quiche_config_load_cert_chain_from_pem_file(
@@ -199,6 +232,10 @@ class H3FFI
         bool quiche_conn_is_timed_out(const quiche_conn *conn);
         uint64_t quiche_conn_timeout_as_millis(const quiche_conn *conn);
         void quiche_conn_on_timeout(quiche_conn *conn);
+        void quiche_conn_stats(const quiche_conn *conn,
+            quiche_stats *out);
+        int quiche_conn_path_stats(const quiche_conn *conn,
+            size_t idx, quiche_path_stats *out);
         int quiche_conn_close(quiche_conn *conn, bool app,
             uint64_t err, const uint8_t *reason, size_t reason_len);
         ssize_t quiche_conn_stream_send(quiche_conn *conn,
@@ -1265,6 +1302,112 @@ class H3Listener extends Listener
         }
         unset($this->connections[$conn->scid_hex]);
         $conn->close();
+    }
+    /**
+     * Returns a snapshot of libquiche's transport-level counters
+     * for a single connection: packets/bytes sent, received,
+     * lost, retransmitted; reset/stopped stream counts; and the
+     * smoothed RTT, congestion window, and delivery rate from
+     * the active path. Useful for diagnosing perf issues
+     * (compare cwnd with what bench is throughput-limited at) or
+     * just confirming the connection is healthy.
+     *
+     * Returned array shape:
+     *   [
+     *     'cid'             => '<8 hex chars of scid>',
+     *     'state'           => 'pending'|'established'|'draining'|'closed',
+     *     'recv'            => int,    // packets received
+     *     'sent'            => int,    // packets sent
+     *     'lost'            => int,
+     *     'retrans'         => int,
+     *     'recv_bytes'      => int,
+     *     'sent_bytes'      => int,
+     *     'lost_bytes'      => int,
+     *     'paths_count'     => int,
+     *     'rtt_ms'          => float,  // active path RTT
+     *     'cwnd'            => int,    // congestion window in bytes
+     *     'pmtu'            => int,
+     *     'delivery_rate'   => int,    // bytes/sec
+     *   ]
+     *
+     * Returns null if the connection has been freed.
+     *
+     * @param H3Connection $conn the connection to snapshot
+     * @return array|null stats snapshot
+     */
+    public function getConnectionStats($conn)
+    {
+        if ($conn === null || $conn->quiche_conn === null) {
+            return null;
+        }
+        $q = $this->ffi->ffi;
+        $stats = $q->new('quiche_stats');
+        $q->quiche_conn_stats($conn->quiche_conn,
+            \FFI::addr($stats));
+        $state = 'pending';
+        if ($q->quiche_conn_is_closed($conn->quiche_conn)) {
+            $state = 'closed';
+        } else if ($q->quiche_conn_is_draining($conn->quiche_conn)) {
+            $state = 'draining';
+        } else if ($q->quiche_conn_is_established(
+                $conn->quiche_conn)) {
+            $state = 'established';
+        }
+        $out = [
+            'cid' => substr($conn->scid_hex, 0, 8),
+            'state' => $state,
+            'recv' => $stats->recv,
+            'sent' => $stats->sent,
+            'lost' => $stats->lost,
+            'retrans' => $stats->retrans,
+            'recv_bytes' => $stats->recv_bytes,
+            'sent_bytes' => $stats->sent_bytes,
+            'lost_bytes' => $stats->lost_bytes,
+            'paths_count' => $stats->paths_count,
+            'rtt_ms' => 0.0,
+            'cwnd' => 0,
+            'pmtu' => 0,
+            'delivery_rate' => 0,
+        ];
+        /*
+            Pull active-path stats (RTT, cwnd, pmtu, delivery)
+            from path index 0 if available. Returns < 0 if the
+            connection has no validated path (e.g. handshake
+            still in progress); leave the perf fields at zero
+            in that case.
+         */
+        if ($stats->paths_count > 0) {
+            $path = $q->new('quiche_path_stats');
+            $rc = $q->quiche_conn_path_stats($conn->quiche_conn,
+                0, \FFI::addr($path));
+            if ($rc === 0) {
+                $out['rtt_ms'] = $path->rtt / 1000000.0;
+                $out['cwnd'] = $path->cwnd;
+                $out['pmtu'] = $path->pmtu;
+                $out['delivery_rate'] = $path->delivery_rate;
+            }
+        }
+        return $out;
+    }
+    /**
+     * Returns stats for every currently-tracked connection on
+     * this listener. The result is a list (not keyed by CID
+     * since CIDs are sensitive) ordered by no particular sort
+     * key; callers that want stable ordering can sort by 'cid'
+     * or 'sent_bytes'.
+     *
+     * @return array list of getConnectionStats results
+     */
+    public function snapshotAllStats()
+    {
+        $out = [];
+        foreach ($this->connections as $conn) {
+            $stats = $this->getConnectionStats($conn);
+            if ($stats !== null) {
+                $out[] = $stats;
+            }
+        }
+        return $out;
     }
     /**
      * Sends a Version Negotiation packet to the peer when an

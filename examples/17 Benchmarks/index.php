@@ -100,6 +100,12 @@ $test->get('/', function () {
         white-space: pre; max-height: 12em; }
     .raw-toggle { color: #06c; cursor: pointer;
         text-decoration: underline; font-size: 0.85em; }
+    .endpoints { margin: 0.5em 0 1.5em; font-size: 0.9em;
+        color: #555; }
+    .endpoints summary { cursor: pointer; color: #06c; }
+    .endpoints ul { margin: 0.5em 0 0 0; padding-left: 1.5em; }
+    .endpoints li { margin: 0.3em 0; }
+    .endpoints code, .endpoints a { font-family: monospace; }
     #global_status { font-weight: bold; margin: 1em 0; }
 </style>
 </head>
@@ -111,6 +117,33 @@ $test->get('/', function () {
     Atto's single-threaded event loop &mdash; treat trends, not
     absolutes. <a href="/raw">Plain CLI output also available.</a>
 </p>
+<details class="endpoints">
+    <summary>Diagnostic endpoints</summary>
+    <ul>
+        <li><a href="/raw" target="_blank">/raw</a> &mdash;
+            current bench.php text output (what the dashboard
+            parses).</li>
+        <li><a href="/status" target="_blank">/status</a> &mdash;
+            JSON: bench progress + raw output (polled by the
+            dashboard while a run is in flight).</li>
+        <li><a href="/h3stats" target="_blank">/h3stats</a>
+            &mdash; JSON: libquiche transport-level counters
+            (sent / recv / lost / retrans / RTT / cwnd) for
+            every active H3 connection. Empty when libquiche
+            is missing or no H3 traffic has hit the server
+            yet. To populate: open
+            <a href="https://localhost:8443/" target="_blank">
+            https://localhost:8443/</a> in a browser that
+            speaks H3, then refresh /h3stats.</li>
+        <li><a href="/small" target="_blank">/small</a>,
+            <a href="/big" target="_blank">/big</a>,
+            <a href="/headers" target="_blank">/headers</a>,
+            <a href="/asset/1" target="_blank">/asset/{n}</a>
+            &mdash; the bench test endpoints. Hit them
+            directly with curl --http3-only to drive H3
+            traffic and watch /h3stats update.</li>
+    </ul>
+</details>
 <div id="controls">
     <button id="start_btn">Run benchmark</button>
     <label style="margin-left: 1em; font-size: 0.9em;
@@ -469,6 +502,33 @@ $test->post('/echo-post', function () use ($test) {
     $test->header("Content-Type: application/octet-stream");
     $test->header("Content-Length: " . strlen($body));
     echo $body;
+});
+$test->get('/h3stats', function () use ($test) {
+    /*
+        Returns a JSON snapshot of libquiche's transport-level
+        counters (sent, recv, lost, retrans, RTT, cwnd) for
+        every currently-tracked H3 connection on this server.
+        Returns an empty list if no H3 listener is bound (e.g.
+        libquiche missing) or no H3 connections are active.
+
+        Useful for diagnosing H3 perf: compare cwnd against the
+        bench's observed throughput, or look for non-zero lost
+        / retrans counters. This route is GET so it can be hit
+        from any browser / curl / dashboard fetch.
+     */
+    $test->header("Content-Type: application/json");
+    $stats = [];
+    foreach ($test->listeners() as $listener) {
+        if ($listener instanceof seekquarry\atto\H3Listener) {
+            foreach ($listener->snapshotAllStats() as $row) {
+                $stats[] = $row;
+            }
+        }
+    }
+    echo json_encode([
+        'connections' => count($stats),
+        'stats' => $stats,
+    ], JSON_PRETTY_PRINT);
 });
 if ($test->isCli()) {
     /*

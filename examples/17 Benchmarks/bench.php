@@ -87,7 +87,7 @@ if (php_sapi_name() !== 'cli') {
     functions that have been no-ops since 8.0; we don't call them
     anymore but third-party extensions may.
  */
-error_reporting(E_ALL & ~E_DEPRECATED & ~E_STRICT);
+error_reporting(E_ALL & ~E_DEPRECATED);
 
 $opts = parseArgs($argv);
 if (!empty($opts['help'])) {

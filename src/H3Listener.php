@@ -1583,7 +1583,22 @@ class H3Transport extends Transport
         }
         $this->sendResponse($listener, $conn, $stream_id, $status,
             $headers, $body);
-        unset($conn->streams[$stream_id]);
+        /*
+            Do NOT unset the stream entry here. sendResponse may
+            have stashed an unsent body tail in pending_body if
+            quiche_h3_send_body could not accept the whole body
+            in one call (which is normal for any response larger
+            than the initial congestion window: ~14 KiB). The
+            tail is drained over subsequent ACK-triggered drive
+            cycles by flushAllPendingBodies, which iterates
+            $conn->streams looking for non-empty pending_body.
+            Removing the stream here would discard the tail and
+            the client would hang forever waiting for body data
+            that is never sent. Per-stream cleanup happens later
+            in flushPendingBody once the body fully drains; the
+            'dispatched' flag prevents re-dispatch even if the
+            stream entry sticks around.
+         */
     }
     /**
      * Builds an H1/H2-style $context array from the captured H3

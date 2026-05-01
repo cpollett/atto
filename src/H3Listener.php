@@ -1143,12 +1143,25 @@ class H3Listener extends Listener
         return [null, null];
     }
     /**
-     * Calls quiche_conn_on_timeout on every tracked connection,
-     * then reaps any that have transitioned to closed / draining /
-     * timed-out as a result. Catches connections that are stuck
-     * mid-handshake (orphans from client connection-racing) and
-     * connections whose idle timer just expired but never received
-     * a triggering packet.
+     * Calls quiche_conn_on_timeout on every tracked connection
+     * whose internal timer has actually expired, drains any
+     * outbound packets the timeout queued (PTO retransmissions
+     * and the like), then reaps any that have transitioned to
+     * closed / draining / timed-out as a result. Catches stuck
+     * connections like idle-timed-out and probe-timed-out
+     * connections that wouldn't otherwise advance because they
+     * receive no further inbound packets.
+     *
+     * Only calls on_timeout when timeout_as_millis() returns 0,
+     * which is quiche's signal that a timer has expired and
+     * processing is needed. Calling on_timeout when no timer
+     * fired is documented as safe but historically has been a
+     * source of subtle state corruption in older libquiche
+     * versions; gating on the millis check is the conservative
+     * choice. quiche_conn_send must be drained after every
+     * on_timeout call because PTO retransmissions and idle ACK-
+     * eliciting probes are queued internally and only flushed
+     * by the next quiche_conn_send loop.
      *
      * Also forcibly reaps connections that have been alive for
      * more than STALE_HANDSHAKE_SECS without completing the QUIC
@@ -1170,10 +1183,15 @@ class H3Listener extends Listener
                 unset($this->connections[$scid_hex]);
                 continue;
             }
-            $q->quiche_conn_on_timeout($conn->quiche_conn);
-            $this->reapIfClosed($conn);
-            if (!isset($this->connections[$scid_hex])) {
-                continue;
+            $millis = (int) $q->quiche_conn_timeout_as_millis(
+                $conn->quiche_conn);
+            if ($millis === 0) {
+                $q->quiche_conn_on_timeout($conn->quiche_conn);
+                $this->drainConnection($conn);
+                $this->reapIfClosed($conn);
+                if (!isset($this->connections[$scid_hex])) {
+                    continue;
+                }
             }
             $age = $now - $conn->created_at;
             if ($age > self::STALE_HANDSHAKE_SECS

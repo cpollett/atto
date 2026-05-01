@@ -697,13 +697,35 @@ class GopherSite
         }
     }
     /**
-     * Converts a string with some lines involving gopher links, but all
-     * other lines not in gopher format. Adds an i at the start of non-gopher
-     * lines and adds necessary fake data and tabs as end. Line endings
-     * for all lines are stripped and replaced with CRLF.
+    /**
+     * Wraps a route's plain echo'd output in canonical Gopher menu
+     * framing. Lines that already look like a Gopher record (start
+     * with a known type character followed eventually by a tab) are
+     * passed through with their LF normalized to CRLF; anything else
+     * is treated as informational text and emitted as a type-i line
+     * with placeholder host/port fields appended.
      *
-     * @param string $data to be converted into gopher output
-     * @return string data completely in gopher output
+     * Embedded TAB and CR/LF bytes inside an info line's text are
+     * replaced with spaces before composing the i-line. Without that
+     * scrubbing, a route that echoes attacker-controlled text (e.g.
+     * the contents of a search query, a forum post subject, or any
+     * external string interpolated into the page body) could let the
+     * attacker close the i-line early and inject extra menu records
+     * by smuggling a literal tab into the text. Already-formatted
+     * type lines are passed through unscrubbed: if a route author
+     * is composing its own type line and embedded a stray tab, the
+     * output is still well-framed because the line was deliberately
+     * tab-delimited to begin with.
+     *
+     * The output is always terminated with a "." sentinel line per
+     * RFC 1436 sec 3.8. This is correct for menu (type 1), text
+     * (type 0), and search response (type 7) replies. Routes that
+     * serve binary types (5, 9, g, I, s, ...) MUST be registered
+     * with raw=true so this method is bypassed; otherwise the
+     * trailing period would corrupt the binary stream.
+     *
+     * @param string $data plain echo output from the route handler
+     * @return string complete Gopher-framed output ready to send
      */
     protected function gopherize($data)
     {
@@ -712,13 +734,15 @@ class GopherSite
             array_pop($lines);
         }
         $out = "";
-        $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+',
-            'g','I','T', 'h', 'i', 's'];
+        $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8',
+            '9', '+', 'g', 'I', 'M', 'T', 'h', 'i', 's'];
+        $strip = ["\t" => " ", "\r" => " ", "\n" => " ", "\0" => ""];
         foreach ($lines as $line) {
             $first = (empty($line)) ? "\0" : $line[0];
             if (!in_array($first, $line_starts) ||
                 strpos($line, "\x09") === false) {
-                $out .= "i" . $line .
+                $safe_line = strtr($line, $strip);
+                $out .= "i" . $safe_line .
                     $this->default_server_globals['INFORMATION_EOL'];
             } else {
                 $out .= rtrim($line, "\x0A") . "\x0D\x0A";
@@ -956,7 +980,21 @@ class GopherSite
         foreach ($out_streams_with_data as $out_stream) {
             $key = (int)$out_stream;
             $data = $this->out_streams[self::DATA][$key];
-            $num_bytes = fwrite($out_stream, $data);
+            $num_bytes = @fwrite($out_stream, $data);
+            /*
+                fwrite returns false on a closed/broken pipe, and
+                returns 0 if the kernel send buffer is full. The
+                previous code coerced false through max(0, len - false)
+                = len, which kept the stream around forever sending
+                zero bytes per loop until cullDeadStreams hit the
+                CONNECTION_TIMEOUT. Treat false as a hard error and
+                shut the stream down immediately so the descriptor
+                is freed for the next client.
+             */
+            if ($num_bytes === false) {
+                $this->shutdownGopherStream($key);
+                continue;
+            }
             $remaining_bytes = max(0, strlen($data) - $num_bytes);
             if ($num_bytes > 0) {
                 $this->out_streams[self::DATA][$key] =
@@ -1038,17 +1076,41 @@ class GopherSite
         $_REQUEST = $_GET;
     }
     /**
-     * Outputs Gopher error response message in the case that no specific error
-     * handler was set
+     * Outputs Gopher error response message in the case that no specific
+     * error handler was set. Emits a type-3 error line plus a single
+     * info line, terminated by the menu period sentinel.
      *
-     * @param string $route the route of the error. Internally, when an Gopher
-     *      error occurs it is usually given a route of the form /response code.
-     *      For example, /404 for a NOT FOUND error.
+     * The route string is interpolated into the display text, so it
+     * must be stripped of tab and CR/LF characters first; otherwise a
+     * crafted selector like "/x\tfake\thost\t70\r\n0evil..." would
+     * inject extra menu lines past the error and let an attacker
+     * counterfeit menu entries on the error page.
+     *
+     * @param string $route the route of the error. Internally, when an
+     *      Gopher error occurs it is usually given a route of the form
+     *      /response code. For example, /404 for a NOT FOUND error.
      */
     protected function defaultErrorHandler($route = "")
     {
-        echo "3 '$route' doesn't exist\tfake\t\0\t0\r\n";
-        echo "i This resource cannot be located.\tfake\t\0\t0\r\n";
+        $safe_route = strtr((string) $route,
+            ["\t" => " ", "\r" => " ", "\n" => " ", "\0" => " "]);
+        /*
+            $_SERVER is populated for the in-flight request by
+            setGlobals before process() dispatches; SERVER_NAME and
+            SERVER_PORT are guaranteed there. Fall back to defaults
+            only for the ERROR path that runs before any request
+            context has been installed (e.g. the 400 BAD REQUEST
+            short-circuit), where $_SERVER may still hold values
+            from a previous request.
+         */
+        $host = $_SERVER['SERVER_NAME']
+            ?? ($this->default_server_globals['SERVER_NAME']
+                ?? 'localhost');
+        $port = $_SERVER['SERVER_PORT']
+            ?? ($this->default_server_globals['SERVER_PORT']
+                ?? 70);
+        echo "3'$safe_route' doesn't exist\tfake\t$host\t$port\r\n";
+        echo "iThis resource cannot be located.\tfake\t$host\t$port\r\n";
         echo ".\r\n";
     }
     /**
@@ -1139,19 +1201,46 @@ class GopherSite
     }
 }
 /**
- * Used to create a gopher link line corresponding to a uri and the provided
- * link text.
+ * Composes a single gopher menu-line selector for the current site
+ * or for an external gopher / web destination.
  *
- * @param string $uri either a selector for the current gopher site or
- *      complete uri to either another gopher site or web url.
- * @param string $link_text the text that will appear in the hyperlink
+ * Returns one menu line in the canonical RFC 1436 form
+ *      <type><display>\t<selector>\t<host>\t<port>
+ * surrounded by leading/trailing newlines so the line is its own
+ * record in the menu when emitted from a route's echo'd output.
+ *
+ * The display text and selector are stripped of TAB and CR/LF
+ * characters before composing the line. Without that scrubbing, a
+ * caller who passes attacker-controlled bytes (for instance, a
+ * forum's user-entered subject line being rendered as a link
+ * label) could break the four-tab framing and inject extra menu
+ * entries that look as if they came from this server (the gopher
+ * equivalent of HTTP response splitting).
+ *
+ * For URIs whose scheme is http or https the link is rewritten as
+ * a Gopher type-h pointer with a "URL:" selector prefix. This is
+ * the Floodgap convention and how every modern gopher client
+ * (Lynx, Overbite, Castor) renders web links from a gopher menu.
+ * The host and port advertised for the h-link are this server's
+ * own host and port (the URL: selector is opaque to the gopher
+ * server; the client extracts the URL itself and follows it
+ * directly), NOT the external URL's port. Earlier versions of
+ * this function leaked the gopher default 70 here; the fix
+ * resolves the port to default_port AFTER the scheme rewrite.
+ *
+ * @param string $uri either a bare selector for the current
+ *      gopher site (e.g. /bio.txt or /1/news for an explicit
+ *      menu type), a full gopher:// URI, or an http(s):// URI
+ * @param string $link_text the display text shown to the user
+ * @return string a single menu line ready to concatenate into a
+ *      route's gopher-format response
  */
 function link($uri, $link_text)
 {
-    $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+',
-        'g','I','T', 'h', 'i', 's'];
+    $line_starts = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+        '+', 'g', 'I', 'M', 'T', 'h', 'i', 's'];
     $uri_parts = parse_url($uri);
-    $link_type = 1;
+    $link_type = '1';
     if (empty($uri_parts['path'])) {
         $path = "/";
     } else {
@@ -1164,19 +1253,30 @@ function link($uri, $link_text)
     }
     $host = empty($uri_parts['host']) ? $_SERVER['SERVER_NAME'] :
         $uri_parts['host'];
-    $default_port = ($host == $_SERVER['SERVER_NAME']) ?
-        $_SERVER['SERVER_PORT'] : 70;
-    $port = empty($uri_parts['port']) ? $default_port :
-        $uri_parts['port'];
-    if (!empty($uri_parts['scheme']) &&in_array($uri_parts['scheme'],
+    if (!empty($uri_parts['scheme']) && in_array($uri_parts['scheme'],
         ['http', 'https'])) {
         $link_type = "h";
         $path = "URL:$uri";
         $host = $_SERVER['SERVER_NAME'];
-        $port = $default_port;
     }
-    return \PHP_EOL . $link_type . $link_text . "\t" . $path . "\t" . $host .
-        "\t" . $port . \PHP_EOL;
+    /*
+        Resolve the port AFTER the scheme rewrite above. For h-type
+        web links we have just rewritten the host back to this
+        server's name; using the parsed external URL's port (or 70
+        as the gopher default) here would produce a menu line that
+        points to this server's name on the wrong port. Compute
+        default_port from the now-final host so same-host links use
+        SERVER_PORT and external gopher links fall back to 70.
+     */
+    $default_port = ($host == $_SERVER['SERVER_NAME']) ?
+        $_SERVER['SERVER_PORT'] : 70;
+    $port = (empty($uri_parts['port']) || $link_type === 'h') ?
+        $default_port : $uri_parts['port'];
+    $strip = ["\t" => " ", "\r" => " ", "\n" => " ", "\0" => ""];
+    $safe_text = strtr((string) $link_text, $strip);
+    $safe_path = strtr((string) $path, $strip);
+    return \PHP_EOL . $link_type . $safe_text . "\t" . $safe_path .
+        "\t" . $host . "\t" . $port . \PHP_EOL;
 }
 
 /**

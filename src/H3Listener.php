@@ -813,6 +813,17 @@ class H3Listener extends Listener
         }
         self::$trace_handle = $fh;
         self::$trace_start = microtime(true);
+        /*
+            Write a marker line at activation time, flushed
+            immediately. Confirms the file is openable and
+            writable before any actual H3 traffic happens, so
+            an operator who tails the file or stat's it after
+            startup can tell tracing is live without waiting
+            for an inbound packet.
+         */
+        @fwrite($fh, sprintf("H3TRACE %8.3f START pid=%d\n",
+            0.0, getmypid()));
+        @fflush($fh);
         return true;
     }
     /**
@@ -832,6 +843,13 @@ class H3Listener extends Listener
      * the wall-clock offset since traceTo was first called.
      * No-op if tracing is disabled (single isset check).
      *
+     * Each line is flushed to disk immediately so an operator
+     * can tail the file in real time during a long-running
+     * connection. Per-line flush adds a syscall but the
+     * overhead is in the noise compared to the FFI calls
+     * surrounding each event, and the live-tail visibility is
+     * worth it for the diagnostic use case.
+     *
      * @param string $event short event tag (RECV / DRAIN / etc.)
      * @param array $kv key/value pairs to log
      */
@@ -848,6 +866,7 @@ class H3Listener extends Listener
         @fwrite(self::$trace_handle, sprintf(
             "H3TRACE %8.3f %s %s\n",
             $offset, $event, implode(' ', $parts)));
+        @fflush(self::$trace_handle);
     }
     /**
      * Constructs an H3Listener. Most callers should use

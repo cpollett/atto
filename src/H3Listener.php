@@ -1634,21 +1634,31 @@ class H3Transport extends Transport
         $this->sendResponse($listener, $conn, $stream_id, $status,
             $headers, $body);
         /*
-            Do NOT unset the stream entry here. sendResponse may
-            have stashed an unsent body tail in pending_body if
-            quiche_h3_send_body could not accept the whole body
-            in one call (which is normal for any response larger
-            than the initial congestion window: ~14 KiB). The
+            Stream cleanup is conditional. sendResponse stashes
+            any unsent body tail into pending_body when
+            quiche_h3_send_body cannot accept the full body in
+            one call (which is normal for any response larger
+            than the initial congestion window: ~14 KiB). That
             tail is drained over subsequent ACK-triggered drive
             cycles by flushAllPendingBodies, which iterates
             $conn->streams looking for non-empty pending_body.
-            Removing the stream here would discard the tail and
-            the client would hang forever waiting for body data
-            that is never sent. Per-stream cleanup happens later
-            in flushPendingBody once the body fully drains; the
-            'dispatched' flag prevents re-dispatch even if the
-            stream entry sticks around.
+            If we removed the stream here while pending_body was
+            still non-empty, the tail would be discarded and the
+            client would hang forever waiting for body data that
+            is never sent.
+
+            For responses that fit in one quiche_h3_send_body
+            call (small bodies, zero-byte bodies), pending_body
+            is already empty by the time sendResponse returns,
+            so we can clean up immediately. The same cleanup
+            also happens in flushPendingBody once a long-running
+            response finally drains.
          */
+        if (isset($conn->streams[$stream_id])
+            && ($conn->streams[$stream_id]['pending_body'] ?? '')
+                === '') {
+            unset($conn->streams[$stream_id]);
+        }
     }
     /**
      * Builds an H1/H2-style $context array from the captured H3
@@ -1856,20 +1866,28 @@ class H3Transport extends Transport
                 QUICHE_H3_ERR_DONE / QUICHE_ERR_DONE means the
                 stream is currently flow-control-blocked. Keep
                 pending_body intact and retry later; a fatal
-                error (anything else negative) just drops the
-                remainder since the stream is gone.
+                error (anything else negative) means the stream
+                is gone, so drop the remainder and clean up the
+                stream entry.
              */
             if ($written !== H3FFI::QUICHE_ERR_DONE) {
-                $conn->streams[$stream_id]['pending_body'] = '';
+                unset($conn->streams[$stream_id]);
             }
             return false;
         }
         if ($written >= $len) {
-            $conn->streams[$stream_id]['pending_body'] = '';
-        } else {
-            $conn->streams[$stream_id]['pending_body']
-                = substr($pending, $written);
+            /*
+                Full body accepted. Stream is done from atto's
+                perspective: quiche owns the in-flight bytes
+                and any retransmission. Remove the entry so
+                $conn->streams does not grow without bound on
+                long-lived connections handling many requests.
+             */
+            unset($conn->streams[$stream_id]);
+            return true;
         }
+        $conn->streams[$stream_id]['pending_body']
+            = substr($pending, $written);
         return true;
     }
     /**

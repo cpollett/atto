@@ -1,9 +1,8 @@
 <?php
 /**
- * seekquarry\atto\MailSite -- a small STMP and Mail server and routing engine
+ * seekquarry\atto\MailSite -- a single-file SMTP and IMAP mail server
  *
- *
- * Copyright (C) 2017  Chris Pollett chris@pollett.org
+ * Copyright (C) 2017-2026  Chris Pollett chris@pollett.org
  *
  * LICENSE:
  *
@@ -25,1613 +24,1750 @@
  * @author Chris Pollett chris@pollett.org
  * @license http://www.gnu.org/licenses/ GPL-3.0-or-later
  * @link http://www.seekquarry.com/
- * @copyright 2017
+ * @copyright 2017-2026
  * @filesource
  */
-
 namespace seekquarry\atto;
 
 /**
- * A single file, low dependency, pure PHP mail server and routing engine
- * class.
+ * Abstract base for password / identity backends used by MailSite.
  *
- * This software can be used to serve mail apps. It is request
- * event-driven, supporting asynchronous I/O for mail traffic. It also
- * supports timers for background events. It automatically sets up
- * subperglobals such as $_REQUEST and $_SERVER which can be useful in
- * processing requests.
+ * A concrete Authenticator answers two questions: "does this user
+ * exist?" and "is this candidate password valid for this user?".
+ * The default verifyPassword path uses password_verify against a
+ * hash returned by getPasswordHash, which keeps subclasses small:
+ * a flat-file or DB-backed Authenticator only needs to implement
+ * userExists and getPasswordHash. A subclass can override
+ * verifyPassword directly when the backend cannot expose hashes
+ * (e.g. when delegating to PAM, LDAP bind, or an external HTTP
+ * auth endpoint that only returns yes/no).
+ *
+ * Implementations should treat usernames case-insensitively for
+ * lookup but preserve the case the user typed when echoing it
+ * back (this matches what most mail clients expect).
+ */
+abstract class Authenticator
+{
+    /**
+     * Returns whether a user account exists in this backend. Used
+     * by the SMTP path to decide whether RCPT TO addresses for
+     * local domains are deliverable, independent of authentication
+     * (an unauthenticated remote can deliver TO a local user but
+     * cannot deliver FROM one).
+     *
+     * @param string $username the local part of an email address
+     *      or the bare username supplied at AUTH/LOGIN time
+     * @return bool true if the user is known to this backend
+     */
+    abstract public function userExists($username);
+    /**
+     * Returns the password hash stored for this user, in the form
+     * accepted by PHP's password_verify. The default
+     * verifyPassword implementation uses this. Subclasses that
+     * cannot expose a hash should override verifyPassword instead
+     * and may make this throw or return false.
+     *
+     * @param string $username the username to look up
+     * @return string|false the hash, or false if user not found
+     */
+    abstract public function getPasswordHash($username);
+    /**
+     * Default password check: load the stored hash and use
+     * password_verify, which is constant-time and handles the
+     * stored algorithm/cost parameters embedded in the hash. A
+     * non-existent user gets the same kind of negative answer as
+     * a wrong password without leaking the difference through
+     * timing, by running password_verify against a fixed dummy
+     * hash so the work factor is paid either way.
+     *
+     * @param string $username
+     * @param string $password the candidate plaintext password
+     * @return bool true on success
+     */
+    public function verifyPassword($username, $password)
+    {
+        $hash = $this->getPasswordHash($username);
+        if ($hash === false || $hash === null || $hash === "") {
+            /*
+                Burn a password_verify call against a known-good
+                dummy hash so a missing user takes about the same
+                wall-clock time as a wrong password. The exact
+                hash value here is irrelevant; what matters is
+                that it is a real bcrypt hash so the cost factor
+                is paid.
+             */
+            password_verify($password,
+                '$2y$10$abcdefghijklmnopqrstuv1234567890ABCDEFGHIJKLMNOPQ.');
+            return false;
+        }
+        return password_verify($password, $hash);
+    }
+}
+/**
+ * Authenticator backed by a flat file in "user:bcrypt-hash" form,
+ * one record per line. The format is identical to Apache htpasswd
+ * with the bcrypt option, so the same htpasswd -B tool can be
+ * used to create or update accounts. Comments (lines beginning
+ * with #) and blank lines are ignored.
+ *
+ * The file is loaded lazily on first access and cached for the
+ * lifetime of the process; long-running mail servers should call
+ * reload() after editing the file out-of-band, or register a
+ * SIGHUP handler that calls reload(). For small deployments (a
+ * handful of users on a personal server) the default lazy-load
+ * behavior is enough.
+ */
+class FileAuthenticator extends Authenticator
+{
+    protected $path;
+    protected $users;
+    /**
+     * @param string $path path to the password file
+     */
+    public function __construct($path)
+    {
+        $this->path = $path;
+        $this->users = null;
+    }
+    /**
+     * Forces a re-read of the password file on next lookup.
+     * Useful after editing accounts with htpasswd while the
+     * server is running.
+     */
+    public function reload()
+    {
+        $this->users = null;
+    }
+    public function userExists($username)
+    {
+        $this->load();
+        return isset($this->users[strtolower($username)]);
+    }
+    public function getPasswordHash($username)
+    {
+        $this->load();
+        $key = strtolower($username);
+        return isset($this->users[$key]) ? $this->users[$key] :
+            false;
+    }
+    /**
+     * Reads the password file into the in-memory map keyed by
+     * lowercased username. Silently skips malformed lines and
+     * comments rather than aborting; a typo in one record should
+     * not lock everyone out.
+     */
+    protected function load()
+    {
+        if ($this->users !== null) {
+            return;
+        }
+        $this->users = [];
+        if (!is_file($this->path) || !is_readable($this->path)) {
+            return;
+        }
+        $lines = file($this->path,
+            FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($lines === false) {
+            return;
+        }
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === "" || $line[0] === '#') {
+                continue;
+            }
+            $colon = strpos($line, ':');
+            if ($colon === false) {
+                continue;
+            }
+            $user = trim(substr($line, 0, $colon));
+            $hash = trim(substr($line, $colon + 1));
+            if ($user === "" || $hash === "") {
+                continue;
+            }
+            $this->users[strtolower($user)] = $hash;
+        }
+    }
+}
+/**
+ * Abstract storage backend for mail folders and messages.
+ *
+ * The interface is shaped around what IMAP4rev1 needs but is
+ * directly callable from any context (a web frontend, a CLI
+ * tool, a cron job that imports mbox), not just from inside the
+ * IMAP command parser. UIDs are per-user and monotonic across
+ * the whole account: a message keeps its UID when moved between
+ * folders, which is what IMAP UIDPLUS clients assume.
+ *
+ * Folder names use "/" as the hierarchy delimiter. The reserved
+ * folder INBOX always exists for every user and cannot be
+ * deleted or renamed.
+ *
+ * Flags are the seven RFC 3501 system flags (\Seen, \Answered,
+ * \Flagged, \Deleted, \Draft, plus the session-only \Recent) and
+ * arbitrary user-defined keywords. Storage should accept any
+ * string flag and round-trip it; clients filter for what they
+ * understand.
+ *
+ * Methods are synchronous and may do disk or network I/O. They
+ * are not safe to call from inside the event loop's hot path
+ * unless the backend is in-memory; concrete file/DB backends
+ * assume the IMAP/SMTP command parser is the only caller and
+ * accepts the latency.
+ */
+abstract class MailStorage
+{
+    /**
+     * Provision storage for a user, creating the user's INBOX
+     * and any per-user metadata. Idempotent: calling on an
+     * existing user is a no-op and returns true.
+     *
+     * @param string $user the username (no @domain)
+     * @return bool true on success
+     */
+    abstract public function ensureUser($user);
+    /**
+     * Returns the list of folder names for this user, including
+     * INBOX. Names are returned with their full hierarchy path
+     * (e.g. "Archive/2026").
+     *
+     * @param string $user
+     * @return array list of folder name strings
+     */
+    abstract public function listFolders($user);
+    /**
+     * Creates a new folder. Idempotent: creating an existing
+     * folder returns true without error.
+     *
+     * @param string $user
+     * @param string $folder e.g. "Archive/2026/Q1"
+     * @return bool true on success
+     */
+    abstract public function createFolder($user, $folder);
+    /**
+     * Deletes a folder and all messages in it. Refuses to
+     * delete INBOX and refuses to delete a folder that has
+     * subfolders (the IMAP convention; clients delete subtrees
+     * recursively).
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool true on success
+     */
+    abstract public function deleteFolder($user, $folder);
+    /**
+     * Renames a folder. Refuses to rename INBOX (per RFC 3501
+     * the rename of INBOX has special semantics; we choose the
+     * simpler "no" answer instead).
+     *
+     * @param string $user
+     * @param string $old
+     * @param string $new
+     * @return bool true on success
+     */
+    abstract public function renameFolder($user, $old, $new);
+    /**
+     * Returns whether the named folder exists for this user.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool
+     */
+    abstract public function folderExists($user, $folder);
+    /**
+     * Stores a new message and returns its assigned UID.
+     *
+     * @param string $user
+     * @param string $folder destination folder; will be auto-
+     *      created if missing
+     * @param string $bytes the full RFC 5322 message including
+     *      headers and body, with CRLF line endings
+     * @param array $flags initial flag set (e.g. ['\Recent'])
+     * @param int $internal_date Unix timestamp; 0 for "now"
+     * @return int|false the new UID, or false on failure
+     */
+    abstract public function appendMessage($user, $folder, $bytes,
+        $flags = [], $internal_date = 0);
+    /**
+     * Returns the raw RFC 5322 bytes of a message, or false if
+     * not found.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @return string|false
+     */
+    abstract public function fetchMessage($user, $folder, $uid);
+    /**
+     * Returns metadata for every message in a folder, sorted
+     * ascending by UID. Each entry is an associative array with
+     * keys: uid (int), size (int), flags (array of strings),
+     * internal_date (int unix ts).
+     *
+     * @param string $user
+     * @param string $folder
+     * @return array list of message metadata records
+     */
+    abstract public function listMessages($user, $folder);
+    /**
+     * Returns metadata for one message: same shape as one entry
+     * of listMessages, or false if not found.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @return array|false
+     */
+    abstract public function messageMeta($user, $folder, $uid);
+    /**
+     * Replaces the flag set for a message. Pass an empty array
+     * to clear all flags.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @param array $flags
+     * @return bool
+     */
+    abstract public function setFlags($user, $folder, $uid, $flags);
+    /**
+     * Permanently removes every message in $folder that has the
+     * \Deleted flag set. Returns the UIDs that were removed.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return array list of expunged UIDs
+     */
+    abstract public function expunge($user, $folder);
+    /**
+     * Moves a message from one folder to another. The UID is
+     * preserved (UIDs are per-user, not per-folder).
+     *
+     * @param string $user
+     * @param string $from
+     * @param string $to
+     * @param int $uid
+     * @return bool
+     */
+    abstract public function moveMessage($user, $from, $to, $uid);
+    /**
+     * Returns the message count for the named folder.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
+    abstract public function messageCount($user, $folder);
+    /**
+     * Returns the UIDVALIDITY value for a folder. IMAP clients
+     * cache this and discard their local cache when it changes;
+     * we issue one stable value per user account over its
+     * lifetime.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
+    abstract public function uidValidity($user, $folder);
+    /**
+     * Returns the UID that will be assigned to the next message
+     * appended (predicted, may not match reality under concurrent
+     * appends).
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
+    abstract public function uidNext($user, $folder);
+}
+/**
+ * Filesystem-backed MailStorage. Directory layout under the
+ * configured base path:
+ *
+ *      $base/
+ *          users/
+ *              <username>/
+ *                  .uidvalidity   (single integer, fixed at create)
+ *                  .uidnext       (single integer, monotonic)
+ *                  INBOX/
+ *                      <uid>.eml
+ *                      <uid>.flags    (one flag per line)
+ *                      <uid>.date     (single integer unix ts)
+ *                  <folder1>/
+ *                  <folder2>/...
+ *
+ * Folder hierarchy is encoded by replacing "/" in folder names
+ * with "%2F" at the directory-name level, so "Archive/2026" maps
+ * to a single directory "Archive%2F2026" rather than nested
+ * ones. This avoids a class of edge cases where a parent folder
+ * both holds messages and contains subfolders.
+ *
+ * Concurrent writes are handled by allocating UIDs through a
+ * file-locked counter file; concurrent reads of message bodies
+ * are safe because filenames are immutable once written. The
+ * append path writes via a temp-then-rename so a partial write
+ * does not produce a half-message visible to readers.
+ */
+class FileMailStorage extends MailStorage
+{
+    protected $base;
+    /**
+     * @param string $base directory under which the "users/"
+     *      subtree is created
+     */
+    public function __construct($base)
+    {
+        $this->base = rtrim($base, "/\\");
+    }
+    /**
+     * Returns the absolute directory path for a user's account.
+     * Does not check existence.
+     */
+    protected function userDir($user)
+    {
+        return $this->base . DIRECTORY_SEPARATOR . "users" .
+            DIRECTORY_SEPARATOR . $this->safeName($user);
+    }
+    /**
+     * Returns the absolute directory path for a folder. Folder
+     * names are encoded so "/" in a folder name becomes "%2F" in
+     * the directory name.
+     */
+    protected function folderDir($user, $folder)
+    {
+        $folder = $this->normalizeFolder($folder);
+        $encoded = rawurlencode($folder);
+        return $this->userDir($user) . DIRECTORY_SEPARATOR .
+            $encoded;
+    }
+    /**
+     * Strips path separators and dot-prefixed components from a
+     * username so it can be used as a directory name without
+     * letting a crafted username escape the user-tree base. Mail
+     * usernames in the wild use [A-Za-z0-9._-]; we accept that
+     * set and normalize the rest to underscore.
+     */
+    protected function safeName($user)
+    {
+        $user = (string) $user;
+        $user = preg_replace('/[^A-Za-z0-9._-]/', '_', $user);
+        $user = ltrim($user, '.');
+        if ($user === "" || $user === "_") {
+            $user = "_invalid_";
+        }
+        return $user;
+    }
+    /**
+     * Canonicalizes a folder path: collapses repeated slashes,
+     * strips leading/trailing slashes, and rejects "." or ".."
+     * components. INBOX is normalized to all-uppercase per RFC
+     * 3501. Throws on invalid input.
+     */
+    protected function normalizeFolder($folder)
+    {
+        $folder = (string) $folder;
+        $folder = trim($folder, "/");
+        if ($folder === "") {
+            return "INBOX";
+        }
+        if (strcasecmp($folder, "INBOX") === 0) {
+            return "INBOX";
+        }
+        $parts = preg_split('#/+#', $folder);
+        $clean = [];
+        foreach ($parts as $p) {
+            if ($p === "" || $p === "." || $p === "..") {
+                throw new \InvalidArgumentException(
+                    "invalid folder component: '$p'");
+            }
+            $clean[] = $p;
+        }
+        return implode("/", $clean);
+    }
+    public function ensureUser($user)
+    {
+        $dir = $this->userDir($user);
+        if (!is_dir($dir) && !@mkdir($dir, 0700, true)) {
+            return false;
+        }
+        $uidvalidity_file = $dir . DIRECTORY_SEPARATOR .
+            ".uidvalidity";
+        if (!is_file($uidvalidity_file)) {
+            /*
+                UIDVALIDITY must be a 32-bit unsigned int that
+                strictly increases across recreations of the
+                folder. time() at account creation is the standard
+                trick: monotonic per-user across deletes and fits
+                in 32 bits until 2106.
+             */
+            file_put_contents($uidvalidity_file, (string) time());
+        }
+        $uidnext_file = $dir . DIRECTORY_SEPARATOR . ".uidnext";
+        if (!is_file($uidnext_file)) {
+            file_put_contents($uidnext_file, "1");
+        }
+        $this->createFolder($user, "INBOX");
+        return true;
+    }
+    public function listFolders($user)
+    {
+        $dir = $this->userDir($user);
+        if (!is_dir($dir)) {
+            return [];
+        }
+        $folders = [];
+        $entries = @scandir($dir);
+        if ($entries === false) {
+            return [];
+        }
+        foreach ($entries as $entry) {
+            if ($entry === "." || $entry === ".." ||
+                $entry[0] === ".") {
+                /*
+                    Hide dotfiles such as .uidvalidity and
+                    .uidnext from the folder listing; they are
+                    metadata, not folders.
+                 */
+                continue;
+            }
+            $sub = $dir . DIRECTORY_SEPARATOR . $entry;
+            if (is_dir($sub)) {
+                $folders[] = rawurldecode($entry);
+            }
+        }
+        sort($folders);
+        return $folders;
+    }
+    public function createFolder($user, $folder)
+    {
+        $folder = $this->normalizeFolder($folder);
+        $path = $this->folderDir($user, $folder);
+        if (is_dir($path)) {
+            return true;
+        }
+        if (!is_dir($this->userDir($user))) {
+            $this->ensureUser($user);
+        }
+        return @mkdir($path, 0700, true);
+    }
+    public function deleteFolder($user, $folder)
+    {
+        $folder = $this->normalizeFolder($folder);
+        if ($folder === "INBOX") {
+            return false;
+        }
+        $path = $this->folderDir($user, $folder);
+        if (!is_dir($path)) {
+            return false;
+        }
+        $prefix = $folder . "/";
+        foreach ($this->listFolders($user) as $f) {
+            if (strpos($f, $prefix) === 0) {
+                return false;
+            }
+        }
+        $entries = @scandir($path);
+        if ($entries !== false) {
+            foreach ($entries as $entry) {
+                if ($entry === "." || $entry === "..") {
+                    continue;
+                }
+                @unlink($path . DIRECTORY_SEPARATOR . $entry);
+            }
+        }
+        return @rmdir($path);
+    }
+    public function renameFolder($user, $old, $new)
+    {
+        $old = $this->normalizeFolder($old);
+        $new = $this->normalizeFolder($new);
+        if ($old === "INBOX" || $new === "INBOX") {
+            return false;
+        }
+        $old_path = $this->folderDir($user, $old);
+        $new_path = $this->folderDir($user, $new);
+        if (!is_dir($old_path) || is_dir($new_path)) {
+            return false;
+        }
+        return @rename($old_path, $new_path);
+    }
+    public function folderExists($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        return is_dir($this->folderDir($user, $folder));
+    }
+    /**
+     * Atomically allocates and returns the next per-user UID.
+     * Uses an exclusive flock on .uidnext so two concurrent
+     * appendMessage calls cannot hand out the same number.
+     */
+    protected function allocUid($user)
+    {
+        $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
+            ".uidnext";
+        $fp = @fopen($file, "c+");
+        if ($fp === false) {
+            return false;
+        }
+        if (!flock($fp, LOCK_EX)) {
+            fclose($fp);
+            return false;
+        }
+        rewind($fp);
+        $contents = stream_get_contents($fp);
+        $next = (int) trim($contents);
+        if ($next < 1) {
+            $next = 1;
+        }
+        $assigned = $next;
+        ftruncate($fp, 0);
+        rewind($fp);
+        fwrite($fp, (string) ($assigned + 1));
+        fflush($fp);
+        flock($fp, LOCK_UN);
+        fclose($fp);
+        return $assigned;
+    }
+    public function appendMessage($user, $folder, $bytes,
+        $flags = [], $internal_date = 0)
+    {
+        if (!$this->folderExists($user, $folder)) {
+            if (!$this->createFolder($user, $folder)) {
+                return false;
+            }
+        }
+        $uid = $this->allocUid($user);
+        if ($uid === false) {
+            return false;
+        }
+        if ($internal_date <= 0) {
+            $internal_date = time();
+        }
+        $dir = $this->folderDir($user, $folder);
+        $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
+        $tmp = $eml . ".tmp";
+        if (file_put_contents($tmp, $bytes) === false) {
+            return false;
+        }
+        if (!@rename($tmp, $eml)) {
+            @unlink($tmp);
+            return false;
+        }
+        file_put_contents(
+            $dir . DIRECTORY_SEPARATOR . "$uid.flags",
+            implode("\n", $flags));
+        file_put_contents(
+            $dir . DIRECTORY_SEPARATOR . "$uid.date",
+            (string) $internal_date);
+        return $uid;
+    }
+    public function fetchMessage($user, $folder, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        $eml = $this->folderDir($user, $folder) .
+            DIRECTORY_SEPARATOR . "$uid.eml";
+        if (!is_file($eml)) {
+            return false;
+        }
+        $bytes = @file_get_contents($eml);
+        return ($bytes === false) ? false : $bytes;
+    }
+    public function listMessages($user, $folder)
+    {
+        $dir = $this->folderDir($user, $folder);
+        if (!is_dir($dir)) {
+            return [];
+        }
+        $messages = [];
+        $entries = @scandir($dir);
+        if ($entries === false) {
+            return [];
+        }
+        foreach ($entries as $entry) {
+            if (substr($entry, -4) !== ".eml") {
+                continue;
+            }
+            $uid = (int) substr($entry, 0, -4);
+            if ($uid < 1) {
+                continue;
+            }
+            $meta = $this->messageMeta($user, $folder, $uid);
+            if ($meta !== false) {
+                $messages[] = $meta;
+            }
+        }
+        usort($messages, function ($a, $b) {
+            return $a['uid'] - $b['uid'];
+        });
+        return $messages;
+    }
+    public function messageMeta($user, $folder, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        $dir = $this->folderDir($user, $folder);
+        $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
+        if (!is_file($eml)) {
+            return false;
+        }
+        $size = (int) @filesize($eml);
+        $flags_file = $dir . DIRECTORY_SEPARATOR . "$uid.flags";
+        $flags = [];
+        if (is_file($flags_file)) {
+            $contents = (string) @file_get_contents($flags_file);
+            foreach (preg_split('/\r\n|\r|\n/', $contents) as $f) {
+                $f = trim($f);
+                if ($f !== "") {
+                    $flags[] = $f;
+                }
+            }
+        }
+        $date_file = $dir . DIRECTORY_SEPARATOR . "$uid.date";
+        $date = is_file($date_file) ?
+            (int) @file_get_contents($date_file) : 0;
+        if ($date <= 0) {
+            $date = (int) @filemtime($eml);
+        }
+        return [
+            'uid' => $uid,
+            'size' => $size,
+            'flags' => $flags,
+            'internal_date' => $date,
+        ];
+    }
+    public function setFlags($user, $folder, $uid, $flags)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        $dir = $this->folderDir($user, $folder);
+        $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
+        if (!is_file($eml)) {
+            return false;
+        }
+        $clean = [];
+        foreach ($flags as $f) {
+            $f = trim((string) $f);
+            if ($f !== "") {
+                $clean[] = $f;
+            }
+        }
+        $written = @file_put_contents(
+            $dir . DIRECTORY_SEPARATOR . "$uid.flags",
+            implode("\n", $clean));
+        return $written !== false;
+    }
+    public function expunge($user, $folder)
+    {
+        $expunged = [];
+        foreach ($this->listMessages($user, $folder) as $meta) {
+            if (in_array('\Deleted', $meta['flags'])) {
+                $dir = $this->folderDir($user, $folder);
+                @unlink($dir . DIRECTORY_SEPARATOR .
+                    $meta['uid'] . ".eml");
+                @unlink($dir . DIRECTORY_SEPARATOR .
+                    $meta['uid'] . ".flags");
+                @unlink($dir . DIRECTORY_SEPARATOR .
+                    $meta['uid'] . ".date");
+                $expunged[] = $meta['uid'];
+            }
+        }
+        return $expunged;
+    }
+    public function moveMessage($user, $from, $to, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        $from_dir = $this->folderDir($user, $from);
+        $to_dir = $this->folderDir($user, $to);
+        if (!is_dir($from_dir)) {
+            return false;
+        }
+        if (!is_dir($to_dir)) {
+            if (!$this->createFolder($user, $to)) {
+                return false;
+            }
+            $to_dir = $this->folderDir($user, $to);
+        }
+        foreach (['eml', 'flags', 'date'] as $ext) {
+            $src = $from_dir . DIRECTORY_SEPARATOR . "$uid.$ext";
+            $dst = $to_dir . DIRECTORY_SEPARATOR . "$uid.$ext";
+            if (is_file($src) && !@rename($src, $dst)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    public function messageCount($user, $folder)
+    {
+        return count($this->listMessages($user, $folder));
+    }
+    public function uidValidity($user, $folder)
+    {
+        $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
+            ".uidvalidity";
+        if (!is_file($file)) {
+            $this->ensureUser($user);
+        }
+        return (int) @file_get_contents($file);
+    }
+    public function uidNext($user, $folder)
+    {
+        $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
+            ".uidnext";
+        if (!is_file($file)) {
+            $this->ensureUser($user);
+        }
+        return (int) trim((string) @file_get_contents($file));
+    }
+}
+/**
+ * The mail server itself. Single instance per process; binds one
+ * SMTP and one IMAP listening socket and pumps the event loop.
+ *
+ * Configuration shape:
+ *      $mail = new MailSite();
+ *      $mail->auth($authenticator);
+ *      $mail->storage($storage);
+ *      $mail->filter(function ($from, $to, $bytes, $ctx) { });
+ *      $mail->domains(['example.com', 'localhost']);
+ *      $mail->listen(['SMTP_PORT' => 2525, 'IMAP_PORT' => 1143,
+ *          'SERVER_CONTEXT' => ['ssl' => [...]]]);
+ *
+ * Public methods that web/CLI frontends can call directly bypass
+ * the wire protocol entirely; they reach the same MailStorage
+ * the IMAP parser uses, so a webmail UI and a Thunderbird
+ * connection see consistent state. See deliverMail, listFolders,
+ * createFolder, deleteFolder, renameFolder, appendMessage,
+ * fetchMessage, listMessages, setFlags, expunge, moveMessage,
+ * messageCount.
  */
 class MailSite
 {
+    /* indices into the in_streams / out_streams parallel arrays */
     const CONNECTION = 0;
     const DATA = 1;
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
-    public $immortal_stream_keys = [];
-    public $base_path;
-    public $domains = ['localhost'];
-    public $mail_db;
+    /** @var Authenticator */
+    protected $authenticator;
+    /** @var MailStorage */
+    protected $mail_storage;
+    /** @var callable|null filter callable(from, to, bytes, ctx) */
+    protected $filter_fn;
+    /** @var array list of locally hosted domains */
+    protected $local_domains = ['localhost'];
+    /** @var array */
     protected $default_server_globals;
-    protected $routes = [ "APPEND" => [], "AUTH" => [], "CLOSE" => [],
-        "CHECK" => [], "COPY" => [], "CREATE" => [],
-        "DATA" => [], "DELETE" => [],  "ENDIDLE"=> [],"ERROR"  => [],
-        "EXAMINE"  => [], "EXPUNGE" => [],
-        "EXISTS" => [], "FETCH" =>[], "FLAGS" =>[], "LIST" => [], "LSUB" => [],
-        "MAILFROM" => [], "RCPTTO" => [], "RECENT" => [],
-        "RENAME" => [], "SEARCH" => [], "SELECT" => [], "SEND" => [],
-        "STARTIDLE"=> [], "STATUS" => [],  "STORE" => [],
-        "SUBSCRIBE" => [], "UNSEEN" =>[], "UIDNEXT" => [], "UIDVALIDITY" => [],
-        "UNSUBSCRIBE" => []];
-    protected $state_commands = [
-        'SMTP' => [
-            'AUTH' => ['AUTH', 'HELP'],
-            'INIT' => ['EHLO', 'HELO', 'NOOP', 'QUIT', 'RSET', 'STARTTLS', 'HELP'],
-            'HELO' => ['NOOP', 'QUIT', 'RSET','STARTTLS', 'HELP'],
-            'TLS' => ['EHLO', 'HELO', 'NOOP', 'QUIT', 'RSET', 'HELP'],
-            'EHLO_TLS' => ['AUTH', 'MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
-            'MAIL' => ['NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
-            'RCPT' => ['DATA', 'NOOP', 'QUIT', 'RCPT', 'RSET', 'HELP'],
-            'DATA' => ['MAIL', 'NOOP', 'QUIT', 'RSET', 'HELP'],
-        ],
-        'IMAP' => [
-            'APPEND' => ['APPEND'],
-            'AUTH' => ['AUTH'],
-            'IDLE' => ['IDLE'],
-            'INIT' => ['CAPABILITY', 'NOOP', 'STARTTLS'],
-            'TLS'=> ['AUTH', 'CAPABILITY',  'LOGIN', 'LOGOUT', 'NOOP'],
-            'USER' => ['APPEND', 'AUTH', 'CAPABILITY', 'CHECK', 'COPY', 'CLOSE',
-                'CREATE', 'DELETE', 'EXAMINE', 'EXPUNGE', 'IDLE', 'LIST',
-                'LSUB', 'LOGIN', 'LOGOUT', 'NOOP', 'RENAME', 'SELECT', 'SEND',
-                'STATUS', 'STORE', 'SUBSCRIBE', 'UID', 'UNSUBSCRIBE']
-        ]
-    ];
-    protected $capabilities = [
-        "INIT" => "CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED",
-        "TLS" => "CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=LOGIN",
-        "USER" => "CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=LOGIN"
-    ];
-    protected $mail_methods;
+    /** @var array */
+    protected $immortal_stream_keys = [];
+    /** @var array */
     protected $in_streams = [];
+    /** @var array */
     protected $out_streams = [];
-    protected $middle_wares = [];
-    protected $request_script;
-    protected $timers = [];
+    /** @var \SplPriorityQueue|null */
     protected $timer_alarms;
-    protected $file_cache = ['MARKED' => [], 'UNMARKED' => []];
-    /**
-     * Sets the base path used for determining request routes. Sets
-     * precision for timed events and sets up timer heap and other
-     * field variables
-     *
-     * @param string $base_path used to determine portion of path to ignore
-     *      when checking if a route matches against the current request.
-     *      If it is left blank, then a base path will be computed using
-     *      the $_SERVER script name variable.
-     */
-    public function __construct($base_path = "")
+    /** @var array */
+    protected $timers = [];
+    public function __construct()
     {
-        $this->mail_methods = array_keys($this->routes);
-        $this->default_server_globals = [];
-        if (empty($base_path)) {
-            $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
-            $base_path = $pathinfo['dirname'];
-            $base_path = $pathinfo["dirname"];
-            if ($base_path == ".") {
-                $base_path = "";
+        $this->timer_alarms = new \SplPriorityQueue();
+        $this->timer_alarms->setExtractFlags(
+            \SplPriorityQueue::EXTR_BOTH);
+    }
+    /**
+     * Sets the authenticator used by SMTP AUTH and IMAP LOGIN.
+     */
+    public function auth(Authenticator $authenticator)
+    {
+        $this->authenticator = $authenticator;
+        return $this;
+    }
+    /**
+     * Sets the storage backend used by both protocols and by
+     * the direct-call public API.
+     */
+    public function storage(MailStorage $storage)
+    {
+        $this->mail_storage = $storage;
+        return $this;
+    }
+    /**
+     * Sets the optional filter callable run when a message
+     * arrives via SMTP for a local user. Signature:
+     *      function($from, $to, $bytes, $ctx): array|bool|null
+     * The return value either:
+     *   - false to drop the message silently (still 250 to the
+     *     sender so spam senders cannot probe filter behavior)
+     *   - an array ['folder' => 'Junk', 'flags' => ['\Seen']]
+     *     to redirect delivery to a different folder and/or set
+     *     initial flags
+     *   - true or null to deliver to INBOX with default flags
+     * The $ctx is the per-connection context array containing
+     * REMOTE_ADDR, REMOTE_PORT, AUTH_USER (if authenticated),
+     * etc., useful for sender-policy decisions.
+     */
+    public function filter(callable $filter)
+    {
+        $this->filter_fn = $filter;
+        return $this;
+    }
+    /**
+     * Sets the list of locally hosted domains. RCPT TO addresses
+     * whose domain matches (case-insensitively) are treated as
+     * local; any other RCPT TO requires that the SMTP session
+     * be authenticated, otherwise the server refuses with 550
+     * to prevent open-relay use.
+     */
+    public function domains(array $domains)
+    {
+        $clean = [];
+        foreach ($domains as $d) {
+            $d = strtolower(trim((string) $d));
+            if ($d !== "") {
+                $clean[] = $d;
             }
         }
-        $this->base_path = $base_path;
-        ini_set('precision', 16);
-        $this->timer_alarms = new \SplMinHeap();
+        $this->local_domains = $clean ?: ['localhost'];
+        return $this;
     }
     /**
-     * Magic method __call is called whenever an unknown method is called
-     * for this class. In this case, we check if the method name corresponds
-     * to a lower case SMTP or IMAP command. In which case, we check that the
-     * arguments are a two element array with a route and a callback function
-     * and add the appropriate route to a routing table.
+     * Delivers a message into a local user's mailbox, running
+     * the configured filter exactly as the SMTP path would. This
+     * is the entry point for non-SMTP message ingestion (e.g. a
+     * webmail "Save Draft" action, a CLI import tool, an HTTP
+     * webhook from a transactional sender). The recipient must
+     * be a local user; this method does NOT do outbound queueing.
      *
-     * @param string $method
-     * @param array $callback a callback function.
+     * @param string $from RFC 5321 reverse-path (envelope sender)
+     * @param string $to RFC 5321 forward-path (one envelope
+     *      recipient; multi-recipient delivery should call this
+     *      method once per recipient)
+     * @param string $bytes the full RFC 5322 message
+     * @param array $ctx optional context array passed to the
+     *      filter (caller supplies arbitrary fields)
+     * @return int|false UID of the delivered message, or false
+     *      on filter-drop or unknown recipient
      */
-    public function __call($method, $callback)
+    public function deliverMail($from, $to, $bytes, $ctx = [])
     {
-        $num_args = count($callback);
-        $route_name = strtoupper($method);
-        if ($num_args < 1 || $num_args > 1 ||
-            !in_array($route_name, $this->mail_methods)) {
-            throw new \Error("Call to undefined method \"$method\".");
-        }
-        $this->addRoute($route_name, $callback[0]);
-    }
-    /**
-     * Generic function for associating a function $callback to be called
-     * when a web request using $method method and with a uri matching
-     * $route occurs.
-     *
-     * @param string $method the name of a web request method for example, "GET"
-     * @param callable $callback function to be called if the incoming request
-     *      matches with $method and $route
-     */
-    public function addRoute($method, callable $callback)
-    {
-        if (!isset($this->routes[$method])) {
-            throw new \Exception("Unknown Router Method");
-        } else if (!is_callable($callback)) {
-            throw new \Exception("Callback not callable");
-        }
-        if (!isset($this->routes[$method])) {
-            $this->routes[$method] = [];
-        }
-        $this->routes[$method] = $callback;
-    }
-    /**
-     * Calls any callbacks associated with a given $method and $argument
-     * provided that recursion in $method $argument call is not detected.
-     *
-     * @param string $method the name of a email command for example,
-     *  "MAILFROM"
-     * @return bool whether the $argument was handled by any callback
-     */
-    public function trigger($method, &$results, $context = false)
-    {
-        if (empty($_SERVER['RECURSION'])) {
-            $_SERVER['RECURSION'] = [];
-        }
-        if(empty($this->routes[$method])) {
+        $local = $this->resolveLocalUser($to);
+        if ($local === false) {
             return false;
         }
-        if (in_array($method, $_SERVER['RECURSION']) ) {
-            echo "<br />\nError: Recursion detected for $method $argument.\n";
-            return true;
-        }
-        if (empty($this->routes[$method])) {
-            $handled = false;
-        } else {
-            if ($context) {
-                $this->setGlobals($context);
+        $folder = "INBOX";
+        $flags = ['\Recent'];
+        if (is_callable($this->filter_fn)) {
+            $verdict = call_user_func($this->filter_fn, $from, $to,
+                $bytes, $ctx);
+            if ($verdict === false) {
+                return false;
             }
-            $callback = $this->routes[$method];
-            $results = $callback();
-            $handled = true;
+            if (is_array($verdict)) {
+                if (isset($verdict['folder'])) {
+                    $folder = (string) $verdict['folder'];
+                }
+                if (isset($verdict['flags']) &&
+                    is_array($verdict['flags'])) {
+                    $flags = $verdict['flags'];
+                }
+            }
         }
-        return $handled;
+        $this->mail_storage->ensureUser($local);
+        return $this->mail_storage->appendMessage($local, $folder,
+            $bytes, $flags);
+    }
+    public function listFolders($user)
+    {
+        return $this->mail_storage->listFolders($user);
+    }
+    public function createFolder($user, $folder)
+    {
+        return $this->mail_storage->createFolder($user, $folder);
+    }
+    public function deleteFolder($user, $folder)
+    {
+        return $this->mail_storage->deleteFolder($user, $folder);
+    }
+    public function renameFolder($user, $old, $new)
+    {
+        return $this->mail_storage->renameFolder($user, $old,
+            $new);
+    }
+    public function appendMessage($user, $folder, $bytes,
+        $flags = [], $date = 0)
+    {
+        return $this->mail_storage->appendMessage($user, $folder,
+            $bytes, $flags, $date);
+    }
+    public function fetchMessage($user, $folder, $uid)
+    {
+        return $this->mail_storage->fetchMessage($user, $folder,
+            $uid);
+    }
+    public function listMessages($user, $folder)
+    {
+        return $this->mail_storage->listMessages($user, $folder);
+    }
+    public function messageMeta($user, $folder, $uid)
+    {
+        return $this->mail_storage->messageMeta($user, $folder,
+            $uid);
+    }
+    public function setFlags($user, $folder, $uid, $flags)
+    {
+        return $this->mail_storage->setFlags($user, $folder, $uid,
+            $flags);
+    }
+    public function expunge($user, $folder)
+    {
+        return $this->mail_storage->expunge($user, $folder);
+    }
+    public function moveMessage($user, $from, $to, $uid)
+    {
+        return $this->mail_storage->moveMessage($user, $from, $to,
+            $uid);
+    }
+    public function messageCount($user, $folder)
+    {
+        return $this->mail_storage->messageCount($user, $folder);
     }
     /**
-     * Sets up a repeating or one-time timer that calls $callback every or after
-     * $time seconds
-     *
-     * @param float $time time in seconds (fractional seconds okay) after which
-     *      $callback should be called. Or interval between calls if this is
-     *      a repeating timer.
-     * @param callable $callback a function to be called after now + $time
-     * @param bool $repeating whether $callback should be called every $time
-     *      seconds or just once.
-     * @return int an id for the timer that can be used to turn it off (@see
-     *      clearTimer())
+     * Resolves a recipient address to a local username, or false
+     * if the recipient is not local. The local part is returned
+     * in its lowercased form because storage is case-insensitive.
      */
-    public function setTimer($time, callable $callback, $repeating = true)
+    public function resolveLocalUser($address)
     {
-        $next_time = (int)microtime(true) + $time;
-        $this->timers[$next_time] = [$repeating, $time, $callback];
-        $this->timer_alarms->insert([$next_time, $next_time]);
-        return $next_time;
+        $address = trim((string) $address, "<> \t\r\n");
+        $at = strrpos($address, '@');
+        if ($at === false) {
+            return false;
+        }
+        $local = substr($address, 0, $at);
+        $domain = strtolower(substr($address, $at + 1));
+        if (!in_array($domain, $this->local_domains)) {
+            return false;
+        }
+        if ($this->authenticator === null) {
+            return false;
+        }
+        $local_lc = strtolower($local);
+        if (!$this->authenticator->userExists($local_lc)) {
+            return false;
+        }
+        return $local_lc;
     }
     /**
-     * Deletes a timer for the list of active timers. (@see setTimer)
-     *
-     * @param int $timer_id the id of the timer to remove
+     * Schedules a callable to fire after $time seconds. If
+     * $repeating is true (default) the callable fires every
+     * $time seconds; if false, just once. Returns an opaque
+     * timer id that can be passed to clearTimer.
      */
-    public function clearTimer($timer_id)
+    public function setTimer($time, callable $callback,
+        $repeating = true)
     {
-        unset($this->timers[$timer_id]);
-    }
-    /**
-     * Starts an Atto Mail Server listening at $address using the
-     * configuration values provided. It also has this server's event loop. As
-     * requests come in $this->process is called to handle them. This input
-     * and output tcp streams used by this method are non-blocking. Detecting
-     * traffic is done using stream_select().  This maps to Unix-select calls,
-     * which seemed to be the most cross-platform compatible way to do things.
-     * Streaming methods could be easily re-written to support libevent
-     * (doesn't work yet PHP7) or more modern event library
-     *
-     * @param int $address address and port to listen for requests on
-     * @param mixed $config_array_or_ini_filename either an associative
-     *      array of configuration parameters or the filename of a .ini
-     *      with such parameters. Things that can be set are mainly fields
-     *      that might typically show up in the $_SERVER superglobal.
-     *      See the $default_server_globals variable below for some of them.
-     *      The SERVER_CONTENT field can be set to an array of stream
-     *      context field values and these can be used to configure
-     *      the server to handle SSL/TLS (one of the examples in the examples
-     *      folder.)
-     */
-    public function listen($domain = "", $config_array_or_ini_filename = false)
-    {
-        $path = (!empty($_SERVER['PATH'])) ? $_SERVER['PATH'] :
-            ((!empty($_SERVER['Path'])) ? $_SERVER['Path'] : ".");
-        $default_server_globals = [ "CONNECTION_TIMEOUT" => 30 * 60, //30min
-            "DOCUMENT_ROOT" => getcwd(),
-            "IMAP_PORT" => 143, "MAIL_DB" => null,
-            "MAX_CACHE_FILESIZE" => 1000000, "MAX_CACHE_FILES" => 100,
-            "MAX_COMMAND_LEN" => 2048,
-            "MAX_REQUEST_LEN" => 10000000,
-            "PATH" => $path,
-            "SERVER_ADMIN" => "you@example.com", "SERVER_SIGNATURE" => "",
-            "SERVER_SOFTWARE" => "ATTO MAIL SERVER",
-            "SMTP_PORT" => 25,
+        $id = uniqid("t_", true);
+        $this->timers[$id] = [
+            'interval' => (float) $time,
+            'callback' => $callback,
+            'repeating' => (bool) $repeating,
         ];
-        if ($domain == "") {
-            /*
-             both work on windows, but localhost doesn't give windows defender
-             warning
-            */
-            $localhost = strstr(PHP_OS, "WIN") ? "localhost" : "0.0.0.0";
-            // 0 binds to any incoming ipv4 address
-            $address = "tcp://$localhost";
-            $server_globals = ["SERVER_NAME" => "localhost"];
-        } else {
-            $server_globals = ['SERVER_NAME' => $domain];
-            $address = "tcp://$domain";
+        $this->timer_alarms->insert([$id, microtime(true) + $time],
+            -(microtime(true) + $time));
+        return $id;
+    }
+    public function clearTimer($id)
+    {
+        unset($this->timers[$id]);
+    }
+    /**
+     * Binds the SMTP and IMAP listening sockets and runs the
+     * event loop forever. The $config array overrides the
+     * built-in defaults; the SERVER_CONTEXT key (if present) is
+     * passed through to stream_context_create for TLS settings.
+     */
+    public function listen($config = [])
+    {
+        $defaults = [
+            'SMTP_PORT' => 2525,
+            'IMAP_PORT' => 1143,
+            'BIND' => '0.0.0.0',
+            'SERVER_NAME' => 'localhost',
+            'SERVER_SOFTWARE' => 'AttoMail',
+            'CONNECTION_TIMEOUT' => 30 * 60,
+            'MAX_COMMAND_LEN' => 2048,
+            'MAX_MESSAGE_LEN' => 25 * 1024 * 1024,
+        ];
+        $context_array = [];
+        if (isset($config['SERVER_CONTEXT'])) {
+            $context_array = $config['SERVER_CONTEXT'];
+            unset($config['SERVER_CONTEXT']);
         }
-        $context = [];
-        if (is_array($config_array_or_ini_filename)) {
-            if (!empty($config_array_or_ini_filename['SERVER_CONTEXT'])) {
-                $context = $config_array_or_ini_filename['SERVER_CONTEXT'];
-                unset($config_array_or_ini_filename['SERVER_CONTEXT']);
-            }
-            $server_globals = array_merge($server_globals,
-                $config_array_or_ini_filename);
-        } else if (is_string($config_array_or_ini_filename) &&
-            file_exists($config_array_or_ini_filename)) {
-            $ini_data = parse_ini_file($config_array_or_ini_filename);
-            if (!empty($ini_data['SERVER_CONTEXT'])) {
-                $context = $ini_data['SERVER_CONTEXT'];
-                unset($ini_data['SERVER_CONTEXT']);
-            }
-            $server_globals = array_merge($server_globals, $ini_data);
+        $this->default_server_globals = array_merge($defaults,
+            $config);
+        $bind = $this->default_server_globals['BIND'];
+        $smtp_addr = "tcp://$bind:" .
+            $this->default_server_globals['SMTP_PORT'];
+        $imap_addr = "tcp://$bind:" .
+            $this->default_server_globals['IMAP_PORT'];
+        $ctx = stream_context_create($context_array);
+        $smtp = @stream_socket_server($smtp_addr, $errno, $errstr,
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
+        if (!$smtp) {
+            echo "Failed to bind SMTP $smtp_addr: $errstr\n";
+            return false;
         }
-        $this->default_server_globals = array_merge($_SERVER,
-            $default_server_globals, $server_globals);
-        $smtp_server_context = stream_context_create($context);
-        $smtp_address = "$address:" .
-            $this->default_server_globals["SMTP_PORT"];
-        $smtp_server = stream_socket_server($smtp_address, $errno, $errstr,
-            STREAM_SERVER_BIND|STREAM_SERVER_LISTEN, $smtp_server_context);
-        if (!$smtp_server) {
-            echo "Failed to bind SMTP address $smtp_address\nServer Stopping\n";
-            exit();
+        stream_set_blocking($smtp, 0);
+        $imap = @stream_socket_server($imap_addr, $errno, $errstr,
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
+        if (!$imap) {
+            echo "Failed to bind IMAP $imap_addr: $errstr\n";
+            fclose($smtp);
+            return false;
         }
-        stream_set_blocking($smtp_server, 0);
-        $imap_server_context = stream_context_create($context);
-        $imap_address = "$address:" .
-            $this->default_server_globals["IMAP_PORT"];
-        $imap_server = stream_socket_server($imap_address, $errno, $errstr,
-            STREAM_SERVER_BIND|STREAM_SERVER_LISTEN, $imap_server_context);
-        if (!$imap_server) {
-            echo "Failed to bind IMAP address $imap_address\nServer Stopping\n";
-            exit();
-        }
-        stream_set_blocking($imap_server, 0);
-        $this->immortal_stream_keys[] = (int)$smtp_server;
-        $this->immortal_stream_keys[] = (int)$imap_server;
-        $this->in_streams = [self::CONNECTION => [(int)$smtp_server =>
-            $smtp_server, (int)$imap_server => $imap_server],
-            self::DATA => [""]];
-        $this->out_streams = [self::CONNECTION => [], self::DATA => []];
-        $servers = [$smtp_server, $imap_server];
+        stream_set_blocking($imap, 0);
+        $this->immortal_stream_keys = [(int) $smtp, (int) $imap];
+        $this->in_streams = [
+            self::CONNECTION => [(int) $smtp => $smtp,
+                (int) $imap => $imap],
+            self::DATA => [(int) $smtp => "", (int) $imap => ""],
+            self::CONTEXT => [],
+            self::MODIFIED_TIME => [],
+        ];
+        $this->out_streams = [
+            self::CONNECTION => [],
+            self::DATA => [],
+            self::CONTEXT => [],
+            self::MODIFIED_TIME => [],
+        ];
+        $listeners = [(int) $smtp => 'SMTP', (int) $imap => 'IMAP'];
+        echo "AttoMail SMTP listening at $smtp_addr\n";
+        echo "AttoMail IMAP listening at $imap_addr\n";
         $excepts = null;
-        echo "SERVER listening at $address\n";
         while (true) {
-            $in_streams_with_data = $this->in_streams[self::CONNECTION];
-            $out_streams_with_data = $this->out_streams[self::CONNECTION];
-            if ($this->timer_alarms->isEmpty()) {
-                $timeout = null;
-                $micro_timeout = 0;
-            } else {
-                $next_alarm = $this->timer_alarms->top();
-                $pre_timeout = max(0, microtime(true) - $next_alarm[0]);
-                $timeout = floor($pre_timeout);
-                $micro_timeout = intval(($timeout - floor($pre_timeout))
-                    * 1000000);
+            $reads = $this->in_streams[self::CONNECTION];
+            $writes = $this->out_streams[self::CONNECTION];
+            $timeout = null;
+            $microtimeout = 0;
+            if (!$this->timer_alarms->isEmpty()) {
+                $top = $this->timer_alarms->top();
+                $when = $top['data'][1];
+                $delta = max(0.0, $when - microtime(true));
+                $timeout = (int) floor($delta);
+                $microtimeout = (int) (($delta - $timeout) * 1e6);
             }
-            $num_selected = stream_select($in_streams_with_data,
-                $out_streams_with_data, $excepts, $timeout, $micro_timeout);
+            $n = @stream_select($reads, $writes, $excepts,
+                $timeout, $microtimeout);
             $this->processTimers();
-            if ($num_selected > 0) {
-                $this->processRequestStreams($servers, $in_streams_with_data);
-                $this->processResponseStreams($out_streams_with_data);
+            if ($n > 0) {
+                foreach ($reads as $stream) {
+                    $key = (int) $stream;
+                    if (isset($listeners[$key])) {
+                        $this->acceptConnection($stream,
+                            $listeners[$key]);
+                    } else {
+                        $this->readClient($stream);
+                    }
+                }
+                foreach ($writes as $stream) {
+                    $this->writeClient($stream);
+                }
             }
             $this->cullDeadStreams();
         }
     }
-
     /**
-     * Handles processing timers on this Atto Mail Site. This method is called
-     * from the event loop in @see listen and checks to see if any callbacks
-     * associated with timers need to be called.
+     * Accepts a new client connection on one of the listening
+     * sockets and installs an initial context with the welcome
+     * banner queued for write. SMTP greets with 220, IMAP with
+     * "* OK".
      */
+    protected function acceptConnection($server, $protocol)
+    {
+        $conn = @stream_socket_accept($server, 0);
+        if (!$conn) {
+            return;
+        }
+        stream_set_blocking($conn, 0);
+        $key = (int) $conn;
+        $remote = (string) stream_socket_get_name($conn, true);
+        $colon = strrpos($remote, ":");
+        $remote_addr = ($colon === false) ? $remote :
+            substr($remote, 0, $colon);
+        $remote_port = ($colon === false) ? 0 :
+            (int) substr($remote, $colon + 1);
+        $name = $this->default_server_globals['SERVER_NAME'];
+        $this->in_streams[self::CONNECTION][$key] = $conn;
+        $this->in_streams[self::DATA][$key] = "";
+        $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        $this->in_streams[self::CONTEXT][$key] = [
+            'PROTOCOL' => $protocol,
+            'STATE' => 'INIT',
+            'REMOTE_ADDR' => $remote_addr,
+            'REMOTE_PORT' => $remote_port,
+            'AUTH_USER' => null,
+            'MAILFROM' => null,
+            'RCPTTO' => [],
+            'TLS' => false,
+            'AUTH_USERNAME' => null,
+        ];
+        if ($protocol === 'SMTP') {
+            $banner = "220 $name " .
+                $this->default_server_globals['SERVER_SOFTWARE'] .
+                " ESMTP ready\r\n";
+        } else {
+            $banner = "* OK [CAPABILITY IMAP4rev1 STARTTLS " .
+                "LOGINDISABLED] $name ready\r\n";
+        }
+        $this->queueWrite($key, $banner);
+    }
+    protected function queueWrite($key, $bytes)
+    {
+        if (!isset($this->in_streams[self::CONNECTION][$key])) {
+            return;
+        }
+        if (!isset($this->out_streams[self::DATA][$key])) {
+            $this->out_streams[self::CONNECTION][$key] =
+                $this->in_streams[self::CONNECTION][$key];
+            $this->out_streams[self::DATA][$key] = "";
+            $this->out_streams[self::CONTEXT][$key] =
+                $this->in_streams[self::CONTEXT][$key];
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        }
+        $this->out_streams[self::DATA][$key] .= $bytes;
+        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+    }
+    protected function readClient($stream)
+    {
+        $key = (int) $stream;
+        $meta = stream_get_meta_data($stream);
+        if ($meta['eof']) {
+            $this->shutdownStream($key);
+            return;
+        }
+        $chunk = @fread($stream, 8192);
+        if ($chunk === false || $chunk === "") {
+            return;
+        }
+        $this->in_streams[self::DATA][$key] .= $chunk;
+        $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        /*
+            Process as many complete commands as the buffer
+            holds. SMTP commands and the IMAP authentication
+            subset we support are line-based with CRLF
+            terminators; the DATA phase has its own end-of-
+            message sentinel.
+         */
+        while ($this->processOne($key)) {
+            /* loop until buffer drains */
+        }
+    }
+    /**
+     * Returns true if it consumed a command (caller should loop),
+     * false if it needs more bytes or the stream was destroyed.
+     */
+    protected function processOne($key)
+    {
+        if (!isset($this->in_streams[self::CONTEXT][$key])) {
+            return false;
+        }
+        $ctx = & $this->in_streams[self::CONTEXT][$key];
+        $proto = $ctx['PROTOCOL'];
+        $buf = & $this->in_streams[self::DATA][$key];
+        if ($proto === 'SMTP' && $ctx['STATE'] === 'DATA') {
+            return $this->consumeSmtpDataPhase($key, $buf, $ctx);
+        }
+        $eol = strpos($buf, "\r\n");
+        if ($eol === false) {
+            $eol = strpos($buf, "\n");
+            if ($eol === false) {
+                return false;
+            }
+            $line = substr($buf, 0, $eol);
+            $buf = substr($buf, $eol + 1);
+        } else {
+            $line = substr($buf, 0, $eol);
+            $buf = substr($buf, $eol + 2);
+        }
+        $line = rtrim($line, "\r\n");
+        if ($proto === 'SMTP') {
+            $this->dispatchSmtp($key, $line, $ctx);
+        } else {
+            $this->dispatchImap($key, $line, $ctx);
+        }
+        return true;
+    }
+    /**
+     * Dispatches one SMTP command line. The state machine is:
+     *   INIT  -> after EHLO/HELO -> READY
+     *   READY + AUTH ok           -> READY (with AUTH_USER set)
+     *   READY + MAIL FROM         -> MAIL
+     *   MAIL  + RCPT TO           -> RCPT
+     *   RCPT  + DATA              -> DATA
+     *   DATA  + ".\r\n"           -> READY (message accepted)
+     */
+    protected function dispatchSmtp($key, $line, &$ctx)
+    {
+        $upper = strtoupper($line);
+        if (strncmp($upper, 'EHLO', 4) === 0 ||
+            strncmp($upper, 'HELO', 4) === 0) {
+            $ctx['STATE'] = 'READY';
+            $name = $this->default_server_globals['SERVER_NAME'];
+            $resp = "250-$name Hello\r\n";
+            $resp .= "250-AUTH PLAIN LOGIN\r\n";
+            $resp .= "250-SIZE " .
+                $this->default_server_globals['MAX_MESSAGE_LEN'] .
+                "\r\n";
+            $resp .= "250 HELP\r\n";
+            $this->queueWrite($key, $resp);
+            return;
+        }
+        if (strncmp($upper, 'NOOP', 4) === 0) {
+            $this->queueWrite($key, "250 OK\r\n");
+            return;
+        }
+        if (strncmp($upper, 'RSET', 4) === 0) {
+            $ctx['MAILFROM'] = null;
+            $ctx['RCPTTO'] = [];
+            $ctx['STATE'] = 'READY';
+            $this->queueWrite($key, "250 OK\r\n");
+            return;
+        }
+        if (strncmp($upper, 'QUIT', 4) === 0) {
+            $this->queueWrite($key, "221 Bye\r\n");
+            $ctx['STATE'] = 'QUIT';
+            return;
+        }
+        if ($ctx['STATE'] === 'INIT') {
+            $this->queueWrite($key,
+                "503 5.5.1 send EHLO/HELO first\r\n");
+            return;
+        }
+        if (strncmp($upper, 'AUTH ', 5) === 0 ||
+            $ctx['STATE'] === 'AUTH-PLAIN' ||
+            $ctx['STATE'] === 'AUTH-LOGIN-USER' ||
+            $ctx['STATE'] === 'AUTH-LOGIN-PASS') {
+            $this->dispatchSmtpAuth($key, $line, $ctx);
+            return;
+        }
+        if (strncmp($upper, 'MAIL FROM', 9) === 0) {
+            $this->dispatchSmtpMailFrom($key, $line, $ctx);
+            return;
+        }
+        if (strncmp($upper, 'RCPT TO', 7) === 0) {
+            $this->dispatchSmtpRcptTo($key, $line, $ctx);
+            return;
+        }
+        if (strncmp($upper, 'DATA', 4) === 0) {
+            if ($ctx['STATE'] !== 'RCPT') {
+                $this->queueWrite($key,
+                    "503 5.5.1 need RCPT TO first\r\n");
+                return;
+            }
+            $ctx['STATE'] = 'DATA';
+            $this->queueWrite($key,
+                "354 End data with <CR><LF>.<CR><LF>\r\n");
+            return;
+        }
+        $this->queueWrite($key,
+            "500 5.5.1 Unrecognized command\r\n");
+    }
+    /**
+     * Handles AUTH PLAIN and AUTH LOGIN. PLAIN can carry the
+     * credentials inline ("AUTH PLAIN <base64>") or in a
+     * continuation line after a 334 challenge. LOGIN always
+     * uses a two-line continuation: server prompts username
+     * then password, both base64-encoded.
+     */
+    protected function dispatchSmtpAuth($key, $line, &$ctx)
+    {
+        if ($ctx['STATE'] === 'AUTH-PLAIN') {
+            $this->finishAuthPlain($key, $line, $ctx);
+            return;
+        }
+        if ($ctx['STATE'] === 'AUTH-LOGIN-USER') {
+            $ctx['AUTH_USERNAME'] = (string) base64_decode($line,
+                true);
+            $ctx['STATE'] = 'AUTH-LOGIN-PASS';
+            $this->queueWrite($key,
+                "334 " . base64_encode("Password:") . "\r\n");
+            return;
+        }
+        if ($ctx['STATE'] === 'AUTH-LOGIN-PASS') {
+            $pass = (string) base64_decode($line, true);
+            $user = (string) $ctx['AUTH_USERNAME'];
+            $ctx['AUTH_USERNAME'] = null;
+            $this->verifyAndSetAuth($key, $user, $pass, $ctx);
+            return;
+        }
+        if (preg_match('/^AUTH\s+PLAIN(?:\s+(.+))?$/i', $line,
+            $m)) {
+            if (!empty($m[1])) {
+                $this->finishAuthPlain($key, trim($m[1]), $ctx);
+                return;
+            }
+            $ctx['STATE'] = 'AUTH-PLAIN';
+            $this->queueWrite($key, "334 \r\n");
+            return;
+        }
+        if (preg_match('/^AUTH\s+LOGIN(?:\s+(.+))?$/i', $line,
+            $m)) {
+            $ctx['STATE'] = 'AUTH-LOGIN-USER';
+            if (!empty($m[1])) {
+                $ctx['AUTH_USERNAME'] = (string) base64_decode(
+                    trim($m[1]), true);
+                $ctx['STATE'] = 'AUTH-LOGIN-PASS';
+                $this->queueWrite($key,
+                    "334 " . base64_encode("Password:") . "\r\n");
+                return;
+            }
+            $this->queueWrite($key,
+                "334 " . base64_encode("Username:") . "\r\n");
+            return;
+        }
+        $this->queueWrite($key,
+            "504 5.5.4 Unrecognized authentication mechanism\r\n");
+    }
+    protected function finishAuthPlain($key, $b64, &$ctx)
+    {
+        $raw = (string) base64_decode($b64, true);
+        $parts = explode("\x00", $raw);
+        if (count($parts) !== 3) {
+            $ctx['STATE'] = 'READY';
+            $this->queueWrite($key,
+                "535 5.7.8 Authentication credentials" .
+                " invalid\r\n");
+            return;
+        }
+        list(, $user, $pass) = $parts;
+        $this->verifyAndSetAuth($key, $user, $pass, $ctx);
+    }
+    protected function verifyAndSetAuth($key, $user, $pass, &$ctx)
+    {
+        $ok = false;
+        if ($this->authenticator !== null) {
+            $ok = $this->authenticator->verifyPassword($user,
+                $pass);
+        }
+        if ($ok) {
+            $ctx['AUTH_USER'] = strtolower($user);
+            $ctx['STATE'] = 'READY';
+            $this->queueWrite($key,
+                "235 2.7.0 Authentication succeeded\r\n");
+        } else {
+            $ctx['STATE'] = 'READY';
+            $this->queueWrite($key,
+                "535 5.7.8 Authentication credentials" .
+                " invalid\r\n");
+        }
+    }
+    /**
+     * Parses MAIL FROM:<addr> and stores the envelope sender on
+     * the connection. Accepts an empty path "<>" (DSN/bounce).
+     * The session does not need to be authenticated to set a
+     * sender; what is policed is the RCPT TO step.
+     */
+    protected function dispatchSmtpMailFrom($key, $line, &$ctx)
+    {
+        if (!preg_match(
+            '/^MAIL\s+FROM\s*:\s*<([^>]*)>(?:\s+.*)?$/i',
+            $line, $m)) {
+            $this->queueWrite($key,
+                "501 5.5.4 Syntax: MAIL FROM:<address>\r\n");
+            return;
+        }
+        $ctx['MAILFROM'] = trim($m[1]);
+        $ctx['RCPTTO'] = [];
+        $ctx['STATE'] = 'MAIL';
+        $this->queueWrite($key, "250 2.1.0 Ok\r\n");
+    }
+    /**
+     * Parses RCPT TO:<addr> and applies the anti-relay rule:
+     *   - if the recipient is local (a known user at a local
+     *     domain), accept regardless of authentication
+     *   - if the recipient is non-local, require that the
+     *     session be authenticated; otherwise reject 550 5.7.1
+     * This is what makes the server NOT an open relay.
+     */
+    protected function dispatchSmtpRcptTo($key, $line, &$ctx)
+    {
+        if ($ctx['STATE'] !== 'MAIL' && $ctx['STATE'] !== 'RCPT') {
+            $this->queueWrite($key,
+                "503 5.5.1 need MAIL FROM first\r\n");
+            return;
+        }
+        if (!preg_match(
+            '/^RCPT\s+TO\s*:\s*<([^>]*)>(?:\s+.*)?$/i',
+            $line, $m)) {
+            $this->queueWrite($key,
+                "501 5.5.4 Syntax: RCPT TO:<address>\r\n");
+            return;
+        }
+        $rcpt = trim($m[1]);
+        $local_user = $this->resolveLocalUser($rcpt);
+        if ($local_user === false) {
+            if (empty($ctx['AUTH_USER'])) {
+                $this->queueWrite($key,
+                    "550 5.7.1 Relay access denied\r\n");
+                return;
+            }
+            /*
+                Authenticated submission to a non-local recipient
+                would be outbound relay. We do not implement an
+                outbound queue in this phase, so reject with a
+                clear message. A later phase can hook a smarthost
+                or queue here.
+             */
+            $this->queueWrite($key,
+                "550 5.7.1 Outbound relay not configured\r\n");
+            return;
+        }
+        $ctx['RCPTTO'][] = ['addr' => $rcpt, 'user' => $local_user];
+        $ctx['STATE'] = 'RCPT';
+        $this->queueWrite($key, "250 2.1.5 Ok\r\n");
+    }
+    /**
+     * Drains DATA bytes from the input buffer until it sees the
+     * end-of-data sentinel CRLF.CRLF (or LF.LF as a tolerated
+     * variant). Returns true once one full message has been
+     * consumed (caller will loop and try the next command).
+     * Performs CRLF dot-unstuffing per RFC 5321 sec 4.5.2.
+     */
+    protected function consumeSmtpDataPhase($key, &$buf, &$ctx)
+    {
+        $marker = "\r\n.\r\n";
+        $pos = strpos($buf, $marker);
+        $marker_len = 5;
+        if ($pos === false) {
+            $alt = "\n.\n";
+            $alt_pos = strpos($buf, $alt);
+            if ($alt_pos === false) {
+                return false;
+            }
+            $pos = $alt_pos;
+            $marker_len = 3;
+        }
+        $msg = substr($buf, 0, $pos + 2);
+        $buf = substr($buf, $pos + $marker_len);
+        $msg = preg_replace('/(\r\n|\n)\.(\r\n|\n|\.)/',
+            '$1$2', $msg);
+        $max = $this->default_server_globals['MAX_MESSAGE_LEN'];
+        if (strlen($msg) > $max) {
+            $this->queueWrite($key,
+                "552 5.3.4 Message exceeds size limit\r\n");
+            $ctx['STATE'] = 'READY';
+            $ctx['MAILFROM'] = null;
+            $ctx['RCPTTO'] = [];
+            return true;
+        }
+        $msg = $this->prependReceivedHeader($msg, $ctx);
+        $delivered_any = false;
+        foreach ($ctx['RCPTTO'] as $r) {
+            $uid = $this->deliverMail($ctx['MAILFROM'], $r['addr'],
+                $msg, $ctx);
+            if ($uid !== false) {
+                $delivered_any = true;
+            }
+        }
+        $ctx['STATE'] = 'READY';
+        $ctx['MAILFROM'] = null;
+        $ctx['RCPTTO'] = [];
+        if ($delivered_any) {
+            $this->queueWrite($key,
+                "250 2.0.0 Ok: message accepted\r\n");
+        } else {
+            /*
+                All recipients filtered or unknown. We still
+                respond 250 to the sender to avoid leaking
+                filter or user-existence info; the message is
+                just gone.
+             */
+            $this->queueWrite($key, "250 2.0.0 Ok\r\n");
+        }
+        return true;
+    }
+    /**
+     * Prepends a Received: trace header per RFC 5321 sec 4.4.
+     * Mail clients use this header to render the routing path
+     * and SpamAssassin-class tools rely on it to reconstruct
+     * the delivery chain. We include the remote address, our
+     * server name, the protocol (ESMTPA when authenticated),
+     * and the receipt timestamp.
+     */
+    protected function prependReceivedHeader($msg, $ctx)
+    {
+        $name = $this->default_server_globals['SERVER_NAME'];
+        $sw = $this->default_server_globals['SERVER_SOFTWARE'];
+        $with = empty($ctx['AUTH_USER']) ? 'ESMTP' : 'ESMTPA';
+        $now = gmdate("D, d M Y H:i:s") . " +0000";
+        $remote = $ctx['REMOTE_ADDR'];
+        $rcpt = "";
+        if (!empty($ctx['RCPTTO'])) {
+            $first = $ctx['RCPTTO'][0];
+            $rcpt = "for <" . $first['addr'] . ">";
+        }
+        $hdr = "Received: from [$remote] by $name ($sw)" .
+            " with $with $rcpt; $now\r\n";
+        return $hdr . $msg;
+    }
+    /**
+     * Stubs out IMAP for Phase 1: replies BAD to any command so
+     * a client probing the port gets a clear error rather than
+     * a hang. Phase 3 will replace this with real LOGIN, LIST,
+     * SELECT, FETCH, etc.
+     */
+    protected function dispatchImap($key, $line, &$ctx)
+    {
+        $tag = "*";
+        $sp = strpos($line, " ");
+        if ($sp !== false) {
+            $tag = substr($line, 0, $sp);
+        }
+        $upper = strtoupper(trim(substr($line, $sp === false ?
+            0 : $sp + 1)));
+        if (strncmp($upper, 'LOGOUT', 6) === 0) {
+            $this->queueWrite($key, "* BYE Logging out\r\n");
+            $this->queueWrite($key,
+                "$tag OK LOGOUT completed\r\n");
+            $ctx['STATE'] = 'QUIT';
+            return;
+        }
+        if (strncmp($upper, 'CAPABILITY', 10) === 0) {
+            $this->queueWrite($key, "* CAPABILITY IMAP4rev1\r\n");
+            $this->queueWrite($key,
+                "$tag OK CAPABILITY completed\r\n");
+            return;
+        }
+        if (strncmp($upper, 'NOOP', 4) === 0) {
+            $this->queueWrite($key,
+                "$tag OK NOOP completed\r\n");
+            return;
+        }
+        $this->queueWrite($key,
+            "$tag BAD IMAP not yet implemented in this build\r\n");
+    }
+    protected function writeClient($stream)
+    {
+        $key = (int) $stream;
+        if (!isset($this->out_streams[self::DATA][$key])) {
+            return;
+        }
+        $data = $this->out_streams[self::DATA][$key];
+        if ($data === "") {
+            $this->finishWrite($key);
+            return;
+        }
+        $n = @fwrite($stream, $data);
+        if ($n === false) {
+            $this->shutdownStream($key);
+            return;
+        }
+        if ($n > 0) {
+            $this->out_streams[self::DATA][$key] =
+                substr($data, $n);
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        }
+        if ($this->out_streams[self::DATA][$key] === "") {
+            $this->finishWrite($key);
+        }
+    }
+    /**
+     * Called once the out_streams buffer for $key has fully
+     * drained: clears the entry and, if the connection was set
+     * to QUIT during command processing, tears the stream down
+     * for real. Splitting this out keeps writeClient short.
+     */
+    protected function finishWrite($key)
+    {
+        unset(
+            $this->out_streams[self::CONNECTION][$key],
+            $this->out_streams[self::DATA][$key],
+            $this->out_streams[self::CONTEXT][$key],
+            $this->out_streams[self::MODIFIED_TIME][$key]);
+        $ctx = isset($this->in_streams[self::CONTEXT][$key]) ?
+            $this->in_streams[self::CONTEXT][$key] : null;
+        if ($ctx && isset($ctx['STATE']) &&
+            $ctx['STATE'] === 'QUIT') {
+            $this->shutdownStream($key);
+        }
+    }
+    protected function shutdownStream($key)
+    {
+        if (in_array($key, $this->immortal_stream_keys)) {
+            return;
+        }
+        if (isset($this->in_streams[self::CONNECTION][$key])) {
+            $stream = $this->in_streams[self::CONNECTION][$key];
+            @stream_socket_shutdown($stream, STREAM_SHUT_RDWR);
+            @fclose($stream);
+        }
+        unset(
+            $this->in_streams[self::CONNECTION][$key],
+            $this->in_streams[self::DATA][$key],
+            $this->in_streams[self::CONTEXT][$key],
+            $this->in_streams[self::MODIFIED_TIME][$key],
+            $this->out_streams[self::CONNECTION][$key],
+            $this->out_streams[self::DATA][$key],
+            $this->out_streams[self::CONTEXT][$key],
+            $this->out_streams[self::MODIFIED_TIME][$key]);
+    }
+    protected function cullDeadStreams()
+    {
+        $timeout =
+            $this->default_server_globals['CONNECTION_TIMEOUT'];
+        $now = time();
+        foreach ($this->in_streams[self::MODIFIED_TIME]
+            as $key => $t) {
+            if (in_array($key, $this->immortal_stream_keys)) {
+                continue;
+            }
+            if ($now - $t > $timeout) {
+                $this->shutdownStream($key);
+            }
+        }
+    }
     protected function processTimers()
     {
         if ($this->timer_alarms->isEmpty()) {
             return;
         }
         $now = microtime(true);
-        $top = $this->timer_alarms->top();
-        while ($now > $top[0]) {
-            $this->timer_alarms->extract();
-            if (!empty($this->timers[$top[1]])) {
-                list($repeating, $time, $callback) = $this->timers[$top[1]];
-                $callback();
-                if ($repeating) {
-                    $next_time = $now + $time;
-                    $this->timer_alarms->insert([$next_time, $top[1]]);
-                }
-            }
+        while (!$this->timer_alarms->isEmpty()) {
             $top = $this->timer_alarms->top();
-        }
-    }
-    /**
-     * Processes incoming streams with data. If the server has detected a
-     * new connection, then a stream is set-up. For other streams,
-     * request data is processed as it comes in. Once the request is complete,
-     * superglobals are set up. When this is complete, an output stream is
-     * instantiated to send this data asynchronously back to the browser.
-     *
-     * @param array $servers an array of socket servers used to listen for
-     *  incoming connections
-     * @param array $in_streams_with_data streams with request data to be
-     *  processed.
-     */
-    protected function processRequestStreams($servers, $in_streams_with_data)
-    {
-        foreach ($in_streams_with_data as $in_stream) {
-            if (in_array($in_stream, $servers)) {
-                $this->processServerRequest($in_stream);
+            $when = $top['data'][1];
+            if ($when > $now) {
                 return;
             }
-            $meta = stream_get_meta_data($in_stream);
-            $key = (int)$in_stream;
-            if ($meta['eof']) {
-                $this->shutdownStream($key);
+            $this->timer_alarms->extract();
+            $id = $top['data'][0];
+            if (!isset($this->timers[$id])) {
                 continue;
             }
-            $len = strlen($this->in_streams[self::DATA][$key]);
-            $protocol = $this->in_streams[self::CONTEXT][$key]['PROTOCOL'];
-            $max_len = $this->default_server_globals['MAX_COMMAND_LEN'];
-            if (($protocol == 'SMTP' &&
-                $this->in_streams[self::CONTEXT][$key]['SERVER_STATE'] ==
-                'DATA') || ($protocol == 'IMAP' &&
-                $this->in_streams[self::CONTEXT][$key]['SERVER_STATE'] ==
-                'APPEND')) {
-                $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
+            $t = $this->timers[$id];
+            try {
+                call_user_func($t['callback']);
+            } catch (\Throwable $e) {
+                /* keep loop alive */
             }
-            $too_long = $len >= $max_len;
-            if (!$too_long) {
-                stream_set_blocking($in_stream, 0);
-                $data = stream_get_contents($in_stream, $max_len - $len);
+            if (!empty($t['repeating']) &&
+                isset($this->timers[$id])) {
+                $next = microtime(true) + $t['interval'];
+                $this->timer_alarms->insert([$id, $next], -$next);
             } else {
-                $data = "";
-                $this->in_streams[self::DATA][$key] = "";
-                $this->in_streams[self::CONTEXT][$key]['RESPONSE'] =
-                    '500 LINE TOO LONG';
-            }
-            if ($too_long || $this->parseRequest($key, $data)) {
-                if (empty($this->in_streams[self::CONTEXT][$key]['RESPONSE'])) {
-                    continue;
-                }
-                $out_data = $this->in_streams[self::CONTEXT][$key]['RESPONSE'] . "\x0D\x0A";
-                $this->logIncomingMailRequest($out_data, $key);
-                if (empty($this->out_streams[self::CONNECTION][$key])) {
-                    $this->out_streams[self::CONNECTION][$key] = $in_stream;
-                    $this->out_streams[self::DATA][$key] = $out_data;
-                    $this->out_streams[self::CONTEXT][$key] =
-                        $this->in_streams[self::CONTEXT][$key];
-                    $this->out_streams[self::MODIFIED_TIME][$key] = time();
-                }
-            }
-            $this->in_streams[self::MODIFIED_TIME][$key] = time();
-        }
-    }
-    /**
-     * Used to process any timers for MailSite and
-     * used to check if the server has detected a
-     * new connection. In which case, a read stream is set-up.
-     *
-     * @param resource $server socket server used to listen for incoming
-     *  connections
-     */
-    protected function processServerRequest($server)
-    {
-        if ($this->timer_alarms->isEmpty()) {
-            $timeout = ini_get("default_socket_timeout");
-        } else {
-            $next_alarm = $this->timer_alarms->top();
-            $timeout = max(min( $next_alarm[0] - microtime(true),
-                ini_get("default_socket_timeout")), 0);
-        }
-        $connection = stream_socket_accept($server, $timeout);
-        if ($connection) {
-            $key = (int)$connection;
-            $this->in_streams[self::CONNECTION][$key] = $connection;
-            $this->initRequestStream($key);
-        }
-    }
-    /**
-     * Gets info about an incoming request stream and uses this to set up
-     * an initial stream context. This context is used to populate the $_SERVER
-     * variable when the request is later processed.
-     *
-     * @param int key id of request stream to initialize context for
-     */
-    protected function initRequestStream($key)
-    {
-        $connection = $this->in_streams[self::CONNECTION][$key];
-        $remote_name = stream_socket_get_name($connection, true);
-        $remote_col = strrpos($remote_name, ":");
-        $server_name = stream_socket_get_name($connection,
-            false);
-        $server_col = strrpos($server_name, ":");
-        $server_addr = substr($server_name, 0, $server_col);
-        $this->in_streams[self::CONTEXT][$key] =
-            ["REMOTE_ADDR" => substr($remote_name, 0, $remote_col),
-             "REMOTE_PORT" => substr($remote_name, $remote_col + 1),
-             "REQUEST_TIME" => time(),
-             "REQUEST_TIME_FLOAT" => microtime(true),
-             "SERVER_STATE" => "INIT",
-             "SERVER_ADDR" => $server_addr,
-             "SERVER_PORT" => substr($server_name, $server_col + 1),
-             ];
-        if ($this->in_streams[self::CONTEXT][$key]['SERVER_PORT'] ==
-            $this->default_server_globals["SMTP_PORT"]) {
-            $this->in_streams[self::CONTEXT][$key]['PROTOCOL'] = 'SMTP';
-            // initial welcome message
-            $this->out_streams[self::DATA][$key] =
-                "220 $server_addr " . $this->default_server_globals[
-                'SERVER_SOFTWARE'] . "\x0D\x0A";
-        } else {
-            $this->in_streams[self::CONTEXT][$key]['PROTOCOL'] = 'IMAP';
-            $this->out_streams[self::DATA][$key] =
-                "* OK [".$this->capabilities['INIT']."] " .
-                $this->default_server_globals['SERVER_SOFTWARE'] .
-                " READY \x0D\x0A";
-        }
-        $this->out_streams[self::CONNECTION][$key] = $connection;
-        $this->out_streams[self::CONTEXT][$key] =
-            $this->in_streams[self::CONTEXT][$key];
-        $this->out_streams[self::MODIFIED_TIME][$key] = time();
-        $this->in_streams[self::DATA][$key] = "";
-        $this->in_streams[self::MODIFIED_TIME][$key] = time();
-    }
-    /**
-     * Used to send response data to out stream for which responses have not
-     * been written.
-     *
-     * @param array $out_streams_with_data rout streams that are ready
-     *      to send more response data
-     */
-    protected function processResponseStreams($out_streams_with_data)
-    {
-        foreach ($out_streams_with_data as $out_stream) {
-            $meta = stream_get_meta_data($out_stream);
-            $key = (int)$out_stream;
-            if ($meta['eof']) {
-                $this->shutdownStream($key);
-                continue;
-            }
-            $data = $this->out_streams[self::DATA][$key];
-            $num_bytes = fwrite($out_stream, $data);
-            $remaining_bytes = max(0, strlen($data) - $num_bytes);
-            if ($num_bytes > 0) {
-                $this->out_streams[self::DATA][$key] =
-                    substr($data, $num_bytes);
-                $this->out_streams[self::MODIFIED_TIME][$key] = time();
-            }
-            if ($remaining_bytes == 0) {
-                $context = $this->out_streams[self::CONTEXT][$key];
-                if (in_array($context['SERVER_STATE'], ['QUIT'])) {
-                    $this->shutdownStream($key);
-                } else {
-                    if (!empty($context['STARTING_TLS'])) {
-                        stream_socket_enable_crypto(
-                            $this->in_streams[self::CONNECTION][$key], true,
-                            STREAM_CRYPTO_METHOD_TLS_SERVER|
-                            STREAM_CRYPTO_METHOD_TLSv1_1_SERVER|
-                            STREAM_CRYPTO_METHOD_TLSv1_2_SERVER);
-                        stream_set_blocking(
-                            $this->in_streams[self::CONNECTION][$key], 0);
-                        unset(
-                        $this->in_streams[self::CONTEXT][$key]['STARTING_TLS']);
-                    }
-                    $this->shutdownWriteStream($key);
-                }
+                unset($this->timers[$id]);
             }
         }
-    }
-    /**
-     * Takes the string $data recently read from the request stream with
-     * id $key, tacks that on to the previous received data. If this completes
-     * an HTTP request then the request headers and request are parsed
-     *
-     * @param int $key id of request stream to process data for
-     * @param string $data from request stream
-     * @return bool whether the request is complete
-     */
-    protected function parseRequest($key, $data)
-    {
-        $this->in_streams[self::DATA][$key] .= $data;
-        $context =  $this->in_streams[self::CONTEXT][$key];
-        $protocol = $context['PROTOCOL'];
-        $state = $context['SERVER_STATE'];
-        if ($state == 'QUIT') {
-            return false;
-        }
-        $allowed_commands = $this->state_commands[$protocol][$state];
-        // Check for the HELP command
-        if ($protocol == 'SMTP' && str_starts_with(strtoupper($data), 'HELP')) {
-            $jsonCmds = $this->parseHelp();
-            $context['RESPONSE'] = $jsonCmds;
-            $this->in_streams[self::CONTEXT][$key]['RESPONSE'] = $jsonCmds;
-            return true;
-        }
-        $data = $this->in_streams[self::DATA][$key];
-        $eol = "\x0D\x0A"; /*
-            spec says use CRLF, but hard to type as human on Mac or Linux
-            so relax spec for inputs. (Follow spec exactly for output)
-        */
-        if (strpos($data, "\x0D") === false && strpos($data, "\x0A") === false){
-            return false;
-        }
-        if (($request_pos = strpos($data, $eol)) === false) {
-            $eol = \PHP_EOL;
-            $request_pos = strpos($data, $eol);
-            if ($request_pos === false) {
-                $context['RESPONSE'] = ($protocol == 'SMTP') ?
-                    "500 BAD COMMAND" : "{$line_parts[0]} BAD Unknown Command";
-                return true;
-            }
-        }
-        $first_line = trim(substr($data, 0, $request_pos));
-        $remainder = substr($data, $request_pos + strlen($eol));
-        if ($protocol == 'SMTP' && $state == 'DATA') {
-            if (strpos($data, "$eol.$eol") !== false) {
-                $results = false;
-                $_REQUEST['data'] = $data;
-                $command = "DATA";
-            }   else {
-                return false;
-            }
-        } else if ($protocol == "SMTP") {
-            $command = strtoupper(substr($first_line, 0, 4));
-            if ($command == 'STAR') {
-                $command = strtoupper(substr($first_line, 0, 8));
-            }
-        } else {
-            $line_parts = preg_split("/\s+/", $first_line);
-            $command = (empty($line_parts[1])) ? "" : $line_parts[1];
-            $command = strtoupper($command);
-            if ($line_parts[1] == 'AUTHENTICATE') {
-                $command = 'AUTH';
-            }
-        }
-        if (in_array($state, ['APPEND', 'AUTH', 'IDLE'])) {
-                $command = $state;
-        }
-        if (in_array($command, $allowed_commands) ) {
-            $parseCommand = "parse" . ucfirst(strtolower($command));
-            $_REQUEST = [];
-            $result = $this->$parseCommand($key, $first_line, $data, $context);
-            if ($result == 'error') {
-                if (empty($context['RESPONSE'])) {
-                    $context['RESPONSE'] = ($protocol == 'SMTP') ?
-                        "500 BAD COMMAND" :
-                        "{$line_parts[0]} BAD Unknown Command";
-                }
-                $this->in_streams[self::DATA][$key] = $remainder;
-            } else if ($result == 'not done') {
-                return false;
-            } else {
-                $this->in_streams[self::DATA][$key] = $remainder;
-            }
-        } else if ($state == 'TLS') {
-            $this->in_streams[self::DATA][$key] = $remainder;
-            $context['RESPONSE'] = ($protocol == 'SMTP') ?
-                "503 5.5.1 Error: send HELO/EHLO first" :
-                "{$line_parts[0]} BAD Unknown Command";
-        } else {
-            $this->in_streams[self::DATA][$key] = $remainder;
-            $context['RESPONSE'] = ($protocol == 'SMTP') ? "500 BAD COMMAND" :
-                "{$line_parts[0]} BAD Unknown Command";
-        }
-        $this->in_streams[self::CONTEXT][$key] = $context;
-        return true;
-    }
-    /**
-     *
-     */
-    protected function parseAppend($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (!empty($context['APPEND_STATE'])) {
-            $data = rtrim($data, "\x0A\x0D");
-            if (strlen($data) <
-                $context['APPEND_LENGTH']) {
-                return 'not done';
-            }
-            $_REQUEST['message'] = $data;
-            $context['SERVER_STATE'] = $context['APPEND_STATE'];
-            unset($context['APPEND_STATE'], $context['APPEND_FLAGS'],
-                $context['APPEND_DATE'], $context['APPEND_LENGTH']);
-            $handled = $this->trigger("APPEND", $results, $context);
-            if ($handled) {
-                $context['RESPONSE'] = $results["RESPONSE"] .
-                    $line_parts[0] . $results["STATUS"];
-            } else {
-                return "error";
-            }
-        } else {
-            $context['RESPONSE'] = "+ Ready for literal data";
-            $num_parts = count($line_parts);
-            if ($num_parts < 4 || $num_parts > 6) {
-                $context['RESPONSE'] = $line_parts[0] .
-                    "BAD Number of Append parameters incorrect.";
-                return "error";
-            }
-            $context['APPEND_MAILBOX'] = trim($line_parts[2], "\"'\t ");
-            $context['APPEND_FLAGS'] = [];
-            $context['APPEND_DATE'] = date();
-            if ($num_parts == 5) {
-                $optional_arg = trim($line_parts[3]);
-                if ($optional_arg[0] == '(') {
-                    $context['APPEND_FLAGS'] = preg_split("/\s+/",
-                        trim($optional_arg, "()"));
-                } else {
-                    $context['APPEND_DATE'] = $optional_arg;
-                }
-            } else if ($num_parts == 6) {
-                $context['APPEND_FLAGS'] = preg_split("/\s+/",
-                    trim($line_parts[3], "()"));
-                $context['APPEND_DATE'] = $line_parts[4];
-            }
-            $context['APPEND_STATE'] = $context['SERVER_STATE'];
-            $context['APPEND_LENGTH'] = intval(
-                trim($line_parts[$num_parts - 1], "{}\t "));
-            $context['SERVER_STATE'] = 'APPEND';
-        }
-        return 'success';
-    }
-    /**
-     *
-     */
-    protected function parseAuth($key, $first_line, $data, &$context)
-    {
-        $protocol = $context['PROTOCOL'];
-        $continue = ($protocol == 'SMTP') ? "334 " : "+ ";
-        $authenticate = ($protocol == 'SMTP') ? 'AUTH' : 'AUTHENTICATE';
-        $msg_id = "";
-        $auth_line = $first_line;
-        if ($protocol == 'IMAP') {
-            $line_parts = preg_split("/\s+/", $first_line, 2);
-            if (empty($context['AUTH_STATE'] )) {
-                if (count($line_parts) != 2) {
-                    $context['RESPONSE'] = $line_parts[0] .
-                        "NO [AUTHENTICATIONFAILED] Incorrect number ".
-                        "of parameters: ID LOGIN login password";
-                    unset($context['AUTH_MSG_ID'], $context['AUTH_STATE'],
-                        $context['AUTH_USER'], $context['AUTH_USERNAME']);
-                    return 'error';
-                }
-                $msg_id = $line_parts[0];
-                $auth_line = $line_parts[1];
-            }
-        }
-        if (!empty($context['AUTH_STATE'] ) &&
-            $context['AUTH_STATE'] == 'PLAIN') {
-            return $this->checkAuth($auth_line, $context,
-                $context['AUTH_MSG_ID']);
-        }
-        if (!empty($context['AUTH_STATE'] ) &&
-            $context['AUTH_STATE'] == 'LOGIN') {
-            $context['AUTH_USERNAME'] = $first_line;
-            $context['RESPONSE'] = $continue . base64_encode("Password:");
-            $context['AUTH_STATE'] = 'LOGIN2';
-            return 'success';
-        }
-        if (!empty($context['AUTH_STATE'] ) &&
-            $context['AUTH_STATE'] == 'LOGIN2') {
-            if (empty($context['AUTH_USERNAME'])) {
-                $context['AUTH_USERNAME'] = "";
-            }
-            $username = (empty($context['AUTH_USERNAME'])) ? "" :
-                 base64_decode($context['AUTH_USERNAME']);
-            $password = base64_decode($first_line);
-            return $this->checkAuth( base64_encode("LOGIN" . "\x00" .
-                $username . "\x00". $password), $context,
-                $context['AUTH_MSG_ID']);
-        }
-        if (preg_match("/^\s*$authenticate\s+PLAIN\s*(.*)$/i", $auth_line,
-            $matches)) {
-            if($login_info = trim($matches[1])) {
-                return $this->checkAuth($login_info, $context, $msg_id);
-            } else {
-                $context['SERVER_STATE'] = 'AUTH';
-                $context['RESPONSE'] = $continue;
-                $context['AUTH_STATE'] = 'PLAIN';
-                $context['AUTH_MSG_ID'] = $msg_id;
-            }
-            return 'success';
-        }
-        if (preg_match("/^\s*$authenticate\s+LOGIN\s*$/i", $auth_line,
-            $matches)) {
-            $context['SERVER_STATE'] = 'AUTH';
-            $context['RESPONSE'] = $continue . base64_encode("Username:");
-            $context['AUTH_STATE'] = 'LOGIN';
-            $context['AUTH_MSG_ID'] = $msg_id;
-            return 'success';
-        }
-        return "error";
-    }
-    /**
-     *
-     */
-    protected function checkAuth($login_info, &$context, $msg_id = "")
-    {
-        $protocol = $context['PROTOCOL'];
-        $context['SERVER_STATE'] = ($protocol == 'SMTP') ? 'EHLO_TLS' : 'TLS';
-        $response_ok = ($protocol == 'SMTP') ?
-            "235 2.7.0  Authentication Succeeded" :
-            "$msg_id OK Logged in";
-        $response_no = ($protocol == 'SMTP') ?
-            "535 5.7.8  Authentication credentials invalid" :
-            "$msg_id NO [AUTHENTICATIONFAILED] Authentication failed.";
-        $login_parts = explode("\x00", base64_decode($login_info));
-        if (count($login_parts) != 3) {
-            $context['RESPONSE'] = $response_no;
-            unset($context['AUTH_MSG_ID'], $context['AUTH_STATE'],
-                $context['AUTH_USER'], $context['AUTH_USERNAME']);
-            return 'error';
-        }
-        list($auth_id, $user, $password) = $login_parts;
-        $add_request = ["auth_id" => $auth_id, "user" => $user,
-            "password" => $password];
-        $_REQUEST = array_merge($_REQUEST, $add_request);
-        $handled = $this->trigger("AUTH", $results, $context);
-        unset($context['AUTH_MSG_ID'], $context['AUTH_STATE'],
-            $context['AUTH_USER'], $context['AUTH_USERNAME']);
-        if ($results) {
-            $context['RESPONSE'] = $response_ok;
-            $context['AUTH_USER'] = $user;
-            if ($protocol == 'IMAP') {
-                $context['SERVER_STATE'] = "USER";
-            }
-            return 'success';
-        } else {
-            $context['RESPONSE'] = $response_no;
-            if ($protocol == 'IMAP') {
-                $context['SERVER_STATE'] = "TLS";
-            }
-            unset($context['AUTH_MSG_ID'], $context['AUTH_STATE'],
-                $context['AUTH_USER'], $context['AUTH_USERNAME']);
-            return 'error';
-        }
-    }
-    /**
-     *
-     */
-    protected function parseCapability($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 2);
-        if (empty($context['AUTH_USER'])) {
-            $context['RESPONSE'] = "* " . $this->capabilities[
-                $context['SERVER_STATE']] .
-                 "\x0D\x0A{$line_parts[0]} OK ".
-                "Pre-login capabilities above, post-login ".
-                "capabilities may be different.";
-        } else {
-            $context['RESPONSE'] = "* " . $this->capabilities[
-                $context['SERVER_STATE']] . "\x0D\x0A{$line_parts[0]} OK ";
-        }
-        return 'success';
-    }
-    protected function parseCheck($key, $first_line, $data, &$context)
-    {
-        $context['RESPONSE'] .= " OK CHECK completed.";
-        unset($context['MAILBOX'], $context['MAILBOX_ID']);
-        return 'success';
-    }
-    protected function parseClose($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        $context['RESPONSE'] = $line_parts[0];
-        if (empty($context['MAILBOX'])) {
-            $context['RESPONSE'] .= " BAD No mailbox selected.";
-        } else {
-            $_REQUEST['mailbox'] = $context['MAILBOX'];
-            $handled = $this->trigger("EXPUNGE", $results);
-            $context['RESPONSE'] .= " OK CLOSE completed.";
-        }
-        unset($context['MAILBOX'], $context['MAILBOX_ID']);
-        return 'success';
-    }
-    protected function parseCopy($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 4);
-        $context['RESPONSE'] = $line_parts[0];
-        if (empty($context['MAILBOX'])) {
-            $context['RESPONSE'] = $line_parts[0] . " BAD No mailbox selected.";
-            return "error";
-        }
-        if (count($line_parts) != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Incorrect number of arguments for COPY.";
-            return "error";
-        }
-        if (!$_REQUEST['sequence-set'] =
-            $this->getSequenceSetArrays($line_parts[2])) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Sequence-set parse error.";
-            return "error";
-        }
-        $_REQUEST['mailbox'] = trim($line_parts[3], "\"'\t ");
-        $handled = $this->trigger("COPY", $results);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    protected function parseCreate($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of CREATE parameters incorrect.";
-        }
-        $_REQUEST['mailbox'] = trim($line_parts[2], "\"'\t ");
-        $handled = $this->trigger("CREATE", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        }
-        return 'success';
-    }
-    protected function parseData($key, $first_line, $data, &$context)
-    {
-        if (!empty($context['SERVER_STATE']) && $context['SERVER_STATE'] ==
-            'DATA') {
-            if (empty($context['RCPTTO'])) {
-                unset ($context['RCPTTO'], $context['MAILFROM']);
-                $context['SERVER_STATE'] =  "EHLO_TLS";
-                return 'error';
-            }
-            $mail_from = $context['MAILFROM'];
-            $recipients = $context['RCPTTO'];
-            foreach ($recipients as $recipient) {
-                list($email, $is_local) = $recipient;
-                if ($is_local) {
-                    $_REQUEST['message'] = $data;
-                    $context['APPEND_MAILBOX'] = 'INBOX';
-                    $context['APPEND_FLAGS'] = ['Recent'];
-                    $context['APPEND_DATE'] = time();
-                    $context['MAILBOX_ID'] = -1;
-                    $this->trigger("APPEND", $results, $context);
-                    if ($results) {
-                        $context['RESPONSE'] =
-                            "250 Message accepted for delivery";
-                    } else {
-                        $context['RESPONSE'] = "451 local error in processing";
-                        return "error";
-                    }
-                    $context['SERVER_STATE'] = 'EHLO_TLS';
-                }
-            }
-            unset ($context['RCPTTO'], $context['MAILFROM']);
-            $context['SERVER_STATE'] =  "EHLO_TLS";
-            return 'success';
-        }
-        $context['RESPONSE'] = '354 Enter mail, end with "." on a line' .
-            " by itself";
-        $context['SERVER_STATE'] = 'DATA';
-        return 'success';
-    }
-    protected function parseDelete($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of DELETE parameters incorrect.";
-            return 'error';
-        }
-        $_REQUEST['mailbox'] = trim($line_parts[2], "\"'\t ");
-        $handled = $this->trigger("DELETE", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        }
-        return 'success';
-    }
-    protected function parseEhlo($key, $first_line, $data, &$context)
-    {
-        $msg = "250-STARTTLS\x0D\x0A" .
-            "250 AUTH LOGIN PLAIN";
-        return $this->parseGreet('EHLO', $msg, $first_line,
-            $data, $context);
-    }
-    protected function parseExamine($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of EXAMINE parameters incorrect.";
-            return 'error';
-        }
-        $_REQUEST['mailbox'] = trim($line_parts[2], "\"'\t ");
-        $handled = $this->trigger("EXAMINE", $results);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        }
-        return 'success';
-    }
-    protected function parseExpunge($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        $context['RESPONSE'] = $line_parts[0];
-        if (empty($_SERVER['MAILBOX'])) {
-            $context['RESPONSE'] = $line_parts[0] . " BAD No mailbox selected.";
-            return 'error';
-        } else {
-            $_REQUEST['mailbox'] = $_SERVER['MAILBOX'];
-            $handled = $this->trigger("EXPUNGE", $results, $context);
-            if ($handled) {
-                $context['RESPONSE'] = $results["RESPONSE"] .
-                    $line_parts[0] . $results["STATUS"];
-            }
-        }
-        return 'success';
-    }
-    /**
-     *
-     */
-    protected function parseFetch($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 4);
-        $context['RESPONSE'] = $line_parts[0];
-        if (empty($_SERVER['MAILBOX'])) {
-            $context['RESPONSE'] = $line_parts[0] . " BAD No mailbox selected.";
-            return "error";
-        }
-        if (count($line_parts) != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Incorrect number of arguments for FETCH.";
-            return "error";
-        }
-        if (!$_REQUEST['sequence-set'] =
-            $this->getSequenceSetArrays($line_parts[2])) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Sequence-set parse error.";
-            return "error";
-        }
-        $parts_requested =
-            strtoupper(trim($line_parts[3], "\"'\t ()"));
-        $type_names = "ALL|FAST|FULL|BODY|BODY\[(?:.*)\]|".
-            "BODYSTRUCTURE|BODY.PEEK\[(?:.*)\]|BODYSTRUCTURE|ENVELOPE|FLAGS|".
-            "INTERNALDATE|RFC822|RFC822\.HEADER|RFC822\.SIZE|RFC822\.TEXT|UID";
-        if (!preg_match("/^($type_names)(?:\s+($type_names))+?$/",
-            $parts_requested, $matches)) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD message data items parse error.";
-            return "error";
-        }
-        array_shift($matches);
-        $_REQUEST['parts_requested'] = $matches;
-        if (empty($_REQUEST['uid'])) {
-            $_REQUEST['uid'] = false;
-        }
-        $handled = $this->trigger("FETCH", $results);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    /**
-     *
-     */
-    protected function parseGreet($command, $msg, $first_line, $data,
-        &$context)
-    {
-        $domain = @trim(substr($first_line, 5));
-        if ($this->isDomain($domain)) {
-            if ($context['SERVER_STATE'] == 'INIT') {
-                $context['SERVER_STATE'] = 'HELO';
-            } else if ($context['SERVER_STATE'] == 'TLS') {
-                $context['SERVER_STATE'] = 'EHLO_TLS';
-            }
-            $hyphen = ($msg) ? "-" :" ";
-            $context['RESPONSE'] = "250$hyphen".$context['SERVER_ADDR'].
-                "\x0D\x0A" . $msg;
-        } else {
-            $context['RESPONSE'] = "501 Syntax: $command hostname";
-        }
-        return 'success';
-    }
-    protected function parseHelo($key, $first_line, $data, &$context)
-    {
-        return $this->parseGreet('HELO', "", $first_line,
-            $data, $context);
-    }
-    protected function parseIdle($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (!empty($context['IDLE_STATE'])) {
-            $context['SERVER_STATE'] = $context['IDLE_STATE'];
-            if (!empty($context['MAILBOX_ID'])) {
-                $this->trigger("ENDIDLE", $results);
-            }
-            unset($context['IDLE_STATE']);
-            if (trim(strtoupper($line_parts[0])) != 'DONE') {
-                $context['RESPONSE'] = $line_parts[0] .
-                    " BAD Expected DONE.";
-                return 'error';
-            }
-        } else {
-            $context['RESPONSE'] = "+ idling";
-            $context['IDLE_STATE'] = $context['SERVER_STATE'];
-            if (!empty($context['MAILBOX_ID'])) {
-                $this->trigger("STARTIDLE", $results);
-            }
-            $context['SERVER_STATE'] = 'IDLE';
-        }
-        return 'success';
-    }
-    protected function parseList($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of LIST parameters incorrect.";
-        }
-        list(,,$reference, $mailbox) = $line_parts;
-        $_REQUEST['reference'] = trim($reference, "\"'\t ");
-        $_REQUEST['mailbox'] = trim($mailbox, "\"'\t ");
-        $handled = $this->trigger("LIST", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        }
-        return 'success';
-    }
-    protected function parseLogin($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts) != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "NO [AUTHENTICATIONFAILED] Incorrect number of parameters: ".
-                "ID LOGIN login password";
-            unset($context['AUTH_STATE'],
-                $context['AUTH_USER'], $context['AUTH_USERNAME']);
-            return 'error';
-        }
-        list(,,$user, $password) = $line_parts;
-        $user = trim($user, "\"'");
-        $password = trim($password, "\"'");
-        $_REQUEST = array_merge($_REQUEST, ["user" => $user,
-            "password" =>$password ]);
-        $handled = $this->trigger("AUTH", $results, $context);
-        unset($context['AUTH_STATE'],
-            $context['AUTH_USER'], $context['AUTH_USERNAME']);
-        if ($results) {
-            $context['RESPONSE'] = "* ". $this->capabilities['USER'].
-                "\x0D\x0A{$line_parts[0]} OK Logged in";
-            $context['SERVER_STATE'] = "USER";
-            $context['AUTH_USER'] = $user;
-            return 'success';
-        } else {
-            $context['SERVER_USER'] = "TLS";
-            $context['RESPONSE'] = $line_parts[0] .
-                "NO [AUTHENTICATIONFAILED] Authentication failed.";
-            unset($context['AUTH_STATE'],
-                $context['AUTH_USER'], $context['AUTH_USERNAME']);
-            return 'error';
-        }
-    }
-    protected function parseLogout($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 2);
-        $context['RESPONSE'] = "* BYE Logging out\x0D\x0A".
-            $line_parts[0] . " OK Logout completed.";
-        $context['SERVER_STATE'] = 'QUIT';
-        return 'success';
-    }
-    protected function parseLsub($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of LSUB parameters incorrect.";
-        }
-        list(,,$reference, $mailbox) = $line_parts;
-        $_REQUEST['reference'] = trim($reference, "\"'\t ");
-        $_REQUEST['mailbox'] = trim($mailbox, "\"'\t ");
-        $handled = $this->trigger("LSUB", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        }
-        return 'success';
-    }
-    protected function parseMail($key, $first_line, $data, &$context)
-    {
-        $domain = trim(preg_replace("/^\s*MAIL\s+FROM\s*\:s*/i", "",
-            $first_line));
-        $_REQUEST['domain'] = trim($domain, "<>");
-        if ($this->isDomain($domain) || $this->isEmail($domain)) {
-            $handled = $this->trigger("MAILFROM", $results, $context);
-            if ($results) {
-                $context['RESPONSE'] = "250 2.1.0 Ok";
-                $context['MAILFROM'] = $domain;
-                $context['SERVER_STATE'] = "MAIL";
-            } else {
-                $context['RESPONSE'] = "550 Mail refused for local policy".
-                    " reasons.";
-            }
-        } else {
-            $context['RESPONSE'] = "501 Syntax error: MAIL FROM:";
-        }
-        return 'success';
-    }
-    protected function parseNoop($key, $first_line, $data, &$context)
-    {
-        $protocol = $context['PROTOCOL'];
-        if ($protocol == 'SMTP') {
-            $context['RESPONSE'] = "250 OK";
-        } else {
-            $line_parts = preg_split("/\s+/", $first_line, 2);
-            $context['RESPONSE'] = $line_parts[0] . " OK NOOP completed.";
-        }
-        return 'success';
-    }
-    protected function parseQuit($key, $first_line, $data, &$context)
-    {
-        $context['RESPONSE'] = "221 2.0.0 Bye";
-        $context['SERVER_STATE'] = 'QUIT';
-        return 'success';
-    }
-    protected function parseRcpt($key, $first_line, $data, &$context)
-    {
-        $email = trim(preg_replace("/^\s*RCPT\s+TO\s*\:s*/i", "",
-            $first_line));
-        $email = trim($email, "<>");
-        $_REQUEST['email'] = $email;
-        if ($this->isEmail($email)) {
-            $handled = $this->trigger("RCPTTO", $results, $context);
-            if ($handled && !empty($results)) {
-                $context['RESPONSE'] = "250 2.1.0 Ok";
-                if (empty($context['RCPTTO'])) {
-                    $context['RCPTTO'] = [];
-                }
-                $context['RCPTTO'][] = [$email, $result[0]];
-                $context['SERVER_STATE'] = "RCPT";
-            } else {
-                $context['RESPONSE'] = "550 Mail refused for local policy".
-                    " reasons.";
-            }
-        } else {
-            $context['RESPONSE'] = "501 Syntax: RCPT TO:";
-        }
-        return 'success';
-    }
-    protected function parseRename($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of CREATE parameters incorrect.";
-        }
-        list(,, $oldname, $newname) = $line_parts;
-        $_REQUEST['old_mailbox'] = trim($oldname, "\"'\t ");
-        $_REQUEST['new_mailbox'] = trim($newname, "\"'\t ");
-        $handled = $this->trigger("RENAME", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        }
-        return 'success';
-    }
-    protected function parseRset($key, $first_line, $data, &$context)
-    {
-        $context['SERVER_STATE'] = "EHLO_TLS";
-        unset($context['MAILFROM'], $context['RCPTTO']);
-        $context['RESPONSE'] = "250 OK";
-        return 'success';
-    }
-    protected function parseSearch($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 3);
-        $context['RESPONSE'] = $line_parts[0];
-        if (empty($_SERVER['MAILBOX'])) {
-            $context['RESPONSE'] = $line_parts[0] . " BAD No mailbox selected.";
-            return "error";
-        }
-        if (count($line_parts) != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Incorrect number of arguments for SEARCH.";
-            return "error";
-        }
-        $search_pattern = "ALL|ANSWERED|BCC\s+[^\s]+|BEFORE\s+[^\s]+|BODY" .
-            "|CC\s+[^\s]+|DELETED|DRAFT|FLAGGED|FROM\s+[^\s]+".
-            "|HEADER\s+[^\s]+\s+[^\s]+|KEYWORD\s+[^\s]+|LARGER\s+\d+|NEW".
-            "|NOT|OLD|ON\s+[^\s]|OR|RECENT|SEEN|SENTBEFORE\s+[^\s]+".
-            "|SENTON\s+[^\s]+|SENTSINCE\s+[^\s]+|SINCE\s+[^\s+]".
-            "|SMALLER\s+\d+|SUBJECT\s+[^\s]+|TEXT\s+[^\s]+|TO\s+[^\s]+".
-            "|UID\s+[^\s]+|UNANSWERED|UNDRAFT|UNFLAGGED|UNKEYWORD\s+[^\s]+".
-            "|UNSEEN";
-        if ($_REQUEST['sequence_set'] =
-            $this->getSequenceSetArrays($line_parts[2])) {
-            $_REQUEST['query'] = "SEQUENCE_SET";
-        } else if(preg_match("/($search_pattern)/i", $line_parts[2], $matches)) {
-        } else {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Invalid arguments.";
-            return "error";
-        }
-//to do
-        if (empty($_REQUEST['uid'])) {
-            $_REQUEST['uid'] = false;
-        }
-        $handled = $this->trigger("SEARCH", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    protected function parseSelect($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of SELECT parameters incorrect.";
-        }
-        list(,, $_REQUEST['mailbox']) = $line_parts;
-        $_REQUEST['mailbox'] = trim($_REQUEST['mailbox'], "\"'\t ");
-        $handled = $this->trigger("SELECT", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-            if (!empty($_SERVER['MAILBOX'])) {
-                $context['MAILBOX'] = $_SERVER['MAILBOX'];
-            }
-            if (!empty($_SERVER['MAILBOX_ID'])) {
-                $context['MAILBOX_ID'] = $_SERVER['MAILBOX_ID'];
-            }
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    protected function parseStatus($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 4);
-        if (count($line_parts)  != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of STATUS parameters incorrect.";
-            return "error";
-        }
-        list(,, $mailbox, $pre_items) = $line_parts;
-        $_REQUEST['mailbox'] = trim($mailbox, "\"'\t ");
-        $pre_items = trim($_REQUEST['data_items']);
-        if ($pre_items[0] != '(' || $pre_items[strlen($pre_items) - 1] != ')') {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD STATUS data item list does not parse.";
-            return "error";
-        }
-        $pre_items = trim($pre_items, "()");
-        $response_items = preg_split("/\s+/", $pre_items);
-        $allowed_items = ['MESSAGES', 'RECENT', 'UIDNEXT', 'UIDVALIDITY',
-            'UNSEEN'];
-        $out_message = "";
-        foreach ($response_items as $response_item) {
-            if (in_array($response_item, $allowed_items)) {
-                if ($response_item == 'MESSAGES') {
-                    $response_item = "EXISTS";
-                }
-                // these may depend on $_REQUEST['mailbox']
-                $test->trigger($response_item, $out);
-                $out_message .= $out;
-            } else {
-                $context['RESPONSE'] = $line_parts[0] .
-                   " BAD Invalid Argument.";
-                return "error";
-            }
-        }
-        if ($handled) {
-            $context['RESPONSE'] = $out_message .
-                $line_parts[0] . " OK STATUS completed.";
-        }
-        return 'success';
-    }
-    protected function parseStarttls($key, $first_line, $data, &$context)
-    {
-        $connection = $this->in_streams[self::CONNECTION][$key];
-        stream_set_blocking($connection, 1);
-        $context['SERVER_STATE'] = 'TLS';
-        $context['STARTING_TLS'] = true;
-        $protocol = $this->in_streams[self::CONTEXT][$key]['PROTOCOL'];
-        if ($protocol == 'SMTP') {
-            $context['RESPONSE'] = "220  2.0.0 Ready to start TLS";
-        } else {
-            $line_parts = preg_split("/\s+/", $first_line);
-            $context['RESPONSE'] =
-                "{$line_parts[0]} OK Begin TLS negotiation now";
-        }
-        return 'success';
-    }
-    protected function parseStore($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 5);
-        $context['RESPONSE'] = $line_parts[0];
-        if (empty($_SERVER['MAILBOX'])) {
-            $context['RESPONSE'] = $line_parts[0] . " BAD No mailbox selected.";
-            return "error";
-        }
-        if (count($line_parts) != 5) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Incorrect number of arguments for STORE.";
-            return "error";
-        }
-        if (!$_REQUEST['sequence-set'] =
-            $this->getSequenceSetArrays($line_parts[2])) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Sequence-set parse error.";
-            return "error";
-        }
-        $flags_arg = $line_parts[3];
-        if (!preg_match("/^[+-]?FLAGS(:?\.SILENT)?$/i", $flags_arg)) {
-            $context['RESPONSE'] = $line_parts[0] .
-                " BAD Illegal Flags Arguments.";
-            return "error";
-        }
-        $_REQUEST['flag-operation'] = (in_array($flags_arg[0], ["+", "-"])) ?
-            $flags_arg[0] : "";
-        $_REQUEST['silent'] = false;
-        if (strlen($flags_arg) >= 6 && substr($flags_arg, -6) == "SILENT") {
-            $_REQUEST['silent'] = true;
-        }
-        $_REQUEST['flag-list'] = preg_split("/\s+/",
-            trim($line_parts[4], "()"));
-        if (empty($_REQUEST['uid'])) {
-            $_REQUEST['uid'] = false;
-        }
-        $handled = $this->trigger("STORE", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    protected function getSequenceSetArrays($sequence_set)
-    {
-        $sequence_parts = explode(",", $sequence_set);
-        $out_set = [];
-        foreach ($sequence_parts as $sequence_part) {
-            if ($sequence_part == "*") {
-                $out_set[] = [0, '*'];
-            } else if (is_numeric($sequence_part)) {
-                $value = intval($sequence_part);
-                $out_set[] = [$value, $value];
-            } else {
-                $range_parts = explode(":", $sequence_part, 2);
-                if (count($range_parts) != 2) {
-                    return false;
-                }
-                if ($range_parts[0] == $range_parts[1] &&
-                    $range_parts[1] == '*') {
-                    $out_set[] = [0, '*'];
-                } else if ($range_parts[0] == "*" &&
-                    is_numeric($range_parts[1])) {
-                    $out_set[] = [intval($range_parts[1]), "*"];
-                } else if ($range_parts[1] == "*" &&
-                    is_numeric($range_parts[0])) {
-                    $out_set[] = [intval($range_parts[0]), "*"];
-                } else if (is_numeric($range_parts[0]) &&
-                    is_numeric($range_parts[1])) {
-                    $value0 = intval($range_parts[0]);
-                    $value1 = intval($range_parts[1]);
-                    $out_set[] = [min($value0, $value1), max($value0, $value1)];
-                } else {
-                    return false;
-                }
-            }
-        }
-        return $out_set;
-    }
-    protected function parseSubscribe($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of SUBSCRIBE parameters incorrect.";
-            return "error";
-        }
-        list(,, $_REQUEST['mailbox']) = $line_parts;
-        $handled = $this->trigger("SUBSCRIBE", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    /**
-     *
-     */
-    protected function parseUid($key, $first_line, $data, &$context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line, 4);
-        if (count($line_parts)  != 4) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of UID parameters incorrect.";
-            return "error";
-        }
-        list(,, $command, ) = $line_parts;
-        $command = strtoupper($command);
-        if (!in_array($command, ["COPY", "FETCH", "SEARCH", "STORE"])) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD UID command unknown.";
-            return "error";
-        }
-        $_REQUEST["uid"] = true;
-        array_shift($line_parts);
-        $first_line = implode(" ", $line_parts);
-        $parseCommand = "parse" . ucfirst(strtolower($command));
-        return $this->$parseCommand($key, $first_line, $data, $context);
-    }
-    protected function parseUnsubscribe($key, $first_line, $data, $context)
-    {
-        $line_parts = preg_split("/\s+/", $first_line);
-        if (count($line_parts)  != 3) {
-            $context['RESPONSE'] = $line_parts[0] .
-                "BAD Number of UNSUBSCRIBE parameters incorrect.";
-            return "error";
-        }
-        list(,, $_REQUEST['mailbox']) = $line_parts;
-        $handled = $this->trigger("UNSUBSCRIBE", $results, $context);
-        if ($handled) {
-            $context['RESPONSE'] = $results["RESPONSE"] .
-                $line_parts[0] . $results["STATUS"];
-        } else {
-            return "error";
-        }
-        return 'success';
-    }
-    protected function isDomain($domain)
-    {
-        return filter_var('postmaster@' . $domain, FILTER_VALIDATE_EMAIL) ||
-            filter_var($domain, FILTER_VALIDATE_IP) ||
-            $domain == 'localhost';
-    }
-    protected function isEmail($email)
-    {
-        $email_parts = explode("@", $email, 2);
-        if (!isset($email_parts[1])) {
-            return false;
-        }
-        return filter_var($email_parts[0] . "@somewhere.com",
-            FILTER_VALIDATE_EMAIL) && $this->isDomain($email_parts[1]);
-    }
-    /**
- * Handler for the HELP command.
- * Contains a list of commands and their descriptions in an array.
- */
-protected function parseHelp()
-{
-    $commands = [
-        "AUTH" => "Used for authentication during the SMTP session. It is typically used when the server requires the client to authenticate before sending emails.",
-        "EHLO" => "Initiates the SMTP session with the server and requests extended SMTP capabilities. It is used to identify the client to the server and to negotiate the supported features.",
-        "HELO" => "Initiates the SMTP session with the server. It is a simpler version of EHLO and is used when extended capabilities are not required.",
-        "NOOP" => "Does nothing but can be used as a keep-alive mechanism during the SMTP session to prevent the connection from timing out.",
-        "QUIT" => "Ends the SMTP session with the server and closes the connection. It is used to gracefully terminate the session.",
-        "RSET" => "Resets the current SMTP session state. It is used to abort the current email transaction and return to the initial state.",
-        "STARTTLS" => "Initiates a TLS-encrypted SMTP session. It is used to secure the connection between the client and server by encrypting the data transmission.",
-        "MAIL" => "Specifies the sender's email address in the email transaction. It is used to indicate who is sending the email.",
-        "RCPT" => "Specifies the recipient's email address in the email transaction. It is used to indicate who is receiving the email.",
-        "DATA" => "Indicates the start of the email message body. It is used to transmit the content of the email message.",
-        "VRFY" => "Verifies if a given email address is valid and exists on the server. It can be used to check the validity of email addresses before sending emails.",
-        "HELP" => "Requests help information from the server. It can be used to retrieve information about available commands and their usage."
-    ];
-    $helpResponse = "214 - Available commands:\r\n";
-    foreach ($commands as $command => $desc) {
-        $helpResponse .= "[$command] \r\n\r\n $desc\r\n\r\n\r\n";
-    }
-    $helpResponse .= "214 End of HELP response\r\n\r\n";
-    return $helpResponse;
-}
-
-    /**
-     * Used to initialize the superglobals before process() is called.
-     * The values for the globals come from the
-     * request streams context which has request headers.
-     *
-     * @param array $context associative array of information parsed from
-     *      a mail request.
-     */
-    protected function setGlobals($context)
-    {
-        $_SERVER = array_merge($this->default_server_globals, $context);
-    }
-    /**
-     * Used to close connections and remove from stream arrays streams that
-     * have not had traffic in the last CONNECTION_TIMEOUT seconds. The
-     * stream socket server is exempt from being culled, as are any streams
-     * whose ids are in $this->immortal_stream_keys.
-     */
-    protected function cullDeadStreams()
-    {
-        $keys = array_merge(array_keys($this->in_streams[self::CONNECTION]),
-            array_keys($this->out_streams[self::CONNECTION]));
-        foreach ($keys as $key) {
-            if (in_array($key, $this->immortal_stream_keys)) {
-                continue;
-            }
-            $in_time = empty($this->in_streams[self::MODIFIED_TIME][$key]) ?
-                0 : $this->in_streams[self::MODIFIED_TIME][$key];
-            $out_time = empty($this->out_streams[self::MODIFIED_TIME][$key]) ?
-                0 : $this->out_streams[self::MODIFIED_TIME][$key];
-            $modified_time = max($in_time, $out_time);
-            if (time() - $modified_time > $this->default_server_globals[
-                'CONNECTION_TIMEOUT']) {
-                $this->shutdownStream($key);
-            }
-        }
-    }
-    /**
-     * Closes stream with id $key and removes it from in_streams and
-     * outstreams arrays.
-     *
-     * @param int $key id of stream to delete
-     */
-    protected function shutdownStream($key)
-    {
-        if (!empty($this->in_streams[self::CONNECTION][$key])) {
-            @stream_socket_shutdown($this->in_streams[self::CONNECTION][$key],
-                STREAM_SHUT_RDWR);
-        }
-        unset($this->in_streams[self::CONNECTION][$key],
-            $this->in_streams[self::CONTEXT][$key],
-            $this->in_streams[self::DATA][$key],
-            $this->in_streams[self::MODIFIED_TIME][$key],
-            $this->out_streams[self::CONNECTION][$key],
-            $this->out_streams[self::CONTEXT][$key],
-            $this->out_streams[self::DATA][$key],
-            $this->out_streams[self::MODIFIED_TIME][$key]
-        );
-    }
-    /**
-     * Removes a stream from outstream arrays. Since an HTTP connection can
-     * handle several requests from a single client, this method does not close
-     * the connection. It might be run after a request response pair, while
-     * waiting for the next request.
-     *
-     * @param int $key id of stream to remove from outstream arrays.
-     */
-    protected function shutdownWriteStream($key)
-    {
-        unset($this->out_streams[self::CONNECTION][$key],
-            $this->out_streams[self::CONTEXT][$key],
-            $this->out_streams[self::DATA][$key],
-            $this->out_streams[self::MODIFIED_TIME][$key]
-        );
     }
 }

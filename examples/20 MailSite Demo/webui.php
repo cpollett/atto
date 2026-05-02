@@ -612,8 +612,9 @@ $scenarios['api_inbox'] = [
 $scenarios['api_show'] = [
     'group' => 'Direct API (no wire protocol)',
     'label' => 'Fetch latest alice/INBOX message',
-    'desc' => '$mail->fetchMessage(...) -- raw RFC 5322 ' .
-        'bytes including the trace header we stamped.',
+    'desc' => '$mail->fetchMessage("alice", "INBOX", $uid) ' .
+        'returns raw RFC 5322 bytes, including the Received: ' .
+        'trace header we stamped on inbound.',
     'kind' => 'api',
     'run' => function () use ($users_file, $store_dir) {
         $m = shareMail($users_file, $store_dir);
@@ -637,6 +638,144 @@ $scenarios['api_junk_count'] = [
         $m = shareMail($users_file, $store_dir);
         return "alice/Junk: " .
             $m->messageCount('alice', 'Junk') . "\n";
+    },
+];
+$scenarios['api_create_folder'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'Create a folder via the direct API',
+    'desc' => '$mail->createFolder("alice", "Notes") -- ' .
+        'idempotent; calling on an existing folder is a ' .
+        'successful no-op.',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir) {
+        $m = shareMail($users_file, $store_dir);
+        $m->createFolder('alice', 'Notes');
+        $tx = "Folders after createFolder('Notes'):\n";
+        foreach ($m->listFolders('alice') as $f) {
+            $tx .= "  $f\n";
+        }
+        $tx .= "\nCalling createFolder('Notes') again is a " .
+            "no-op:\n";
+        $tx .= "  result = " .
+            ($m->createFolder('alice', 'Notes') ?
+                'true (idempotent)' : 'false') . "\n";
+        return $tx;
+    },
+];
+$scenarios['api_lifecycle'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'CREATE / RENAME / DELETE folder lifecycle',
+    'desc' => 'Walks createFolder -> renameFolder -> ' .
+        'deleteFolder, listing folders at each step. ' .
+        'deleteFolder("alice", "INBOX") is refused.',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir) {
+        $m = shareMail($users_file, $store_dir);
+        $tx = "";
+        $list = function ($label) use ($m, &$tx) {
+            $tx .= "$label:\n";
+            foreach ($m->listFolders('alice') as $f) {
+                $tx .= "  $f\n";
+            }
+            $tx .= "\n";
+        };
+        $list("Folders at start");
+        $tx .= '$mail->createFolder("alice", "Demo") => ' .
+            ($m->createFolder('alice', 'Demo') ? 'true' :
+                'false') . "\n";
+        $tx .= '$mail->createFolder("alice", "Demo/2026") => ' .
+            ($m->createFolder('alice', 'Demo/2026') ? 'true' :
+                'false') . "\n";
+        $list("After CREATE");
+        $tx .= '$mail->renameFolder("alice", "Demo/2026",' .
+            ' "Demo/Archived") => ' .
+            ($m->renameFolder('alice', 'Demo/2026',
+                'Demo/Archived') ? 'true' : 'false') . "\n";
+        $list("After RENAME");
+        $tx .= '$mail->deleteFolder("alice", "Demo/Archived")' .
+            ' => ' .
+            ($m->deleteFolder('alice', 'Demo/Archived') ?
+                'true' : 'false') . "\n";
+        $tx .= '$mail->deleteFolder("alice", "Demo") => ' .
+            ($m->deleteFolder('alice', 'Demo') ? 'true' :
+                'false') . "\n";
+        $list("After DELETE");
+        $tx .= '$mail->deleteFolder("alice", "INBOX") => ' .
+            ($m->deleteFolder('alice', 'INBOX') ? 'true' :
+                'false (refused; INBOX is reserved)') . "\n";
+        return $tx;
+    },
+];
+$scenarios['api_setflags'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'Set flags on the latest INBOX message',
+    'desc' => '$mail->setFlags("alice", "INBOX", $uid, ' .
+        '["\\Seen", "\\Flagged"]) replaces the flag set. ' .
+        'Pass [] to clear all flags.',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir) {
+        $m = shareMail($users_file, $store_dir);
+        $msgs = $m->listMessages('alice', 'INBOX');
+        if (empty($msgs)) {
+            return "(no messages in alice/INBOX; deliver " .
+                "one first via the SMTP scenarios)\n";
+        }
+        $latest = end($msgs);
+        $uid = $latest['uid'];
+        $tx = "Operating on alice/INBOX UID $uid\n";
+        $tx .= "Flags before: " .
+            (implode(' ', $latest['flags']) ?: '(none)') .
+            "\n";
+        $m->setFlags('alice', 'INBOX', $uid,
+            ['\Seen', '\Flagged']);
+        $after = $m->messageMeta('alice', 'INBOX', $uid);
+        $tx .= "Flags after setFlags(\\Seen, \\Flagged): " .
+            (implode(' ', $after['flags']) ?: '(none)') .
+            "\n";
+        return $tx;
+    },
+];
+$scenarios['api_movemessage'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'Move a message between folders',
+    'desc' => '$mail->moveMessage("alice", "INBOX", "Junk", ' .
+        '$uid). UID is preserved across the move because ' .
+        'UIDs are per-user, not per-folder (matches IMAP ' .
+        'UIDPLUS semantics).',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir) {
+        $m = shareMail($users_file, $store_dir);
+        $msgs = $m->listMessages('alice', 'INBOX');
+        if (empty($msgs)) {
+            return "(no messages in alice/INBOX; deliver " .
+                "one first via the SMTP scenarios)\n";
+        }
+        $latest = end($msgs);
+        $uid = $latest['uid'];
+        $m->createFolder('alice', 'Junk');
+        $tx = "INBOX before: " .
+            $m->messageCount('alice', 'INBOX') .
+            " message(s); Junk before: " .
+            $m->messageCount('alice', 'Junk') .
+            " message(s)\n";
+        $tx .= '$mail->moveMessage("alice", "INBOX", ' .
+            "\"Junk\", $uid) => " .
+            ($m->moveMessage('alice', 'INBOX', 'Junk', $uid) ?
+                'true' : 'false') . "\n";
+        $tx .= "INBOX after:  " .
+            $m->messageCount('alice', 'INBOX') .
+            " message(s); Junk after:  " .
+            $m->messageCount('alice', 'Junk') .
+            " message(s)\n";
+        $moved = $m->messageMeta('alice', 'Junk', $uid);
+        if ($moved !== false) {
+            $tx .= "Junk now contains UID $uid (preserved " .
+                "across the move).\n";
+        } else {
+            $tx .= "(could not find UID $uid in Junk after " .
+                "move)\n";
+        }
+        return $tx;
     },
 ];
 /* ---------- HTTP routes ---------- */

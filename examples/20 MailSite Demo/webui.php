@@ -523,6 +523,65 @@ $site->post('/run', function () use ($site, $scenarios) {
         'label' => $scenarios[$id]['label'],
     ]);
 });
+/*
+    POST /reset wipes the on-disk message store so subsequent
+    scenario runs start from a clean slate. Deletes everything
+    under maildata/ but leaves users.htpasswd alone (that file
+    is a static seed; removing it would lock alice/bob out
+    until index.php restart re-seeded it). The recursive
+    deletion uses RecursiveIteratorIterator with CHILD_FIRST
+    so files are unlinked before the directories that contain
+    them, the only walk order rmdir tolerates.
+ */
+$site->post('/reset', function () use ($site, $store_dir) {
+    $site->header("Content-Type: application/json; charset=utf-8");
+    if (!is_dir($store_dir)) {
+        echo json_encode([
+            'message' => 'maildata/ already absent; nothing ' .
+                'to do.',
+        ]);
+        return;
+    }
+    $errors = [];
+    $deleted_files = 0;
+    $deleted_dirs = 0;
+    try {
+        $it = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($store_dir,
+                \FilesystemIterator::SKIP_DOTS),
+            \RecursiveIteratorIterator::CHILD_FIRST);
+        foreach ($it as $entry) {
+            $path = $entry->getPathname();
+            if ($entry->isDir()) {
+                if (@rmdir($path)) {
+                    $deleted_dirs++;
+                } else {
+                    $errors[] = "rmdir failed: $path";
+                }
+            } else {
+                if (@unlink($path)) {
+                    $deleted_files++;
+                } else {
+                    $errors[] = "unlink failed: $path";
+                }
+            }
+        }
+        /*
+            The iterator does not visit the root itself; remove
+            and recreate it so the next delivery has a fresh
+            directory to populate.
+         */
+        @rmdir($store_dir);
+        @mkdir($store_dir, 0700, true);
+    } catch (\Throwable $e) {
+        $errors[] = $e->getMessage();
+    }
+    echo json_encode([
+        'message' => "Reset complete. Deleted $deleted_files " .
+            "file(s) and $deleted_dirs director(ies).",
+        'errors' => $errors,
+    ]);
+});
 $site->get('/', function () use ($scenarios) {
     /*
         Group scenarios by their 'group' field for rendering.
@@ -552,8 +611,11 @@ h2 { font-size: 1.05em; margin-top: 1.6em; padding-bottom: 0.2em;
     justify-content: space-between; gap: 1em; }
 .scenario button { font: inherit; padding: 0.35em 0.9em;
     background: #06c; color: white; border: 0; border-radius: 4px;
-    cursor: pointer; flex-shrink: 0; }
+    cursor: pointer; flex-shrink: 0; min-width: 4.5em;
+    text-align: center; }
 .scenario button:disabled { background: #888; cursor: default; }
+.scenario button.close { background: #b33; }
+.scenario button.close:hover { background: #c44; }
 .scenario .label { font-weight: 600; }
 .scenario .desc { color: #555; font-size: 0.92em;
     margin-top: 0.25em; }
@@ -564,6 +626,16 @@ h2 { font-size: 1.05em; margin-top: 1.6em; padding-bottom: 0.2em;
     max-height: 360px; overflow: auto; }
 .scenario .transcript.visible { display: block; }
 .note { color: #555; font-size: 0.88em; }
+.reset-bar { display: flex; align-items: center; gap: 1em;
+    margin: 1em 0 1.5em; padding: 0.7em 0.9em;
+    background: #fff8e6; border: 1px solid #f0d890;
+    border-radius: 4px; }
+.reset-bar button { font: inherit; padding: 0.4em 1em;
+    background: #d97706; color: white; border: 0;
+    border-radius: 4px; cursor: pointer; flex-shrink: 0; }
+.reset-bar button:hover { background: #b85f04; }
+.reset-bar button:disabled { background: #888; cursor: default; }
+.reset-bar .reset-status { color: #555; font-size: 0.9em; }
 code { background: #eee; padding: 0.1em 0.3em; border-radius: 3px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>
@@ -580,6 +652,13 @@ shared instance pointing at the same on-disk store.
 </div>
 <p class="note">Demo accounts: <code>alice</code> /
 <code>bob</code>, password <code>hunter2</code>.</p>
+<div class="reset-bar">
+<button type="button" id="reset-btn">Reset all stored mail</button>
+<span class="reset-status" id="reset-status">
+Wipes <code>maildata/</code> so every scenario starts fresh.
+The committed <code>users.htpasswd</code> is left in place.
+</span>
+</div>
 <?php foreach ($by_group as $group => $items): ?>
 <h2><?= htmlspecialchars($group) ?></h2>
 <?php foreach ($items as $id => $s): ?>
@@ -595,13 +674,42 @@ shared instance pointing at the same on-disk store.
 </div>
 <?php endforeach; endforeach; ?>
 <script>
+/*
+    Each scenario button is a tri-state toggle:
+        Run   -> click sends the request and renders the
+                 transcript; the button switches to [X].
+        [X]   -> click hides the transcript and reverts the
+                 button to Run.
+        busy  -> while the request is in flight the button
+                 shows "Running..." and is disabled.
+ */
 document.querySelectorAll('.scenario').forEach(function (el) {
     var btn = el.querySelector('button');
     var id = el.dataset.id;
     var pre = el.querySelector('.transcript');
-    btn.addEventListener('click', function () {
-        btn.disabled = true;
+    function showRun() {
+        btn.textContent = 'Run';
+        btn.classList.remove('close');
+        btn.disabled = false;
+    }
+    function showClose() {
+        btn.textContent = '\u2715';
+        btn.classList.add('close');
+        btn.disabled = false;
+    }
+    function showBusy() {
         btn.textContent = 'Running...';
+        btn.classList.remove('close');
+        btn.disabled = true;
+    }
+    btn.addEventListener('click', function () {
+        if (btn.classList.contains('close')) {
+            pre.classList.remove('visible');
+            pre.textContent = '';
+            showRun();
+            return;
+        }
+        showBusy();
         pre.classList.add('visible');
         pre.textContent = '(running...)';
         var body = new URLSearchParams();
@@ -622,14 +730,68 @@ document.querySelectorAll('.scenario').forEach(function (el) {
                 pre.textContent = data.transcript ||
                     '(empty transcript)';
             }
+            showClose();
         }).catch(function (err) {
             pre.textContent = 'ERROR: ' + err;
-        }).finally(function () {
-            btn.disabled = false;
-            btn.textContent = 'Run';
+            showClose();
         });
     });
 });
+/*
+    Reset button: confirms before posting to /reset, then
+    reports the deletion summary. Also closes any open
+    scenario transcripts since their results may now be stale.
+ */
+(function () {
+    var resetBtn = document.getElementById('reset-btn');
+    var resetStatus = document.getElementById('reset-status');
+    var defaultStatus = resetStatus.innerHTML;
+    resetBtn.addEventListener('click', function () {
+        if (!window.confirm(
+            'Delete every stored message under maildata/?\n' +
+            'This cannot be undone.')) {
+            return;
+        }
+        resetBtn.disabled = true;
+        resetBtn.textContent = 'Resetting...';
+        resetStatus.textContent = '';
+        fetch('/reset', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                resetStatus.textContent = data.message ||
+                    '(reset returned no message)';
+                if (data.errors && data.errors.length) {
+                    resetStatus.textContent += ' Errors: ' +
+                        data.errors.join('; ');
+                }
+                document.querySelectorAll('.scenario')
+                    .forEach(function (el) {
+                        var pre = el.querySelector('.transcript');
+                        var btn = el.querySelector('button');
+                        pre.classList.remove('visible');
+                        pre.textContent = '';
+                        btn.textContent = 'Run';
+                        btn.classList.remove('close');
+                        btn.disabled = false;
+                    });
+            })
+            .catch(function (err) {
+                resetStatus.textContent = 'ERROR: ' + err;
+            })
+            .finally(function () {
+                resetBtn.disabled = false;
+                resetBtn.textContent = 'Reset all stored mail';
+                /*
+                    Restore the original explanatory text after
+                    a few seconds so the bar does not stay
+                    cluttered with the last operation summary.
+                 */
+                setTimeout(function () {
+                    resetStatus.innerHTML = defaultStatus;
+                }, 6000);
+            });
+    });
+})();
 </script>
 </body>
 </html><?php

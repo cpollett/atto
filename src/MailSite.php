@@ -840,10 +840,40 @@ class FileMailStorage extends MailStorage
  *      $mail = new MailSite();
  *      $mail->auth($authenticator);
  *      $mail->storage($storage);
- *      $mail->filter(function ($from, $to, $bytes, $ctx) { });
  *      $mail->domains(['example.com', 'localhost']);
- *      $mail->listen(['SMTP_PORT' => 2525, 'IMAP_PORT' => 1143,
+ *      $mail->onConnect(function ($info, $ctx) { });
+ *      $mail->onMailFrom(function ($info, $ctx) { });
+ *      $mail->onRcptTo(function ($info, $ctx) { });
+ *      $mail->onHeader(function ($info, $ctx) { });
+ *      $mail->onMessage(function ($info, $ctx) { });
+ *      $mail->listen([
+ *          'SMTP_PORT' => 2525, 'IMAP_PORT' => 1143,
+ *          'SMTPS_PORT' => 4465, 'IMAPS_PORT' => 9933,
  *          'SERVER_CONTEXT' => ['ssl' => [...]]]);
+ *
+ * Hook stages (each onX call appends a callback; multiple
+ * callbacks per stage compose, evaluated in registration order
+ * with first-non-null verdict winning):
+ *   onBanner   - before greeting; can replace banner string or
+ *                close the connection without one
+ *   onConnect  - after accept; can refuse the session
+ *   onHelo     - after EHLO/HELO; can refuse with 550
+ *   onMailFrom - after MAIL FROM; can reject the sender
+ *   onRcptTo   - per RCPT TO; can reject one recipient
+ *   onHeader   - once the message headers are parsed but before
+ *                the body is stored; can reject the message
+ *   onMessage  - with full bytes; can drop, redirect, or accept
+ * Hook return values:
+ *   null / true                       - continue
+ *   false                             - drop silently (still
+ *                                       250 to the SMTP client
+ *                                       so filter behavior is
+ *                                       not probeable)
+ *   'reject'                          - SMTP-level reject with
+ *                                       a hard 550 / 421 reply
+ *   string (only at onBanner)         - replacement banner text
+ *   ['folder'=>...,'flags'=>[...]]    - at onMessage, redirect
+ *                                       delivery to a folder
  *
  * Public methods that web/CLI frontends can call directly bypass
  * the wire protocol entirely; they reach the same MailStorage
@@ -864,8 +894,12 @@ class MailSite
     protected $authenticator;
     /** @var MailStorage */
     protected $mail_storage;
-    /** @var callable|null filter callable(from, to, bytes, ctx) */
-    protected $filter_fn;
+    /** @var array hook callbacks keyed by stage */
+    protected $hooks = [
+        'banner' => [], 'connect' => [], 'helo' => [],
+        'mailfrom' => [], 'rcptto' => [], 'header' => [],
+        'message' => [],
+    ];
     /** @var array list of locally hosted domains */
     protected $local_domains = ['localhost'];
     /** @var array */
@@ -880,6 +914,10 @@ class MailSite
     protected $timer_alarms;
     /** @var array */
     protected $timers = [];
+    /** @var array stream context array (for TLS) */
+    protected $server_context_array = [];
+    /** @var bool whether listen() detected an SSL config */
+    protected $tls_available = false;
     public function __construct()
     {
         $this->timer_alarms = new \SplPriorityQueue();
@@ -904,24 +942,116 @@ class MailSite
         return $this;
     }
     /**
-     * Sets the optional filter callable run when a message
-     * arrives via SMTP for a local user. Signature:
-     *      function($from, $to, $bytes, $ctx): array|bool|null
-     * The return value either:
-     *   - false to drop the message silently (still 250 to the
-     *     sender so spam senders cannot probe filter behavior)
-     *   - an array ['folder' => 'Junk', 'flags' => ['\Seen']]
-     *     to redirect delivery to a different folder and/or set
-     *     initial flags
-     *   - true or null to deliver to INBOX with default flags
-     * The $ctx is the per-connection context array containing
-     * REMOTE_ADDR, REMOTE_PORT, AUTH_USER (if authenticated),
-     * etc., useful for sender-policy decisions.
+     * Registers a callback to run before the welcome banner is
+     * sent. The callback receives ($info, $ctx) where $info has
+     * 'remote_addr', 'remote_port', 'protocol' ('SMTP'|'IMAP'),
+     * 'tls_active', and 'default_banner'. It may return:
+     *   - null / true: send the default banner
+     *   - a string: replace the banner with this text (the
+     *     trailing CRLF is appended automatically)
+     *   - 'reject': close the connection; SMTP gets 421, IMAP
+     *     gets a "* BYE" before close
      */
-    public function filter(callable $filter)
+    public function onBanner(callable $fn)
     {
-        $this->filter_fn = $filter;
+        $this->hooks['banner'][] = $fn;
         return $this;
+    }
+    /**
+     * Registers a callback to run immediately after a client
+     * connects (after TLS upgrade for implicit-TLS sockets).
+     * $info has 'remote_addr', 'remote_port', 'protocol',
+     * 'tls_active'. Returning 'reject' closes the connection.
+     * Useful for IP-based allow/deny lists.
+     */
+    public function onConnect(callable $fn)
+    {
+        $this->hooks['connect'][] = $fn;
+        return $this;
+    }
+    /**
+     * Registers a callback to run after EHLO/HELO has been
+     * parsed. $info has 'domain', 'verb' ('EHLO'|'HELO').
+     * Returning 'reject' replies 550 and the session stays in
+     * INIT state.
+     */
+    public function onHelo(callable $fn)
+    {
+        $this->hooks['helo'][] = $fn;
+        return $this;
+    }
+    /**
+     * Registers a callback to run after MAIL FROM has been
+     * parsed. $info has 'from'. Returning 'reject' replies
+     * 550 5.7.1 and MAIL FROM is not accepted.
+     */
+    public function onMailFrom(callable $fn)
+    {
+        $this->hooks['mailfrom'][] = $fn;
+        return $this;
+    }
+    /**
+     * Registers a callback to run per RCPT TO (the anti-relay
+     * check runs first; this hook only sees recipients that
+     * survive that check). $info has 'to' and 'local_user' (the
+     * resolved local username). Returning 'reject' replies
+     * 550 5.7.1 for that recipient only.
+     */
+    public function onRcptTo(callable $fn)
+    {
+        $this->hooks['rcptto'][] = $fn;
+        return $this;
+    }
+    /**
+     * Registers a callback to run once the message DATA is in
+     * hand and the headers have been parsed, but before the
+     * body is stored. $info has 'from', 'to', 'headers' (array
+     * of [name, value] pairs preserving order and case),
+     * 'header_block', 'bytes'. Returning 'reject' replies
+     * 550 5.6.0 and the message is discarded.
+     */
+    public function onHeader(callable $fn)
+    {
+        $this->hooks['header'][] = $fn;
+        return $this;
+    }
+    /**
+     * Registers a callback to run with the full message bytes
+     * for delivery. $info has 'from', 'to', 'bytes'. Return
+     * value:
+     *   - null/true: deliver to INBOX with default flags
+     *   - false: drop silently (still 250 to client)
+     *   - 'reject': SMTP-level reject with 550
+     *   - ['folder'=>'Junk','flags'=>['\Recent']]: redirect
+     */
+    public function onMessage(callable $fn)
+    {
+        $this->hooks['message'][] = $fn;
+        return $this;
+    }
+    /**
+     * Runs all hooks for $stage in registration order. Returns
+     * the first non-null verdict, or null if every hook returned
+     * null/true. Hooks that throw are caught and treated as if
+     * they returned null so a buggy filter cannot kill the loop.
+     */
+    protected function runHooks($stage, $info, $ctx)
+    {
+        if (empty($this->hooks[$stage])) {
+            return null;
+        }
+        foreach ($this->hooks[$stage] as $fn) {
+            try {
+                $verdict = call_user_func($fn, $info, $ctx);
+            } catch (\Throwable $e) {
+                $verdict = null;
+            }
+            if ($verdict === null || $verdict === true) {
+                continue;
+            }
+            return $verdict;
+        }
+        return null;
     }
     /**
      * Sets the list of locally hosted domains. RCPT TO addresses
@@ -956,9 +1086,9 @@ class MailSite
      *      method once per recipient)
      * @param string $bytes the full RFC 5322 message
      * @param array $ctx optional context array passed to the
-     *      filter (caller supplies arbitrary fields)
+     *      onMessage hook (caller supplies arbitrary fields)
      * @return int|false UID of the delivered message, or false
-     *      on filter-drop or unknown recipient
+     *      on hook-drop, hook-reject, or unknown recipient
      */
     public function deliverMail($from, $to, $bytes, $ctx = [])
     {
@@ -968,20 +1098,18 @@ class MailSite
         }
         $folder = "INBOX";
         $flags = ['\Recent'];
-        if (is_callable($this->filter_fn)) {
-            $verdict = call_user_func($this->filter_fn, $from, $to,
-                $bytes, $ctx);
-            if ($verdict === false) {
-                return false;
+        $info = ['from' => $from, 'to' => $to, 'bytes' => $bytes];
+        $verdict = $this->runHooks('message', $info, $ctx);
+        if ($verdict === false || $verdict === 'reject') {
+            return false;
+        }
+        if (is_array($verdict)) {
+            if (isset($verdict['folder'])) {
+                $folder = (string) $verdict['folder'];
             }
-            if (is_array($verdict)) {
-                if (isset($verdict['folder'])) {
-                    $folder = (string) $verdict['folder'];
-                }
-                if (isset($verdict['flags']) &&
-                    is_array($verdict['flags'])) {
-                    $flags = $verdict['flags'];
-                }
+            if (isset($verdict['flags']) &&
+                is_array($verdict['flags'])) {
+                $flags = $verdict['flags'];
             }
         }
         $this->mail_storage->ensureUser($local);
@@ -1095,20 +1223,35 @@ class MailSite
     /**
      * Binds the SMTP and IMAP listening sockets and runs the
      * event loop forever. The $config array overrides the
-     * built-in defaults; the SERVER_CONTEXT key (if present) is
-     * passed through to stream_context_create for TLS settings.
+     * built-in defaults. If the SERVER_CONTEXT.ssl key is set
+     * and the SMTPS_PORT or IMAPS_PORT keys are non-zero,
+     * additional implicit-TLS sockets are bound on those ports
+     * (TLS is negotiated immediately on accept, no plaintext
+     * greeting). STARTTLS is advertised on the plaintext SMTP
+     * and IMAP listeners whenever a TLS context is configured.
      */
     public function listen($config = [])
     {
         $defaults = [
             'SMTP_PORT' => 2525,
             'IMAP_PORT' => 1143,
+            'SMTPS_PORT' => 0,
+            'IMAPS_PORT' => 0,
             'BIND' => '0.0.0.0',
             'SERVER_NAME' => 'localhost',
             'SERVER_SOFTWARE' => 'AttoMail',
             'CONNECTION_TIMEOUT' => 30 * 60,
             'MAX_COMMAND_LEN' => 2048,
             'MAX_MESSAGE_LEN' => 25 * 1024 * 1024,
+            /*
+                If true, AUTH PLAIN/LOGIN on the plaintext SMTP
+                and the IMAP LOGIN command are accepted before
+                TLS is negotiated. Default false because credentials
+                in cleartext are a security hazard on real
+                networks; flip on for development against
+                127.0.0.1 where there is no eavesdropper.
+             */
+            'ALLOW_PLAINTEXT_AUTH' => false,
         ];
         $context_array = [];
         if (isset($config['SERVER_CONTEXT'])) {
@@ -1117,32 +1260,84 @@ class MailSite
         }
         $this->default_server_globals = array_merge($defaults,
             $config);
+        $this->server_context_array = $context_array;
+        $tls_available = !empty($context_array['ssl']);
+        $this->tls_available = $tls_available;
         $bind = $this->default_server_globals['BIND'];
+        $listeners = [];
+        $listener_streams = [];
+        $announce = [];
+        /* plaintext SMTP listener */
         $smtp_addr = "tcp://$bind:" .
             $this->default_server_globals['SMTP_PORT'];
-        $imap_addr = "tcp://$bind:" .
-            $this->default_server_globals['IMAP_PORT'];
-        $ctx = stream_context_create($context_array);
         $smtp = @stream_socket_server($smtp_addr, $errno, $errstr,
-            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
         if (!$smtp) {
             echo "Failed to bind SMTP $smtp_addr: $errstr\n";
             return false;
         }
         stream_set_blocking($smtp, 0);
+        $listeners[(int) $smtp] = ['protocol' => 'SMTP',
+            'tls_implicit' => false];
+        $listener_streams[(int) $smtp] = $smtp;
+        $announce[] = "SMTP at $smtp_addr";
+        /* plaintext IMAP listener */
+        $imap_addr = "tcp://$bind:" .
+            $this->default_server_globals['IMAP_PORT'];
         $imap = @stream_socket_server($imap_addr, $errno, $errstr,
-            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $ctx);
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
         if (!$imap) {
             echo "Failed to bind IMAP $imap_addr: $errstr\n";
             fclose($smtp);
             return false;
         }
         stream_set_blocking($imap, 0);
-        $this->immortal_stream_keys = [(int) $smtp, (int) $imap];
+        $listeners[(int) $imap] = ['protocol' => 'IMAP',
+            'tls_implicit' => false];
+        $listener_streams[(int) $imap] = $imap;
+        $announce[] = "IMAP at $imap_addr";
+        /* implicit-TLS sockets, if configured */
+        if ($tls_available &&
+            !empty($this->default_server_globals['SMTPS_PORT'])) {
+            $smtps_addr = "tcp://$bind:" .
+                $this->default_server_globals['SMTPS_PORT'];
+            $smtps = @stream_socket_server($smtps_addr,
+                $errno, $errstr,
+                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+            if ($smtps) {
+                stream_set_blocking($smtps, 0);
+                $listeners[(int) $smtps] = ['protocol' => 'SMTP',
+                    'tls_implicit' => true];
+                $listener_streams[(int) $smtps] = $smtps;
+                $announce[] = "SMTPS at $smtps_addr (implicit TLS)";
+            } else {
+                echo "Warning: failed to bind SMTPS $smtps_addr:" .
+                    " $errstr\n";
+            }
+        }
+        if ($tls_available &&
+            !empty($this->default_server_globals['IMAPS_PORT'])) {
+            $imaps_addr = "tcp://$bind:" .
+                $this->default_server_globals['IMAPS_PORT'];
+            $imaps = @stream_socket_server($imaps_addr,
+                $errno, $errstr,
+                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+            if ($imaps) {
+                stream_set_blocking($imaps, 0);
+                $listeners[(int) $imaps] = ['protocol' => 'IMAP',
+                    'tls_implicit' => true];
+                $listener_streams[(int) $imaps] = $imaps;
+                $announce[] = "IMAPS at $imaps_addr (implicit TLS)";
+            } else {
+                echo "Warning: failed to bind IMAPS $imaps_addr:" .
+                    " $errstr\n";
+            }
+        }
+        $this->immortal_stream_keys = array_keys($listener_streams);
         $this->in_streams = [
-            self::CONNECTION => [(int) $smtp => $smtp,
-                (int) $imap => $imap],
-            self::DATA => [(int) $smtp => "", (int) $imap => ""],
+            self::CONNECTION => $listener_streams,
+            self::DATA => array_fill_keys(
+                array_keys($listener_streams), ""),
             self::CONTEXT => [],
             self::MODIFIED_TIME => [],
         ];
@@ -1152,9 +1347,9 @@ class MailSite
             self::CONTEXT => [],
             self::MODIFIED_TIME => [],
         ];
-        $listeners = [(int) $smtp => 'SMTP', (int) $imap => 'IMAP'];
-        echo "AttoMail SMTP listening at $smtp_addr\n";
-        echo "AttoMail IMAP listening at $imap_addr\n";
+        foreach ($announce as $a) {
+            echo "AttoMail listening: $a\n";
+        }
         $excepts = null;
         while (true) {
             $reads = $this->in_streams[self::CONNECTION];
@@ -1191,10 +1386,15 @@ class MailSite
     /**
      * Accepts a new client connection on one of the listening
      * sockets and installs an initial context with the welcome
-     * banner queued for write. SMTP greets with 220, IMAP with
-     * "* OK".
+     * banner queued for write. The $listener arg is a record
+     * {protocol => SMTP|IMAP, tls_implicit => bool}; for
+     * implicit-TLS sockets the TLS handshake runs synchronously
+     * on the just-accepted socket before any banner is queued.
+     * SMTP greets with 220, IMAP with "* OK". The onConnect and
+     * onBanner hooks fire after accept (and after TLS upgrade
+     * if implicit) so they see the eventual TLS state.
      */
-    protected function acceptConnection($server, $protocol)
+    protected function acceptConnection($server, $listener)
     {
         $conn = @stream_socket_accept($server, 0);
         if (!$conn) {
@@ -1208,7 +1408,25 @@ class MailSite
             substr($remote, 0, $colon);
         $remote_port = ($colon === false) ? 0 :
             (int) substr($remote, $colon + 1);
-        $name = $this->default_server_globals['SERVER_NAME'];
+        $protocol = $listener['protocol'];
+        $tls_active = false;
+        if (!empty($listener['tls_implicit'])) {
+            /*
+                Implicit TLS: negotiate the handshake before
+                queueing any banner. The crypto call is blocking,
+                which is acceptable on accept since we have no
+                application-layer state to drain first. Failure
+                tears the connection down without ever sending
+                bytes (important: we must NOT send a plaintext
+                fallback banner because the client is waiting for
+                a TLS ServerHello).
+             */
+            if (!$this->upgradeToTls($conn)) {
+                @fclose($conn);
+                return;
+            }
+            $tls_active = true;
+        }
         $this->in_streams[self::CONNECTION][$key] = $conn;
         $this->in_streams[self::DATA][$key] = "";
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
@@ -1220,18 +1438,134 @@ class MailSite
             'AUTH_USER' => null,
             'MAILFROM' => null,
             'RCPTTO' => [],
-            'TLS' => false,
+            'TLS_ACTIVE' => $tls_active,
             'AUTH_USERNAME' => null,
+            'PENDING_STARTTLS' => false,
         ];
-        if ($protocol === 'SMTP') {
-            $banner = "220 $name " .
-                $this->default_server_globals['SERVER_SOFTWARE'] .
-                " ESMTP ready\r\n";
-        } else {
-            $banner = "* OK [CAPABILITY IMAP4rev1 STARTTLS " .
-                "LOGINDISABLED] $name ready\r\n";
+        $ctx_ref = & $this->in_streams[self::CONTEXT][$key];
+        $connect_info = [
+            'remote_addr' => $remote_addr,
+            'remote_port' => $remote_port,
+            'protocol' => $protocol,
+            'tls_active' => $tls_active,
+        ];
+        $verdict = $this->runHooks('connect', $connect_info,
+            $ctx_ref);
+        if ($verdict === 'reject' || $verdict === false) {
+            /*
+                Reject before any banner. SMTP convention is to
+                send a 421 "service not available" greeting and
+                then close; IMAP sends "* BYE". Either is
+                non-binding since we are tearing the connection
+                down regardless.
+             */
+            $bye = ($protocol === 'SMTP') ?
+                "421 4.7.0 Service not available\r\n" :
+                "* BYE Service not available\r\n";
+            @fwrite($conn, $bye);
+            $this->shutdownStream($key);
+            return;
         }
-        $this->queueWrite($key, $banner);
+        $name = $this->default_server_globals['SERVER_NAME'];
+        if ($protocol === 'SMTP') {
+            $default_banner = "220 $name " .
+                $this->default_server_globals['SERVER_SOFTWARE'] .
+                " ESMTP ready";
+        } else {
+            $caps = $this->imapPreAuthCapabilities($tls_active);
+            $default_banner = "* OK [$caps] $name ready";
+        }
+        $banner_info = $connect_info;
+        $banner_info['default_banner'] = $default_banner;
+        $banner_verdict = $this->runHooks('banner', $banner_info,
+            $ctx_ref);
+        if ($banner_verdict === 'reject' ||
+            $banner_verdict === false) {
+            $bye = ($protocol === 'SMTP') ?
+                "421 4.7.0 Service not available\r\n" :
+                "* BYE Service not available\r\n";
+            @fwrite($conn, $bye);
+            $this->shutdownStream($key);
+            return;
+        }
+        if (is_string($banner_verdict)) {
+            $banner = $banner_verdict;
+        } else {
+            $banner = $default_banner;
+        }
+        $this->queueWrite($key, $banner . "\r\n");
+    }
+    /**
+     * Returns the IMAP CAPABILITY string we advertise BEFORE
+     * the user authenticates. STARTTLS is offered while the
+     * connection is in plaintext and we have a TLS context
+     * configured; LOGIN is suppressed (LOGINDISABLED) until TLS
+     * is up unless ALLOW_PLAINTEXT_AUTH is set. IDLE is offered
+     * unconditionally since RFC 2177 places no auth requirement
+     * on advertising it.
+     */
+    protected function imapPreAuthCapabilities($tls_active)
+    {
+        $parts = ['CAPABILITY', 'IMAP4rev1', 'IDLE'];
+        $allow_plain =
+            !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
+        if (!$tls_active && $this->tls_available) {
+            $parts[] = 'STARTTLS';
+        }
+        if ($tls_active || $allow_plain) {
+            $parts[] = 'AUTH=PLAIN';
+            $parts[] = 'AUTH=LOGIN';
+            /*
+                LOGIN (the IMAP command) is the user-friendly
+                mechanism that takes "LOGIN user pass" inline.
+                It is enabled by default once TLS is up (or in
+                dev mode) so manual telnet testing works.
+             */
+        } else {
+            $parts[] = 'LOGINDISABLED';
+        }
+        return implode(' ', $parts);
+    }
+    /**
+     * Performs the server-side TLS handshake on an accepted
+     * client socket. Wraps stream_socket_enable_crypto in a
+     * scoped error handler so the actual SSL error message can
+     * be attributed to this call (using error_get_last alone is
+     * unreliable because that buffer is process-wide). Returns
+     * true on success, false on failure (caller closes socket).
+     */
+    protected function upgradeToTls($conn)
+    {
+        if (empty($this->server_context_array['ssl'])) {
+            return false;
+        }
+        foreach ($this->server_context_array['ssl'] as $k => $v) {
+            stream_context_set_option($conn, 'ssl', $k, $v);
+        }
+        $err = null;
+        set_error_handler(
+            function ($errno, $errstr) use (&$err) {
+                $err = $errstr;
+                return true;
+            });
+        stream_set_blocking($conn, 1);
+        $method = STREAM_CRYPTO_METHOD_TLS_SERVER;
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_SERVER')) {
+            $method |= STREAM_CRYPTO_METHOD_TLSv1_2_SERVER;
+        }
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')) {
+            $method |= STREAM_CRYPTO_METHOD_TLSv1_3_SERVER;
+        }
+        $ok = @stream_socket_enable_crypto($conn, true, $method);
+        stream_set_blocking($conn, 0);
+        restore_error_handler();
+        if ($ok === true) {
+            return true;
+        }
+        if ($err !== null) {
+            echo "TLS handshake failed: $err\n";
+        }
+        return false;
     }
     protected function queueWrite($key, $bytes)
     {
@@ -1323,10 +1657,31 @@ class MailSite
         $upper = strtoupper($line);
         if (strncmp($upper, 'EHLO', 4) === 0 ||
             strncmp($upper, 'HELO', 4) === 0) {
+            $verb = strncmp($upper, 'EHLO', 4) === 0 ?
+                'EHLO' : 'HELO';
+            $domain = trim(substr($line, 4));
+            $verdict = $this->runHooks('helo',
+                ['domain' => $domain, 'verb' => $verb], $ctx);
+            if ($verdict === 'reject' || $verdict === false) {
+                $this->queueWrite($key,
+                    "550 5.7.1 HELO rejected\r\n");
+                return;
+            }
             $ctx['STATE'] = 'READY';
             $name = $this->default_server_globals['SERVER_NAME'];
             $resp = "250-$name Hello\r\n";
-            $resp .= "250-AUTH PLAIN LOGIN\r\n";
+            $allow_plain =
+                !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
+            if (!empty($ctx['TLS_ACTIVE']) && $this->tls_available) {
+                /*
+                    Already in TLS; do not re-advertise STARTTLS.
+                 */
+            } elseif ($this->tls_available) {
+                $resp .= "250-STARTTLS\r\n";
+            }
+            if (!empty($ctx['TLS_ACTIVE']) || $allow_plain) {
+                $resp .= "250-AUTH PLAIN LOGIN\r\n";
+            }
             $resp .= "250-SIZE " .
                 $this->default_server_globals['MAX_MESSAGE_LEN'] .
                 "\r\n";
@@ -1350,6 +1705,10 @@ class MailSite
             $ctx['STATE'] = 'QUIT';
             return;
         }
+        if (strncmp($upper, 'STARTTLS', 8) === 0) {
+            $this->dispatchSmtpStarttls($key, $ctx);
+            return;
+        }
         if ($ctx['STATE'] === 'INIT') {
             $this->queueWrite($key,
                 "503 5.5.1 send EHLO/HELO first\r\n");
@@ -1359,6 +1718,13 @@ class MailSite
             $ctx['STATE'] === 'AUTH-PLAIN' ||
             $ctx['STATE'] === 'AUTH-LOGIN-USER' ||
             $ctx['STATE'] === 'AUTH-LOGIN-PASS') {
+            $allow_plain =
+                !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
+            if (empty($ctx['TLS_ACTIVE']) && !$allow_plain) {
+                $this->queueWrite($key,
+                    "538 5.7.11 Encryption required for AUTH\r\n");
+                return;
+            }
             $this->dispatchSmtpAuth($key, $line, $ctx);
             return;
         }
@@ -1383,6 +1749,30 @@ class MailSite
         }
         $this->queueWrite($key,
             "500 5.5.1 Unrecognized command\r\n");
+    }
+    /**
+     * Handles SMTP STARTTLS (RFC 3207). Refuses if already in
+     * TLS or if no TLS context is configured. On accept, queues
+     * the 220 ready reply and sets a deferred-upgrade flag; the
+     * actual stream_socket_enable_crypto call runs in
+     * finishWrite once the 220 has been flushed to the wire,
+     * because anything written before the handshake corrupts
+     * the TLS framing the client expects.
+     */
+    protected function dispatchSmtpStarttls($key, &$ctx)
+    {
+        if (!$this->tls_available) {
+            $this->queueWrite($key,
+                "454 4.7.0 TLS not available\r\n");
+            return;
+        }
+        if (!empty($ctx['TLS_ACTIVE'])) {
+            $this->queueWrite($key,
+                "503 5.5.1 TLS already active\r\n");
+            return;
+        }
+        $ctx['PENDING_STARTTLS'] = true;
+        $this->queueWrite($key, "220 2.0.0 Ready to start TLS\r\n");
     }
     /**
      * Handles AUTH PLAIN and AUTH LOGIN. PLAIN can carry the
@@ -1474,32 +1864,98 @@ class MailSite
         }
     }
     /**
-     * Parses MAIL FROM:<addr> and stores the envelope sender on
-     * the connection. Accepts an empty path "<>" (DSN/bounce).
-     * The session does not need to be authenticated to set a
-     * sender; what is policed is the RCPT TO step.
+     * Parses an address string from MAIL FROM or RCPT TO. Accepts
+     * the strict RFC 5321 form "<addr>" and also the lenient
+     * bareword form "addr" (which most live MTAs tolerate and
+     * which is convenient for typing into telnet). Whitespace
+     * around the address is ignored. Returns the address (which
+     * may be the empty string for the null reverse-path "<>"),
+     * or false if the line cannot be parsed.
+     */
+    protected function parseSmtpAddress($line, $verb)
+    {
+        $verb_pat = preg_quote(strtoupper($verb), '/');
+        $rest_pat = '\s*:?\s*';
+        if (strtoupper($verb) === 'MAIL') {
+            $verb_pat = 'MAIL\s+FROM';
+            $rest_pat = '\s*:\s*';
+        } elseif (strtoupper($verb) === 'RCPT') {
+            $verb_pat = 'RCPT\s+TO';
+            $rest_pat = '\s*:\s*';
+        }
+        if (!preg_match("/^{$verb_pat}{$rest_pat}(.*)$/i",
+            $line, $m)) {
+            return false;
+        }
+        $tail = trim($m[1]);
+        /*
+            Tolerated forms:
+                <addr>
+                <>
+                addr (bareword)
+                <addr> SIZE=123 BODY=8BITMIME (parameters; we
+                drop them)
+                addr SIZE=123 (parameters with bareword)
+            We split off the first whitespace-delimited token as
+            the address candidate and discard the rest as ESMTP
+            parameters; we do not currently honor SIZE= or other
+            extensions but accepting them is harmless.
+         */
+        $space = strpos($tail, ' ');
+        if ($space !== false) {
+            $addr_tok = substr($tail, 0, $space);
+        } else {
+            $addr_tok = $tail;
+        }
+        if ($addr_tok === '') {
+            return false;
+        }
+        if ($addr_tok[0] === '<') {
+            $end = strpos($addr_tok, '>');
+            if ($end === false) {
+                return false;
+            }
+            return substr($addr_tok, 1, $end - 1);
+        }
+        return $addr_tok;
+    }
+    /**
+     * Parses MAIL FROM and stores the envelope sender on the
+     * connection. Accepts both "<addr>" and bareword "addr"
+     * forms; accepts the empty path "<>" for DSN/bounce. The
+     * session does not need to be authenticated to set a sender;
+     * what is policed is the RCPT TO step. Fires the onMailFrom
+     * hook; a 'reject' verdict refuses with 550 5.7.1.
      */
     protected function dispatchSmtpMailFrom($key, $line, &$ctx)
     {
-        if (!preg_match(
-            '/^MAIL\s+FROM\s*:\s*<([^>]*)>(?:\s+.*)?$/i',
-            $line, $m)) {
+        $addr = $this->parseSmtpAddress($line, 'MAIL');
+        if ($addr === false) {
             $this->queueWrite($key,
                 "501 5.5.4 Syntax: MAIL FROM:<address>\r\n");
             return;
         }
-        $ctx['MAILFROM'] = trim($m[1]);
+        $verdict = $this->runHooks('mailfrom',
+            ['from' => $addr], $ctx);
+        if ($verdict === 'reject' || $verdict === false) {
+            $this->queueWrite($key,
+                "550 5.7.1 Sender rejected\r\n");
+            return;
+        }
+        $ctx['MAILFROM'] = $addr;
         $ctx['RCPTTO'] = [];
         $ctx['STATE'] = 'MAIL';
         $this->queueWrite($key, "250 2.1.0 Ok\r\n");
     }
     /**
-     * Parses RCPT TO:<addr> and applies the anti-relay rule:
+     * Parses RCPT TO and applies the anti-relay rule:
      *   - if the recipient is local (a known user at a local
      *     domain), accept regardless of authentication
      *   - if the recipient is non-local, require that the
      *     session be authenticated; otherwise reject 550 5.7.1
-     * This is what makes the server NOT an open relay.
+     * This is what makes the server NOT an open relay. Fires
+     * the onRcptTo hook only after the recipient has passed the
+     * anti-relay check.
      */
     protected function dispatchSmtpRcptTo($key, $line, &$ctx)
     {
@@ -1508,15 +1964,13 @@ class MailSite
                 "503 5.5.1 need MAIL FROM first\r\n");
             return;
         }
-        if (!preg_match(
-            '/^RCPT\s+TO\s*:\s*<([^>]*)>(?:\s+.*)?$/i',
-            $line, $m)) {
+        $addr = $this->parseSmtpAddress($line, 'RCPT');
+        if ($addr === false || $addr === '') {
             $this->queueWrite($key,
                 "501 5.5.4 Syntax: RCPT TO:<address>\r\n");
             return;
         }
-        $rcpt = trim($m[1]);
-        $local_user = $this->resolveLocalUser($rcpt);
+        $local_user = $this->resolveLocalUser($addr);
         if ($local_user === false) {
             if (empty($ctx['AUTH_USER'])) {
                 $this->queueWrite($key,
@@ -1534,7 +1988,14 @@ class MailSite
                 "550 5.7.1 Outbound relay not configured\r\n");
             return;
         }
-        $ctx['RCPTTO'][] = ['addr' => $rcpt, 'user' => $local_user];
+        $verdict = $this->runHooks('rcptto',
+            ['to' => $addr, 'local_user' => $local_user], $ctx);
+        if ($verdict === 'reject' || $verdict === false) {
+            $this->queueWrite($key,
+                "550 5.7.1 Recipient rejected\r\n");
+            return;
+        }
+        $ctx['RCPTTO'][] = ['addr' => $addr, 'user' => $local_user];
         $ctx['STATE'] = 'RCPT';
         $this->queueWrite($key, "250 2.1.5 Ok\r\n");
     }
@@ -1572,6 +2033,34 @@ class MailSite
             $ctx['RCPTTO'] = [];
             return true;
         }
+        /*
+            Fire the onHeader hook before stamping our trace
+            header, so policy can examine what the client sent
+            unmodified. The header block ends at the first blank
+            line; if there is no blank line the entire message
+            is treated as headers (defensive: a malformed message
+            without a body separator should still see the hook).
+         */
+        $headers = $this->parseRfc5322Headers($msg);
+        $first_to = !empty($ctx['RCPTTO']) ?
+            $ctx['RCPTTO'][0]['addr'] : '';
+        $hdr_info = [
+            'from' => $ctx['MAILFROM'],
+            'to' => $first_to,
+            'recipients' => $ctx['RCPTTO'],
+            'headers' => $headers['list'],
+            'header_block' => $headers['block'],
+            'bytes' => $msg,
+        ];
+        $verdict = $this->runHooks('header', $hdr_info, $ctx);
+        if ($verdict === 'reject' || $verdict === false) {
+            $this->queueWrite($key,
+                "550 5.6.0 Message rejected by policy\r\n");
+            $ctx['STATE'] = 'READY';
+            $ctx['MAILFROM'] = null;
+            $ctx['RCPTTO'] = [];
+            return true;
+        }
         $msg = $this->prependReceivedHeader($msg, $ctx);
         $delivered_any = false;
         foreach ($ctx['RCPTTO'] as $r) {
@@ -1599,6 +2088,54 @@ class MailSite
         return true;
     }
     /**
+     * Splits an RFC 5322 message into the header block (string)
+     * and a list of [name, value] pairs preserving order and
+     * case. Continuation lines (RFC 5322 sec 2.2.3 folded white
+     * space) are unfolded. The returned 'block' is the raw bytes
+     * up to but not including the empty CRLF separator.
+     */
+    protected function parseRfc5322Headers($msg)
+    {
+        $sep = "\r\n\r\n";
+        $end = strpos($msg, $sep);
+        if ($end === false) {
+            $end = strpos($msg, "\n\n");
+            $block = ($end === false) ? $msg : substr($msg, 0,
+                $end);
+        } else {
+            $block = substr($msg, 0, $end);
+        }
+        $list = [];
+        $current_name = null;
+        $current_val = "";
+        foreach (preg_split('/\r\n|\n/', $block) as $line) {
+            if ($line === "") {
+                continue;
+            }
+            if ($line[0] === ' ' || $line[0] === "\t") {
+                if ($current_name !== null) {
+                    $current_val .= ' ' . trim($line);
+                }
+                continue;
+            }
+            if ($current_name !== null) {
+                $list[] = [$current_name, $current_val];
+            }
+            $colon = strpos($line, ':');
+            if ($colon === false) {
+                $current_name = null;
+                $current_val = "";
+                continue;
+            }
+            $current_name = substr($line, 0, $colon);
+            $current_val = ltrim(substr($line, $colon + 1));
+        }
+        if ($current_name !== null) {
+            $list[] = [$current_name, $current_val];
+        }
+        return ['list' => $list, 'block' => $block];
+    }
+    /**
      * Prepends a Received: trace header per RFC 5321 sec 4.4.
      * Mail clients use this header to render the routing path
      * and SpamAssassin-class tools rely on it to reconstruct
@@ -1623,9 +2160,10 @@ class MailSite
         return $hdr . $msg;
     }
     /**
-     * Stubs out IMAP for Phase 1: replies BAD to any command so
-     * a client probing the port gets a clear error rather than
-     * a hang. Phase 3 will replace this with real LOGIN, LIST,
+     * Stubs out most of IMAP for Phase 1/2: handles the small
+     * subset needed to negotiate TLS and probe capabilities, so
+     * a client can verify the listener and walk through the TLS
+     * upgrade. Phase 3 will replace this with real LOGIN, LIST,
      * SELECT, FETCH, etc.
      */
     protected function dispatchImap($key, $line, &$ctx)
@@ -1645,9 +2183,15 @@ class MailSite
             return;
         }
         if (strncmp($upper, 'CAPABILITY', 10) === 0) {
-            $this->queueWrite($key, "* CAPABILITY IMAP4rev1\r\n");
+            $caps = $this->imapPreAuthCapabilities(
+                !empty($ctx['TLS_ACTIVE']));
+            $this->queueWrite($key, "* $caps\r\n");
             $this->queueWrite($key,
                 "$tag OK CAPABILITY completed\r\n");
+            return;
+        }
+        if (strncmp($upper, 'STARTTLS', 8) === 0) {
+            $this->dispatchImapStarttls($key, $tag, $ctx);
             return;
         }
         if (strncmp($upper, 'NOOP', 4) === 0) {
@@ -1657,6 +2201,30 @@ class MailSite
         }
         $this->queueWrite($key,
             "$tag BAD IMAP not yet implemented in this build\r\n");
+    }
+    /**
+     * Handles IMAP STARTTLS (RFC 2595). Same deferred-upgrade
+     * pattern as SMTP: queue the OK reply, set the pending flag,
+     * the actual stream_socket_enable_crypto runs in finishWrite
+     * once the OK has been flushed. After upgrade, all CAPABILITY
+     * results changes (LOGINDISABLED disappears) so a well-
+     * behaved client re-issues CAPABILITY.
+     */
+    protected function dispatchImapStarttls($key, $tag, &$ctx)
+    {
+        if (!$this->tls_available) {
+            $this->queueWrite($key,
+                "$tag NO STARTTLS not available\r\n");
+            return;
+        }
+        if (!empty($ctx['TLS_ACTIVE'])) {
+            $this->queueWrite($key,
+                "$tag BAD TLS already active\r\n");
+            return;
+        }
+        $ctx['PENDING_STARTTLS'] = true;
+        $this->queueWrite($key,
+            "$tag OK Begin TLS negotiation now\r\n");
     }
     protected function writeClient($stream)
     {
@@ -1696,8 +2264,38 @@ class MailSite
             $this->out_streams[self::DATA][$key],
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::MODIFIED_TIME][$key]);
-        $ctx = isset($this->in_streams[self::CONTEXT][$key]) ?
-            $this->in_streams[self::CONTEXT][$key] : null;
+        if (!isset($this->in_streams[self::CONTEXT][$key])) {
+            return;
+        }
+        $ctx = & $this->in_streams[self::CONTEXT][$key];
+        if (!empty($ctx['PENDING_STARTTLS'])) {
+            /*
+                The 220 reply (or IMAP "OK Begin TLS negotiation
+                now") has been fully flushed. Negotiate the TLS
+                handshake on the same socket; on success, reset
+                the protocol state to INIT (RFC 3207 sec 4.2: the
+                client must re-EHLO after TLS comes up; same idea
+                for IMAP CAPABILITY).
+             */
+            $ctx['PENDING_STARTTLS'] = false;
+            $conn = $this->in_streams[self::CONNECTION][$key];
+            if ($this->upgradeToTls($conn)) {
+                $ctx['TLS_ACTIVE'] = true;
+                $ctx['STATE'] = 'INIT';
+                $ctx['MAILFROM'] = null;
+                $ctx['RCPTTO'] = [];
+                $ctx['AUTH_USER'] = null;
+                $ctx['AUTH_USERNAME'] = null;
+                $this->in_streams[self::DATA][$key] = "";
+            } else {
+                /*
+                    Handshake failure mid-session is unrecoverable
+                    per RFC 3207 sec 4.1: drop the connection.
+                 */
+                $this->shutdownStream($key);
+                return;
+            }
+        }
         if ($ctx && isset($ctx['STATE']) &&
             $ctx['STATE'] === 'QUIT') {
             $this->shutdownStream($key);

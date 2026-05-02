@@ -4,22 +4,23 @@
  * password file and an on-disk message store. Demonstrates:
  *   - FileAuthenticator for password-file accounts
  *   - FileMailStorage for per-user folders on disk
- *   - A simple Subject-line filter that diverts spam-like
- *     messages to a Junk folder
+ *   - Per-stage hooks: onConnect (IP allow-list), onMailFrom
+ *     (sender policy), onHeader (subject filter), onMessage
+ *     (folder routing)
+ *   - STARTTLS for both SMTP and IMAP, plus implicit-TLS
+ *     submission on SMTPS_PORT and IMAPS_PORT
  *   - Anti-relay enforcement (try sending to an external
  *     address without authenticating; you will get 550)
  *
  * Run with low ports for development:
  *      php index.php
- * Bind to 25/143 in production (you will need root or
+ * Bind to 25/143/465/993 in production (you will need root or
  * setcap cap_net_bind_service=+ep on the php binary).
  */
 require '../../src/MailSite.php';
-
 use seekquarry\atto\MailSite;
 use seekquarry\atto\FileAuthenticator;
 use seekquarry\atto\FileMailStorage;
-
 if (!defined("seekquarry\\atto\\RUN")) {
     /*
         The ATTO convention: the framework only runs when its
@@ -58,15 +59,50 @@ $mail->auth(new FileAuthenticator($users_file));
 $mail->storage(new FileMailStorage($store_dir));
 $mail->domains(['localhost', 'example.test']);
 /*
-    Demo filter: route messages whose Subject starts with
-    [SPAM] into the user's Junk folder, drop messages from
-    obviously-bogus senders, and let everything else fall
-    through to INBOX. The filter sees the full RFC 5322
-    message, the envelope addresses, and the connection
-    context (so it can also implement IP-based policy if
-    desired).
+    onConnect: an IP-based allow-list / deny-list lives here.
+    Example below is permissive; uncomment the deny block to
+    refuse a specific source.
  */
-$mail->filter(function ($from, $to, $bytes, $ctx) {
+$mail->onConnect(function ($info, $ctx) {
+    /*
+    if ($info['remote_addr'] === '203.0.113.7') {
+        return 'reject';
+    }
+    */
+    return null;
+});
+/*
+    onMailFrom: drop messages from obviously-bogus senders at
+    the envelope step, before the client even ships DATA.
+ */
+$mail->onMailFrom(function ($info, $ctx) {
+    $from = strtolower($info['from']);
+    if (strpos($from, 'spammer@') === 0) {
+        return 'reject';
+    }
+    return null;
+});
+/*
+    onHeader: inspect parsed headers to apply policy that needs
+    the message-as-written. Reject (hard 550) anything whose
+    Subject begins with [BLOCK].
+ */
+$mail->onHeader(function ($info, $ctx) {
+    foreach ($info['headers'] as $h) {
+        if (strcasecmp($h[0], 'Subject') === 0 &&
+            stripos($h[1], '[BLOCK]') === 0) {
+            return 'reject';
+        }
+    }
+    return null;
+});
+/*
+    onMessage: final delivery decision. [SPAM]-tagged subjects
+    go to Junk; messages from no-reply / mailer-daemon Froms
+    are dropped silently.
+ */
+$mail->onMessage(function ($info, $ctx) {
+    $bytes = $info['bytes'];
     if (preg_match(
         '/^From:\s*<?(?:no-?reply|mailer-daemon)@/im',
         $bytes)) {
@@ -84,5 +120,14 @@ $mail->setTimer(60, function () {
 $mail->listen([
     'SMTP_PORT' => 2525,
     'IMAP_PORT' => 1143,
+    'SMTPS_PORT' => 4465,
+    'IMAPS_PORT' => 9933,
     'SERVER_NAME' => 'localhost',
+    'ALLOW_PLAINTEXT_AUTH' => true,
+    'SERVER_CONTEXT' => ['ssl' => [
+        'allow_self_signed' => true,
+        'local_cert' => __DIR__ . '/cert.pem',
+        'local_pk' => __DIR__ . '/key.pem',
+        'verify_peer' => false,
+    ]],
 ]);

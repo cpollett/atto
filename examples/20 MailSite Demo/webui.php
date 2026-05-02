@@ -410,6 +410,138 @@ $scenarios['imap_starttls'] = [
         ]);
     },
 ];
+/* ---------- IMAP authenticated (Phase 3) ---------- */
+$scenarios['imap_login_list'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'LOGIN alice and LIST all folders',
+    'desc' => 'LOGIN with quoted credentials, then LIST "" "*" ' .
+        'to get the full folder tree.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN \"alice\" \"hunter2\"\r\n",
+            "a2 LIST \"\" \"*\"\r\n",
+            "a3 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_auth_plain'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'AUTHENTICATE PLAIN as alice',
+    'desc' => 'Single-step base64 blob ' .
+        'AGFsaWNlAGh1bnRlcjI= (alice / hunter2). Same blob ' .
+        'used by SMTP AUTH PLAIN.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 AUTHENTICATE PLAIN\r\n",
+            "AGFsaWNlAGh1bnRlcjI=\r\n",
+            "a2 LIST \"\" \"*\"\r\n",
+            "a3 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_auth_login'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'AUTHENTICATE LOGIN as bob (continuation)',
+    'desc' => 'Two-step continuation; the server prompts ' .
+        'with base64-encoded "Username:" and "Password:" ' .
+        'between turns.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 AUTHENTICATE LOGIN\r\n",
+            "Ym9i\r\n",
+            "aHVudGVyMg==\r\n",
+            "a2 LIST \"\" \"*\"\r\n",
+            "a3 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_select'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'SELECT INBOX, EXAMINE Junk, CLOSE',
+    'desc' => 'SELECT opens read-write; EXAMINE opens ' .
+        'read-only. Both return EXISTS, RECENT, UIDVALIDITY, ' .
+        'UIDNEXT, FLAGS, PERMANENTFLAGS.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 CLOSE\r\n",
+            "a4 EXAMINE Junk\r\n",
+            "a5 CLOSE\r\n",
+            "a6 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_status'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'STATUS without selecting',
+    'desc' => 'Probes message counts and UID metadata for a ' .
+        'mailbox without making it the active one.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 STATUS INBOX (MESSAGES UIDNEXT " .
+                "UIDVALIDITY UNSEEN RECENT)\r\n",
+            "a3 STATUS Junk (MESSAGES UIDNEXT)\r\n",
+            "a4 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_create_rename_delete'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'CREATE / RENAME / DELETE folder lifecycle',
+    'desc' => 'Build a hierarchy under Archive/, rename a ' .
+        'subfolder, then delete it. INBOX cannot be deleted.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 CREATE Archive\r\n",
+            "a3 CREATE \"Archive/2025\"\r\n",
+            "a4 LIST \"\" \"*\"\r\n",
+            "a5 RENAME \"Archive/2025\" \"Archive/Old\"\r\n",
+            "a6 LIST \"\" \"*\"\r\n",
+            "a7 DELETE \"Archive/Old\"\r\n",
+            "a8 DELETE Archive\r\n",
+            "a9 DELETE INBOX\r\n",
+            "a10 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_login_required'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'Pre-auth refusal: LIST without LOGIN',
+    'desc' => 'Commands that require authentication get ' .
+        '"NO Login required" before LOGIN runs.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LIST \"\" \"*\"\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_bad_password'] = [
+    'group' => 'IMAP authenticated (port 1143)',
+    'label' => 'Bad password rejection',
+    'desc' => 'LOGIN with wrong password returns ' .
+        '"NO [AUTHENTICATIONFAILED]" and the connection ' .
+        'stays in INIT state.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice wrong-password\r\n",
+            "a2 LIST \"\" \"*\"\r\n",
+            "a3 LOGOUT\r\n",
+        ]);
+    },
+];
 /* ---------- Implicit TLS ---------- */
 $scenarios['smtps_banner'] = [
     'group' => 'Implicit TLS',

@@ -138,11 +138,17 @@ class FileAuthenticator extends Authenticator
     {
         $this->users = null;
     }
+    /**
+     * @inheritdoc
+     */
     public function userExists($username)
     {
         $this->load();
         return isset($this->users[strtolower($username)]);
     }
+    /**
+     * @inheritdoc
+     */
     public function getPasswordHash($username)
     {
         $this->load();
@@ -483,6 +489,9 @@ class FileMailStorage extends MailStorage
         }
         return implode("/", $clean);
     }
+    /**
+     * @inheritdoc
+     */
     public function ensureUser($user)
     {
         $dir = $this->userDir($user);
@@ -508,6 +517,9 @@ class FileMailStorage extends MailStorage
         $this->createFolder($user, "INBOX");
         return true;
     }
+    /**
+     * @inheritdoc
+     */
     public function listFolders($user)
     {
         $dir = $this->userDir($user);
@@ -537,6 +549,9 @@ class FileMailStorage extends MailStorage
         sort($folders);
         return $folders;
     }
+    /**
+     * @inheritdoc
+     */
     public function createFolder($user, $folder)
     {
         $folder = $this->normalizeFolder($folder);
@@ -549,6 +564,9 @@ class FileMailStorage extends MailStorage
         }
         return @mkdir($path, 0700, true);
     }
+    /**
+     * @inheritdoc
+     */
     public function deleteFolder($user, $folder)
     {
         $folder = $this->normalizeFolder($folder);
@@ -576,6 +594,9 @@ class FileMailStorage extends MailStorage
         }
         return @rmdir($path);
     }
+    /**
+     * @inheritdoc
+     */
     public function renameFolder($user, $old, $new)
     {
         $old = $this->normalizeFolder($old);
@@ -590,6 +611,9 @@ class FileMailStorage extends MailStorage
         }
         return @rename($old_path, $new_path);
     }
+    /**
+     * @inheritdoc
+     */
     public function folderExists($user, $folder)
     {
         try {
@@ -631,6 +655,9 @@ class FileMailStorage extends MailStorage
         fclose($fp);
         return $assigned;
     }
+    /**
+     * @inheritdoc
+     */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
     {
@@ -664,6 +691,9 @@ class FileMailStorage extends MailStorage
             (string) $internal_date);
         return $uid;
     }
+    /**
+     * @inheritdoc
+     */
     public function fetchMessage($user, $folder, $uid)
     {
         $uid = (int) $uid;
@@ -678,6 +708,9 @@ class FileMailStorage extends MailStorage
         $bytes = @file_get_contents($eml);
         return ($bytes === false) ? false : $bytes;
     }
+    /**
+     * @inheritdoc
+     */
     public function listMessages($user, $folder)
     {
         $dir = $this->folderDir($user, $folder);
@@ -707,6 +740,9 @@ class FileMailStorage extends MailStorage
         });
         return $messages;
     }
+    /**
+     * @inheritdoc
+     */
     public function messageMeta($user, $folder, $uid)
     {
         $uid = (int) $uid;
@@ -743,6 +779,9 @@ class FileMailStorage extends MailStorage
             'internal_date' => $date,
         ];
     }
+    /**
+     * @inheritdoc
+     */
     public function setFlags($user, $folder, $uid, $flags)
     {
         $uid = (int) $uid;
@@ -766,6 +805,9 @@ class FileMailStorage extends MailStorage
             implode("\n", $clean));
         return $written !== false;
     }
+    /**
+     * @inheritdoc
+     */
     public function expunge($user, $folder)
     {
         $expunged = [];
@@ -783,6 +825,9 @@ class FileMailStorage extends MailStorage
         }
         return $expunged;
     }
+    /**
+     * @inheritdoc
+     */
     public function moveMessage($user, $from, $to, $uid)
     {
         $uid = (int) $uid;
@@ -809,10 +854,16 @@ class FileMailStorage extends MailStorage
         }
         return true;
     }
+    /**
+     * @inheritdoc
+     */
     public function messageCount($user, $folder)
     {
         return count($this->listMessages($user, $folder));
     }
+    /**
+     * @inheritdoc
+     */
     public function uidValidity($user, $folder)
     {
         $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
@@ -822,6 +873,9 @@ class FileMailStorage extends MailStorage
         }
         return (int) @file_get_contents($file);
     }
+    /**
+     * @inheritdoc
+     */
     public function uidNext($user, $folder)
     {
         $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
@@ -918,6 +972,14 @@ class MailSite
     protected $server_context_array = [];
     /** @var bool whether listen() detected an SSL config */
     protected $tls_available = false;
+    /**
+     * Constructs a MailSite. The instance starts unconfigured;
+     * the caller must wire an Authenticator via auth(), a
+     * MailStorage via storage(), and any per-stage hooks via
+     * the onX methods before invoking listen(). Hook callbacks
+     * fire in registration order with first-non-null verdict
+     * winning, so multiple hooks at the same stage compose.
+     */
     public function __construct()
     {
         $this->timer_alarms = new \SplPriorityQueue();
@@ -1116,57 +1178,172 @@ class MailSite
         return $this->mail_storage->appendMessage($local, $folder,
             $bytes, $flags);
     }
+    /**
+     * Returns the list of folder names for a user, including
+     * INBOX. This is the direct-call equivalent of an IMAP LIST
+     * "" "*", suitable for a webmail front-end that wants the
+     * full folder tree without going through the wire protocol.
+     *
+     * @param string $user
+     * @return array list of folder name strings, sorted
+     */
     public function listFolders($user)
     {
         return $this->mail_storage->listFolders($user);
     }
+    /**
+     * Creates a folder for a user. Idempotent; creating an
+     * existing folder is a successful no-op. Mirrors the IMAP
+     * CREATE command for direct callers.
+     *
+     * @param string $user
+     * @param string $folder full folder path, e.g. "Archive/2026"
+     * @return bool true on success
+     */
     public function createFolder($user, $folder)
     {
         return $this->mail_storage->createFolder($user, $folder);
     }
+    /**
+     * Deletes a folder and all its messages. Refuses to delete
+     * INBOX or a folder with subfolders, matching the IMAP
+     * DELETE semantics.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool true on success
+     */
     public function deleteFolder($user, $folder)
     {
         return $this->mail_storage->deleteFolder($user, $folder);
     }
+    /**
+     * Renames a folder. Refuses to rename INBOX. Subfolders move
+     * with the renamed folder.
+     *
+     * @param string $user
+     * @param string $old
+     * @param string $new
+     * @return bool true on success
+     */
     public function renameFolder($user, $old, $new)
     {
         return $this->mail_storage->renameFolder($user, $old,
             $new);
     }
+    /**
+     * Appends a message directly into a user's folder, bypassing
+     * SMTP and the configured filter hooks. Useful for webmail
+     * "Save Draft" or "Save Sent" actions that want a message
+     * placed verbatim with caller-chosen flags.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param string $bytes full RFC 5322 message
+     * @param array $flags initial flag set
+     * @param int $date Unix timestamp; 0 means "now"
+     * @return int|false UID assigned on success
+     */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $date = 0)
     {
         return $this->mail_storage->appendMessage($user, $folder,
             $bytes, $flags, $date);
     }
+    /**
+     * Returns the raw RFC 5322 bytes of a single message.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @return string|false the bytes, or false if not found
+     */
     public function fetchMessage($user, $folder, $uid)
     {
         return $this->mail_storage->fetchMessage($user, $folder,
             $uid);
     }
+    /**
+     * Returns metadata records for every message in a folder,
+     * sorted ascending by UID. Each record is an associative
+     * array with keys uid (int), size (int), flags (array of
+     * strings), internal_date (Unix timestamp). This is the
+     * direct-call shape a webmail message-list view consumes.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return array list of metadata records
+     */
     public function listMessages($user, $folder)
     {
         return $this->mail_storage->listMessages($user, $folder);
     }
+    /**
+     * Returns the metadata record for a single message, with
+     * the same shape as one entry of listMessages.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @return array|false
+     */
     public function messageMeta($user, $folder, $uid)
     {
         return $this->mail_storage->messageMeta($user, $folder,
             $uid);
     }
+    /**
+     * Replaces the flag set on a message. Pass an empty array
+     * to clear all flags.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @param array $flags
+     * @return bool true on success
+     */
     public function setFlags($user, $folder, $uid, $flags)
     {
         return $this->mail_storage->setFlags($user, $folder, $uid,
             $flags);
     }
+    /**
+     * Permanently removes every message in a folder that has the
+     * \Deleted flag set, and returns the list of UIDs that were
+     * removed. Mirrors IMAP EXPUNGE.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return array list of expunged UIDs
+     */
     public function expunge($user, $folder)
     {
         return $this->mail_storage->expunge($user, $folder);
     }
+    /**
+     * Moves a message between folders. The UID is preserved
+     * because UIDs are per-user, not per-folder; this matches
+     * the IMAP UIDPLUS expectation for COPY/MOVE.
+     *
+     * @param string $user
+     * @param string $from source folder
+     * @param string $to destination folder
+     * @param int $uid
+     * @return bool true on success
+     */
     public function moveMessage($user, $from, $to, $uid)
     {
         return $this->mail_storage->moveMessage($user, $from, $to,
             $uid);
     }
+    /**
+     * Returns the number of messages currently in a folder.
+     * Matches the count IMAP reports as EXISTS in SELECT.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
     public function messageCount($user, $folder)
     {
         return $this->mail_storage->messageCount($user, $folder);
@@ -1216,6 +1393,13 @@ class MailSite
             -(microtime(true) + $time));
         return $id;
     }
+    /**
+     * Cancels a previously scheduled timer. The $id is the
+     * value returned by setTimer. Calling with an unknown id
+     * is a silent no-op.
+     *
+     * @param string $id
+     */
     public function clearTimer($id)
     {
         unset($this->timers[$id]);
@@ -2160,47 +2344,855 @@ class MailSite
         return $hdr . $msg;
     }
     /**
-     * Stubs out most of IMAP for Phase 1/2: handles the small
-     * subset needed to negotiate TLS and probe capabilities, so
-     * a client can verify the listener and walk through the TLS
-     * upgrade. Phase 3 will replace this with real LOGIN, LIST,
-     * SELECT, FETCH, etc.
+     * Top-level dispatcher for one IMAP command line. Splits
+     * out the tag and the verb, then routes to a per-verb
+     * handler based on the connection's IMAP STATE. The state
+     * machine matches RFC 3501 sec 3:
+     *   INIT     -- unauthenticated; only LOGIN, AUTHENTICATE,
+     *               STARTTLS, CAPABILITY, NOOP, LOGOUT allowed
+     *   AUTH     -- authenticated; mailbox-level commands and
+     *               selection commands allowed
+     *   SELECTED -- authenticated AND a mailbox is selected;
+     *               adds CLOSE; in Phase 4 will add FETCH/STORE
+     *               etc.
+     * Tags are echoed back in the tagged status response.
      */
     protected function dispatchImap($key, $line, &$ctx)
     {
+        if (!isset($ctx['IMAP_LIT_PENDING'])) {
+            $ctx['IMAP_LIT_PENDING'] = null;
+        }
+        if ($ctx['IMAP_LIT_PENDING'] !== null) {
+            $this->continueImapLiteral($key, $line, $ctx);
+            return;
+        }
         $tag = "*";
         $sp = strpos($line, " ");
+        $rest = "";
         if ($sp !== false) {
             $tag = substr($line, 0, $sp);
+            $rest = substr($line, $sp + 1);
+        } else {
+            /*
+                A bare command word with no tag is a protocol
+                violation. We respond with an untagged BAD so
+                a misbehaving client at least sees an error.
+             */
+            $this->queueWrite($key, "* BAD missing tag\r\n");
+            return;
         }
-        $upper = strtoupper(trim(substr($line, $sp === false ?
-            0 : $sp + 1)));
-        if (strncmp($upper, 'LOGOUT', 6) === 0) {
+        $verb_end = strpos($rest, " ");
+        $verb = ($verb_end === false) ? $rest :
+            substr($rest, 0, $verb_end);
+        $args = ($verb_end === false) ? "" :
+            substr($rest, $verb_end + 1);
+        $V = strtoupper($verb);
+        /*
+            Always-available commands: do not require any state.
+         */
+        if ($V === 'CAPABILITY') {
+            $this->imapCmdCapability($key, $tag, $ctx);
+            return;
+        }
+        if ($V === 'NOOP') {
+            $this->queueWrite($key,
+                "$tag OK NOOP completed\r\n");
+            return;
+        }
+        if ($V === 'LOGOUT') {
             $this->queueWrite($key, "* BYE Logging out\r\n");
             $this->queueWrite($key,
                 "$tag OK LOGOUT completed\r\n");
             $ctx['STATE'] = 'QUIT';
             return;
         }
-        if (strncmp($upper, 'CAPABILITY', 10) === 0) {
-            $caps = $this->imapPreAuthCapabilities(
-                !empty($ctx['TLS_ACTIVE']));
-            $this->queueWrite($key, "* $caps\r\n");
-            $this->queueWrite($key,
-                "$tag OK CAPABILITY completed\r\n");
-            return;
-        }
-        if (strncmp($upper, 'STARTTLS', 8) === 0) {
+        if ($V === 'STARTTLS') {
             $this->dispatchImapStarttls($key, $tag, $ctx);
             return;
         }
-        if (strncmp($upper, 'NOOP', 4) === 0) {
+        /*
+            Pre-authenticated commands (only allowed in INIT).
+         */
+        if ($ctx['STATE'] === 'INIT') {
+            if ($V === 'LOGIN') {
+                $this->imapCmdLogin($key, $tag, $args, $ctx);
+                return;
+            }
+            if ($V === 'AUTHENTICATE') {
+                $this->imapCmdAuthenticate($key, $tag, $args,
+                    $ctx);
+                return;
+            }
             $this->queueWrite($key,
-                "$tag OK NOOP completed\r\n");
+                "$tag NO Login required\r\n");
+            return;
+        }
+        /*
+            Authenticated-state and selected-state commands.
+            Most are allowed in either AUTH or SELECTED state;
+            CLOSE requires SELECTED.
+         */
+        if ($V === 'LIST') {
+            $this->imapCmdList($key, $tag, $args, $ctx, false);
+            return;
+        }
+        if ($V === 'LSUB') {
+            $this->imapCmdList($key, $tag, $args, $ctx, true);
+            return;
+        }
+        if ($V === 'SUBSCRIBE' || $V === 'UNSUBSCRIBE') {
+            /*
+                We do not maintain per-user subscription state;
+                LSUB returns the same list as LIST. SUBSCRIBE
+                and UNSUBSCRIBE accept any name that resolves
+                to an existing folder and OK without further
+                effect.
+             */
+            $this->imapCmdSubscribe($key, $tag, $args, $V, $ctx);
+            return;
+        }
+        if ($V === 'STATUS') {
+            $this->imapCmdStatus($key, $tag, $args, $ctx);
+            return;
+        }
+        if ($V === 'CREATE') {
+            $this->imapCmdCreate($key, $tag, $args, $ctx);
+            return;
+        }
+        if ($V === 'DELETE') {
+            $this->imapCmdDelete($key, $tag, $args, $ctx);
+            return;
+        }
+        if ($V === 'RENAME') {
+            $this->imapCmdRename($key, $tag, $args, $ctx);
+            return;
+        }
+        if ($V === 'SELECT' || $V === 'EXAMINE') {
+            $this->imapCmdSelect($key, $tag, $args, $ctx,
+                $V === 'EXAMINE');
+            return;
+        }
+        if ($V === 'CLOSE') {
+            $this->imapCmdClose($key, $tag, $ctx);
             return;
         }
         $this->queueWrite($key,
-            "$tag BAD IMAP not yet implemented in this build\r\n");
+            "$tag BAD command not implemented in this build\r\n");
+    }
+    /**
+     * Sends an untagged CAPABILITY response and tags it OK.
+     * Capability advertisement varies based on TLS state and
+     * authentication state, both of which imapPreAuthCapabilities
+     * handles. Once the client is authenticated, STARTTLS and
+     * LOGINDISABLED stop being relevant; the spec lets us
+     * advertise the same string post-auth.
+     */
+    protected function imapCmdCapability($key, $tag, $ctx)
+    {
+        $caps = $this->imapPreAuthCapabilities(
+            !empty($ctx['TLS_ACTIVE']));
+        $this->queueWrite($key, "* $caps\r\n");
+        $this->queueWrite($key,
+            "$tag OK CAPABILITY completed\r\n");
+    }
+    /**
+     * Handles "LOGIN <user> <pass>". Refuses if TLS is required
+     * (matches the LOGINDISABLED capability) and the connection
+     * is plaintext. Both arguments may be atoms, quoted
+     * strings, or literals; this implementation accepts atoms
+     * and quoted strings inline and the password as a literal
+     * for clients that send unprintable bytes (the literal
+     * continuation arrives as the next line through
+     * continueImapLiteral).
+     */
+    protected function imapCmdLogin($key, $tag, $args, &$ctx)
+    {
+        $allow_plain =
+            !empty($this->default_server_globals[
+                'ALLOW_PLAINTEXT_AUTH']);
+        if (empty($ctx['TLS_ACTIVE']) && !$allow_plain) {
+            $this->queueWrite($key,
+                "$tag NO [PRIVACYREQUIRED] " .
+                "STARTTLS required before LOGIN\r\n");
+            return;
+        }
+        $tokens = $this->parseImapTokens($args);
+        if (count($tokens) === 1 && $tokens[0][0] === 'literal') {
+            /*
+                LOGIN with a literal username triggers the
+                continuation flow: server sends "+ Ready" and
+                accepts the literal bytes on the next line.
+                Our literal collector keeps accumulated tokens
+                in IMAP_LIT_BUFFER for the eventual full
+                command. This case is rare in practice; most
+                clients send LOGIN with quoted strings.
+             */
+            $ctx['IMAP_LIT_PENDING'] = [
+                'remaining' => $tokens[0][1],
+                'collected' => [],
+                'continuation' => 'login',
+                'tag' => $tag,
+            ];
+            $this->queueWrite($key, "+ Ready for literal\r\n");
+            return;
+        }
+        if (count($tokens) < 2 || $tokens[0][0] === 'literal' ||
+            $tokens[1][0] === 'literal') {
+            $this->queueWrite($key,
+                "$tag BAD LOGIN syntax\r\n");
+            return;
+        }
+        $this->finishImapLogin($key, $tag, $tokens[0][1],
+            $tokens[1][1], $ctx);
+    }
+    /**
+     * Final step of IMAP LOGIN: verify credentials, ensure the
+     * user's storage is provisioned, and transition the
+     * connection to AUTH state. Invoked from the inline path
+     * (imapCmdLogin) and from the literal-continuation path
+     * (continueImapLiteral).
+     */
+    protected function finishImapLogin($key, $tag, $user, $pass,
+        &$ctx)
+    {
+        if ($this->authenticator === null ||
+            !$this->authenticator->verifyPassword($user, $pass)) {
+            $this->queueWrite($key,
+                "$tag NO [AUTHENTICATIONFAILED] " .
+                "Authentication failed\r\n");
+            return;
+        }
+        $ctx['AUTH_USER'] = strtolower($user);
+        $ctx['STATE'] = 'AUTH';
+        if ($this->mail_storage !== null) {
+            $this->mail_storage->ensureUser($ctx['AUTH_USER']);
+        }
+        $this->queueWrite($key,
+            "$tag OK [CAPABILITY IMAP4rev1 IDLE] LOGIN " .
+            "completed\r\n");
+    }
+    /**
+     * Handles AUTHENTICATE PLAIN and AUTHENTICATE LOGIN. PLAIN
+     * uses a single base64 blob in the same "\0user\0pass"
+     * format as SMTP AUTH PLAIN; LOGIN uses the two-step
+     * username-then-password continuation. The mechanism name
+     * is the only positional argument here; everything else
+     * arrives via continueImapLiteral on subsequent lines.
+     */
+    protected function imapCmdAuthenticate($key, $tag, $args, &$ctx)
+    {
+        $allow_plain =
+            !empty($this->default_server_globals[
+                'ALLOW_PLAINTEXT_AUTH']);
+        if (empty($ctx['TLS_ACTIVE']) && !$allow_plain) {
+            $this->queueWrite($key,
+                "$tag NO [PRIVACYREQUIRED] " .
+                "STARTTLS required before AUTHENTICATE\r\n");
+            return;
+        }
+        $mech = strtoupper(trim($args));
+        if ($mech === 'PLAIN') {
+            $ctx['IMAP_LIT_PENDING'] = [
+                'continuation' => 'auth-plain',
+                'tag' => $tag,
+            ];
+            $this->queueWrite($key, "+ \r\n");
+            return;
+        }
+        if ($mech === 'LOGIN') {
+            $ctx['IMAP_LIT_PENDING'] = [
+                'continuation' => 'auth-login-user',
+                'tag' => $tag,
+            ];
+            $this->queueWrite($key,
+                "+ " . base64_encode("Username:") . "\r\n");
+            return;
+        }
+        $this->queueWrite($key,
+            "$tag NO [CANNOT] Unsupported mechanism\r\n");
+    }
+    /**
+     * Drives the multi-line continuations for AUTHENTICATE and
+     * for LOGIN literals. The pending-state record carries a
+     * "continuation" key naming the expected next phase; once
+     * the final line arrives we finish the operation and clear
+     * the pending slot.
+     */
+    protected function continueImapLiteral($key, $line, &$ctx)
+    {
+        $pend = $ctx['IMAP_LIT_PENDING'];
+        $tag = $pend['tag'];
+        $cont = $pend['continuation'];
+        if ($cont === 'auth-plain') {
+            $ctx['IMAP_LIT_PENDING'] = null;
+            $raw = (string) base64_decode(trim($line), true);
+            $parts = explode("\x00", $raw);
+            if (count($parts) !== 3) {
+                $this->queueWrite($key,
+                    "$tag NO [AUTHENTICATIONFAILED] " .
+                    "Authentication failed\r\n");
+                return;
+            }
+            list(, $user, $pass) = $parts;
+            $this->finishImapLogin($key, $tag, $user, $pass,
+                $ctx);
+            return;
+        }
+        if ($cont === 'auth-login-user') {
+            $user = (string) base64_decode(trim($line), true);
+            $ctx['IMAP_LIT_PENDING'] = [
+                'continuation' => 'auth-login-pass',
+                'tag' => $tag,
+                'user' => $user,
+            ];
+            $this->queueWrite($key,
+                "+ " . base64_encode("Password:") . "\r\n");
+            return;
+        }
+        if ($cont === 'auth-login-pass') {
+            $ctx['IMAP_LIT_PENDING'] = null;
+            $pass = (string) base64_decode(trim($line), true);
+            $this->finishImapLogin($key, $tag, $pend['user'],
+                $pass, $ctx);
+            return;
+        }
+        if ($cont === 'login') {
+            $ctx['IMAP_LIT_PENDING'] = null;
+            /*
+                Phase 3 only supports LOGIN literals as a
+                fall-back; production clients send LOGIN with
+                quoted strings. We do not currently chain a
+                second literal for the password.
+             */
+            $this->queueWrite($key,
+                "$tag BAD literal LOGIN not fully implemented\r\n");
+            return;
+        }
+        $ctx['IMAP_LIT_PENDING'] = null;
+        $this->queueWrite($key, "$tag BAD continuation lost\r\n");
+    }
+    /**
+     * Tokenizes the argument tail of an IMAP command into a
+     * list of [type, value] pairs. Recognized types:
+     *   'atom'    -- bare unquoted token
+     *   'quoted'  -- characters between matching double-quotes
+     *                with backslash-escaped " and \
+     *   'literal' -- {N} synchronizing literal; the value is
+     *                the byte count, the actual bytes arrive
+     *                on the next line and must be reassembled
+     *                by the caller via continueImapLiteral
+     * NIL is decoded as an atom with the literal value "NIL".
+     * Whitespace between tokens is consumed but not represented.
+     * Returns an empty array on a parse error mid-string; the
+     * caller should treat that as BAD syntax.
+     */
+    protected function parseImapTokens($s)
+    {
+        $tokens = [];
+        $i = 0;
+        $n = strlen($s);
+        while ($i < $n) {
+            $c = $s[$i];
+            if ($c === ' ' || $c === "\t") {
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $j = $i + 1;
+                $val = '';
+                while ($j < $n && $s[$j] !== '"') {
+                    if ($s[$j] === '\\' && $j + 1 < $n) {
+                        $val .= $s[$j + 1];
+                        $j += 2;
+                        continue;
+                    }
+                    $val .= $s[$j];
+                    $j++;
+                }
+                if ($j >= $n) {
+                    return [];
+                }
+                $tokens[] = ['quoted', $val];
+                $i = $j + 1;
+                continue;
+            }
+            if ($c === '{') {
+                $end = strpos($s, '}', $i);
+                if ($end === false) {
+                    return [];
+                }
+                $count = (int) substr($s, $i + 1, $end - $i - 1);
+                $tokens[] = ['literal', $count];
+                $i = $end + 1;
+                continue;
+            }
+            if ($c === '(') {
+                /*
+                    Parenthesized list: keep all contents as one
+                    'list' token. Nested lists are flattened
+                    into the outer paren count, which is fine
+                    for the IMAP commands we handle in Phase 3
+                    where lists are flat (status items, search
+                    keys etc).
+                 */
+                $depth = 1;
+                $j = $i + 1;
+                while ($j < $n && $depth > 0) {
+                    if ($s[$j] === '(') {
+                        $depth++;
+                    } else if ($s[$j] === ')') {
+                        $depth--;
+                        if ($depth === 0) {
+                            break;
+                        }
+                    }
+                    $j++;
+                }
+                if ($depth !== 0) {
+                    return [];
+                }
+                $tokens[] = ['list',
+                    substr($s, $i + 1, $j - $i - 1)];
+                $i = $j + 1;
+                continue;
+            }
+            /*
+                Bare atom: take everything up to the next
+                whitespace or end of string. List arguments
+                like "(\Seen \Answered)" or "(MESSAGES UNSEEN)"
+                are atoms in the IMAP grammar; we keep the
+                parens as part of the atom and let the caller
+                strip them.
+             */
+            $j = $i;
+            while ($j < $n && $s[$j] !== ' ' &&
+                $s[$j] !== "\t") {
+                $j++;
+            }
+            $tokens[] = ['atom', substr($s, $i, $j - $i)];
+            $i = $j;
+        }
+        return $tokens;
+    }
+    /**
+     * Convenience: pull the first string-valued token from a
+     * tokens list, returning false if the list is empty or the
+     * first token is a literal (literals require continuation
+     * handling and cannot be returned synchronously).
+     */
+    protected function tokenString($tokens, $idx)
+    {
+        if (!isset($tokens[$idx])) {
+            return false;
+        }
+        $t = $tokens[$idx];
+        if ($t[0] === 'atom' || $t[0] === 'quoted') {
+            return $t[1];
+        }
+        return false;
+    }
+    /**
+     * Handles LIST and LSUB. Both have the same syntax:
+     *      LIST <reference> <mailbox-pattern>
+     * where reference is usually "" (or sometimes "INBOX") and
+     * the pattern can include "*" (any chars) or "%" (any chars
+     * except hierarchy delimiter). Two special cases per
+     * RFC 3501 sec 6.3.8:
+     *   - empty mailbox argument: server returns the hierarchy
+     *     delimiter and root, used by clients to discover the
+     *     separator
+     *   - "%" with empty reference: returns top-level folders
+     * We implement the regex translation locally so we do not
+     * need to push wildcard semantics down into MailStorage.
+     */
+    protected function imapCmdList($key, $tag, $args, &$ctx,
+        $is_lsub)
+    {
+        $verb = $is_lsub ? 'LSUB' : 'LIST';
+        $tokens = $this->parseImapTokens($args);
+        $ref = $this->tokenString($tokens, 0);
+        $pat = $this->tokenString($tokens, 1);
+        if ($ref === false || $pat === false) {
+            $this->queueWrite($key,
+                "$tag BAD $verb syntax\r\n");
+            return;
+        }
+        if ($pat === '') {
+            /*
+                Empty pattern: respond with the hierarchy
+                delimiter and an empty mailbox name, then OK.
+             */
+            $this->queueWrite($key,
+                "* $verb (\\Noselect) \"/\" \"\"\r\n");
+            $this->queueWrite($key,
+                "$tag OK $verb completed\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        $folders = $this->mail_storage->listFolders($user);
+        /*
+            Make sure INBOX is always reported even if the
+            storage has not provisioned its directory yet
+            (some clients LIST before any message has arrived).
+         */
+        if (!in_array('INBOX', $folders, true)) {
+            $folders[] = 'INBOX';
+            sort($folders);
+        }
+        $combined = $ref === '' ? $pat : $ref . $pat;
+        $regex = $this->imapPatternToRegex($combined);
+        foreach ($folders as $f) {
+            if (preg_match($regex, $f)) {
+                $name = $this->imapEncodeMailboxName($f);
+                $this->queueWrite($key,
+                    "* $verb () \"/\" $name\r\n");
+            }
+        }
+        $this->queueWrite($key, "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Converts an IMAP LIST/LSUB pattern to a PCRE regex.
+     * Wildcards: "*" matches any sequence of characters
+     * including the hierarchy delimiter; "%" matches any
+     * sequence not containing the delimiter. All other regex
+     * metacharacters are escaped.
+     */
+    protected function imapPatternToRegex($pattern)
+    {
+        $out = '';
+        $n = strlen($pattern);
+        for ($i = 0; $i < $n; $i++) {
+            $c = $pattern[$i];
+            if ($c === '*') {
+                $out .= '.*';
+            } else if ($c === '%') {
+                $out .= '[^/]*';
+            } else {
+                $out .= preg_quote($c, '#');
+            }
+        }
+        return '#^' . $out . '$#';
+    }
+    /**
+     * Renders a folder name for inclusion in an IMAP response.
+     * If the name is a printable ASCII atom (no spaces, no
+     * special chars) it is returned bare; otherwise it is
+     * wrapped in double-quotes with " and \ escaped. RFC 3501
+     * also allows literals here, but quoted strings are easier
+     * for clients to parse and sufficient for our folder
+     * namespace.
+     */
+    protected function imapEncodeMailboxName($name)
+    {
+        if (preg_match('#^[A-Za-z0-9./_-]+$#', $name)) {
+            return $name;
+        }
+        $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'],
+            $name);
+        return '"' . $escaped . '"';
+    }
+    /**
+     * Stub SUBSCRIBE/UNSUBSCRIBE: since we do not maintain a
+     * per-user subscription list, accept any folder name that
+     * names an existing mailbox and return OK. This is what a
+     * client sees as "all folders are subscribed", which is the
+     * simplest correct behavior for a server without subscription
+     * state.
+     */
+    protected function imapCmdSubscribe($key, $tag, $args, $verb,
+        &$ctx)
+    {
+        $tokens = $this->parseImapTokens($args);
+        $name = $this->tokenString($tokens, 0);
+        if ($name === false) {
+            $this->queueWrite($key,
+                "$tag BAD $verb syntax\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        if (!$this->mail_storage->folderExists($user, $name)) {
+            $this->queueWrite($key,
+                "$tag NO Mailbox does not exist\r\n");
+            return;
+        }
+        $this->queueWrite($key, "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Handles STATUS <mailbox> (<items...>). The items list
+     * names attributes the client wants reported: any of
+     * MESSAGES, RECENT, UIDNEXT, UIDVALIDITY, UNSEEN. Returns
+     * an untagged STATUS response then the tagged OK. Folder
+     * is NOT made the selected mailbox.
+     */
+    protected function imapCmdStatus($key, $tag, $args, &$ctx)
+    {
+        $tokens = $this->parseImapTokens($args);
+        $folder = $this->tokenString($tokens, 0);
+        $items_str = false;
+        if (isset($tokens[1])) {
+            if ($tokens[1][0] === 'list') {
+                $items_str = $tokens[1][1];
+            } else if ($tokens[1][0] === 'atom' ||
+                $tokens[1][0] === 'quoted') {
+                $items_str = trim($tokens[1][1], '()');
+            }
+        }
+        if ($folder === false || $items_str === false) {
+            $this->queueWrite($key,
+                "$tag BAD STATUS syntax\r\n");
+            return;
+        }
+        $items = preg_split('/\s+/', trim($items_str));
+        $user = $ctx['AUTH_USER'];
+        if (!$this->mail_storage->folderExists($user, $folder)) {
+            $this->queueWrite($key,
+                "$tag NO Mailbox does not exist\r\n");
+            return;
+        }
+        $stat = $this->imapFolderStats($user, $folder);
+        $parts = [];
+        foreach ($items as $it) {
+            $itu = strtoupper($it);
+            if ($itu === 'MESSAGES') {
+                $parts[] = "MESSAGES " . $stat['messages'];
+            } else if ($itu === 'RECENT') {
+                $parts[] = "RECENT " . $stat['recent'];
+            } else if ($itu === 'UIDNEXT') {
+                $parts[] = "UIDNEXT " . $stat['uidnext'];
+            } else if ($itu === 'UIDVALIDITY') {
+                $parts[] = "UIDVALIDITY " . $stat['uidvalidity'];
+            } else if ($itu === 'UNSEEN') {
+                $parts[] = "UNSEEN " . $stat['unseen'];
+            }
+        }
+        $name = $this->imapEncodeMailboxName($folder);
+        $this->queueWrite($key,
+            "* STATUS $name (" . implode(' ', $parts) . ")\r\n");
+        $this->queueWrite($key,
+            "$tag OK STATUS completed\r\n");
+    }
+    /**
+     * Computes the metrics SELECT/EXAMINE/STATUS need for a
+     * folder: total message count, RECENT count (\Recent flag),
+     * UNSEEN UID (UID of the first message lacking \Seen, or
+     * 0 if all are seen), and the UIDNEXT / UIDVALIDITY values.
+     * Folders with no messages still report well-defined zero/
+     * one values rather than failing.
+     */
+    protected function imapFolderStats($user, $folder)
+    {
+        $messages = $this->mail_storage->listMessages($user,
+            $folder);
+        $count = count($messages);
+        $recent = 0;
+        $unseen_uid = 0;
+        $first_unseen_seq = 0;
+        foreach ($messages as $idx => $m) {
+            if (in_array('\Recent', $m['flags'], true)) {
+                $recent++;
+            }
+            if ($first_unseen_seq === 0 &&
+                !in_array('\Seen', $m['flags'], true)) {
+                $first_unseen_seq = $idx + 1;
+                $unseen_uid = $m['uid'];
+            }
+        }
+        return [
+            'messages' => $count,
+            'recent' => $recent,
+            'unseen' => $unseen_uid,
+            'unseen_seq' => $first_unseen_seq,
+            'uidnext' => $this->mail_storage->uidNext($user,
+                $folder),
+            'uidvalidity' => $this->mail_storage->uidValidity(
+                $user, $folder),
+        ];
+    }
+    /**
+     * Handles CREATE <mailbox>. Refuses to create INBOX (it
+     * already exists) or names that fail the storage layer's
+     * folder validation.
+     */
+    protected function imapCmdCreate($key, $tag, $args, &$ctx)
+    {
+        $tokens = $this->parseImapTokens($args);
+        $name = $this->tokenString($tokens, 0);
+        if ($name === false || $name === '') {
+            $this->queueWrite($key,
+                "$tag BAD CREATE syntax\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        if ($this->mail_storage->folderExists($user, $name)) {
+            $this->queueWrite($key,
+                "$tag NO Mailbox already exists\r\n");
+            return;
+        }
+        try {
+            $ok = $this->mail_storage->createFolder($user, $name);
+        } catch (\InvalidArgumentException $e) {
+            $this->queueWrite($key,
+                "$tag NO Invalid mailbox name\r\n");
+            return;
+        }
+        if (!$ok) {
+            $this->queueWrite($key,
+                "$tag NO CREATE failed\r\n");
+            return;
+        }
+        $this->queueWrite($key, "$tag OK CREATE completed\r\n");
+    }
+    /**
+     * Handles DELETE <mailbox>. The storage layer refuses to
+     * delete INBOX or a folder with subfolders; we propagate
+     * those as NO responses.
+     */
+    protected function imapCmdDelete($key, $tag, $args, &$ctx)
+    {
+        $tokens = $this->parseImapTokens($args);
+        $name = $this->tokenString($tokens, 0);
+        if ($name === false || $name === '') {
+            $this->queueWrite($key,
+                "$tag BAD DELETE syntax\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        if (!$this->mail_storage->folderExists($user, $name)) {
+            $this->queueWrite($key,
+                "$tag NO Mailbox does not exist\r\n");
+            return;
+        }
+        if (!$this->mail_storage->deleteFolder($user, $name)) {
+            $this->queueWrite($key,
+                "$tag NO Cannot delete (INBOX, " .
+                "non-empty parent, or I/O error)\r\n");
+            return;
+        }
+        /*
+            If the deleted mailbox was the currently selected
+            one, drop selection so subsequent message-level
+            commands fail cleanly rather than operating on a
+            phantom mailbox.
+         */
+        if (!empty($ctx['SELECTED']) &&
+            $ctx['SELECTED'] === $name) {
+            $ctx['SELECTED'] = null;
+            $ctx['STATE'] = 'AUTH';
+        }
+        $this->queueWrite($key, "$tag OK DELETE completed\r\n");
+    }
+    /**
+     * Handles RENAME <old> <new>. INBOX is not renameable. If
+     * the renamed folder was selected, selection updates to
+     * the new name so the SELECTED state stays consistent.
+     */
+    protected function imapCmdRename($key, $tag, $args, &$ctx)
+    {
+        $tokens = $this->parseImapTokens($args);
+        $old = $this->tokenString($tokens, 0);
+        $new = $this->tokenString($tokens, 1);
+        if ($old === false || $new === false ||
+            $old === '' || $new === '') {
+            $this->queueWrite($key,
+                "$tag BAD RENAME syntax\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        if (!$this->mail_storage->folderExists($user, $old)) {
+            $this->queueWrite($key,
+                "$tag NO Source mailbox does not exist\r\n");
+            return;
+        }
+        if (!$this->mail_storage->renameFolder($user, $old,
+            $new)) {
+            $this->queueWrite($key,
+                "$tag NO RENAME failed\r\n");
+            return;
+        }
+        if (!empty($ctx['SELECTED']) &&
+            $ctx['SELECTED'] === $old) {
+            $ctx['SELECTED'] = $new;
+        }
+        $this->queueWrite($key, "$tag OK RENAME completed\r\n");
+    }
+    /**
+     * Handles SELECT and EXAMINE: open a mailbox for message-
+     * level access (SELECT) or read-only inspection (EXAMINE).
+     * Returns the standard required untagged responses (EXISTS,
+     * RECENT, FLAGS, OK [PERMANENTFLAGS], OK [UIDVALIDITY],
+     * OK [UIDNEXT], optional OK [UNSEEN]) followed by the
+     * tagged OK [READ-WRITE] or OK [READ-ONLY]. After SELECT
+     * the connection STATE is SELECTED.
+     */
+    protected function imapCmdSelect($key, $tag, $args, &$ctx,
+        $is_examine)
+    {
+        $verb = $is_examine ? 'EXAMINE' : 'SELECT';
+        $tokens = $this->parseImapTokens($args);
+        $folder = $this->tokenString($tokens, 0);
+        if ($folder === false || $folder === '') {
+            $this->queueWrite($key,
+                "$tag BAD $verb syntax\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        if (!$this->mail_storage->folderExists($user, $folder)) {
+            /*
+                INBOX should auto-exist; ensureUser created it.
+                For any other unknown folder, return NO without
+                changing selection state.
+             */
+            $this->queueWrite($key,
+                "$tag NO Mailbox does not exist\r\n");
+            return;
+        }
+        $stat = $this->imapFolderStats($user, $folder);
+        $flags = '\Answered \Flagged \Deleted \Seen \Draft';
+        $this->queueWrite($key,
+            "* " . $stat['messages'] . " EXISTS\r\n");
+        $this->queueWrite($key,
+            "* " . $stat['recent'] . " RECENT\r\n");
+        if ($stat['unseen_seq'] > 0) {
+            $this->queueWrite($key,
+                "* OK [UNSEEN " . $stat['unseen_seq'] .
+                "] First unseen message\r\n");
+        }
+        $this->queueWrite($key,
+            "* OK [UIDVALIDITY " . $stat['uidvalidity'] .
+            "] UIDs valid\r\n");
+        $this->queueWrite($key,
+            "* OK [UIDNEXT " . $stat['uidnext'] .
+            "] Predicted next UID\r\n");
+        $this->queueWrite($key,
+            "* FLAGS ($flags)\r\n");
+        $this->queueWrite($key,
+            "* OK [PERMANENTFLAGS ($flags \\*)] " .
+            "Limited\r\n");
+        $access = $is_examine ? 'READ-ONLY' : 'READ-WRITE';
+        $ctx['SELECTED'] = $folder;
+        $ctx['SELECTED_READONLY'] = $is_examine;
+        $ctx['STATE'] = 'SELECTED';
+        $this->queueWrite($key,
+            "$tag OK [$access] $verb completed\r\n");
+    }
+    /**
+     * Handles CLOSE: leave SELECTED state and return to AUTH
+     * state. RFC 3501 sec 6.4.2 says CLOSE silently expunges
+     * \Deleted messages; Phase 4 will add that semantics
+     * along with the EXPUNGE command. For Phase 3 CLOSE just
+     * deselects so navigation between folders works.
+     */
+    protected function imapCmdClose($key, $tag, &$ctx)
+    {
+        if ($ctx['STATE'] !== 'SELECTED') {
+            $this->queueWrite($key,
+                "$tag BAD CLOSE without SELECT\r\n");
+            return;
+        }
+        $ctx['SELECTED'] = null;
+        $ctx['SELECTED_READONLY'] = false;
+        $ctx['STATE'] = 'AUTH';
+        $this->queueWrite($key, "$tag OK CLOSE completed\r\n");
     }
     /**
      * Handles IMAP STARTTLS (RFC 2595). Same deferred-upgrade

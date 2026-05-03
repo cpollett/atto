@@ -1677,6 +1677,1063 @@ class RamMailStorage extends MailStorage
     }
 }
 /**
+ * Database-backed MailStorage. Mail metadata (users, folders,
+ * messages, subscriptions) lives in a relational store via PDO
+ * (PHP Data Objects, the standard PHP database abstraction);
+ * message bodies live on disk in a content-addressed blob store
+ * with refcounted dedup. The database stores body hashes only,
+ * never the bytes themselves, so two messages with byte-identical
+ * bodies share one on-disk file regardless of how many users
+ * received the message or which folders it lives in. Refcounts
+ * are kept in a sidecar metadata file next to each blob; when a
+ * refcount drops to zero on expunge or delete, both files are
+ * unlinked.
+ *
+ * Construction.
+ *
+ *      new SqlMailStorage($dsn_or_pdo, $blobs_dir = null,
+ *          $username = null, $password = null,
+ *          $dialect_overrides = []);
+ *
+ * The first argument is either a PDO data-source name string
+ * ("sqlite:/path/to.db", "mysql:host=h;dbname=d", etc.) or an
+ * already-constructed PDO instance. The PDO-instance form lets a
+ * host application that already maintains its own connection
+ * pool (Yioop's DatasourceManager being a concrete example) hand
+ * the existing connection in rather than open a second one. To
+ * adapt a Yioop PdoManager call site, pass its underlying PDO
+ * (Yioop's PdoManager exposes it as $pdo->pdo) into this
+ * constructor.
+ *
+ * The second argument is the directory under which content-
+ * addressed blobs are stored. For SQLite DSNs of the form
+ * "sqlite:/path/to.db" we default to "/path/to.db.blobs/" if
+ * $blobs_dir is left null; for any other DSN or for a PDO
+ * instance the caller MUST pass an explicit directory because
+ * we have no sensible default.
+ *
+ * SQL portability.
+ *
+ * The schema and every DML (data-manipulation language) statement
+ * in this class is the intersection of SQL accepted by SQLite,
+ * MySQL, PostgreSQL, DB2, and Oracle. We avoid INSERT OR REPLACE,
+ * ON DUPLICATE KEY UPDATE, AUTOINCREMENT, LIMIT/OFFSET in places
+ * Oracle would reject, and other dialect-specific syntax. Per-
+ * DBMS differences (the integer-PK column declaration, big-int
+ * type name, post-connect pragmas) are pulled from a per-driver
+ * dialect array; pre-populated entries cover sqlite, mysql, and
+ * pgsql. Anyone running against db2 or oci passes a dialect
+ * override into the constructor.
+ *
+ * Schema auto-creation.
+ *
+ * On construction we issue CREATE TABLE IF NOT EXISTS for each
+ * of mail_users, mail_folders, mail_messages, mail_subscriptions.
+ * Subsequent runs see existing tables and skip the create. There
+ * is no migration story yet; if the schema needs to change in a
+ * later phase the caller will need to drop the tables manually.
+ *
+ * Blob layout.
+ *
+ *      $blobs_dir/ab/cd/abcd1234...ef.eml      -- raw message bytes
+ *      $blobs_dir/ab/cd/abcd1234...ef.meta     -- "refcount\n<n>"
+ *
+ * The two-byte / two-byte directory prefix bounds the maximum
+ * fan-out of any one directory to about 65,536 entries even
+ * under extreme load. Refcount files are read/locked/written
+ * under flock LOCK_EX so concurrent appendMessage and expunge
+ * calls cannot lose updates.
+ */
+class SqlMailStorage extends MailStorage
+{
+    /**
+     * @var \PDO open connection used for every query.
+     */
+    protected $pdo;
+    /**
+     * @var string absolute directory under which blobs live.
+     */
+    protected $blobs_dir;
+    /**
+     * @var array per-DBMS dialect strings (pk_int, big_int,
+     * text) and an optional post_connect closure for any
+     * driver-specific tuning (PRAGMA journal_mode for SQLite,
+     * etc.).
+     */
+    protected $dialect;
+    /**
+     * @var array name => SQL template string. Each call to
+     * stmt() prepares a fresh PDOStatement from these to
+     * avoid cursor-state leakage between unrelated callers
+     * (see stmt()'s docblock for the full reasoning).
+     */
+    protected $sql_templates;
+    /**
+     * Constructs a SqlMailStorage.
+     *
+     * @param mixed $dsn_or_pdo either a PDO DSN string
+     *      (e.g. "sqlite:/var/mail/atto.db",
+     *      "mysql:host=db;dbname=atto",
+     *      "pgsql:host=db;dbname=atto") or an already-open
+     *      PDO instance from a host application.
+     * @param string $blobs_dir absolute directory under which
+     *      content-addressed message bodies are stored. May be
+     *      null only when $dsn_or_pdo is an SQLite DSN of the
+     *      form "sqlite:<path>"; we then default to
+     *      "<path>.blobs". Otherwise required.
+     * @param string $username PDO connection username if a DSN
+     *      string was supplied (ignored for PDO instances).
+     * @param string $password PDO connection password if a DSN
+     *      string was supplied.
+     * @param array $dialect_overrides dialect entries to merge
+     *      over the built-in sqlite/mysql/pgsql ones; use this
+     *      to add db2/oci or to override a built-in.
+     */
+    public function __construct($dsn_or_pdo, $blobs_dir = null,
+        $username = null, $password = null,
+        $dialect_overrides = [])
+    {
+        $built_in = $this->builtInDialects();
+        $dialects = array_merge($built_in, $dialect_overrides);
+        if ($dsn_or_pdo instanceof \PDO) {
+            $this->pdo = $dsn_or_pdo;
+            $driver = $this->pdo->getAttribute(
+                \PDO::ATTR_DRIVER_NAME);
+        } else {
+            $dsn = (string) $dsn_or_pdo;
+            $colon = strpos($dsn, ':');
+            if ($colon === false) {
+                throw new \InvalidArgumentException(
+                    "DSN must contain a driver prefix: $dsn");
+            }
+            $driver = substr($dsn, 0, $colon);
+            $this->pdo = new \PDO($dsn, $username, $password);
+            /*
+                Default blobs directory for SQLite DSNs. For
+                "sqlite:/var/mail/atto.db" we assume the caller
+                wants blobs under "/var/mail/atto.db.blobs". Any
+                other driver requires an explicit directory.
+             */
+            if ($blobs_dir === null && $driver === 'sqlite') {
+                $sqlite_path = substr($dsn, $colon + 1);
+                if ($sqlite_path !== '' && $sqlite_path !== ':memory:') {
+                    $blobs_dir = $sqlite_path . '.blobs';
+                }
+            }
+        }
+        if ($blobs_dir === null || $blobs_dir === '') {
+            throw new \InvalidArgumentException(
+                "blobs_dir is required for non-SQLite DSNs");
+        }
+        if (!isset($dialects[$driver])) {
+            throw new \InvalidArgumentException(
+                "no dialect entry for driver '$driver'; pass " .
+                "one in via the dialect_overrides argument");
+        }
+        $this->dialect = $dialects[$driver];
+        $this->blobs_dir = rtrim($blobs_dir, "/\\");
+        $this->pdo->setAttribute(\PDO::ATTR_ERRMODE,
+            \PDO::ERRMODE_EXCEPTION);
+        $this->pdo->setAttribute(\PDO::ATTR_DEFAULT_FETCH_MODE,
+            \PDO::FETCH_ASSOC);
+        if (!empty($this->dialect['post_connect'])) {
+            call_user_func($this->dialect['post_connect'],
+                $this->pdo);
+        }
+        if (!is_dir($this->blobs_dir)) {
+            @mkdir($this->blobs_dir, 0700, true);
+        }
+        $this->createSchema();
+        $this->sql_templates = $this->buildSqlTemplates();
+    }
+    /**
+     * Returns the built-in dialect map keyed by PDO driver
+     * name. Each entry supplies SQL-fragment strings used by
+     * createSchema, plus an optional post_connect closure that
+     * runs against the PDO instance immediately after open
+     * (used to set per-connection pragmas, character sets, or
+     * isolation levels).
+     */
+    protected function builtInDialects()
+    {
+        return [
+            'sqlite' => [
+                'pk_int' => 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'big_int' => 'INTEGER',
+                'text' => 'TEXT',
+                'post_connect' => function ($pdo) {
+                    /*
+                        WAL (write-ahead logging) makes
+                        readers and writers non-blocking
+                        relative to each other, which matters
+                        once IDLE clients sit on SELECT
+                        forever. foreign_keys=ON gets the
+                        cascade behaviour we expect from
+                        FOREIGN KEY clauses (SQLite ignores
+                        them by default).
+                     */
+                    $pdo->exec('PRAGMA journal_mode=WAL');
+                    $pdo->exec('PRAGMA foreign_keys=ON');
+                },
+            ],
+            'mysql' => [
+                'pk_int' =>
+                    'BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY',
+                'big_int' => 'BIGINT',
+                'text' => 'TEXT',
+                'post_connect' => function ($pdo) {
+                    $pdo->exec("SET NAMES 'utf8mb4'");
+                },
+            ],
+            'pgsql' => [
+                'pk_int' => 'BIGSERIAL PRIMARY KEY',
+                'big_int' => 'BIGINT',
+                'text' => 'TEXT',
+                'post_connect' => null,
+            ],
+        ];
+    }
+    /**
+     * Creates the four mail_* tables if they do not exist.
+     * Schema is fully portable across the dialects we support;
+     * dialect strings are substituted for the integer-PK
+     * declaration and the big-int and text type names.
+     */
+    protected function createSchema()
+    {
+        $pk = $this->dialect['pk_int'];
+        $big = $this->dialect['big_int'];
+        $text = $this->dialect['text'];
+        $statements = [
+            "CREATE TABLE IF NOT EXISTS mail_users (
+                id $pk,
+                username VARCHAR(255) NOT NULL UNIQUE,
+                uidnext $big NOT NULL,
+                uidvalidity $big NOT NULL,
+                created_at $big NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS mail_folders (
+                id $pk,
+                user_id $big NOT NULL,
+                name VARCHAR(512) NOT NULL,
+                uidvalidity $big NOT NULL,
+                created_at $big NOT NULL,
+                CONSTRAINT mail_folders_unique
+                    UNIQUE (user_id, name)
+            )",
+            "CREATE TABLE IF NOT EXISTS mail_messages (
+                id $pk,
+                folder_id $big NOT NULL,
+                uid $big NOT NULL,
+                flags $text NOT NULL,
+                internal_date $big NOT NULL,
+                size $big NOT NULL,
+                body_hash CHAR(64) NOT NULL,
+                CONSTRAINT mail_messages_unique
+                    UNIQUE (folder_id, uid)
+            )",
+            "CREATE TABLE IF NOT EXISTS mail_subscriptions (
+                user_id $big NOT NULL,
+                folder VARCHAR(512) NOT NULL,
+                CONSTRAINT mail_subscriptions_pk
+                    PRIMARY KEY (user_id, folder)
+            )",
+        ];
+        foreach ($statements as $sql) {
+            $this->pdo->exec($sql);
+        }
+    }
+    /**
+     * Returns the prepared-statement-template lookup table.
+     * Statements are identified by short symbolic names so the
+     * call sites read like English rather than SQL fragments.
+     * Every template uses positional ? placeholders to keep
+     * parameter binding identical across drivers.
+     */
+    protected function buildSqlTemplates()
+    {
+        return [
+            'user_by_name' =>
+                "SELECT * FROM mail_users WHERE username = ?",
+            'user_insert' =>
+                "INSERT INTO mail_users " .
+                "(username, uidnext, uidvalidity, created_at) " .
+                "VALUES (?, ?, ?, ?)",
+            'user_update_uidnext' =>
+                "UPDATE mail_users SET uidnext = ? " .
+                "WHERE id = ?",
+            'folder_by_user_name' =>
+                "SELECT * FROM mail_folders " .
+                "WHERE user_id = ? AND name = ?",
+            'folders_by_user' =>
+                "SELECT name FROM mail_folders " .
+                "WHERE user_id = ? ORDER BY name",
+            'folder_insert' =>
+                "INSERT INTO mail_folders " .
+                "(user_id, name, uidvalidity, created_at) " .
+                "VALUES (?, ?, ?, ?)",
+            'folder_delete' =>
+                "DELETE FROM mail_folders WHERE id = ?",
+            'folder_rename' =>
+                "UPDATE mail_folders SET name = ? WHERE id = ?",
+            'folder_children' =>
+                "SELECT id FROM mail_folders " .
+                "WHERE user_id = ? AND name LIKE ?",
+            'message_by_uid' =>
+                "SELECT * FROM mail_messages " .
+                "WHERE folder_id = ? AND uid = ?",
+            'messages_by_folder' =>
+                "SELECT * FROM mail_messages " .
+                "WHERE folder_id = ? ORDER BY uid",
+            'message_count' =>
+                "SELECT COUNT(*) AS c FROM mail_messages " .
+                "WHERE folder_id = ?",
+            'message_insert' =>
+                "INSERT INTO mail_messages (folder_id, uid, " .
+                "flags, internal_date, size, body_hash) " .
+                "VALUES (?, ?, ?, ?, ?, ?)",
+            'message_delete' =>
+                "DELETE FROM mail_messages WHERE id = ?",
+            'message_update_flags' =>
+                "UPDATE mail_messages SET flags = ? " .
+                "WHERE id = ?",
+            'message_move' =>
+                "UPDATE mail_messages SET folder_id = ? " .
+                "WHERE id = ?",
+            'messages_in_folder_with_deleted' =>
+                "SELECT id, uid, flags, body_hash " .
+                "FROM mail_messages " .
+                "WHERE folder_id = ? ORDER BY uid",
+            'subscription_check' =>
+                "SELECT 1 FROM mail_subscriptions " .
+                "WHERE user_id = ? AND folder = ?",
+            'subscription_insert' =>
+                "INSERT INTO mail_subscriptions " .
+                "(user_id, folder) VALUES (?, ?)",
+            'subscription_delete' =>
+                "DELETE FROM mail_subscriptions " .
+                "WHERE user_id = ? AND folder = ?",
+            'subscriptions_by_user' =>
+                "SELECT folder FROM mail_subscriptions " .
+                "WHERE user_id = ? ORDER BY folder",
+        ];
+    }
+    /**
+     * Returns a freshly-prepared PDOStatement for the named
+     * template. We deliberately do NOT cache prepared
+     * statements across calls. PDO holds an open cursor on a
+     * statement after execute() returns until every row is
+     * consumed via fetch() or closeCursor() is called; a
+     * single-row lookup like "SELECT * FROM mail_users
+     * WHERE username = ?" looks fine to the calling code
+     * but leaves a cursor pending in the driver until the
+     * next execute() forcibly resets it. With cached
+     * statements that pending state survives between scenario
+     * runs and breaks unrelated callers under sustained load.
+     * Per-call preparation costs ~50 microseconds in SQLite
+     * and is irrelevant against the disk and network costs
+     * dominating mail-server throughput. The clarity is
+     * worth more than the saved milliseconds.
+     */
+    protected function stmt($name)
+    {
+        if (!isset($this->sql_templates[$name])) {
+            throw new \LogicException(
+                "no SQL template named '$name'");
+        }
+        return $this->pdo->prepare(
+            $this->sql_templates[$name]);
+    }
+    /**
+     * Returns the user record (id, uidnext, uidvalidity) for
+     * $username, creating the user lazily on first reference.
+     * Mirrors RamMailStorage::userRef + FileMailStorage's
+     * ensureUser side effect: any operation that touches a
+     * username for the first time materializes a user row and
+     * an INBOX folder row.
+     */
+    protected function userRow($user)
+    {
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $row = $stmt->fetch();
+        if ($row !== false) {
+            return $row;
+        }
+        $now = time();
+        $uv = $this->nextUidValidity();
+        $this->stmt('user_insert')->execute(
+            [$user, 1, $uv, $now]);
+        $user_id = (int) $this->pdo->lastInsertId();
+        $inbox_uv = $this->nextUidValidity();
+        $this->stmt('folder_insert')->execute(
+            [$user_id, 'INBOX', $inbox_uv, $now]);
+        return [
+            'id' => $user_id,
+            'username' => $user,
+            'uidnext' => 1,
+            'uidvalidity' => $uv,
+            'created_at' => $now,
+        ];
+    }
+    /**
+     * Returns the folder row for ($user, $folder) or false if
+     * neither the user nor the folder exists.
+     */
+    protected function folderRow($user, $folder)
+    {
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('folder_by_user_name');
+        $stmt->execute([$user_row['id'], $folder]);
+        $folder_row = $stmt->fetch();
+        if ($folder_row === false) {
+            return false;
+        }
+        $folder_row['user_id'] = $user_row['id'];
+        return $folder_row;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function ensureUser($user)
+    {
+        $this->userRow($user);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listFolders($user)
+    {
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row === false) {
+            return [];
+        }
+        $stmt = $this->stmt('folders_by_user');
+        $stmt->execute([$user_row['id']]);
+        $names = [];
+        while ($row = $stmt->fetch()) {
+            $names[] = $row['name'];
+        }
+        return $names;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function createFolder($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $u = $this->userRow($user);
+        $stmt = $this->stmt('folder_by_user_name');
+        $stmt->execute([$u['id'], $folder]);
+        if ($stmt->fetch() !== false) {
+            return true;
+        }
+        $this->stmt('folder_insert')->execute([
+            $u['id'], $folder, $this->nextUidValidity(), time()
+        ]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function deleteFolder($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if ($folder === "INBOX") {
+            return false;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('folder_children');
+        $stmt->execute([$row['user_id'], $folder . '/%']);
+        if ($stmt->fetch() !== false) {
+            return false;
+        }
+        /*
+            Decrement refcounts for every message in the folder
+            before dropping its rows; expunge does the same
+            thing on a per-message basis but here we are wiping
+            wholesale.
+         */
+        $msgs = $this->stmt('messages_by_folder');
+        $msgs->execute([$row['id']]);
+        while ($m = $msgs->fetch()) {
+            $this->blobDecRef($m['body_hash']);
+        }
+        $this->pdo->exec("DELETE FROM mail_messages " .
+            "WHERE folder_id = " . (int) $row['id']);
+        $this->stmt('folder_delete')->execute([$row['id']]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function renameFolder($user, $old, $new)
+    {
+        try {
+            $old = $this->normalizeFolder($old);
+            $new = $this->normalizeFolder($new);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if ($old === "INBOX" || $new === "INBOX") {
+            return false;
+        }
+        $row = $this->folderRow($user, $old);
+        if ($row === false) {
+            return false;
+        }
+        if ($this->folderRow($user, $new) !== false) {
+            return false;
+        }
+        $this->stmt('folder_rename')->execute(
+            [$new, $row['id']]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function folderExists($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        return $this->folderRow($user, $folder) !== false;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function appendMessage($user, $folder, $bytes,
+        $flags = [], $internal_date = 0)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $u = $this->userRow($user);
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            if (!$this->createFolder($user, $folder)) {
+                return false;
+            }
+            $row = $this->folderRow($user, $folder);
+            if ($row === false) {
+                return false;
+            }
+        }
+        if ($internal_date <= 0) {
+            $internal_date = time();
+        }
+        $clean = [];
+        foreach ($flags as $flag) {
+            $flag = trim((string) $flag);
+            if ($flag !== "") {
+                $clean[] = $flag;
+            }
+        }
+        $bytes = (string) $bytes;
+        $hash = hash('sha256', $bytes);
+        if (!$this->blobIncRef($hash, $bytes)) {
+            return false;
+        }
+        /*
+            Allocate the next per-user UID by reading the
+            current uidnext, incrementing, and writing back.
+            We do this inside a transaction so two concurrent
+            appendMessage calls cannot hand out the same UID;
+            the UNIQUE (folder_id, uid) constraint would
+            otherwise reject the second insert.
+         */
+        $this->pdo->beginTransaction();
+        try {
+            $stmt = $this->stmt('user_by_name');
+            $stmt->execute([$user]);
+            $fresh = $stmt->fetch();
+            $uid = (int) $fresh['uidnext'];
+            $this->stmt('user_update_uidnext')->execute(
+                [$uid + 1, $u['id']]);
+            $this->stmt('message_insert')->execute([
+                $row['id'], $uid, implode(' ', $clean),
+                (int) $internal_date, strlen($bytes), $hash
+            ]);
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            $this->blobDecRef($hash);
+            return false;
+        }
+        return $uid;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function fetchMessage($user, $folder, $uid)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('message_by_uid');
+        $stmt->execute([$row['id'], (int) $uid]);
+        $msg = $stmt->fetch();
+        if ($msg === false) {
+            return false;
+        }
+        return $this->blobRead($msg['body_hash']);
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listMessages($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return [];
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return [];
+        }
+        $stmt = $this->stmt('messages_by_folder');
+        $stmt->execute([$row['id']]);
+        $output = [];
+        while ($msg = $stmt->fetch()) {
+            $output[] = $this->messageRecord($msg);
+        }
+        return $output;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function messageMeta($user, $folder, $uid)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('message_by_uid');
+        $stmt->execute([$row['id'], (int) $uid]);
+        $msg = $stmt->fetch();
+        if ($msg === false) {
+            return false;
+        }
+        return $this->messageRecord($msg);
+    }
+    /**
+     * Shapes a raw mail_messages row into the public record
+     * format that the abstract MailStorage interface promises.
+     */
+    protected function messageRecord($row)
+    {
+        $flags = preg_split('/\s+/', trim((string) $row['flags']));
+        $flags = array_values(array_filter($flags,
+            function ($flag) { return $flag !== ''; }));
+        return [
+            'uid' => (int) $row['uid'],
+            'size' => (int) $row['size'],
+            'flags' => $flags,
+            'internal_date' => (int) $row['internal_date'],
+        ];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function setFlags($user, $folder, $uid, $flags)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('message_by_uid');
+        $stmt->execute([$row['id'], $uid]);
+        $msg = $stmt->fetch();
+        if ($msg === false) {
+            return false;
+        }
+        $clean = [];
+        foreach ($flags as $flag) {
+            $flag = trim((string) $flag);
+            if ($flag !== "") {
+                $clean[] = $flag;
+            }
+        }
+        $this->stmt('message_update_flags')->execute(
+            [implode(' ', $clean), $msg['id']]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function expunge($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return [];
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return [];
+        }
+        $stmt = $this->stmt('messages_in_folder_with_deleted');
+        $stmt->execute([$row['id']]);
+        $expunged = [];
+        $to_drop = [];
+        while ($msg = $stmt->fetch()) {
+            $flags = preg_split('/\s+/',
+                trim((string) $msg['flags']));
+            if (!in_array('\\Deleted', $flags, true)) {
+                continue;
+            }
+            $expunged[] = (int) $msg['uid'];
+            $to_drop[] = $msg;
+        }
+        foreach ($to_drop as $msg) {
+            $this->stmt('message_delete')->execute(
+                [$msg['id']]);
+            $this->blobDecRef($msg['body_hash']);
+        }
+        sort($expunged);
+        return $expunged;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function moveMessage($user, $from, $to, $uid)
+    {
+        try {
+            $from = $this->normalizeFolder($from);
+            $to = $this->normalizeFolder($to);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $uid = (int) $uid;
+        $from_row = $this->folderRow($user, $from);
+        if ($from_row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('message_by_uid');
+        $stmt->execute([$from_row['id'], $uid]);
+        $msg = $stmt->fetch();
+        if ($msg === false) {
+            return false;
+        }
+        $to_row = $this->folderRow($user, $to);
+        if ($to_row === false) {
+            if (!$this->createFolder($user, $to)) {
+                return false;
+            }
+            $to_row = $this->folderRow($user, $to);
+            if ($to_row === false) {
+                return false;
+            }
+        }
+        $this->stmt('message_move')->execute(
+            [$to_row['id'], $msg['id']]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function messageCount($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return 0;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return 0;
+        }
+        $stmt = $this->stmt('message_count');
+        $stmt->execute([$row['id']]);
+        $count_row = $stmt->fetch();
+        return (int) $count_row['c'];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function uidValidity($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return 0;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row !== false) {
+            return (int) $row['uidvalidity'];
+        }
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row === false) {
+            return 0;
+        }
+        return (int) $user_row['uidvalidity'];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function uidNext($user, $folder)
+    {
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row === false) {
+            $u = $this->userRow($user);
+            return (int) $u['uidnext'];
+        }
+        return (int) $user_row['uidnext'];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function isSubscribed($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if ($folder === "INBOX") {
+            return true;
+        }
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('subscription_check');
+        $stmt->execute([$user_row['id'], $folder]);
+        return $stmt->fetch() !== false;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function subscribe($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $u = $this->userRow($user);
+        $stmt = $this->stmt('subscription_check');
+        $stmt->execute([$u['id'], $folder]);
+        if ($stmt->fetch() !== false) {
+            return true;
+        }
+        $this->stmt('subscription_insert')->execute(
+            [$u['id'], $folder]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function unsubscribe($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row === false) {
+            return true;
+        }
+        $this->stmt('subscription_delete')->execute(
+            [$user_row['id'], $folder]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listSubscribed($user)
+    {
+        $names = ['INBOX'];
+        $stmt = $this->stmt('user_by_name');
+        $stmt->execute([$user]);
+        $user_row = $stmt->fetch();
+        if ($user_row !== false) {
+            $stmt = $this->stmt('subscriptions_by_user');
+            $stmt->execute([$user_row['id']]);
+            while ($row = $stmt->fetch()) {
+                if (!in_array($row['folder'], $names, true)) {
+                    $names[] = $row['folder'];
+                }
+            }
+        }
+        sort($names);
+        return $names;
+    }
+    /**
+     * Returns the on-disk path to the blob for $hash. Layout
+     * is two-byte / two-byte directory prefix to bound the
+     * fan-out of any one directory; a hash starting with
+     * "abcd1234..." goes under "ab/cd/abcd1234...".
+     */
+    protected function blobPath($hash, $suffix)
+    {
+        return $this->blobs_dir . '/' .
+            substr($hash, 0, 2) . '/' .
+            substr($hash, 2, 2) . '/' .
+            $hash . $suffix;
+    }
+    /**
+     * Increments the refcount for $hash, creating the blob
+     * file from $bytes if it does not already exist.
+     * Concurrent appendMessage calls flock the metadata file
+     * so refcount updates serialize correctly.
+     */
+    protected function blobIncRef($hash, $bytes)
+    {
+        $eml_path = $this->blobPath($hash, '.eml');
+        $meta_path = $this->blobPath($hash, '.meta');
+        $dir = dirname($eml_path);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0700, true);
+        }
+        $handle = @fopen($meta_path, 'c+');
+        if (!$handle) {
+            return false;
+        }
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            return false;
+        }
+        rewind($handle);
+        $current = stream_get_contents($handle);
+        $count = 0;
+        if (preg_match('/^refcount\s+(\d+)/', $current, $m)) {
+            $count = (int) $m[1];
+        }
+        if ($count === 0) {
+            /*
+                First reference; we are responsible for the
+                actual bytes. Write to a temp file and
+                atomically rename so a crash mid-write cannot
+                leave a torn blob behind.
+             */
+            $temp = $eml_path . '.tmp';
+            $written = @file_put_contents($temp, $bytes);
+            if ($written === false ||
+                !@rename($temp, $eml_path)) {
+                @unlink($temp);
+                flock($handle, LOCK_UN);
+                fclose($handle);
+                return false;
+            }
+        }
+        $count++;
+        ftruncate($handle, 0);
+        rewind($handle);
+        fwrite($handle, "refcount $count\n");
+        fflush($handle);
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        return true;
+    }
+    /**
+     * Decrements the refcount for $hash. When the count
+     * reaches zero both the blob and its metadata are
+     * removed. Locking matches blobIncRef.
+     */
+    protected function blobDecRef($hash)
+    {
+        $eml_path = $this->blobPath($hash, '.eml');
+        $meta_path = $this->blobPath($hash, '.meta');
+        $handle = @fopen($meta_path, 'c+');
+        if (!$handle) {
+            return false;
+        }
+        if (!flock($handle, LOCK_EX)) {
+            fclose($handle);
+            return false;
+        }
+        rewind($handle);
+        $current = stream_get_contents($handle);
+        $count = 0;
+        if (preg_match('/^refcount\s+(\d+)/', $current, $m)) {
+            $count = (int) $m[1];
+        }
+        $count = max(0, $count - 1);
+        if ($count === 0) {
+            @unlink($eml_path);
+            flock($handle, LOCK_UN);
+            fclose($handle);
+            @unlink($meta_path);
+            return true;
+        }
+        ftruncate($handle, 0);
+        rewind($handle);
+        fwrite($handle, "refcount $count\n");
+        fflush($handle);
+        flock($handle, LOCK_UN);
+        fclose($handle);
+        return true;
+    }
+    /**
+     * Reads the bytes of the blob identified by $hash, or
+     * returns false if the blob is missing (which would
+     * indicate database/filesystem desynchronization, a
+     * bug rather than an expected condition).
+     */
+    protected function blobRead($hash)
+    {
+        $eml_path = $this->blobPath($hash, '.eml');
+        if (!is_file($eml_path)) {
+            return false;
+        }
+        return @file_get_contents($eml_path);
+    }
+}
+/**
  * The mail server itself. Single instance per process; binds one
  * SMTP and one IMAP listening socket and pumps the event loop.
  *

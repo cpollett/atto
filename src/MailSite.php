@@ -3332,9 +3332,25 @@ class MailSite
         $verb = $is_examine ? 'EXAMINE' : 'SELECT';
         $tokens = $this->parseImapTokens($args);
         $folder = $this->tokenString($tokens, 0);
-        if ($folder === false || $folder === '') {
+        if ($folder === false) {
             $this->queueWrite($key,
                 "$tag BAD $verb syntax\r\n");
+            return;
+        }
+        if ($folder === '') {
+            /*
+                Empty mailbox name. Some clients (Apple Mail
+                in particular) issue "SELECT """ as a recovery
+                step when they want to deselect without using
+                CLOSE. RFC 3501 leaves this case undefined;
+                the polite reaction is NO with a clear reason
+                rather than BAD, so the client knows we
+                understood the syntax but rejected the
+                operation. The client typically follows up
+                with a real SELECT INBOX immediately after.
+             */
+            $this->queueWrite($key,
+                "$tag NO Empty mailbox name\r\n");
             return;
         }
         $user = $ctx['AUTH_USER'];

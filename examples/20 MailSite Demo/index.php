@@ -80,6 +80,45 @@
  *
  * Bare-word MAIL FROM / RCPT TO (no angle brackets) is
  * accepted as a tolerance for clumsy hand-typing.
+ *
+ *
+ * --- IMAP CLIENT NOTES ---
+ *
+ * The server has been verified against Apple Mail (macOS
+ * Sonoma+) and accepts the standard RFC 3501 / RFC 6851 /
+ * RFC 2177 command set. A few client-specific quirks are
+ * worth knowing about:
+ *
+ * Folder discovery in Apple Mail. Apple Mail caches the
+ * folder list locally and only refreshes it at account
+ * setup, after a UIDVALIDITY change, when it creates a
+ * folder itself, or in the Account Info dialog (Mailbox menu
+ * with the account selected, or right-click an account
+ * folder -> "Get Account Info..."). It does NOT issue LIST
+ * during a normal Synchronize. As a result, folders created
+ * out-of-band -- via the direct API on the MailSite
+ * instance, or via another IMAP client -- do not appear in
+ * Apple Mail's sidebar until the next discovery event.
+ * Workarounds: use the Account Info dialog (which issues
+ * LIST and shows every folder under "Quota Limits"), quit
+ * and relaunch Mail, or do folder mutations through the
+ * IMAP protocol so Apple Mail learns about them at the time
+ * of the change.
+ *
+ * SELECT "" recovery. Apple Mail occasionally issues
+ * SELECT "" (empty mailbox name) as a deselect-without-
+ * CLOSE recovery step. RFC 3501 does not define this case;
+ * the server replies with NO rather than BAD so the client
+ * knows we understood the syntax and just rejected the
+ * operation. Apple Mail follows up with SELECT INBOX
+ * immediately after and proceeds normally.
+ *
+ * IDLE. The server accepts and acknowledges IDLE/DONE but
+ * does not currently push untagged status updates during
+ * the idle window (no server-side change-notification
+ * infrastructure). Clients that rely on IDLE for new-mail
+ * alerts will see the new mail on the next NOOP or
+ * reconnect rather than instantly.
  */
 require '../../src/MailSite.php';
 use seekquarry\atto\MailSite;

@@ -632,27 +632,27 @@ class FileMailStorage extends MailStorage
     {
         $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
             ".uidnext";
-        $fp = @fopen($file, "c+");
-        if ($fp === false) {
+        $file_handle = @fopen($file, "c+");
+        if ($file_handle === false) {
             return false;
         }
-        if (!flock($fp, LOCK_EX)) {
-            fclose($fp);
+        if (!flock($file_handle, LOCK_EX)) {
+            fclose($file_handle);
             return false;
         }
-        rewind($fp);
-        $contents = stream_get_contents($fp);
+        rewind($file_handle);
+        $contents = stream_get_contents($file_handle);
         $next = (int) trim($contents);
         if ($next < 1) {
             $next = 1;
         }
         $assigned = $next;
-        ftruncate($fp, 0);
-        rewind($fp);
-        fwrite($fp, (string) ($assigned + 1));
-        fflush($fp);
-        flock($fp, LOCK_UN);
-        fclose($fp);
+        ftruncate($file_handle, 0);
+        rewind($file_handle);
+        fwrite($file_handle, (string) ($assigned + 1));
+        fflush($file_handle);
+        flock($file_handle, LOCK_UN);
+        fclose($file_handle);
         return $assigned;
     }
     /**
@@ -675,12 +675,12 @@ class FileMailStorage extends MailStorage
         }
         $dir = $this->folderDir($user, $folder);
         $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
-        $tmp = $eml . ".tmp";
-        if (file_put_contents($tmp, $bytes) === false) {
+        $temp_path = $eml . ".tmp";
+        if (file_put_contents($temp_path, $bytes) === false) {
             return false;
         }
-        if (!@rename($tmp, $eml)) {
-            @unlink($tmp);
+        if (!@rename($temp_path, $eml)) {
+            @unlink($temp_path);
             return false;
         }
         file_put_contents(
@@ -895,11 +895,11 @@ class FileMailStorage extends MailStorage
  *      $mail->auth($authenticator);
  *      $mail->storage($storage);
  *      $mail->domains(['example.com', 'localhost']);
- *      $mail->onConnect(function ($info, $ctx) { });
- *      $mail->onMailFrom(function ($info, $ctx) { });
- *      $mail->onRcptTo(function ($info, $ctx) { });
- *      $mail->onHeader(function ($info, $ctx) { });
- *      $mail->onMessage(function ($info, $ctx) { });
+ *      $mail->onConnect(function ($info, $context) { });
+ *      $mail->onMailFrom(function ($info, $context) { });
+ *      $mail->onRcptTo(function ($info, $context) { });
+ *      $mail->onHeader(function ($info, $context) { });
+ *      $mail->onMessage(function ($info, $context) { });
  *      $mail->listen([
  *          'SMTP_PORT' => 2525, 'IMAP_PORT' => 1143,
  *          'SMTPS_PORT' => 4465, 'IMAPS_PORT' => 9933,
@@ -1005,7 +1005,7 @@ class MailSite
     }
     /**
      * Registers a callback to run before the welcome banner is
-     * sent. The callback receives ($info, $ctx) where $info has
+     * sent. The callback receives ($info, $context) where $info has
      * 'remote_addr', 'remote_port', 'protocol' ('SMTP'|'IMAP'),
      * 'tls_active', and 'default_banner'. It may return:
      *   - null / true: send the default banner
@@ -1014,9 +1014,9 @@ class MailSite
      *   - 'reject': close the connection; SMTP gets 421, IMAP
      *     gets a "* BYE" before close
      */
-    public function onBanner(callable $fn)
+    public function onBanner(callable $callback)
     {
-        $this->hooks['banner'][] = $fn;
+        $this->hooks['banner'][] = $callback;
         return $this;
     }
     /**
@@ -1026,9 +1026,9 @@ class MailSite
      * 'tls_active'. Returning 'reject' closes the connection.
      * Useful for IP-based allow/deny lists.
      */
-    public function onConnect(callable $fn)
+    public function onConnect(callable $callback)
     {
-        $this->hooks['connect'][] = $fn;
+        $this->hooks['connect'][] = $callback;
         return $this;
     }
     /**
@@ -1037,9 +1037,9 @@ class MailSite
      * Returning 'reject' replies 550 and the session stays in
      * INIT state.
      */
-    public function onHelo(callable $fn)
+    public function onHelo(callable $callback)
     {
-        $this->hooks['helo'][] = $fn;
+        $this->hooks['helo'][] = $callback;
         return $this;
     }
     /**
@@ -1047,9 +1047,9 @@ class MailSite
      * parsed. $info has 'from'. Returning 'reject' replies
      * 550 5.7.1 and MAIL FROM is not accepted.
      */
-    public function onMailFrom(callable $fn)
+    public function onMailFrom(callable $callback)
     {
-        $this->hooks['mailfrom'][] = $fn;
+        $this->hooks['mailfrom'][] = $callback;
         return $this;
     }
     /**
@@ -1059,9 +1059,9 @@ class MailSite
      * resolved local username). Returning 'reject' replies
      * 550 5.7.1 for that recipient only.
      */
-    public function onRcptTo(callable $fn)
+    public function onRcptTo(callable $callback)
     {
-        $this->hooks['rcptto'][] = $fn;
+        $this->hooks['rcptto'][] = $callback;
         return $this;
     }
     /**
@@ -1072,9 +1072,9 @@ class MailSite
      * 'header_block', 'bytes'. Returning 'reject' replies
      * 550 5.6.0 and the message is discarded.
      */
-    public function onHeader(callable $fn)
+    public function onHeader(callable $callback)
     {
-        $this->hooks['header'][] = $fn;
+        $this->hooks['header'][] = $callback;
         return $this;
     }
     /**
@@ -1086,9 +1086,9 @@ class MailSite
      *   - 'reject': SMTP-level reject with 550
      *   - ['folder'=>'Junk','flags'=>['\Recent']]: redirect
      */
-    public function onMessage(callable $fn)
+    public function onMessage(callable $callback)
     {
-        $this->hooks['message'][] = $fn;
+        $this->hooks['message'][] = $callback;
         return $this;
     }
     /**
@@ -1097,14 +1097,14 @@ class MailSite
      * null/true. Hooks that throw are caught and treated as if
      * they returned null so a buggy filter cannot kill the loop.
      */
-    protected function runHooks($stage, $info, $ctx)
+    protected function runHooks($stage, $info, $context)
     {
         if (empty($this->hooks[$stage])) {
             return null;
         }
-        foreach ($this->hooks[$stage] as $fn) {
+        foreach ($this->hooks[$stage] as $callback) {
             try {
-                $verdict = call_user_func($fn, $info, $ctx);
+                $verdict = call_user_func($callback, $info, $context);
             } catch (\Throwable $e) {
                 $verdict = null;
             }
@@ -1147,12 +1147,12 @@ class MailSite
      *      recipient; multi-recipient delivery should call this
      *      method once per recipient)
      * @param string $bytes the full RFC 5322 message
-     * @param array $ctx optional context array passed to the
+     * @param array $context optional context array passed to the
      *      onMessage hook (caller supplies arbitrary fields)
      * @return int|false UID of the delivered message, or false
      *      on hook-drop, hook-reject, or unknown recipient
      */
-    public function deliverMail($from, $to, $bytes, $ctx = [])
+    public function deliverMail($from, $to, $bytes, $context = [])
     {
         $local = $this->resolveLocalUser($to);
         if ($local === false) {
@@ -1161,7 +1161,7 @@ class MailSite
         $folder = "INBOX";
         $flags = ['\Recent'];
         $info = ['from' => $from, 'to' => $to, 'bytes' => $bytes];
-        $verdict = $this->runHooks('message', $info, $ctx);
+        $verdict = $this->runHooks('message', $info, $context);
         if ($verdict === false || $verdict === 'reject') {
             return false;
         }
@@ -1629,13 +1629,13 @@ class MailSite
      */
     protected function acceptConnection($server, $listener)
     {
-        $conn = @stream_socket_accept($server, 0);
-        if (!$conn) {
+        $connection = @stream_socket_accept($server, 0);
+        if (!$connection) {
             return;
         }
-        stream_set_blocking($conn, 0);
-        $key = (int) $conn;
-        $remote = (string) stream_socket_get_name($conn, true);
+        stream_set_blocking($connection, 0);
+        $key = (int) $connection;
+        $remote = (string) stream_socket_get_name($connection, true);
         $colon = strrpos($remote, ":");
         $remote_addr = ($colon === false) ? $remote :
             substr($remote, 0, $colon);
@@ -1654,13 +1654,13 @@ class MailSite
                 fallback banner because the client is waiting for
                 a TLS ServerHello).
              */
-            if (!$this->upgradeToTls($conn)) {
-                @fclose($conn);
+            if (!$this->upgradeToTls($connection)) {
+                @fclose($connection);
                 return;
             }
             $tls_active = true;
         }
-        $this->in_streams[self::CONNECTION][$key] = $conn;
+        $this->in_streams[self::CONNECTION][$key] = $connection;
         $this->in_streams[self::DATA][$key] = "";
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
         $this->in_streams[self::CONTEXT][$key] = [
@@ -1695,7 +1695,7 @@ class MailSite
             $bye = ($protocol === 'SMTP') ?
                 "421 4.7.0 Service not available\r\n" :
                 "* BYE Service not available\r\n";
-            @fwrite($conn, $bye);
+            @fwrite($connection, $bye);
             $this->shutdownStream($key);
             return;
         }
@@ -1717,7 +1717,7 @@ class MailSite
             $bye = ($protocol === 'SMTP') ?
                 "421 4.7.0 Service not available\r\n" :
                 "* BYE Service not available\r\n";
-            @fwrite($conn, $bye);
+            @fwrite($connection, $bye);
             $this->shutdownStream($key);
             return;
         }
@@ -1769,13 +1769,13 @@ class MailSite
      * unreliable because that buffer is process-wide). Returns
      * true on success, false on failure (caller closes socket).
      */
-    protected function upgradeToTls($conn)
+    protected function upgradeToTls($connection)
     {
         if (empty($this->server_context_array['ssl'])) {
             return false;
         }
         foreach ($this->server_context_array['ssl'] as $k => $v) {
-            stream_context_set_option($conn, 'ssl', $k, $v);
+            stream_context_set_option($connection, 'ssl', $k, $v);
         }
         $err = null;
         set_error_handler(
@@ -1783,7 +1783,7 @@ class MailSite
                 $err = $errstr;
                 return true;
             });
-        stream_set_blocking($conn, 1);
+        stream_set_blocking($connection, 1);
         $method = STREAM_CRYPTO_METHOD_TLS_SERVER;
         if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_SERVER')) {
             $method |= STREAM_CRYPTO_METHOD_TLSv1_2_SERVER;
@@ -1791,8 +1791,8 @@ class MailSite
         if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')) {
             $method |= STREAM_CRYPTO_METHOD_TLSv1_3_SERVER;
         }
-        $ok = @stream_socket_enable_crypto($conn, true, $method);
-        stream_set_blocking($conn, 0);
+        $ok = @stream_socket_enable_crypto($connection, true, $method);
+        stream_set_blocking($connection, 0);
         restore_error_handler();
         if ($ok === true) {
             return true;
@@ -1802,6 +1802,19 @@ class MailSite
         }
         return false;
     }
+    /**
+     * Appends bytes to the outbound write buffer for a
+     * connection. Allocates the out_streams slot lazily on
+     * the first write so connections that never produce
+     * output do not pay for an empty buffer. The actual
+     * fwrite to the socket happens later in writeClient
+     * when the select loop reports the socket writable; this
+     * keeps queueWrite cheap and lets handlers emit many
+     * lines without blocking.
+     *
+     * @param int $key connection key
+     * @param string $bytes bytes to enqueue (may be empty)
+     */
     protected function queueWrite($key, $bytes)
     {
         if (!isset($this->in_streams[self::CONNECTION][$key])) {
@@ -1818,6 +1831,17 @@ class MailSite
         $this->out_streams[self::DATA][$key] .= $bytes;
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
     }
+    /**
+     * Reads any pending bytes from a client socket into the
+     * inbound buffer and drains the buffer by repeatedly
+     * calling processOne until no more complete commands can
+     * be parsed. Closes the connection if the socket has hit
+     * EOF. Tolerates short reads: a single fread chunk may
+     * span multiple commands or only part of one, and the
+     * remaining bytes carry over to the next select tick.
+     *
+     * @param resource $stream client socket
+     */
     protected function readClient($stream)
     {
         $key = (int) $stream;
@@ -1852,11 +1876,11 @@ class MailSite
         if (!isset($this->in_streams[self::CONTEXT][$key])) {
             return false;
         }
-        $ctx = & $this->in_streams[self::CONTEXT][$key];
-        $proto = $ctx['PROTOCOL'];
-        $buf = & $this->in_streams[self::DATA][$key];
-        if ($proto === 'SMTP' && $ctx['STATE'] === 'DATA') {
-            return $this->consumeSmtpDataPhase($key, $buf, $ctx);
+        $context = & $this->in_streams[self::CONTEXT][$key];
+        $proto = $context['PROTOCOL'];
+        $buffer = & $this->in_streams[self::DATA][$key];
+        if ($proto === 'SMTP' && $context['STATE'] === 'DATA') {
+            return $this->consumeSmtpDataPhase($key, $buffer, $context);
         }
         /*
             IMAP APPEND literal: when a synchronizing literal is
@@ -1870,18 +1894,18 @@ class MailSite
             command, or just a CRLF that we silently consume).
          */
         if ($proto === 'IMAP' &&
-            !empty($ctx['IMAP_LIT_PENDING']) &&
-            isset($ctx['IMAP_LIT_PENDING']['continuation']) &&
-            $ctx['IMAP_LIT_PENDING']['continuation'] === 'append'
+            !empty($context['IMAP_LIT_PENDING']) &&
+            isset($context['IMAP_LIT_PENDING']['continuation']) &&
+            $context['IMAP_LIT_PENDING']['continuation'] === 'append'
             ) {
-            $pend = & $ctx['IMAP_LIT_PENDING'];
-            $avail = strlen($buf);
+            $pend = & $context['IMAP_LIT_PENDING'];
+            $avail = strlen($buffer);
             if ($avail === 0) {
                 return false;
             }
             $take = min($pend['remaining'], $avail);
-            $pend['collected'] .= substr($buf, 0, $take);
-            $buf = substr($buf, $take);
+            $pend['collected'] .= substr($buffer, 0, $take);
+            $buffer = substr($buffer, $take);
             $pend['remaining'] -= $take;
             if ($pend['remaining'] > 0) {
                 return false;
@@ -1893,31 +1917,31 @@ class MailSite
                 without this the next processOne would see an
                 empty line and reply BAD.
              */
-            if (substr($buf, 0, 2) === "\r\n") {
-                $buf = substr($buf, 2);
-            } else if (substr($buf, 0, 1) === "\n") {
-                $buf = substr($buf, 1);
+            if (substr($buffer, 0, 2) === "\r\n") {
+                $buffer = substr($buffer, 2);
+            } else if (substr($buffer, 0, 1) === "\n") {
+                $buffer = substr($buffer, 1);
             }
-            $this->continueImapLiteral($key, '', $ctx);
+            $this->continueImapLiteral($key, '', $context);
             return true;
         }
-        $eol = strpos($buf, "\r\n");
+        $eol = strpos($buffer, "\r\n");
         if ($eol === false) {
-            $eol = strpos($buf, "\n");
+            $eol = strpos($buffer, "\n");
             if ($eol === false) {
                 return false;
             }
-            $line = substr($buf, 0, $eol);
-            $buf = substr($buf, $eol + 1);
+            $line = substr($buffer, 0, $eol);
+            $buffer = substr($buffer, $eol + 1);
         } else {
-            $line = substr($buf, 0, $eol);
-            $buf = substr($buf, $eol + 2);
+            $line = substr($buffer, 0, $eol);
+            $buffer = substr($buffer, $eol + 2);
         }
         $line = rtrim($line, "\r\n");
         if ($proto === 'SMTP') {
-            $this->dispatchSmtp($key, $line, $ctx);
+            $this->dispatchSmtp($key, $line, $context);
         } else {
-            $this->dispatchImap($key, $line, $ctx);
+            $this->dispatchImap($key, $line, $context);
         }
         return true;
     }
@@ -1930,7 +1954,7 @@ class MailSite
      *   RCPT  + DATA              -> DATA
      *   DATA  + ".\r\n"           -> READY (message accepted)
      */
-    protected function dispatchSmtp($key, $line, &$ctx)
+    protected function dispatchSmtp($key, $line, &$context)
     {
         $upper = strtoupper($line);
         if (strncmp($upper, 'EHLO', 4) === 0 ||
@@ -1939,25 +1963,25 @@ class MailSite
                 'EHLO' : 'HELO';
             $domain = trim(substr($line, 4));
             $verdict = $this->runHooks('helo',
-                ['domain' => $domain, 'verb' => $verb], $ctx);
+                ['domain' => $domain, 'verb' => $verb], $context);
             if ($verdict === 'reject' || $verdict === false) {
                 $this->queueWrite($key,
                     "550 5.7.1 HELO rejected\r\n");
                 return;
             }
-            $ctx['STATE'] = 'READY';
+            $context['STATE'] = 'READY';
             $name = $this->default_server_globals['SERVER_NAME'];
             $resp = "250-$name Hello\r\n";
             $allow_plain =
                 !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
-            if (!empty($ctx['TLS_ACTIVE']) && $this->tls_available) {
+            if (!empty($context['TLS_ACTIVE']) && $this->tls_available) {
                 /*
                     Already in TLS; do not re-advertise STARTTLS.
                  */
             } elseif ($this->tls_available) {
                 $resp .= "250-STARTTLS\r\n";
             }
-            if (!empty($ctx['TLS_ACTIVE']) || $allow_plain) {
+            if (!empty($context['TLS_ACTIVE']) || $allow_plain) {
                 $resp .= "250-AUTH PLAIN LOGIN\r\n";
             }
             $resp .= "250-SIZE " .
@@ -1972,55 +1996,55 @@ class MailSite
             return;
         }
         if (strncmp($upper, 'RSET', 4) === 0) {
-            $ctx['MAILFROM'] = null;
-            $ctx['RCPTTO'] = [];
-            $ctx['STATE'] = 'READY';
+            $context['MAILFROM'] = null;
+            $context['RCPTTO'] = [];
+            $context['STATE'] = 'READY';
             $this->queueWrite($key, "250 OK\r\n");
             return;
         }
         if (strncmp($upper, 'QUIT', 4) === 0) {
             $this->queueWrite($key, "221 Bye\r\n");
-            $ctx['STATE'] = 'QUIT';
+            $context['STATE'] = 'QUIT';
             return;
         }
         if (strncmp($upper, 'STARTTLS', 8) === 0) {
-            $this->dispatchSmtpStarttls($key, $ctx);
+            $this->dispatchSmtpStarttls($key, $context);
             return;
         }
-        if ($ctx['STATE'] === 'INIT') {
+        if ($context['STATE'] === 'INIT') {
             $this->queueWrite($key,
                 "503 5.5.1 send EHLO/HELO first\r\n");
             return;
         }
         if (strncmp($upper, 'AUTH ', 5) === 0 ||
-            $ctx['STATE'] === 'AUTH-PLAIN' ||
-            $ctx['STATE'] === 'AUTH-LOGIN-USER' ||
-            $ctx['STATE'] === 'AUTH-LOGIN-PASS') {
+            $context['STATE'] === 'AUTH-PLAIN' ||
+            $context['STATE'] === 'AUTH-LOGIN-USER' ||
+            $context['STATE'] === 'AUTH-LOGIN-PASS') {
             $allow_plain =
                 !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
-            if (empty($ctx['TLS_ACTIVE']) && !$allow_plain) {
+            if (empty($context['TLS_ACTIVE']) && !$allow_plain) {
                 $this->queueWrite($key,
                     "538 5.7.11 Encryption required for AUTH\r\n");
                 return;
             }
-            $this->dispatchSmtpAuth($key, $line, $ctx);
+            $this->dispatchSmtpAuth($key, $line, $context);
             return;
         }
         if (strncmp($upper, 'MAIL FROM', 9) === 0) {
-            $this->dispatchSmtpMailFrom($key, $line, $ctx);
+            $this->dispatchSmtpMailFrom($key, $line, $context);
             return;
         }
         if (strncmp($upper, 'RCPT TO', 7) === 0) {
-            $this->dispatchSmtpRcptTo($key, $line, $ctx);
+            $this->dispatchSmtpRcptTo($key, $line, $context);
             return;
         }
         if (strncmp($upper, 'DATA', 4) === 0) {
-            if ($ctx['STATE'] !== 'RCPT') {
+            if ($context['STATE'] !== 'RCPT') {
                 $this->queueWrite($key,
                     "503 5.5.1 need RCPT TO first\r\n");
                 return;
             }
-            $ctx['STATE'] = 'DATA';
+            $context['STATE'] = 'DATA';
             $this->queueWrite($key,
                 "354 End data with <CR><LF>.<CR><LF>\r\n");
             return;
@@ -2037,19 +2061,19 @@ class MailSite
      * because anything written before the handshake corrupts
      * the TLS framing the client expects.
      */
-    protected function dispatchSmtpStarttls($key, &$ctx)
+    protected function dispatchSmtpStarttls($key, &$context)
     {
         if (!$this->tls_available) {
             $this->queueWrite($key,
                 "454 4.7.0 TLS not available\r\n");
             return;
         }
-        if (!empty($ctx['TLS_ACTIVE'])) {
+        if (!empty($context['TLS_ACTIVE'])) {
             $this->queueWrite($key,
                 "503 5.5.1 TLS already active\r\n");
             return;
         }
-        $ctx['PENDING_STARTTLS'] = true;
+        $context['PENDING_STARTTLS'] = true;
         $this->queueWrite($key, "220 2.0.0 Ready to start TLS\r\n");
     }
     /**
@@ -2059,44 +2083,44 @@ class MailSite
      * uses a two-line continuation: server prompts username
      * then password, both base64-encoded.
      */
-    protected function dispatchSmtpAuth($key, $line, &$ctx)
+    protected function dispatchSmtpAuth($key, $line, &$context)
     {
-        if ($ctx['STATE'] === 'AUTH-PLAIN') {
-            $this->finishAuthPlain($key, $line, $ctx);
+        if ($context['STATE'] === 'AUTH-PLAIN') {
+            $this->finishAuthPlain($key, $line, $context);
             return;
         }
-        if ($ctx['STATE'] === 'AUTH-LOGIN-USER') {
-            $ctx['AUTH_USERNAME'] = (string) base64_decode($line,
+        if ($context['STATE'] === 'AUTH-LOGIN-USER') {
+            $context['AUTH_USERNAME'] = (string) base64_decode($line,
                 true);
-            $ctx['STATE'] = 'AUTH-LOGIN-PASS';
+            $context['STATE'] = 'AUTH-LOGIN-PASS';
             $this->queueWrite($key,
                 "334 " . base64_encode("Password:") . "\r\n");
             return;
         }
-        if ($ctx['STATE'] === 'AUTH-LOGIN-PASS') {
+        if ($context['STATE'] === 'AUTH-LOGIN-PASS') {
             $pass = (string) base64_decode($line, true);
-            $user = (string) $ctx['AUTH_USERNAME'];
-            $ctx['AUTH_USERNAME'] = null;
-            $this->verifyAndSetAuth($key, $user, $pass, $ctx);
+            $user = (string) $context['AUTH_USERNAME'];
+            $context['AUTH_USERNAME'] = null;
+            $this->verifyAndSetAuth($key, $user, $pass, $context);
             return;
         }
         if (preg_match('/^AUTH\s+PLAIN(?:\s+(.+))?$/i', $line,
             $m)) {
             if (!empty($m[1])) {
-                $this->finishAuthPlain($key, trim($m[1]), $ctx);
+                $this->finishAuthPlain($key, trim($m[1]), $context);
                 return;
             }
-            $ctx['STATE'] = 'AUTH-PLAIN';
+            $context['STATE'] = 'AUTH-PLAIN';
             $this->queueWrite($key, "334 \r\n");
             return;
         }
         if (preg_match('/^AUTH\s+LOGIN(?:\s+(.+))?$/i', $line,
             $m)) {
-            $ctx['STATE'] = 'AUTH-LOGIN-USER';
+            $context['STATE'] = 'AUTH-LOGIN-USER';
             if (!empty($m[1])) {
-                $ctx['AUTH_USERNAME'] = (string) base64_decode(
+                $context['AUTH_USERNAME'] = (string) base64_decode(
                     trim($m[1]), true);
-                $ctx['STATE'] = 'AUTH-LOGIN-PASS';
+                $context['STATE'] = 'AUTH-LOGIN-PASS';
                 $this->queueWrite($key,
                     "334 " . base64_encode("Password:") . "\r\n");
                 return;
@@ -2108,21 +2132,47 @@ class MailSite
         $this->queueWrite($key,
             "504 5.5.4 Unrecognized authentication mechanism\r\n");
     }
-    protected function finishAuthPlain($key, $b64, &$ctx)
+    /**
+     * Completes an SMTP AUTH PLAIN exchange. The base64
+     * argument is the SASL PLAIN payload "authzid\0authcid
+     * \0password" (RFC 4616). On a parse failure the SMTP
+     * state is reset to READY and a 535 reply is queued; on
+     * success authentication is delegated to verifyAndSetAuth.
+     *
+     * @param int $key connection key
+     * @param string $b64 base64-encoded SASL PLAIN payload
+     * @param array &$context connection context (mutated)
+     */
+    protected function finishAuthPlain($key, $b64, &$context)
     {
         $raw = (string) base64_decode($b64, true);
         $parts = explode("\x00", $raw);
         if (count($parts) !== 3) {
-            $ctx['STATE'] = 'READY';
+            $context['STATE'] = 'READY';
             $this->queueWrite($key,
                 "535 5.7.8 Authentication credentials" .
                 " invalid\r\n");
             return;
         }
         list(, $user, $pass) = $parts;
-        $this->verifyAndSetAuth($key, $user, $pass, $ctx);
+        $this->verifyAndSetAuth($key, $user, $pass, $context);
     }
-    protected function verifyAndSetAuth($key, $user, $pass, &$ctx)
+    /**
+     * Verifies a username/password pair against the
+     * configured authenticator and updates the SMTP
+     * connection state accordingly. On success the lowercased
+     * username is stored in AUTH_USER (storage paths are
+     * case-insensitive) and a 235 reply is queued; on
+     * failure a 535 reply is queued and AUTH_USER is left
+     * unset. Either way the SMTP state returns to READY so
+     * the client can issue MAIL FROM next.
+     *
+     * @param int $key connection key
+     * @param string $user candidate username
+     * @param string $pass candidate password
+     * @param array &$context connection context (mutated)
+     */
+    protected function verifyAndSetAuth($key, $user, $pass, &$context)
     {
         $ok = false;
         if ($this->authenticator !== null) {
@@ -2130,12 +2180,12 @@ class MailSite
                 $pass);
         }
         if ($ok) {
-            $ctx['AUTH_USER'] = strtolower($user);
-            $ctx['STATE'] = 'READY';
+            $context['AUTH_USER'] = strtolower($user);
+            $context['STATE'] = 'READY';
             $this->queueWrite($key,
                 "235 2.7.0 Authentication succeeded\r\n");
         } else {
-            $ctx['STATE'] = 'READY';
+            $context['STATE'] = 'READY';
             $this->queueWrite($key,
                 "535 5.7.8 Authentication credentials" .
                 " invalid\r\n");
@@ -2205,7 +2255,7 @@ class MailSite
      * what is policed is the RCPT TO step. Fires the onMailFrom
      * hook; a 'reject' verdict refuses with 550 5.7.1.
      */
-    protected function dispatchSmtpMailFrom($key, $line, &$ctx)
+    protected function dispatchSmtpMailFrom($key, $line, &$context)
     {
         $addr = $this->parseSmtpAddress($line, 'MAIL');
         if ($addr === false) {
@@ -2214,15 +2264,15 @@ class MailSite
             return;
         }
         $verdict = $this->runHooks('mailfrom',
-            ['from' => $addr], $ctx);
+            ['from' => $addr], $context);
         if ($verdict === 'reject' || $verdict === false) {
             $this->queueWrite($key,
                 "550 5.7.1 Sender rejected\r\n");
             return;
         }
-        $ctx['MAILFROM'] = $addr;
-        $ctx['RCPTTO'] = [];
-        $ctx['STATE'] = 'MAIL';
+        $context['MAILFROM'] = $addr;
+        $context['RCPTTO'] = [];
+        $context['STATE'] = 'MAIL';
         $this->queueWrite($key, "250 2.1.0 Ok\r\n");
     }
     /**
@@ -2235,9 +2285,9 @@ class MailSite
      * the onRcptTo hook only after the recipient has passed the
      * anti-relay check.
      */
-    protected function dispatchSmtpRcptTo($key, $line, &$ctx)
+    protected function dispatchSmtpRcptTo($key, $line, &$context)
     {
-        if ($ctx['STATE'] !== 'MAIL' && $ctx['STATE'] !== 'RCPT') {
+        if ($context['STATE'] !== 'MAIL' && $context['STATE'] !== 'RCPT') {
             $this->queueWrite($key,
                 "503 5.5.1 need MAIL FROM first\r\n");
             return;
@@ -2250,7 +2300,7 @@ class MailSite
         }
         $local_user = $this->resolveLocalUser($addr);
         if ($local_user === false) {
-            if (empty($ctx['AUTH_USER'])) {
+            if (empty($context['AUTH_USER'])) {
                 $this->queueWrite($key,
                     "550 5.7.1 Relay access denied\r\n");
                 return;
@@ -2267,14 +2317,14 @@ class MailSite
             return;
         }
         $verdict = $this->runHooks('rcptto',
-            ['to' => $addr, 'local_user' => $local_user], $ctx);
+            ['to' => $addr, 'local_user' => $local_user], $context);
         if ($verdict === 'reject' || $verdict === false) {
             $this->queueWrite($key,
                 "550 5.7.1 Recipient rejected\r\n");
             return;
         }
-        $ctx['RCPTTO'][] = ['addr' => $addr, 'user' => $local_user];
-        $ctx['STATE'] = 'RCPT';
+        $context['RCPTTO'][] = ['addr' => $addr, 'user' => $local_user];
+        $context['STATE'] = 'RCPT';
         $this->queueWrite($key, "250 2.1.5 Ok\r\n");
     }
     /**
@@ -2284,31 +2334,31 @@ class MailSite
      * consumed (caller will loop and try the next command).
      * Performs CRLF dot-unstuffing per RFC 5321 sec 4.5.2.
      */
-    protected function consumeSmtpDataPhase($key, &$buf, &$ctx)
+    protected function consumeSmtpDataPhase($key, &$buffer, &$context)
     {
         $marker = "\r\n.\r\n";
-        $pos = strpos($buf, $marker);
+        $position = strpos($buffer, $marker);
         $marker_len = 5;
-        if ($pos === false) {
+        if ($position === false) {
             $alt = "\n.\n";
-            $alt_pos = strpos($buf, $alt);
+            $alt_pos = strpos($buffer, $alt);
             if ($alt_pos === false) {
                 return false;
             }
-            $pos = $alt_pos;
+            $position = $alt_pos;
             $marker_len = 3;
         }
-        $msg = substr($buf, 0, $pos + 2);
-        $buf = substr($buf, $pos + $marker_len);
-        $msg = preg_replace('/(\r\n|\n)\.(\r\n|\n|\.)/',
-            '$1$2', $msg);
+        $message = substr($buffer, 0, $position + 2);
+        $buffer = substr($buffer, $position + $marker_len);
+        $message = preg_replace('/(\r\n|\n)\.(\r\n|\n|\.)/',
+            '$1$2', $message);
         $max = $this->default_server_globals['MAX_MESSAGE_LEN'];
-        if (strlen($msg) > $max) {
+        if (strlen($message) > $max) {
             $this->queueWrite($key,
                 "552 5.3.4 Message exceeds size limit\r\n");
-            $ctx['STATE'] = 'READY';
-            $ctx['MAILFROM'] = null;
-            $ctx['RCPTTO'] = [];
+            $context['STATE'] = 'READY';
+            $context['MAILFROM'] = null;
+            $context['RCPTTO'] = [];
             return true;
         }
         /*
@@ -2319,38 +2369,38 @@ class MailSite
             is treated as headers (defensive: a malformed message
             without a body separator should still see the hook).
          */
-        $headers = $this->parseRfc5322Headers($msg);
-        $first_to = !empty($ctx['RCPTTO']) ?
-            $ctx['RCPTTO'][0]['addr'] : '';
+        $headers = $this->parseRfc5322Headers($message);
+        $first_to = !empty($context['RCPTTO']) ?
+            $context['RCPTTO'][0]['addr'] : '';
         $hdr_info = [
-            'from' => $ctx['MAILFROM'],
+            'from' => $context['MAILFROM'],
             'to' => $first_to,
-            'recipients' => $ctx['RCPTTO'],
+            'recipients' => $context['RCPTTO'],
             'headers' => $headers['list'],
             'header_block' => $headers['block'],
-            'bytes' => $msg,
+            'bytes' => $message,
         ];
-        $verdict = $this->runHooks('header', $hdr_info, $ctx);
+        $verdict = $this->runHooks('header', $hdr_info, $context);
         if ($verdict === 'reject' || $verdict === false) {
             $this->queueWrite($key,
                 "550 5.6.0 Message rejected by policy\r\n");
-            $ctx['STATE'] = 'READY';
-            $ctx['MAILFROM'] = null;
-            $ctx['RCPTTO'] = [];
+            $context['STATE'] = 'READY';
+            $context['MAILFROM'] = null;
+            $context['RCPTTO'] = [];
             return true;
         }
-        $msg = $this->prependReceivedHeader($msg, $ctx);
+        $message = $this->prependReceivedHeader($message, $context);
         $delivered_any = false;
-        foreach ($ctx['RCPTTO'] as $r) {
-            $uid = $this->deliverMail($ctx['MAILFROM'], $r['addr'],
-                $msg, $ctx);
+        foreach ($context['RCPTTO'] as $r) {
+            $uid = $this->deliverMail($context['MAILFROM'], $r['addr'],
+                $message, $context);
             if ($uid !== false) {
                 $delivered_any = true;
             }
         }
-        $ctx['STATE'] = 'READY';
-        $ctx['MAILFROM'] = null;
-        $ctx['RCPTTO'] = [];
+        $context['STATE'] = 'READY';
+        $context['MAILFROM'] = null;
+        $context['RCPTTO'] = [];
         if ($delivered_any) {
             $this->queueWrite($key,
                 "250 2.0.0 Ok: message accepted\r\n");
@@ -2372,16 +2422,16 @@ class MailSite
      * space) are unfolded. The returned 'block' is the raw bytes
      * up to but not including the empty CRLF separator.
      */
-    protected function parseRfc5322Headers($msg)
+    protected function parseRfc5322Headers($message)
     {
         $sep = "\r\n\r\n";
-        $end = strpos($msg, $sep);
+        $end = strpos($message, $sep);
         if ($end === false) {
-            $end = strpos($msg, "\n\n");
-            $block = ($end === false) ? $msg : substr($msg, 0,
+            $end = strpos($message, "\n\n");
+            $block = ($end === false) ? $message : substr($message, 0,
                 $end);
         } else {
-            $block = substr($msg, 0, $end);
+            $block = substr($message, 0, $end);
         }
         $list = [];
         $current_name = null;
@@ -2421,21 +2471,21 @@ class MailSite
      * server name, the protocol (ESMTPA when authenticated),
      * and the receipt timestamp.
      */
-    protected function prependReceivedHeader($msg, $ctx)
+    protected function prependReceivedHeader($message, $context)
     {
         $name = $this->default_server_globals['SERVER_NAME'];
-        $sw = $this->default_server_globals['SERVER_SOFTWARE'];
-        $with = empty($ctx['AUTH_USER']) ? 'ESMTP' : 'ESMTPA';
+        $server_software = $this->default_server_globals['SERVER_SOFTWARE'];
+        $with = empty($context['AUTH_USER']) ? 'ESMTP' : 'ESMTPA';
         $now = gmdate("D, d M Y H:i:s") . " +0000";
-        $remote = $ctx['REMOTE_ADDR'];
+        $remote = $context['REMOTE_ADDR'];
         $rcpt = "";
-        if (!empty($ctx['RCPTTO'])) {
-            $first = $ctx['RCPTTO'][0];
+        if (!empty($context['RCPTTO'])) {
+            $first = $context['RCPTTO'][0];
             $rcpt = "for <" . $first['addr'] . ">";
         }
-        $hdr = "Received: from [$remote] by $name ($sw)" .
+        $header_value = "Received: from [$remote] by $name ($server_software)" .
             " with $with $rcpt; $now\r\n";
-        return $hdr . $msg;
+        return $header_value . $message;
     }
     /**
      * Top-level dispatcher for one IMAP command line. Splits
@@ -2451,13 +2501,13 @@ class MailSite
      *               etc.
      * Tags are echoed back in the tagged status response.
      */
-    protected function dispatchImap($key, $line, &$ctx)
+    protected function dispatchImap($key, $line, &$context)
     {
-        if (!isset($ctx['IMAP_LIT_PENDING'])) {
-            $ctx['IMAP_LIT_PENDING'] = null;
+        if (!isset($context['IMAP_LIT_PENDING'])) {
+            $context['IMAP_LIT_PENDING'] = null;
         }
-        if ($ctx['IMAP_LIT_PENDING'] !== null) {
-            $this->continueImapLiteral($key, $line, $ctx);
+        if ($context['IMAP_LIT_PENDING'] !== null) {
+            $this->continueImapLiteral($key, $line, $context);
             return;
         }
         $tag = "*";
@@ -2478,14 +2528,14 @@ class MailSite
         $verb_end = strpos($rest, " ");
         $verb = ($verb_end === false) ? $rest :
             substr($rest, 0, $verb_end);
-        $args = ($verb_end === false) ? "" :
+        $arguments = ($verb_end === false) ? "" :
             substr($rest, $verb_end + 1);
         $V = strtoupper($verb);
         /*
             Always-available commands: do not require any state.
          */
         if ($V === 'CAPABILITY') {
-            $this->imapCmdCapability($key, $tag, $ctx);
+            $this->imapCmdCapability($key, $tag, $context);
             return;
         }
         if ($V === 'NOOP') {
@@ -2497,28 +2547,28 @@ class MailSite
             $this->queueWrite($key, "* BYE Logging out\r\n");
             $this->queueWrite($key,
                 "$tag OK LOGOUT completed\r\n");
-            $ctx['STATE'] = 'QUIT';
+            $context['STATE'] = 'QUIT';
             return;
         }
         if ($V === 'STARTTLS') {
-            $this->dispatchImapStarttls($key, $tag, $ctx);
+            $this->dispatchImapStarttls($key, $tag, $context);
             return;
         }
         if ($V === 'ID') {
-            $this->imapCmdId($key, $tag, $args, $ctx);
+            $this->imapCmdId($key, $tag, $arguments, $context);
             return;
         }
         /*
             Pre-authenticated commands (only allowed in INIT).
          */
-        if ($ctx['STATE'] === 'INIT') {
+        if ($context['STATE'] === 'INIT') {
             if ($V === 'LOGIN') {
-                $this->imapCmdLogin($key, $tag, $args, $ctx);
+                $this->imapCmdLogin($key, $tag, $arguments, $context);
                 return;
             }
             if ($V === 'AUTHENTICATE') {
-                $this->imapCmdAuthenticate($key, $tag, $args,
-                    $ctx);
+                $this->imapCmdAuthenticate($key, $tag, $arguments,
+                    $context);
                 return;
             }
             $this->queueWrite($key,
@@ -2531,15 +2581,15 @@ class MailSite
             CLOSE requires SELECTED.
          */
         if ($V === 'NAMESPACE') {
-            $this->imapCmdNamespace($key, $tag, $ctx);
+            $this->imapCmdNamespace($key, $tag, $context);
             return;
         }
         if ($V === 'LIST') {
-            $this->imapCmdList($key, $tag, $args, $ctx, false);
+            $this->imapCmdList($key, $tag, $arguments, $context, false);
             return;
         }
         if ($V === 'LSUB') {
-            $this->imapCmdList($key, $tag, $args, $ctx, true);
+            $this->imapCmdList($key, $tag, $arguments, $context, true);
             return;
         }
         if ($V === 'SUBSCRIBE' || $V === 'UNSUBSCRIBE') {
@@ -2550,40 +2600,40 @@ class MailSite
                 to an existing folder and OK without further
                 effect.
              */
-            $this->imapCmdSubscribe($key, $tag, $args, $V, $ctx);
+            $this->imapCmdSubscribe($key, $tag, $arguments, $V, $context);
             return;
         }
         if ($V === 'STATUS') {
-            $this->imapCmdStatus($key, $tag, $args, $ctx);
+            $this->imapCmdStatus($key, $tag, $arguments, $context);
             return;
         }
         if ($V === 'CREATE') {
-            $this->imapCmdCreate($key, $tag, $args, $ctx);
+            $this->imapCmdCreate($key, $tag, $arguments, $context);
             return;
         }
         if ($V === 'DELETE') {
-            $this->imapCmdDelete($key, $tag, $args, $ctx);
+            $this->imapCmdDelete($key, $tag, $arguments, $context);
             return;
         }
         if ($V === 'RENAME') {
-            $this->imapCmdRename($key, $tag, $args, $ctx);
+            $this->imapCmdRename($key, $tag, $arguments, $context);
             return;
         }
         if ($V === 'SELECT' || $V === 'EXAMINE') {
-            $this->imapCmdSelect($key, $tag, $args, $ctx,
+            $this->imapCmdSelect($key, $tag, $arguments, $context,
                 $V === 'EXAMINE');
             return;
         }
         if ($V === 'CLOSE') {
-            $this->imapCmdClose($key, $tag, $ctx);
+            $this->imapCmdClose($key, $tag, $context);
             return;
         }
         if ($V === 'APPEND') {
-            $this->imapCmdAppend($key, $tag, $args, $ctx);
+            $this->imapCmdAppend($key, $tag, $arguments, $context);
             return;
         }
         if ($V === 'IDLE') {
-            $this->imapCmdIdle($key, $tag, $ctx);
+            $this->imapCmdIdle($key, $tag, $context);
             return;
         }
         /*
@@ -2592,38 +2642,38 @@ class MailSite
             require a SELECTED mailbox.
          */
         if ($V === 'UID') {
-            $this->imapCmdUid($key, $tag, $args, $ctx);
+            $this->imapCmdUid($key, $tag, $arguments, $context);
             return;
         }
         $needs_selected = in_array($V, ['FETCH', 'STORE', 'COPY',
             'MOVE', 'EXPUNGE', 'SEARCH'], true);
-        if ($needs_selected && $ctx['STATE'] !== 'SELECTED') {
+        if ($needs_selected && $context['STATE'] !== 'SELECTED') {
             $this->queueWrite($key,
                 "$tag NO No mailbox selected\r\n");
             return;
         }
         if ($V === 'FETCH') {
-            $this->imapCmdFetch($key, $tag, $args, $ctx, false);
+            $this->imapCmdFetch($key, $tag, $arguments, $context, false);
             return;
         }
         if ($V === 'STORE') {
-            $this->imapCmdStore($key, $tag, $args, $ctx, false);
+            $this->imapCmdStore($key, $tag, $arguments, $context, false);
             return;
         }
         if ($V === 'COPY') {
-            $this->imapCmdCopy($key, $tag, $args, $ctx, false);
+            $this->imapCmdCopy($key, $tag, $arguments, $context, false);
             return;
         }
         if ($V === 'MOVE') {
-            $this->imapCmdMove($key, $tag, $args, $ctx, false);
+            $this->imapCmdMove($key, $tag, $arguments, $context, false);
             return;
         }
         if ($V === 'EXPUNGE') {
-            $this->imapCmdExpunge($key, $tag, $ctx);
+            $this->imapCmdExpunge($key, $tag, $context);
             return;
         }
         if ($V === 'SEARCH') {
-            $this->imapCmdSearch($key, $tag, $args, $ctx, false);
+            $this->imapCmdSearch($key, $tag, $arguments, $context, false);
             return;
         }
         $this->queueWrite($key,
@@ -2637,10 +2687,10 @@ class MailSite
      * LOGINDISABLED stop being relevant; the spec lets us
      * advertise the same string post-auth.
      */
-    protected function imapCmdCapability($key, $tag, $ctx)
+    protected function imapCmdCapability($key, $tag, $context)
     {
         $caps = $this->imapPreAuthCapabilities(
-            !empty($ctx['TLS_ACTIVE']));
+            !empty($context['TLS_ACTIVE']));
         $this->queueWrite($key, "* $caps\r\n");
         $this->queueWrite($key,
             "$tag OK CAPABILITY completed\r\n");
@@ -2655,12 +2705,12 @@ class MailSite
      * meaning the client wishes to identify nothing; we
      * accept that and still reply with our own identification.
      */
-    protected function imapCmdId($key, $tag, $args, $ctx)
+    protected function imapCmdId($key, $tag, $arguments, $context)
     {
         $name = $this->default_server_globals['SERVER_NAME'];
-        $sw = $this->default_server_globals['SERVER_SOFTWARE'];
+        $server_software = $this->default_server_globals['SERVER_SOFTWARE'];
         $this->queueWrite($key,
-            "* ID (\"name\" \"$sw\" \"vendor\" \"$name\")\r\n");
+            "* ID (\"name\" \"$server_software\" \"vendor\" \"$name\")\r\n");
         $this->queueWrite($key,
             "$tag OK ID completed\r\n");
     }
@@ -2672,7 +2722,7 @@ class MailSite
      * namespaces. The reply form is three nested paren-lists
      * separated by spaces.
      */
-    protected function imapCmdNamespace($key, $tag, $ctx)
+    protected function imapCmdNamespace($key, $tag, $context)
     {
         $this->queueWrite($key,
             "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
@@ -2689,18 +2739,18 @@ class MailSite
      * continuation arrives as the next line through
      * continueImapLiteral).
      */
-    protected function imapCmdLogin($key, $tag, $args, &$ctx)
+    protected function imapCmdLogin($key, $tag, $arguments, &$context)
     {
         $allow_plain =
             !empty($this->default_server_globals[
                 'ALLOW_PLAINTEXT_AUTH']);
-        if (empty($ctx['TLS_ACTIVE']) && !$allow_plain) {
+        if (empty($context['TLS_ACTIVE']) && !$allow_plain) {
             $this->queueWrite($key,
                 "$tag NO [PRIVACYREQUIRED] " .
                 "STARTTLS required before LOGIN\r\n");
             return;
         }
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         if (count($tokens) === 1 && $tokens[0][0] === 'literal') {
             /*
                 LOGIN with a literal username triggers the
@@ -2711,7 +2761,7 @@ class MailSite
                 command. This case is rare in practice; most
                 clients send LOGIN with quoted strings.
              */
-            $ctx['IMAP_LIT_PENDING'] = [
+            $context['IMAP_LIT_PENDING'] = [
                 'remaining' => $tokens[0][1],
                 'collected' => [],
                 'continuation' => 'login',
@@ -2727,7 +2777,7 @@ class MailSite
             return;
         }
         $this->finishImapLogin($key, $tag, $tokens[0][1],
-            $tokens[1][1], $ctx);
+            $tokens[1][1], $context);
     }
     /**
      * Final step of IMAP LOGIN: verify credentials, ensure the
@@ -2737,7 +2787,7 @@ class MailSite
      * (continueImapLiteral).
      */
     protected function finishImapLogin($key, $tag, $user, $pass,
-        &$ctx)
+        &$context)
     {
         if ($this->authenticator === null ||
             !$this->authenticator->verifyPassword($user, $pass)) {
@@ -2746,10 +2796,10 @@ class MailSite
                 "Authentication failed\r\n");
             return;
         }
-        $ctx['AUTH_USER'] = strtolower($user);
-        $ctx['STATE'] = 'AUTH';
+        $context['AUTH_USER'] = strtolower($user);
+        $context['STATE'] = 'AUTH';
         if ($this->mail_storage !== null) {
-            $this->mail_storage->ensureUser($ctx['AUTH_USER']);
+            $this->mail_storage->ensureUser($context['AUTH_USER']);
         }
         $this->queueWrite($key,
             "$tag OK [CAPABILITY IMAP4rev1 IDLE] LOGIN " .
@@ -2763,20 +2813,20 @@ class MailSite
      * is the only positional argument here; everything else
      * arrives via continueImapLiteral on subsequent lines.
      */
-    protected function imapCmdAuthenticate($key, $tag, $args, &$ctx)
+    protected function imapCmdAuthenticate($key, $tag, $arguments, &$context)
     {
         $allow_plain =
             !empty($this->default_server_globals[
                 'ALLOW_PLAINTEXT_AUTH']);
-        if (empty($ctx['TLS_ACTIVE']) && !$allow_plain) {
+        if (empty($context['TLS_ACTIVE']) && !$allow_plain) {
             $this->queueWrite($key,
                 "$tag NO [PRIVACYREQUIRED] " .
                 "STARTTLS required before AUTHENTICATE\r\n");
             return;
         }
-        $mech = strtoupper(trim($args));
+        $mech = strtoupper(trim($arguments));
         if ($mech === 'PLAIN') {
-            $ctx['IMAP_LIT_PENDING'] = [
+            $context['IMAP_LIT_PENDING'] = [
                 'continuation' => 'auth-plain',
                 'tag' => $tag,
             ];
@@ -2784,7 +2834,7 @@ class MailSite
             return;
         }
         if ($mech === 'LOGIN') {
-            $ctx['IMAP_LIT_PENDING'] = [
+            $context['IMAP_LIT_PENDING'] = [
                 'continuation' => 'auth-login-user',
                 'tag' => $tag,
             ];
@@ -2802,13 +2852,13 @@ class MailSite
      * the final line arrives we finish the operation and clear
      * the pending slot.
      */
-    protected function continueImapLiteral($key, $line, &$ctx)
+    protected function continueImapLiteral($key, $line, &$context)
     {
-        $pend = $ctx['IMAP_LIT_PENDING'];
+        $pend = $context['IMAP_LIT_PENDING'];
         $tag = $pend['tag'];
         $cont = $pend['continuation'];
         if ($cont === 'auth-plain') {
-            $ctx['IMAP_LIT_PENDING'] = null;
+            $context['IMAP_LIT_PENDING'] = null;
             $raw = (string) base64_decode(trim($line), true);
             $parts = explode("\x00", $raw);
             if (count($parts) !== 3) {
@@ -2819,12 +2869,12 @@ class MailSite
             }
             list(, $user, $pass) = $parts;
             $this->finishImapLogin($key, $tag, $user, $pass,
-                $ctx);
+                $context);
             return;
         }
         if ($cont === 'auth-login-user') {
             $user = (string) base64_decode(trim($line), true);
-            $ctx['IMAP_LIT_PENDING'] = [
+            $context['IMAP_LIT_PENDING'] = [
                 'continuation' => 'auth-login-pass',
                 'tag' => $tag,
                 'user' => $user,
@@ -2834,14 +2884,14 @@ class MailSite
             return;
         }
         if ($cont === 'auth-login-pass') {
-            $ctx['IMAP_LIT_PENDING'] = null;
+            $context['IMAP_LIT_PENDING'] = null;
             $pass = (string) base64_decode(trim($line), true);
             $this->finishImapLogin($key, $tag, $pend['user'],
-                $pass, $ctx);
+                $pass, $context);
             return;
         }
         if ($cont === 'login') {
-            $ctx['IMAP_LIT_PENDING'] = null;
+            $context['IMAP_LIT_PENDING'] = null;
             /*
                 Phase 3 only supports LOGIN literals as a
                 fall-back; production clients send LOGIN with
@@ -2866,8 +2916,8 @@ class MailSite
             $flags = $pend['flags'];
             $internal_date = $pend['internal_date'];
             $bytes = $pend['collected'];
-            $ctx['IMAP_LIT_PENDING'] = null;
-            $user = $ctx['AUTH_USER'];
+            $context['IMAP_LIT_PENDING'] = null;
+            $user = $context['AUTH_USER'];
             if (!$this->mail_storage->folderExists($user,
                 $folder)) {
                 $this->queueWrite($key,
@@ -2900,7 +2950,7 @@ class MailSite
              */
             $up = strtoupper(trim($line));
             if ($up === 'DONE') {
-                $ctx['IMAP_LIT_PENDING'] = null;
+                $context['IMAP_LIT_PENDING'] = null;
                 $this->queueWrite($key,
                     "$tag OK IDLE terminated\r\n");
                 return;
@@ -2909,12 +2959,12 @@ class MailSite
                 /* keep idling */
                 return;
             }
-            $ctx['IMAP_LIT_PENDING'] = null;
+            $context['IMAP_LIT_PENDING'] = null;
             $this->queueWrite($key,
                 "$tag BAD Expected DONE\r\n");
             return;
         }
-        $ctx['IMAP_LIT_PENDING'] = null;
+        $context['IMAP_LIT_PENDING'] = null;
         $this->queueWrite($key, "$tag BAD continuation lost\r\n");
     }
     /**
@@ -3057,7 +3107,7 @@ class MailSite
      * We implement the regex translation locally so we do not
      * need to push wildcard semantics down into MailStorage.
      */
-    protected function imapCmdList($key, $tag, $args, &$ctx,
+    protected function imapCmdList($key, $tag, $arguments, &$context,
         $is_lsub)
     {
         $verb = $is_lsub ? 'LSUB' : 'LIST';
@@ -3070,7 +3120,7 @@ class MailSite
             options list, e.g. "LIST "" "*" RETURN (SUBSCRIBED
             CHILDREN SPECIAL-USE)".
          */
-        $args_trimmed = ltrim($args);
+        $args_trimmed = ltrim($arguments);
         if ($args_trimmed !== '' && $args_trimmed[0] === '(') {
             $depth = 1;
             $i = 1;
@@ -3101,7 +3151,7 @@ class MailSite
                 "$tag OK $verb completed\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         $folders = $this->mail_storage->listFolders($user);
         /*
             Make sure INBOX is always reported even if the
@@ -3242,17 +3292,17 @@ class MailSite
      * simplest correct behavior for a server without subscription
      * state.
      */
-    protected function imapCmdSubscribe($key, $tag, $args, $verb,
-        &$ctx)
+    protected function imapCmdSubscribe($key, $tag, $arguments, $verb,
+        &$context)
     {
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
         if ($name === false) {
             $this->queueWrite($key,
                 "$tag BAD $verb syntax\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $name)) {
             $this->queueWrite($key,
                 "$tag NO Mailbox does not exist\r\n");
@@ -3267,9 +3317,9 @@ class MailSite
      * an untagged STATUS response then the tagged OK. Folder
      * is NOT made the selected mailbox.
      */
-    protected function imapCmdStatus($key, $tag, $args, &$ctx)
+    protected function imapCmdStatus($key, $tag, $arguments, &$context)
     {
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $folder = $this->tokenString($tokens, 0);
         $items_str = false;
         if (isset($tokens[1])) {
@@ -3286,7 +3336,7 @@ class MailSite
             return;
         }
         $items = preg_split('/\s+/', trim($items_str));
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $folder)) {
             $this->queueWrite($key,
                 "$tag NO Mailbox does not exist\r\n");
@@ -3356,16 +3406,16 @@ class MailSite
      * already exists) or names that fail the storage layer's
      * folder validation.
      */
-    protected function imapCmdCreate($key, $tag, $args, &$ctx)
+    protected function imapCmdCreate($key, $tag, $arguments, &$context)
     {
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
         if ($name === false || $name === '') {
             $this->queueWrite($key,
                 "$tag BAD CREATE syntax\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         if ($this->mail_storage->folderExists($user, $name)) {
             $this->queueWrite($key,
                 "$tag NO Mailbox already exists\r\n");
@@ -3390,16 +3440,16 @@ class MailSite
      * delete INBOX or a folder with subfolders; we propagate
      * those as NO responses.
      */
-    protected function imapCmdDelete($key, $tag, $args, &$ctx)
+    protected function imapCmdDelete($key, $tag, $arguments, &$context)
     {
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
         if ($name === false || $name === '') {
             $this->queueWrite($key,
                 "$tag BAD DELETE syntax\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $name)) {
             $this->queueWrite($key,
                 "$tag NO Mailbox does not exist\r\n");
@@ -3417,10 +3467,10 @@ class MailSite
             commands fail cleanly rather than operating on a
             phantom mailbox.
          */
-        if (!empty($ctx['SELECTED']) &&
-            $ctx['SELECTED'] === $name) {
-            $ctx['SELECTED'] = null;
-            $ctx['STATE'] = 'AUTH';
+        if (!empty($context['SELECTED']) &&
+            $context['SELECTED'] === $name) {
+            $context['SELECTED'] = null;
+            $context['STATE'] = 'AUTH';
         }
         $this->queueWrite($key, "$tag OK DELETE completed\r\n");
     }
@@ -3429,9 +3479,9 @@ class MailSite
      * the renamed folder was selected, selection updates to
      * the new name so the SELECTED state stays consistent.
      */
-    protected function imapCmdRename($key, $tag, $args, &$ctx)
+    protected function imapCmdRename($key, $tag, $arguments, &$context)
     {
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $old = $this->tokenString($tokens, 0);
         $new = $this->tokenString($tokens, 1);
         if ($old === false || $new === false ||
@@ -3440,7 +3490,7 @@ class MailSite
                 "$tag BAD RENAME syntax\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $old)) {
             $this->queueWrite($key,
                 "$tag NO Source mailbox does not exist\r\n");
@@ -3452,9 +3502,9 @@ class MailSite
                 "$tag NO RENAME failed\r\n");
             return;
         }
-        if (!empty($ctx['SELECTED']) &&
-            $ctx['SELECTED'] === $old) {
-            $ctx['SELECTED'] = $new;
+        if (!empty($context['SELECTED']) &&
+            $context['SELECTED'] === $old) {
+            $context['SELECTED'] = $new;
         }
         $this->queueWrite($key, "$tag OK RENAME completed\r\n");
     }
@@ -3467,11 +3517,11 @@ class MailSite
      * tagged OK [READ-WRITE] or OK [READ-ONLY]. After SELECT
      * the connection STATE is SELECTED.
      */
-    protected function imapCmdSelect($key, $tag, $args, &$ctx,
+    protected function imapCmdSelect($key, $tag, $arguments, &$context,
         $is_examine)
     {
         $verb = $is_examine ? 'EXAMINE' : 'SELECT';
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $folder = $this->tokenString($tokens, 0);
         if ($folder === false) {
             $this->queueWrite($key,
@@ -3494,7 +3544,7 @@ class MailSite
                 "$tag NO Empty mailbox name\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
+        $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $folder)) {
             /*
                 INBOX should auto-exist; ensureUser created it.
@@ -3528,9 +3578,9 @@ class MailSite
             "* OK [PERMANENTFLAGS ($flags \\*)] " .
             "Limited\r\n");
         $access = $is_examine ? 'READ-ONLY' : 'READ-WRITE';
-        $ctx['SELECTED'] = $folder;
-        $ctx['SELECTED_READONLY'] = $is_examine;
-        $ctx['STATE'] = 'SELECTED';
+        $context['SELECTED'] = $folder;
+        $context['SELECTED_READONLY'] = $is_examine;
+        $context['STATE'] = 'SELECTED';
         $this->queueWrite($key,
             "$tag OK [$access] $verb completed\r\n");
     }
@@ -3541,16 +3591,16 @@ class MailSite
      * along with the EXPUNGE command. For Phase 3 CLOSE just
      * deselects so navigation between folders works.
      */
-    protected function imapCmdClose($key, $tag, &$ctx)
+    protected function imapCmdClose($key, $tag, &$context)
     {
-        if ($ctx['STATE'] !== 'SELECTED') {
+        if ($context['STATE'] !== 'SELECTED') {
             $this->queueWrite($key,
                 "$tag BAD CLOSE without SELECT\r\n");
             return;
         }
-        $ctx['SELECTED'] = null;
-        $ctx['SELECTED_READONLY'] = false;
-        $ctx['STATE'] = 'AUTH';
+        $context['SELECTED'] = null;
+        $context['SELECTED_READONLY'] = false;
+        $context['STATE'] = 'AUTH';
         $this->queueWrite($key, "$tag OK CLOSE completed\r\n");
     }
     /**
@@ -3566,37 +3616,37 @@ class MailSite
      * sec 6.4.8: "any data items returned MUST include the
      * UID data item".
      */
-    protected function imapCmdUid($key, $tag, $args, &$ctx)
+    protected function imapCmdUid($key, $tag, $arguments, &$context)
     {
-        if ($ctx['STATE'] !== 'SELECTED') {
+        if ($context['STATE'] !== 'SELECTED') {
             $this->queueWrite($key,
                 "$tag NO No mailbox selected\r\n");
             return;
         }
-        $sp = strpos($args, ' ');
-        $sub_verb = ($sp === false) ? $args :
-            substr($args, 0, $sp);
+        $sp = strpos($arguments, ' ');
+        $sub_verb = ($sp === false) ? $arguments :
+            substr($arguments, 0, $sp);
         $sub_args = ($sp === false) ? "" :
-            substr($args, $sp + 1);
+            substr($arguments, $sp + 1);
         $V = strtoupper($sub_verb);
         if ($V === 'FETCH') {
-            $this->imapCmdFetch($key, $tag, $sub_args, $ctx, true);
+            $this->imapCmdFetch($key, $tag, $sub_args, $context, true);
             return;
         }
         if ($V === 'STORE') {
-            $this->imapCmdStore($key, $tag, $sub_args, $ctx, true);
+            $this->imapCmdStore($key, $tag, $sub_args, $context, true);
             return;
         }
         if ($V === 'COPY') {
-            $this->imapCmdCopy($key, $tag, $sub_args, $ctx, true);
+            $this->imapCmdCopy($key, $tag, $sub_args, $context, true);
             return;
         }
         if ($V === 'MOVE') {
-            $this->imapCmdMove($key, $tag, $sub_args, $ctx, true);
+            $this->imapCmdMove($key, $tag, $sub_args, $context, true);
             return;
         }
         if ($V === 'SEARCH') {
-            $this->imapCmdSearch($key, $tag, $sub_args, $ctx, true);
+            $this->imapCmdSearch($key, $tag, $sub_args, $context, true);
             return;
         }
         $this->queueWrite($key,
@@ -3637,9 +3687,9 @@ class MailSite
                 $lo = ($r[0] === '*') ? $last : (int) $r[0];
                 $hi = ($r[1] === '*') ? $last : (int) $r[1];
                 if ($lo > $hi) {
-                    $tmp = $lo;
+                    $temp_path = $lo;
                     $lo = $hi;
-                    $hi = $tmp;
+                    $hi = $temp_path;
                 }
                 if ($val >= $lo && $val <= $hi) {
                     return true;
@@ -3687,9 +3737,9 @@ class MailSite
      * across multiple readClient ticks (the body usually
      * arrives in many TCP fragments).
      */
-    protected function imapCmdAppend($key, $tag, $args, &$ctx)
+    protected function imapCmdAppend($key, $tag, $arguments, &$context)
     {
-        $tokens = $this->parseImapTokens($args);
+        $tokens = $this->parseImapTokens($arguments);
         $folder = $this->tokenString($tokens, 0);
         if ($folder === false || $folder === '') {
             $this->queueWrite($key,
@@ -3736,7 +3786,7 @@ class MailSite
             return;
         }
         $count = $tokens[$literal_idx][1];
-        $ctx['IMAP_LIT_PENDING'] = [
+        $context['IMAP_LIT_PENDING'] = [
             'continuation' => 'append',
             'tag' => $tag,
             'folder' => $folder,
@@ -3850,8 +3900,8 @@ class MailSite
                 }
                 $i++;
             }
-            $tok = substr($items_str, $start, $i - $start);
-            $out[] = $this->imapAnalyzeFetchItem($tok);
+            $token = substr($items_str, $start, $i - $start);
+            $out[] = $this->imapAnalyzeFetchItem($token);
         }
         return $out;
     }
@@ -3862,28 +3912,28 @@ class MailSite
      * cased; field names preserve their original case so the
      * response matches the request.
      */
-    protected function imapAnalyzeFetchItem($tok)
+    protected function imapAnalyzeFetchItem($token)
     {
         $rec = ['kind' => null, 'peek' => false,
             'section' => null, 'fields' => [],
-            'partial' => null, 'raw' => $tok];
-        $b = strpos($tok, '[');
+            'partial' => null, 'raw' => $token];
+        $b = strpos($token, '[');
         if ($b === false) {
-            $rec['kind'] = strtoupper($tok);
+            $rec['kind'] = strtoupper($token);
             return $rec;
         }
-        $name = substr($tok, 0, $b);
+        $name = substr($token, 0, $b);
         if (substr_compare(strtoupper($name), '.PEEK',
             -5) === 0) {
             $rec['peek'] = true;
             $name = substr($name, 0, -5);
         }
         $rec['kind'] = strtoupper($name);
-        $end = strrpos($tok, ']');
+        $end = strrpos($token, ']');
         if ($end === false) {
             return $rec;
         }
-        $section_full = substr($tok, $b + 1, $end - $b - 1);
+        $section_full = substr($token, $b + 1, $end - $b - 1);
         /*
             Section may be empty (whole body), HEADER, TEXT,
             HEADER.FIELDS (Subject From), HEADER.FIELDS.NOT
@@ -3939,9 +3989,9 @@ class MailSite
                 ($it ? '' : '');
         }
         if ($kind === 'RFC822.HEADER') {
-            $hdr = $this->imapHeaderBlock($body);
+            $header_value = $this->imapHeaderBlock($body);
             return "RFC822.HEADER " .
-                $this->imapLiteralOf($hdr);
+                $this->imapLiteralOf($header_value);
         }
         if ($kind === 'RFC822.TEXT') {
             $text = $this->imapBodyText($body);
@@ -4042,8 +4092,8 @@ class MailSite
         }
         if ($section === 'HEADER.FIELDS' ||
             $section === 'HEADER.FIELDS.NOT') {
-            $hdr = $this->imapHeaderBlock($body);
-            return $this->imapFilterHeaders($hdr, $fields,
+            $header_value = $this->imapHeaderBlock($body);
+            return $this->imapFilterHeaders($header_value, $fields,
                 $section === 'HEADER.FIELDS.NOT');
         }
         /*
@@ -4217,11 +4267,11 @@ class MailSite
      * concatenated with comma+space (sufficient for envelope
      * use; full fidelity would need an array per name).
      */
-    protected function imapParseHeaders($msg)
+    protected function imapParseHeaders($message)
     {
-        $sep_pos = strpos($msg, "\r\n\r\n");
-        $block = ($sep_pos === false) ? $msg :
-            substr($msg, 0, $sep_pos);
+        $sep_pos = strpos($message, "\r\n\r\n");
+        $block = ($sep_pos === false) ? $message :
+            substr($message, 0, $sep_pos);
         $lines = preg_split('/\r\n|\n/', $block);
         $out = [];
         $current = null;
@@ -4304,7 +4354,7 @@ class MailSite
     {
         $out = [];
         $tokens = [];
-        $cur = '';
+        $current = '';
         $in_q = false;
         $in_b = 0;
         $n = strlen($s);
@@ -4312,28 +4362,28 @@ class MailSite
             $c = $s[$i];
             if ($c === '"' && ($i === 0 || $s[$i-1] !== '\\')) {
                 $in_q = !$in_q;
-                $cur .= $c;
+                $current .= $c;
                 continue;
             }
             if (!$in_q && $c === '<') {
                 $in_b++;
-                $cur .= $c;
+                $current .= $c;
                 continue;
             }
             if (!$in_q && $c === '>') {
                 $in_b--;
-                $cur .= $c;
+                $current .= $c;
                 continue;
             }
             if (!$in_q && $in_b === 0 && $c === ',') {
-                $tokens[] = trim($cur);
-                $cur = '';
+                $tokens[] = trim($current);
+                $current = '';
                 continue;
             }
-            $cur .= $c;
+            $current .= $c;
         }
-        if (trim($cur) !== '') {
-            $tokens[] = trim($cur);
+        if (trim($current) !== '') {
+            $tokens[] = trim($current);
         }
         foreach ($tokens as $t) {
             if ($t === '') {
@@ -4624,19 +4674,19 @@ class MailSite
      * is set on messages whose body was served via a non-PEEK
      * BODY request.
      */
-    protected function imapCmdFetch($key, $tag, $args, &$ctx,
+    protected function imapCmdFetch($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $sp = strpos($args, ' ');
+        $sp = strpos($arguments, ' ');
         if ($sp === false) {
             $this->queueWrite($key,
                 "$tag BAD FETCH syntax\r\n");
             return;
         }
-        $set = substr($args, 0, $sp);
-        $items_str = substr($args, $sp + 1);
-        $user = $ctx['AUTH_USER'];
-        $folder = $ctx['SELECTED'];
+        $set = substr($arguments, 0, $sp);
+        $items_str = substr($arguments, $sp + 1);
+        $user = $context['AUTH_USER'];
+        $folder = $context['SELECTED'];
         $matched = $this->imapMatchSet($user, $folder, $set,
             $by_uid);
         $verb = $by_uid ? 'UID FETCH' : 'FETCH';
@@ -4651,7 +4701,7 @@ class MailSite
             $this->imapEmitFetch($key, $seq, $meta, $body,
                 $items_str, $by_uid, $mark_seen);
             if ($mark_seen &&
-                empty($ctx['SELECTED_READONLY']) &&
+                empty($context['SELECTED_READONLY']) &&
                 !in_array('\Seen', $meta['flags'], true)) {
                 $new_flags = $meta['flags'];
                 $new_flags[] = '\Seen';
@@ -4669,12 +4719,12 @@ class MailSite
      * suppresses the per-message FETCH response. The flag
      * list itself is a parenthesized atom list.
      */
-    protected function imapCmdStore($key, $tag, $args, &$ctx,
+    protected function imapCmdStore($key, $tag, $arguments, &$context,
         $by_uid)
     {
         if (!preg_match(
             '/^(\S+)\s+([+-]?FLAGS(?:\.SILENT)?)\s+(.+)$/i',
-            $args, $m)) {
+            $arguments, $m)) {
             $this->queueWrite($key,
                 "$tag BAD STORE syntax\r\n");
             return;
@@ -4694,12 +4744,12 @@ class MailSite
         }
         $silent = (substr($op, -7) === '.SILENT');
         $mode = $silent ? substr($op, 0, -7) : $op;
-        $user = $ctx['AUTH_USER'];
-        $folder = $ctx['SELECTED'];
+        $user = $context['AUTH_USER'];
+        $folder = $context['SELECTED'];
         $matched = $this->imapMatchSet($user, $folder, $set,
             $by_uid);
         $verb = $by_uid ? 'UID STORE' : 'STORE';
-        if (!empty($ctx['SELECTED_READONLY'])) {
+        if (!empty($context['SELECTED_READONLY'])) {
             $this->queueWrite($key,
                 "$tag NO Mailbox is read-only\r\n");
             return;
@@ -4747,25 +4797,25 @@ class MailSite
      * the same per-user UID counter is used for the new
      * message.
      */
-    protected function imapCmdCopy($key, $tag, $args, &$ctx,
+    protected function imapCmdCopy($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $sp = strrpos(rtrim($args), ' ');
+        $sp = strrpos(rtrim($arguments), ' ');
         if ($sp === false) {
             $this->queueWrite($key,
                 "$tag BAD COPY syntax\r\n");
             return;
         }
-        $set = trim(substr($args, 0, $sp));
-        $folder_tok = trim(substr($args, $sp + 1));
+        $set = trim(substr($arguments, 0, $sp));
+        $folder_tok = trim(substr($arguments, $sp + 1));
         if ($folder_tok === '' || $folder_tok[0] === '"') {
             $tokens = $this->parseImapTokens($folder_tok);
             $target = $this->tokenString($tokens, 0);
         } else {
             $target = $folder_tok;
         }
-        $user = $ctx['AUTH_USER'];
-        $folder = $ctx['SELECTED'];
+        $user = $context['AUTH_USER'];
+        $folder = $context['SELECTED'];
         if ($target === false || $target === '') {
             $this->queueWrite($key,
                 "$tag BAD COPY syntax\r\n");
@@ -4801,25 +4851,25 @@ class MailSite
      * UID. Per the RFC the server emits an EXPUNGE response
      * for each removed source message after the move.
      */
-    protected function imapCmdMove($key, $tag, $args, &$ctx,
+    protected function imapCmdMove($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $sp = strrpos(rtrim($args), ' ');
+        $sp = strrpos(rtrim($arguments), ' ');
         if ($sp === false) {
             $this->queueWrite($key,
                 "$tag BAD MOVE syntax\r\n");
             return;
         }
-        $set = trim(substr($args, 0, $sp));
-        $folder_tok = trim(substr($args, $sp + 1));
+        $set = trim(substr($arguments, 0, $sp));
+        $folder_tok = trim(substr($arguments, $sp + 1));
         if ($folder_tok === '' || $folder_tok[0] === '"') {
             $tokens = $this->parseImapTokens($folder_tok);
             $target = $this->tokenString($tokens, 0);
         } else {
             $target = $folder_tok;
         }
-        $user = $ctx['AUTH_USER'];
-        $folder = $ctx['SELECTED'];
+        $user = $context['AUTH_USER'];
+        $folder = $context['SELECTED'];
         if ($target === false || $target === '') {
             $this->queueWrite($key,
                 "$tag BAD MOVE syntax\r\n");
@@ -4866,15 +4916,15 @@ class MailSite
      * sequences down. Not allowed on read-only mailboxes
      * (EXAMINE).
      */
-    protected function imapCmdExpunge($key, $tag, &$ctx)
+    protected function imapCmdExpunge($key, $tag, &$context)
     {
-        if (!empty($ctx['SELECTED_READONLY'])) {
+        if (!empty($context['SELECTED_READONLY'])) {
             $this->queueWrite($key,
                 "$tag NO Mailbox is read-only\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
-        $folder = $ctx['SELECTED'];
+        $user = $context['AUTH_USER'];
+        $folder = $context['SELECTED'];
         $messages = $this->mail_storage->listMessages($user,
             $folder);
         $seqs_removed = [];
@@ -4905,17 +4955,17 @@ class MailSite
      * (juxtaposed keys are conjuncted). Sequence-set and
      * UID-set restrictions also work.
      */
-    protected function imapCmdSearch($key, $tag, $args, &$ctx,
+    protected function imapCmdSearch($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $tokens = $this->imapTokenizeSearch($args);
+        $tokens = $this->imapTokenizeSearch($arguments);
         if ($tokens === null) {
             $this->queueWrite($key,
                 "$tag BAD SEARCH syntax\r\n");
             return;
         }
-        $user = $ctx['AUTH_USER'];
-        $folder = $ctx['SELECTED'];
+        $user = $context['AUTH_USER'];
+        $folder = $context['SELECTED'];
         $messages = $this->mail_storage->listMessages($user,
             $folder);
         $last_seq = count($messages);
@@ -4990,8 +5040,8 @@ class MailSite
                 $s[$j] !== ')') {
                 $j++;
             }
-            $tok = substr($s, $i, $j - $i);
-            $out[] = ['ATOM', $tok];
+            $token = substr($s, $i, $j - $i);
+            $out[] = ['ATOM', $token];
             $i = $j;
         }
         return $out;
@@ -5106,16 +5156,16 @@ class MailSite
                 $kw === 'CC' || $kw === 'BCC' ||
                 $kw === 'SUBJECT') {
                 $arg = $tokens[$cursor++][1] ?? '';
-                $hdrs = $this->imapParseHeaders($get_body());
+                $header_map = $this->imapParseHeaders($get_body());
                 $hkey = strtolower($kw);
-                $val = $hdrs[$hkey] ?? '';
+                $val = $header_map[$hkey] ?? '';
                 return stripos($val, $arg) !== false;
             }
             if ($kw === 'HEADER') {
                 $name = $tokens[$cursor++][1] ?? '';
                 $arg = $tokens[$cursor++][1] ?? '';
-                $hdrs = $this->imapParseHeaders($get_body());
-                $val = $hdrs[strtolower($name)] ?? '';
+                $header_map = $this->imapParseHeaders($get_body());
+                $val = $header_map[strtolower($name)] ?? '';
                 return $arg === '' ? $val !== '' :
                     stripos($val, $arg) !== false;
             }
@@ -5179,9 +5229,9 @@ class MailSite
      * Phase 4 does not include. The command still completes
      * successfully so well-behaved clients accept us.
      */
-    protected function imapCmdIdle($key, $tag, &$ctx)
+    protected function imapCmdIdle($key, $tag, &$context)
     {
-        $ctx['IMAP_LIT_PENDING'] = [
+        $context['IMAP_LIT_PENDING'] = [
             'continuation' => 'idle',
             'tag' => $tag,
         ];
@@ -5195,22 +5245,34 @@ class MailSite
      * results changes (LOGINDISABLED disappears) so a well-
      * behaved client re-issues CAPABILITY.
      */
-    protected function dispatchImapStarttls($key, $tag, &$ctx)
+    protected function dispatchImapStarttls($key, $tag, &$context)
     {
         if (!$this->tls_available) {
             $this->queueWrite($key,
                 "$tag NO STARTTLS not available\r\n");
             return;
         }
-        if (!empty($ctx['TLS_ACTIVE'])) {
+        if (!empty($context['TLS_ACTIVE'])) {
             $this->queueWrite($key,
                 "$tag BAD TLS already active\r\n");
             return;
         }
-        $ctx['PENDING_STARTTLS'] = true;
+        $context['PENDING_STARTTLS'] = true;
         $this->queueWrite($key,
             "$tag OK Begin TLS negotiation now\r\n");
     }
+    /**
+     * Drains pending bytes from a connection's outbound
+     * buffer to its socket, called when the select loop
+     * reports the socket writable. Tolerates partial writes:
+     * fwrite may consume fewer bytes than offered (TCP buffer
+     * full), in which case the unwritten tail stays queued
+     * for the next tick. When the buffer fully drains, hands
+     * off to finishWrite to clean up and trigger any deferred
+     * actions (e.g. STARTTLS handshake or QUIT-driven close).
+     *
+     * @param resource $stream client socket
+     */
     protected function writeClient($stream)
     {
         $key = (int) $stream;
@@ -5252,8 +5314,8 @@ class MailSite
         if (!isset($this->in_streams[self::CONTEXT][$key])) {
             return;
         }
-        $ctx = & $this->in_streams[self::CONTEXT][$key];
-        if (!empty($ctx['PENDING_STARTTLS'])) {
+        $context = & $this->in_streams[self::CONTEXT][$key];
+        if (!empty($context['PENDING_STARTTLS'])) {
             /*
                 The 220 reply (or IMAP "OK Begin TLS negotiation
                 now") has been fully flushed. Negotiate the TLS
@@ -5262,15 +5324,15 @@ class MailSite
                 client must re-EHLO after TLS comes up; same idea
                 for IMAP CAPABILITY).
              */
-            $ctx['PENDING_STARTTLS'] = false;
-            $conn = $this->in_streams[self::CONNECTION][$key];
-            if ($this->upgradeToTls($conn)) {
-                $ctx['TLS_ACTIVE'] = true;
-                $ctx['STATE'] = 'INIT';
-                $ctx['MAILFROM'] = null;
-                $ctx['RCPTTO'] = [];
-                $ctx['AUTH_USER'] = null;
-                $ctx['AUTH_USERNAME'] = null;
+            $context['PENDING_STARTTLS'] = false;
+            $connection = $this->in_streams[self::CONNECTION][$key];
+            if ($this->upgradeToTls($connection)) {
+                $context['TLS_ACTIVE'] = true;
+                $context['STATE'] = 'INIT';
+                $context['MAILFROM'] = null;
+                $context['RCPTTO'] = [];
+                $context['AUTH_USER'] = null;
+                $context['AUTH_USERNAME'] = null;
                 $this->in_streams[self::DATA][$key] = "";
             } else {
                 /*
@@ -5281,11 +5343,20 @@ class MailSite
                 return;
             }
         }
-        if ($ctx && isset($ctx['STATE']) &&
-            $ctx['STATE'] === 'QUIT') {
+        if ($context && isset($context['STATE']) &&
+            $context['STATE'] === 'QUIT') {
             $this->shutdownStream($key);
         }
     }
+    /**
+     * Tears down a client connection: shutdown(), fclose(),
+     * and clears every per-connection slot in both in_streams
+     * and out_streams. No-op for immortal listening sockets,
+     * which would otherwise close themselves and stop
+     * accepting new clients.
+     *
+     * @param int $key connection key
+     */
     protected function shutdownStream($key)
     {
         if (in_array($key, $this->immortal_stream_keys)) {
@@ -5306,6 +5377,13 @@ class MailSite
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::MODIFIED_TIME][$key]);
     }
+    /**
+     * Closes connections that have been idle longer than the
+     * configured CONNECTION_TIMEOUT. Called once per main
+     * loop iteration; cheap to skip-call when no streams are
+     * outstanding. Listening sockets are exempt via the
+     * immortal-streams set.
+     */
     protected function cullDeadStreams()
     {
         $timeout =
@@ -5321,6 +5399,14 @@ class MailSite
             }
         }
     }
+    /**
+     * Drains the timer-alarm priority queue: every timer
+     * whose firing time has arrived gets its callback invoked.
+     * Repeating timers are re-queued at firing-time +
+     * interval; one-shot timers are removed. Exceptions inside
+     * a callback are swallowed so a single buggy timer cannot
+     * take down the event loop.
+     */
     protected function processTimers()
     {
         if ($this->timer_alarms->isEmpty()) {

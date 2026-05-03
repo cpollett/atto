@@ -159,7 +159,7 @@ $mail->domains(['localhost', 'example.test']);
     Example below is permissive; uncomment the deny block to
     refuse a specific source.
  */
-$mail->onConnect(function ($info, $ctx) {
+$mail->onConnect(function ($info, $context) {
     /*
     if ($info['remote_addr'] === '203.0.113.7') {
         return 'reject';
@@ -171,7 +171,7 @@ $mail->onConnect(function ($info, $ctx) {
     onMailFrom: drop messages from obviously-bogus senders at
     the envelope step, before the client even ships DATA.
  */
-$mail->onMailFrom(function ($info, $ctx) {
+$mail->onMailFrom(function ($info, $context) {
     $from = strtolower($info['from']);
     if (strpos($from, 'spammer@') === 0) {
         return 'reject';
@@ -183,7 +183,7 @@ $mail->onMailFrom(function ($info, $ctx) {
     needs the message-as-written. Reject (hard 550) anything
     whose Subject begins with [BLOCK].
  */
-$mail->onHeader(function ($info, $ctx) {
+$mail->onHeader(function ($info, $context) {
     foreach ($info['headers'] as $h) {
         if (strcasecmp($h[0], 'Subject') === 0 &&
             stripos($h[1], '[BLOCK]') === 0) {
@@ -197,7 +197,7 @@ $mail->onHeader(function ($info, $ctx) {
     go to Junk; messages from no-reply / mailer-daemon Froms
     are dropped silently.
  */
-$mail->onMessage(function ($info, $ctx) {
+$mail->onMessage(function ($info, $context) {
     $bytes = $info['bytes'];
     if (preg_match(
         '/^From:\s*<?(?:no-?reply|mailer-daemon)@/im',

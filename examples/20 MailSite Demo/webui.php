@@ -891,6 +891,52 @@ $scenarios['imap_multipart'] = [
         ]);
     },
 ];
+$scenarios['imap_attachment'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'Attachment: multipart/mixed + base64 file part',
+    'desc' => 'APPEND a multipart/mixed message: a text/plain ' .
+        'body followed by a base64-encoded text/plain ' .
+        'attachment with a Content-Disposition header naming ' .
+        'the file. BODYSTRUCTURE shows both parts; BODY[2] ' .
+        'returns the encoded attachment bytes, which the ' .
+        'client base64-decodes to recover the original file. ' .
+        'This is the wire-level mechanism Apple Mail uses to ' .
+        'send and receive attachments end to end.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        $attachment_b64 = "SGVsbG8gZnJvbSB0aGUgYXR0YWNobWVudCEK" .
+            "VGhpcyBpcyBhIHRlc3QgZmlsZS4K";
+        $body = "Subject: report and a file\r\n" .
+            "From: x@y.com\r\n" .
+            "To: alice@localhost\r\n" .
+            "MIME-Version: 1.0\r\n" .
+            "Content-Type: multipart/mixed; " .
+                "boundary=\"BNDRY99\"\r\n\r\n" .
+            "--BNDRY99\r\n" .
+            "Content-Type: text/plain; charset=UTF-8\r\n\r\n" .
+            "Please see attached.\r\n" .
+            "--BNDRY99\r\n" .
+            "Content-Type: text/plain; charset=UTF-8; " .
+                "name=\"hello.txt\"\r\n" .
+            "Content-Transfer-Encoding: base64\r\n" .
+            "Content-Disposition: attachment; " .
+                "filename=\"hello.txt\"\r\n\r\n" .
+            $attachment_b64 . "\r\n" .
+            "--BNDRY99--\r\n";
+        $size = strlen($body);
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 APPEND INBOX {" . $size . "}\r\n",
+            $body,
+            "a3 SELECT INBOX\r\n",
+            "a4 FETCH 1 (BODYSTRUCTURE)\r\n",
+            "a5 FETCH 1 BODY.PEEK[1]\r\n",
+            "a6 FETCH 1 BODY.PEEK[2]\r\n",
+            "a7 FETCH 1 BODY.PEEK[2.MIME]\r\n",
+            "a8 LOGOUT\r\n",
+        ]);
+    },
+];
 /* ---------- Implicit TLS ---------- */
 $scenarios['smtps_banner'] = [
     'group' => 'Implicit TLS',

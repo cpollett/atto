@@ -517,31 +517,63 @@ class FileMailStorage extends MailStorage
             $encoded;
     }
     /**
-     * Strips path separators and dot-prefixed components from a
-     * username so it can be used as a directory name without
-     * letting a crafted username escape the user-tree base. Mail
-     * usernames in the wild use [A-Za-z0-9._-]; we accept that
-     * set and normalize the rest to underscore.
+     * Strips path separators, dot-prefixed components, and
+     * other shell-meta characters from a username so it can be
+     * used as a directory name without letting a crafted
+     * username escape the user-tree base. Mail usernames in
+     * the wild use [A-Za-z0-9._-]; we accept that set and
+     * fold every other byte to underscore. Backslashes are
+     * folded too because Windows treats them as path
+     * separators. After folding, leading dots are stripped to
+     * prevent ".." or ".something" inputs from producing a
+     * dot-prefixed directory name.
      */
     protected function safeName($user)
     {
         $user = (string) $user;
         $user = preg_replace('/[^A-Za-z0-9._-]/', '_', $user);
-        $user = ltrim($user, '.');
-        if ($user === "" || $user === "_") {
+        $user = ltrim($user, '._');
+        if ($user === "" ||
+            preg_match('/^[._]+$/', $user) ||
+            strpos($user, '..') !== false) {
             $user = "_invalid_";
         }
         return $user;
     }
     /**
      * Canonicalizes a folder path: collapses repeated slashes,
-     * strips leading/trailing slashes, and rejects "." or ".."
-     * components. INBOX is normalized to all-uppercase per RFC
-     * 3501. Throws on invalid input.
+     * strips leading/trailing slashes, and rejects components
+     * that could escape the folder root or clobber metadata
+     * files. INBOX is normalized to all-uppercase per RFC
+     * 3501. Throws InvalidArgumentException on:
+     *      empty / "." / ".."  components (path traversal)
+     *      NUL byte             (older C-level path injection)
+     *      dot-prefixed         (clobbers .uidvalidity, .uidnext,
+     *                            .subscribed metadata files)
+     *      leading "%"          (after rawurlencode, would
+     *                            collide with literal-percent
+     *                            encoding of a real folder name)
      */
     protected function normalizeFolder($folder)
     {
         $folder = (string) $folder;
+        if (strpos($folder, "\0") !== false) {
+            throw new \InvalidArgumentException(
+                "folder name contains NUL byte");
+        }
+        /*
+            Reject every byte below 0x20 except for the
+            implicit none. CR, LF, and TAB inside a folder
+            name would corrupt the subscription file format
+            (one name per line) and any line-oriented metadata
+            file we add later. Folders with control characters
+            are not useful in any real mail client and
+            allowing them widens the abuse surface.
+         */
+        if (preg_match('/[\x00-\x1F\x7F]/', $folder)) {
+            throw new \InvalidArgumentException(
+                "folder name contains control character");
+        }
         $folder = trim($folder, "/");
         if ($folder === "") {
             return "INBOX";
@@ -551,12 +583,17 @@ class FileMailStorage extends MailStorage
         }
         $parts = preg_split('#/+#', $folder);
         $clean = [];
-        foreach ($parts as $p) {
-            if ($p === "" || $p === "." || $p === "..") {
+        foreach ($parts as $part) {
+            if ($part === "" || $part === "." ||
+                $part === "..") {
                 throw new \InvalidArgumentException(
-                    "invalid folder component: '$p'");
+                    "invalid folder component: '$part'");
             }
-            $clean[] = $p;
+            if ($part[0] === '.') {
+                throw new \InvalidArgumentException(
+                    "folder name may not start with '.'");
+            }
+            $clean[] = $part;
         }
         return implode("/", $clean);
     }
@@ -679,8 +716,8 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $prefix = $folder . "/";
-        foreach ($this->listFolders($user) as $f) {
-            if (strpos($f, $prefix) === 0) {
+        foreach ($this->listFolders($user) as $other_folder) {
+            if (strpos($other_folder, $prefix) === 0) {
                 return false;
             }
         }
@@ -860,10 +897,11 @@ class FileMailStorage extends MailStorage
         $flags = [];
         if (is_file($flags_file)) {
             $contents = (string) @file_get_contents($flags_file);
-            foreach (preg_split('/\r\n|\r|\n/', $contents) as $f) {
-                $f = trim($f);
-                if ($f !== "") {
-                    $flags[] = $f;
+            foreach (preg_split('/\r\n|\r|\n/', $contents)
+                as $flag) {
+                $flag = trim($flag);
+                if ($flag !== "") {
+                    $flags[] = $flag;
                 }
             }
         }
@@ -895,10 +933,10 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $clean = [];
-        foreach ($flags as $f) {
-            $f = trim((string) $f);
-            if ($f !== "") {
-                $clean[] = $f;
+        foreach ($flags as $flag) {
+            $flag = trim((string) $flag);
+            if ($flag !== "") {
+                $clean[] = $flag;
             }
         }
         $written = @file_put_contents(
@@ -1050,8 +1088,8 @@ class FileMailStorage extends MailStorage
         $file = $this->subscriptionFile($user);
         $temp_path = $file . '.tmp';
         $payload = '';
-        foreach ($folders as $f) {
-            $payload .= $f . "\n";
+        foreach ($folders as $folder_name) {
+            $payload .= $folder_name . "\n";
         }
         if (file_put_contents($temp_path, $payload) === false) {
             return false;
@@ -1097,11 +1135,11 @@ class FileMailStorage extends MailStorage
             return true;
         }
         $current = $this->readSubscriptions($user);
-        $idx = array_search($folder, $current, true);
-        if ($idx === false) {
+        $index = array_search($folder, $current, true);
+        if ($index === false) {
             return true;
         }
-        unset($current[$idx]);
+        unset($current[$index]);
         return $this->writeSubscriptions($user,
             array_values($current));
     }
@@ -1364,10 +1402,10 @@ class MailSite
     public function domains(array $domains)
     {
         $clean = [];
-        foreach ($domains as $d) {
-            $d = strtolower(trim((string) $d));
-            if ($d !== "") {
-                $clean[] = $d;
+        foreach ($domains as $domain) {
+            $domain = strtolower(trim((string) $domain));
+            if ($domain !== "") {
+                $clean[] = $domain;
             }
         }
         $this->local_domains = $clean ?: ['localhost'];
@@ -1698,6 +1736,23 @@ class MailSite
         return $this->mailbox_changes[$user][$folder];
     }
     /**
+     * Clears every IDLE-related slot in a connection context.
+     * Called when the client sends DONE, when the literal-
+     * continuation handler decides idle has ended due to a
+     * protocol error, and any other place that needs to
+     * leave the connection in a clean post-idle state. The
+     * three slots are kept null rather than deleted so later
+     * isset() checks can short-circuit without keying through
+     * an undefined index notice in strict environments.
+     */
+    protected function clearImapIdleState(&$context)
+    {
+        $context['IMAP_LIT_PENDING'] = null;
+        $context['IDLE_SNAPSHOT'] = null;
+        $context['IDLE_FOLDER'] = null;
+        $context['IDLE_STATE'] = null;
+    }
+    /**
      * Resolves a recipient address to a local username, or false
      * if the recipient is not local. The local part is returned
      * in its lowercased form because storage is case-insensitive.
@@ -1880,8 +1935,8 @@ class MailSite
             self::CONTEXT => [],
             self::MODIFIED_TIME => [],
         ];
-        foreach ($announce as $a) {
-            echo "AttoMail listening: $a\n";
+        foreach ($announce as $listener) {
+            echo "AttoMail listening: $listener\n";
         }
         $excepts = null;
         while (true) {
@@ -2019,8 +2074,8 @@ class MailSite
                 $this->default_server_globals['SERVER_SOFTWARE'] .
                 " ESMTP ready";
         } else {
-            $caps = $this->imapPreAuthCapabilities($tls_active);
-            $default_banner = "* OK [$caps] $name ready";
+            $capabilities = $this->imapPreAuthCapabilities($tls_active);
+            $default_banner = "* OK [$capabilities] $name ready";
         }
         $banner_info = $connect_info;
         $banner_info['default_banner'] = $default_banner;
@@ -2088,13 +2143,15 @@ class MailSite
         if (empty($this->server_context_array['ssl'])) {
             return false;
         }
-        foreach ($this->server_context_array['ssl'] as $k => $v) {
-            stream_context_set_option($connection, 'ssl', $k, $v);
+        foreach ($this->server_context_array['ssl']
+            as $option_name => $option_value) {
+            stream_context_set_option($connection, 'ssl',
+                $option_name, $option_value);
         }
-        $err = null;
+        $error = null;
         set_error_handler(
-            function ($errno, $errstr) use (&$err) {
-                $err = $errstr;
+            function ($errno, $errstr) use (&$error) {
+                $error = $errstr;
                 return true;
             });
         stream_set_blocking($connection, 1);
@@ -2105,14 +2162,15 @@ class MailSite
         if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')) {
             $method |= STREAM_CRYPTO_METHOD_TLSv1_3_SERVER;
         }
-        $ok = @stream_socket_enable_crypto($connection, true, $method);
+        $ok = @stream_socket_enable_crypto($connection, true,
+            $method);
         stream_set_blocking($connection, 0);
         restore_error_handler();
         if ($ok === true) {
             return true;
         }
-        if ($err !== null) {
-            echo "TLS handshake failed: $err\n";
+        if ($error !== null) {
+            echo "TLS handshake failed: $error\n";
         }
         return false;
     }
@@ -2144,6 +2202,31 @@ class MailSite
         }
         $this->out_streams[self::DATA][$key] .= $bytes;
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
+    }
+    /**
+     * Queues a tagged IMAP response of the given status (OK,
+     * NO, or BAD) and detail text. Centralizes the CRLF
+     * framing so individual command handlers do not have to
+     * repeat the "$tag STATUS detail\r\n" pattern at every
+     * exit. The detail text MUST NOT contain CR or LF; the
+     * helper does no escaping because every existing call
+     * site supplies a fixed English literal.
+     */
+    protected function imapResp($key, $tag, $status, $detail)
+    {
+        $this->queueWrite($key,
+            "$tag $status $detail\r\n");
+    }
+    /**
+     * Common shorthand for the very repetitive "completed"
+     * tag-OK acknowledgement that ends most successful IMAP
+     * commands. Equivalent to imapResp($key, $tag, 'OK',
+     * "$verb completed").
+     */
+    protected function imapOk($key, $tag, $verb)
+    {
+        $this->queueWrite($key,
+            "$tag OK $verb completed\r\n");
     }
     /**
      * Reads any pending bytes from a client socket into the
@@ -2239,17 +2322,28 @@ class MailSite
             $this->continueImapLiteral($key, '', $context);
             return true;
         }
-        $eol = strpos($buffer, "\r\n");
-        if ($eol === false) {
-            $eol = strpos($buffer, "\n");
-            if ($eol === false) {
+        $end_of_line = strpos($buffer, "\r\n");
+        if ($end_of_line === false) {
+            $end_of_line = strpos($buffer, "\n");
+            if ($end_of_line === false) {
+                /*
+                    Buffer cap: a line-oriented protocol must
+                    eventually see a CRLF. If the inbound buffer
+                    exceeds 64 KiB without a line terminator the
+                    client is either malformed or trying to
+                    exhaust memory; drop the connection rather
+                    than keep accumulating.
+                 */
+                if (strlen($buffer) > 65536) {
+                    $this->shutdownStream($key);
+                }
                 return false;
             }
-            $line = substr($buffer, 0, $eol);
-            $buffer = substr($buffer, $eol + 1);
+            $line = substr($buffer, 0, $end_of_line);
+            $buffer = substr($buffer, $end_of_line + 1);
         } else {
-            $line = substr($buffer, 0, $eol);
-            $buffer = substr($buffer, $eol + 2);
+            $line = substr($buffer, 0, $end_of_line);
+            $buffer = substr($buffer, $end_of_line + 2);
         }
         $line = rtrim($line, "\r\n");
         if ($proto === 'SMTP') {
@@ -2285,7 +2379,7 @@ class MailSite
             }
             $context['STATE'] = 'READY';
             $name = $this->default_server_globals['SERVER_NAME'];
-            $resp = "250-$name Hello\r\n";
+            $response = "250-$name Hello\r\n";
             $allow_plain =
                 !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
             if (!empty($context['TLS_ACTIVE']) && $this->tls_available) {
@@ -2293,16 +2387,16 @@ class MailSite
                     Already in TLS; do not re-advertise STARTTLS.
                  */
             } elseif ($this->tls_available) {
-                $resp .= "250-STARTTLS\r\n";
+                $response .= "250-STARTTLS\r\n";
             }
             if (!empty($context['TLS_ACTIVE']) || $allow_plain) {
-                $resp .= "250-AUTH PLAIN LOGIN\r\n";
+                $response .= "250-AUTH PLAIN LOGIN\r\n";
             }
-            $resp .= "250-SIZE " .
+            $response .= "250-SIZE " .
                 $this->default_server_globals['MAX_MESSAGE_LEN'] .
                 "\r\n";
-            $resp .= "250 HELP\r\n";
-            $this->queueWrite($key, $resp);
+            $response .= "250 HELP\r\n";
+            $this->queueWrite($key, $response);
             return;
         }
         if (strncmp($upper, 'NOOP', 4) === 0) {
@@ -2654,8 +2748,8 @@ class MailSite
         $position = strpos($buffer, $marker);
         $marker_len = 5;
         if ($position === false) {
-            $alt = "\n.\n";
-            $alt_pos = strpos($buffer, $alt);
+            $alternative = "\n.\n";
+            $alt_pos = strpos($buffer, $alternative);
             if ($alt_pos === false) {
                 return false;
             }
@@ -2738,8 +2832,8 @@ class MailSite
      */
     protected function parseRfc5322Headers($message)
     {
-        $sep = "\r\n\r\n";
-        $end = strpos($message, $sep);
+        $separator = "\r\n\r\n";
+        $end = strpos($message, $separator);
         if ($end === false) {
             $end = strpos($message, "\n\n");
             $block = ($end === false) ? $message : substr($message, 0,
@@ -2788,17 +2882,35 @@ class MailSite
     protected function prependReceivedHeader($message, $context)
     {
         $name = $this->default_server_globals['SERVER_NAME'];
-        $server_software = $this->default_server_globals['SERVER_SOFTWARE'];
-        $with = empty($context['AUTH_USER']) ? 'ESMTP' : 'ESMTPA';
+        $server_software =
+            $this->default_server_globals['SERVER_SOFTWARE'];
+        $with = empty($context['AUTH_USER']) ?
+            'ESMTP' : 'ESMTPA';
         $now = gmdate("D, d M Y H:i:s") . " +0000";
-        $remote = $context['REMOTE_ADDR'];
+        /*
+            Defense in depth: Received: header values originate
+            from the connection (REMOTE_ADDR), the wire RCPT TO
+            line, and the server config (SERVER_NAME,
+            SERVER_SOFTWARE). The wire path already strips
+            line-level CR and LF before the address parser
+            sees it, but a bug or a hook that mutates
+            $context['RCPTTO'] could reintroduce them. Scrub
+            CR and LF from every interpolated value so a
+            malformed entry cannot inject a fake header.
+         */
+        $strip = function ($value) {
+            return str_replace(["\r", "\n"], ['', ''],
+                (string) $value);
+        };
+        $remote = $strip($context['REMOTE_ADDR']);
         $rcpt = "";
         if (!empty($context['RCPTTO'])) {
             $first = $context['RCPTTO'][0];
-            $rcpt = "for <" . $first['addr'] . ">";
+            $rcpt = "for <" . $strip($first['addr']) . ">";
         }
-        $header_value = "Received: from [$remote] by $name ($server_software)" .
-            " with $with $rcpt; $now\r\n";
+        $header_value = "Received: from [$remote] by " .
+            $strip($name) . " (" . $strip($server_software) .
+            ") with $with $rcpt; $now\r\n";
         return $header_value . $message;
     }
     /**
@@ -2825,11 +2937,11 @@ class MailSite
             return;
         }
         $tag = "*";
-        $sp = strpos($line, " ");
+        $space_position = strpos($line, " ");
         $rest = "";
-        if ($sp !== false) {
-            $tag = substr($line, 0, $sp);
-            $rest = substr($line, $sp + 1);
+        if ($space_position !== false) {
+            $tag = substr($line, 0, $space_position);
+            $rest = substr($line, $space_position + 1);
         } else {
             /*
                 A bare command word with no tag is a protocol
@@ -2853,14 +2965,12 @@ class MailSite
             return;
         }
         if ($V === 'NOOP') {
-            $this->queueWrite($key,
-                "$tag OK NOOP completed\r\n");
+            $this->imapOk($key, $tag, "NOOP");
             return;
         }
         if ($V === 'LOGOUT') {
             $this->queueWrite($key, "* BYE Logging out\r\n");
-            $this->queueWrite($key,
-                "$tag OK LOGOUT completed\r\n");
+            $this->imapOk($key, $tag, "LOGOUT");
             $context['STATE'] = 'QUIT';
             return;
         }
@@ -2885,8 +2995,7 @@ class MailSite
                     $context);
                 return;
             }
-            $this->queueWrite($key,
-                "$tag NO Login required\r\n");
+            $this->imapResp($key, $tag, "NO", "Login required");
             return;
         }
         /*
@@ -2962,8 +3071,7 @@ class MailSite
         $needs_selected = in_array($V, ['FETCH', 'STORE', 'COPY',
             'MOVE', 'EXPUNGE', 'SEARCH'], true);
         if ($needs_selected && $context['STATE'] !== 'SELECTED') {
-            $this->queueWrite($key,
-                "$tag NO No mailbox selected\r\n");
+            $this->imapResp($key, $tag, "NO", "No mailbox selected");
             return;
         }
         if ($V === 'FETCH') {
@@ -2990,8 +3098,8 @@ class MailSite
             $this->imapCmdSearch($key, $tag, $arguments, $context, false);
             return;
         }
-        $this->queueWrite($key,
-            "$tag BAD command not implemented in this build\r\n");
+        $this->imapResp($key, $tag, "BAD",
+            "command not implemented in this build");
     }
     /**
      * Sends an untagged CAPABILITY response and tags it OK.
@@ -3003,11 +3111,10 @@ class MailSite
      */
     protected function imapCmdCapability($key, $tag, $context)
     {
-        $caps = $this->imapPreAuthCapabilities(
+        $capabilities = $this->imapPreAuthCapabilities(
             !empty($context['TLS_ACTIVE']));
-        $this->queueWrite($key, "* $caps\r\n");
-        $this->queueWrite($key,
-            "$tag OK CAPABILITY completed\r\n");
+        $this->queueWrite($key, "* $capabilities\r\n");
+        $this->imapOk($key, $tag, "CAPABILITY");
     }
     /**
      * Handles ID (RFC 2971): a non-protocol-affecting exchange
@@ -3025,8 +3132,7 @@ class MailSite
         $server_software = $this->default_server_globals['SERVER_SOFTWARE'];
         $this->queueWrite($key,
             "* ID (\"name\" \"$server_software\" \"vendor\" \"$name\")\r\n");
-        $this->queueWrite($key,
-            "$tag OK ID completed\r\n");
+        $this->imapOk($key, $tag, "ID");
     }
     /**
      * Handles NAMESPACE (RFC 2342): tells the client about
@@ -3040,8 +3146,7 @@ class MailSite
     {
         $this->queueWrite($key,
             "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
-        $this->queueWrite($key,
-            "$tag OK NAMESPACE completed\r\n");
+        $this->imapOk($key, $tag, "NAMESPACE");
     }
     /**
      * Handles "LOGIN <user> <pass>". Refuses if TLS is required
@@ -3086,8 +3191,7 @@ class MailSite
         }
         if (count($tokens) < 2 || $tokens[0][0] === 'literal' ||
             $tokens[1][0] === 'literal') {
-            $this->queueWrite($key,
-                "$tag BAD LOGIN syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "LOGIN syntax");
             return;
         }
         $this->finishImapLogin($key, $tag, $tokens[0][1],
@@ -3156,8 +3260,7 @@ class MailSite
                 "+ " . base64_encode("Username:") . "\r\n");
             return;
         }
-        $this->queueWrite($key,
-            "$tag NO [CANNOT] Unsupported mechanism\r\n");
+        $this->imapResp($key, $tag, "NO", "[CANNOT] Unsupported mechanism");
     }
     /**
      * Drives the multi-line continuations for AUTHENTICATE and
@@ -3170,8 +3273,8 @@ class MailSite
     {
         $pend = $context['IMAP_LIT_PENDING'];
         $tag = $pend['tag'];
-        $cont = $pend['continuation'];
-        if ($cont === 'auth-plain') {
+        $continuation = $pend['continuation'];
+        if ($continuation === 'auth-plain') {
             $context['IMAP_LIT_PENDING'] = null;
             $raw = (string) base64_decode(trim($line), true);
             $parts = explode("\x00", $raw);
@@ -3186,7 +3289,7 @@ class MailSite
                 $context);
             return;
         }
-        if ($cont === 'auth-login-user') {
+        if ($continuation === 'auth-login-user') {
             $user = (string) base64_decode(trim($line), true);
             $context['IMAP_LIT_PENDING'] = [
                 'continuation' => 'auth-login-pass',
@@ -3197,14 +3300,14 @@ class MailSite
                 "+ " . base64_encode("Password:") . "\r\n");
             return;
         }
-        if ($cont === 'auth-login-pass') {
+        if ($continuation === 'auth-login-pass') {
             $context['IMAP_LIT_PENDING'] = null;
             $pass = (string) base64_decode(trim($line), true);
             $this->finishImapLogin($key, $tag, $pend['user'],
                 $pass, $context);
             return;
         }
-        if ($cont === 'login') {
+        if ($continuation === 'login') {
             $context['IMAP_LIT_PENDING'] = null;
             /*
                 Phase 3 only supports LOGIN literals as a
@@ -3212,11 +3315,11 @@ class MailSite
                 quoted strings. We do not currently chain a
                 second literal for the password.
              */
-            $this->queueWrite($key,
-                "$tag BAD literal LOGIN not fully implemented\r\n");
+            $this->imapResp($key, $tag, "BAD",
+                "literal LOGIN not fully implemented");
             return;
         }
-        if ($cont === 'append') {
+        if ($continuation === 'append') {
             /*
                 APPEND finalization. processOne has already
                 drained the byte-counted body into the pending
@@ -3242,8 +3345,7 @@ class MailSite
             $uid = $this->mail_storage->appendMessage($user,
                 $folder, $bytes, $flags, $internal_date);
             if ($uid === false) {
-                $this->queueWrite($key,
-                    "$tag NO APPEND failed\r\n");
+                $this->imapResp($key, $tag, "NO", "APPEND failed");
                 return;
             }
             $this->bumpMailboxChange($user, $folder);
@@ -3254,7 +3356,7 @@ class MailSite
                 "APPEND completed\r\n");
             return;
         }
-        if ($cont === 'idle') {
+        if ($continuation === 'idle') {
             /*
                 RFC 2177: while idling, the client sends "DONE"
                 on its own line to terminate. Anything else
@@ -3263,26 +3365,19 @@ class MailSite
                 client sends an empty line; non-empty non-DONE
                 lines get a BAD response and the idle ends.
              */
-            $up = strtoupper(trim($line));
-            if ($up === 'DONE') {
-                $context['IMAP_LIT_PENDING'] = null;
-                $context['IDLE_SNAPSHOT'] = null;
-                $context['IDLE_FOLDER'] = null;
-                $context['IDLE_STATE'] = null;
+            $upper = strtoupper(trim($line));
+            if ($upper === 'DONE') {
+                $this->clearImapIdleState($context);
                 $this->queueWrite($key,
                     "$tag OK IDLE terminated\r\n");
                 return;
             }
-            if ($up === '') {
+            if ($upper === '') {
                 /* keep idling */
                 return;
             }
-            $context['IMAP_LIT_PENDING'] = null;
-            $context['IDLE_SNAPSHOT'] = null;
-            $context['IDLE_FOLDER'] = null;
-            $context['IDLE_STATE'] = null;
-            $this->queueWrite($key,
-                "$tag BAD Expected DONE\r\n");
+            $this->clearImapIdleState($context);
+            $this->imapResp($key, $tag, "BAD", "Expected DONE");
             return;
         }
         $context['IMAP_LIT_PENDING'] = null;
@@ -3316,20 +3411,20 @@ class MailSite
             }
             if ($c === '"') {
                 $j = $i + 1;
-                $val = '';
+                $value = '';
                 while ($j < $n && $s[$j] !== '"') {
                     if ($s[$j] === '\\' && $j + 1 < $n) {
-                        $val .= $s[$j + 1];
+                        $value .= $s[$j + 1];
                         $j += 2;
                         continue;
                     }
-                    $val .= $s[$j];
+                    $value .= $s[$j];
                     $j++;
                 }
                 if ($j >= $n) {
                     return [];
                 }
-                $tokens[] = ['quoted', $val];
+                $tokens[] = ['quoted', $value];
                 $i = $j + 1;
                 continue;
             }
@@ -3397,14 +3492,14 @@ class MailSite
      * first token is a literal (literals require continuation
      * handling and cannot be returned synchronously).
      */
-    protected function tokenString($tokens, $idx)
+    protected function tokenString($tokens, $index)
     {
-        if (!isset($tokens[$idx])) {
+        if (!isset($tokens[$index])) {
             return false;
         }
-        $t = $tokens[$idx];
-        if ($t[0] === 'atom' || $t[0] === 'quoted') {
-            return $t[1];
+        $token = $tokens[$index];
+        if ($token[0] === 'atom' || $token[0] === 'quoted') {
+            return $token[1];
         }
         return false;
     }
@@ -3454,14 +3549,13 @@ class MailSite
             $args_trimmed = ltrim(substr($args_trimmed, $i));
         }
         $tokens = $this->parseImapTokens($args_trimmed);
-        $ref = $this->tokenString($tokens, 0);
-        $pat = $this->tokenString($tokens, 1);
-        if ($ref === false || $pat === false) {
-            $this->queueWrite($key,
-                "$tag BAD $verb syntax\r\n");
+        $reference = $this->tokenString($tokens, 0);
+        $pattern = $this->tokenString($tokens, 1);
+        if ($reference === false || $pattern === false) {
+            $this->imapResp($key, $tag, "BAD", "$verb syntax");
             return;
         }
-        if ($pat === '') {
+        if ($pattern === '') {
             /*
                 Empty pattern: respond with the hierarchy
                 delimiter and an empty mailbox name, then OK.
@@ -3500,12 +3594,15 @@ class MailSite
             $folders = array_values(array_intersect($folders,
                 $subscribed));
         }
-        $combined = $ref === '' ? $pat : $ref . $pat;
+        $combined = $reference === '' ? $pattern :
+            $reference . $pattern;
         $regex = $this->imapPatternToRegex($combined);
-        foreach ($folders as $f) {
-            if (preg_match($regex, $f)) {
-                $attrs = $this->imapFolderAttrs($f, $folders);
-                $name = $this->imapEncodeMailboxName($f);
+        foreach ($folders as $folder_name) {
+            if (preg_match($regex, $folder_name)) {
+                $attrs = $this->imapFolderAttrs($folder_name,
+                    $folders);
+                $name = $this->imapEncodeMailboxName(
+                    $folder_name);
                 $this->queueWrite($key,
                     "* $verb ($attrs) \"/\" $name\r\n");
             }
@@ -3531,9 +3628,9 @@ class MailSite
         $attrs = [];
         $prefix = $folder . '/';
         $has_children = false;
-        foreach ($all_folders as $f) {
-            if ($f !== $folder &&
-                strpos($f, $prefix) === 0) {
+        foreach ($all_folders as $other) {
+            if ($other !== $folder &&
+                strpos($other, $prefix) === 0) {
                 $has_children = true;
                 break;
             }
@@ -3590,31 +3687,37 @@ class MailSite
      */
     protected function imapPatternToRegex($pattern)
     {
-        $out = '';
+        $output = '';
         $n = strlen($pattern);
         for ($i = 0; $i < $n; $i++) {
             $c = $pattern[$i];
             if ($c === '*') {
-                $out .= '.*';
+                $output .= '.*';
             } else if ($c === '%') {
-                $out .= '[^/]*';
+                $output .= '[^/]*';
             } else {
-                $out .= preg_quote($c, '#');
+                $output .= preg_quote($c, '#');
             }
         }
-        return '#^' . $out . '$#';
+        return '#^' . $output . '$#';
     }
+    /**
     /**
      * Renders a folder name for inclusion in an IMAP response.
      * If the name is a printable ASCII atom (no spaces, no
      * special chars) it is returned bare; otherwise it is
-     * wrapped in double-quotes with " and \ escaped. RFC 3501
-     * also allows literals here, but quoted strings are easier
-     * for clients to parse and sufficient for our folder
-     * namespace.
+     * wrapped in double-quotes with " and \ escaped. CR and
+     * LF bytes are stripped because they would terminate the
+     * IMAP response line and let a maliciously named folder
+     * inject untagged responses (response splitting). RFC
+     * 3501 also allows literals here, but quoted strings are
+     * easier for clients to parse and sufficient for our
+     * folder namespace.
      */
     protected function imapEncodeMailboxName($name)
     {
+        $name = str_replace(["\r", "\n"], ['', ''],
+            (string) $name);
         if (preg_match('#^[A-Za-z0-9./_-]+$#', $name)) {
             return $name;
         }
@@ -3639,8 +3742,7 @@ class MailSite
         $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
         if ($name === false || $name === '') {
-            $this->queueWrite($key,
-                "$tag BAD $verb syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "$verb syntax");
             return;
         }
         $user = $context['AUTH_USER'];
@@ -3672,38 +3774,35 @@ class MailSite
             }
         }
         if ($folder === false || $items_str === false) {
-            $this->queueWrite($key,
-                "$tag BAD STATUS syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "STATUS syntax");
             return;
         }
         $items = preg_split('/\s+/', trim($items_str));
         $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $folder)) {
-            $this->queueWrite($key,
-                "$tag NO Mailbox does not exist\r\n");
+            $this->imapResp($key, $tag, "NO", "Mailbox does not exist");
             return;
         }
         $stat = $this->imapFolderStats($user, $folder);
         $parts = [];
-        foreach ($items as $it) {
-            $itu = strtoupper($it);
-            if ($itu === 'MESSAGES') {
+        foreach ($items as $item) {
+            $item_upper = strtoupper($item);
+            if ($item_upper === 'MESSAGES') {
                 $parts[] = "MESSAGES " . $stat['messages'];
-            } else if ($itu === 'RECENT') {
+            } else if ($item_upper === 'RECENT') {
                 $parts[] = "RECENT " . $stat['recent'];
-            } else if ($itu === 'UIDNEXT') {
+            } else if ($item_upper === 'UIDNEXT') {
                 $parts[] = "UIDNEXT " . $stat['uidnext'];
-            } else if ($itu === 'UIDVALIDITY') {
+            } else if ($item_upper === 'UIDVALIDITY') {
                 $parts[] = "UIDVALIDITY " . $stat['uidvalidity'];
-            } else if ($itu === 'UNSEEN') {
+            } else if ($item_upper === 'UNSEEN') {
                 $parts[] = "UNSEEN " . $stat['unseen'];
             }
         }
         $name = $this->imapEncodeMailboxName($folder);
         $this->queueWrite($key,
             "* STATUS $name (" . implode(' ', $parts) . ")\r\n");
-        $this->queueWrite($key,
-            "$tag OK STATUS completed\r\n");
+        $this->imapOk($key, $tag, "STATUS");
     }
     /**
      * Computes the metrics SELECT/EXAMINE/STATUS need for a
@@ -3721,13 +3820,13 @@ class MailSite
         $recent = 0;
         $unseen_uid = 0;
         $first_unseen_seq = 0;
-        foreach ($messages as $idx => $m) {
+        foreach ($messages as $index => $m) {
             if (in_array('\Recent', $m['flags'], true)) {
                 $recent++;
             }
             if ($first_unseen_seq === 0 &&
                 !in_array('\Seen', $m['flags'], true)) {
-                $first_unseen_seq = $idx + 1;
+                $first_unseen_seq = $index + 1;
                 $unseen_uid = $m['uid'];
             }
         }
@@ -3752,26 +3851,22 @@ class MailSite
         $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
         if ($name === false || $name === '') {
-            $this->queueWrite($key,
-                "$tag BAD CREATE syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "CREATE syntax");
             return;
         }
         $user = $context['AUTH_USER'];
         if ($this->mail_storage->folderExists($user, $name)) {
-            $this->queueWrite($key,
-                "$tag NO Mailbox already exists\r\n");
+            $this->imapResp($key, $tag, "NO", "Mailbox already exists");
             return;
         }
         try {
             $ok = $this->mail_storage->createFolder($user, $name);
         } catch (\InvalidArgumentException $e) {
-            $this->queueWrite($key,
-                "$tag NO Invalid mailbox name\r\n");
+            $this->imapResp($key, $tag, "NO", "Invalid mailbox name");
             return;
         }
         if (!$ok) {
-            $this->queueWrite($key,
-                "$tag NO CREATE failed\r\n");
+            $this->imapResp($key, $tag, "NO", "CREATE failed");
             return;
         }
         /*
@@ -3783,7 +3878,7 @@ class MailSite
             extra round-trip.
          */
         $this->mail_storage->subscribe($user, $name);
-        $this->queueWrite($key, "$tag OK CREATE completed\r\n");
+        $this->imapOk($key, $tag, "CREATE");
     }
     /**
      * Handles DELETE <mailbox>. The storage layer refuses to
@@ -3795,14 +3890,12 @@ class MailSite
         $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
         if ($name === false || $name === '') {
-            $this->queueWrite($key,
-                "$tag BAD DELETE syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "DELETE syntax");
             return;
         }
         $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $name)) {
-            $this->queueWrite($key,
-                "$tag NO Mailbox does not exist\r\n");
+            $this->imapResp($key, $tag, "NO", "Mailbox does not exist");
             return;
         }
         if (!$this->mail_storage->deleteFolder($user, $name)) {
@@ -3827,7 +3920,7 @@ class MailSite
             $context['SELECTED'] = null;
             $context['STATE'] = 'AUTH';
         }
-        $this->queueWrite($key, "$tag OK DELETE completed\r\n");
+        $this->imapOk($key, $tag, "DELETE");
     }
     /**
      * Handles RENAME <old> <new>. INBOX is not renameable. If
@@ -3841,20 +3934,17 @@ class MailSite
         $new = $this->tokenString($tokens, 1);
         if ($old === false || $new === false ||
             $old === '' || $new === '') {
-            $this->queueWrite($key,
-                "$tag BAD RENAME syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "RENAME syntax");
             return;
         }
         $user = $context['AUTH_USER'];
         if (!$this->mail_storage->folderExists($user, $old)) {
-            $this->queueWrite($key,
-                "$tag NO Source mailbox does not exist\r\n");
+            $this->imapResp($key, $tag, "NO", "Source mailbox does not exist");
             return;
         }
         if (!$this->mail_storage->renameFolder($user, $old,
             $new)) {
-            $this->queueWrite($key,
-                "$tag NO RENAME failed\r\n");
+            $this->imapResp($key, $tag, "NO", "RENAME failed");
             return;
         }
         /*
@@ -3869,7 +3959,7 @@ class MailSite
             $context['SELECTED'] === $old) {
             $context['SELECTED'] = $new;
         }
-        $this->queueWrite($key, "$tag OK RENAME completed\r\n");
+        $this->imapOk($key, $tag, "RENAME");
     }
     /**
      * Handles SELECT and EXAMINE: open a mailbox for message-
@@ -3887,8 +3977,7 @@ class MailSite
         $tokens = $this->parseImapTokens($arguments);
         $folder = $this->tokenString($tokens, 0);
         if ($folder === false) {
-            $this->queueWrite($key,
-                "$tag BAD $verb syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "$verb syntax");
             return;
         }
         if ($folder === '') {
@@ -3903,8 +3992,7 @@ class MailSite
                 operation. The client typically follows up
                 with a real SELECT INBOX immediately after.
              */
-            $this->queueWrite($key,
-                "$tag NO Empty mailbox name\r\n");
+            $this->imapResp($key, $tag, "NO", "Empty mailbox name");
             return;
         }
         $user = $context['AUTH_USER'];
@@ -3914,8 +4002,7 @@ class MailSite
                 For any other unknown folder, return NO without
                 changing selection state.
              */
-            $this->queueWrite($key,
-                "$tag NO Mailbox does not exist\r\n");
+            $this->imapResp($key, $tag, "NO", "Mailbox does not exist");
             return;
         }
         $stat = $this->imapFolderStats($user, $folder);
@@ -3957,14 +4044,13 @@ class MailSite
     protected function imapCmdClose($key, $tag, &$context)
     {
         if ($context['STATE'] !== 'SELECTED') {
-            $this->queueWrite($key,
-                "$tag BAD CLOSE without SELECT\r\n");
+            $this->imapResp($key, $tag, "BAD", "CLOSE without SELECT");
             return;
         }
         $context['SELECTED'] = null;
         $context['SELECTED_READONLY'] = false;
         $context['STATE'] = 'AUTH';
-        $this->queueWrite($key, "$tag OK CLOSE completed\r\n");
+        $this->imapOk($key, $tag, "CLOSE");
     }
     /**
      * Handles UID-prefixed variants of FETCH, STORE, COPY,
@@ -3982,15 +4068,14 @@ class MailSite
     protected function imapCmdUid($key, $tag, $arguments, &$context)
     {
         if ($context['STATE'] !== 'SELECTED') {
-            $this->queueWrite($key,
-                "$tag NO No mailbox selected\r\n");
+            $this->imapResp($key, $tag, "NO", "No mailbox selected");
             return;
         }
-        $sp = strpos($arguments, ' ');
-        $sub_verb = ($sp === false) ? $arguments :
-            substr($arguments, 0, $sp);
-        $sub_args = ($sp === false) ? "" :
-            substr($arguments, $sp + 1);
+        $space_position = strpos($arguments, ' ');
+        $sub_verb = ($space_position === false) ? $arguments :
+            substr($arguments, 0, $space_position);
+        $sub_args = ($space_position === false) ? "" :
+            substr($arguments, $space_position + 1);
         $V = strtoupper($sub_verb);
         if ($V === 'FETCH') {
             $this->imapCmdFetch($key, $tag, $sub_args, $context, true);
@@ -4012,8 +4097,7 @@ class MailSite
             $this->imapCmdSearch($key, $tag, $sub_args, $context, true);
             return;
         }
-        $this->queueWrite($key,
-            "$tag BAD UID $V not supported\r\n");
+        $this->imapResp($key, $tag, "BAD", "UID $V not supported");
     }
     /**
      * Parses an IMAP message-set string ("1", "1:5", "1:*",
@@ -4042,19 +4126,19 @@ class MailSite
                 $ranges[] = [trim($parts[0]), trim($parts[1])];
             }
         }
-        return function ($seq, $last_seq, $uid, $last_uid)
+        return function ($sequence_number, $last_seq, $uid, $last_uid)
             use ($ranges, $by_uid) {
-            $val = $by_uid ? $uid : $seq;
+            $value = $by_uid ? $uid : $sequence_number;
             $last = $by_uid ? $last_uid : $last_seq;
             foreach ($ranges as $r) {
-                $lo = ($r[0] === '*') ? $last : (int) $r[0];
-                $hi = ($r[1] === '*') ? $last : (int) $r[1];
-                if ($lo > $hi) {
-                    $temp_path = $lo;
-                    $lo = $hi;
-                    $hi = $temp_path;
+                $low = ($r[0] === '*') ? $last : (int) $r[0];
+                $high = ($r[1] === '*') ? $last : (int) $r[1];
+                if ($low > $high) {
+                    $temp_path = $low;
+                    $low = $high;
+                    $high = $temp_path;
                 }
-                if ($val >= $lo && $val <= $hi) {
+                if ($value >= $low && $value <= $high) {
                     return true;
                 }
             }
@@ -4079,15 +4163,15 @@ class MailSite
         $last_seq = count($messages);
         $last_uid = end($messages)['uid'];
         $matcher = $this->imapParseMessageSet($set, $by_uid);
-        $out = [];
-        foreach ($messages as $idx => $meta) {
-            $seq = $idx + 1;
-            if ($matcher($seq, $last_seq, $meta['uid'],
+        $output = [];
+        foreach ($messages as $index => $meta) {
+            $sequence_number = $index + 1;
+            if ($matcher($sequence_number, $last_seq, $meta['uid'],
                 $last_uid)) {
-                $out[] = [$seq, $meta];
+                $output[] = [$sequence_number, $meta];
             }
         }
-        return $out;
+        return $output;
     }
     /**
      * Handles APPEND <mailbox> [(<flags>)] [<date-time>]
@@ -4105,38 +4189,38 @@ class MailSite
         $tokens = $this->parseImapTokens($arguments);
         $folder = $this->tokenString($tokens, 0);
         if ($folder === false || $folder === '') {
-            $this->queueWrite($key,
-                "$tag BAD APPEND syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "APPEND syntax");
             return;
         }
         $flags = [];
         $internal_date = 0;
         $literal_idx = -1;
         for ($i = 1; $i < count($tokens); $i++) {
-            $t = $tokens[$i];
-            if ($t[0] === 'literal') {
+            $token = $tokens[$i];
+            if ($token[0] === 'literal') {
                 $literal_idx = $i;
                 break;
             }
-            if ($t[0] === 'list') {
+            if ($token[0] === 'list') {
                 /*
                     Parenthesized flag list, e.g. "(\Seen \Draft)".
                  */
-                foreach (preg_split('/\s+/', trim($t[1])) as $f) {
-                    if ($f !== '') {
-                        $flags[] = $f;
+                foreach (preg_split('/\s+/', trim($token[1]))
+                    as $flag) {
+                    if ($flag !== '') {
+                        $flags[] = $flag;
                     }
                 }
                 continue;
             }
-            if ($t[0] === 'quoted' || $t[0] === 'atom') {
+            if ($token[0] === 'quoted' || $token[0] === 'atom') {
                 /*
                     Date-time argument, e.g.
                     "07-Feb-1994 21:52:25 -0800". We accept and
                     parse with strtotime; if parsing fails the
                     server falls back to "now" at delivery time.
                  */
-                $maybe = strtotime($t[1]);
+                $maybe = strtotime($token[1]);
                 if ($maybe !== false) {
                     $internal_date = $maybe;
                 }
@@ -4144,11 +4228,23 @@ class MailSite
             }
         }
         if ($literal_idx === -1) {
-            $this->queueWrite($key,
-                "$tag BAD APPEND requires a literal body\r\n");
+            $this->imapResp($key, $tag, "BAD",
+                "APPEND requires a literal body");
             return;
         }
-        $count = $tokens[$literal_idx][1];
+        $count = (int) $tokens[$literal_idx][1];
+        $max = $this->default_server_globals['MAX_MESSAGE_LEN'];
+        if ($count < 0 || $count > $max) {
+            /*
+                Reject impossible or oversized literal counts
+                outright. Without this the server would happily
+                allocate buffer space for a 10-petabyte APPEND
+                announcement, which is a trivial DoS.
+             */
+            $this->imapResp($key, $tag, "NO",
+                "[TOOBIG] APPEND size exceeds limit");
+            return;
+        }
         $context['IMAP_LIT_PENDING'] = [
             'continuation' => 'append',
             'tag' => $tag,
@@ -4169,7 +4265,7 @@ class MailSite
      * BODY.PEEK[HEADER.FIELDS (Date Subject)])". We parse it
      * by walking and recognizing each top-level item.
      */
-    protected function imapEmitFetch($key, $seq, $meta, $body,
+    protected function imapEmitFetch($key, $sequence_number, $meta, $body,
         $items_str, $is_uid_variant, &$mark_seen)
     {
         $items = $this->imapParseFetchItems($items_str);
@@ -4179,8 +4275,8 @@ class MailSite
          */
         if ($is_uid_variant) {
             $has_uid = false;
-            foreach ($items as $it) {
-                if (strtoupper($it['kind']) === 'UID') {
+            foreach ($items as $item) {
+                if (strtoupper($item['kind']) === 'UID') {
                     $has_uid = true;
                     break;
                 }
@@ -4191,15 +4287,15 @@ class MailSite
             }
         }
         $parts = [];
-        foreach ($items as $it) {
-            $rendered = $this->imapRenderFetchItem($it, $meta,
+        foreach ($items as $item) {
+            $rendered = $this->imapRenderFetchItem($item, $meta,
                 $body, $mark_seen);
             if ($rendered !== null) {
                 $parts[] = $rendered;
             }
         }
         $this->queueWrite($key,
-            "* $seq FETCH (" . implode(' ', $parts) . ")\r\n");
+            "* $sequence_number FETCH (" . implode(' ', $parts) . ")\r\n");
     }
     /**
      * Parses the items list of a FETCH command. Accepts both
@@ -4233,7 +4329,7 @@ class MailSite
             $items_str = 'FLAGS INTERNALDATE RFC822.SIZE ' .
                 'ENVELOPE BODY';
         }
-        $out = [];
+        $output = [];
         $i = 0;
         $n = strlen($items_str);
         while ($i < $n) {
@@ -4252,21 +4348,21 @@ class MailSite
             $depth_b = 0;
             $depth_p = 0;
             while ($i < $n) {
-                $ch = $items_str[$i];
-                if ($ch === '[') $depth_b++;
-                else if ($ch === ']') $depth_b--;
-                else if ($ch === '(') $depth_p++;
-                else if ($ch === ')') $depth_p--;
-                else if (($ch === ' ' || $ch === "\t") &&
+                $character = $items_str[$i];
+                if ($character === '[') $depth_b++;
+                else if ($character === ']') $depth_b--;
+                else if ($character === '(') $depth_p++;
+                else if ($character === ')') $depth_p--;
+                else if (($character === ' ' || $character === "\t") &&
                     $depth_b === 0 && $depth_p === 0) {
                     break;
                 }
                 $i++;
             }
             $token = substr($items_str, $start, $i - $start);
-            $out[] = $this->imapAnalyzeFetchItem($token);
+            $output[] = $this->imapAnalyzeFetchItem($token);
         }
-        return $out;
+        return $output;
     }
     /**
      * Decomposes one FETCH item token like "BODY.PEEK[HEADER.
@@ -4277,26 +4373,27 @@ class MailSite
      */
     protected function imapAnalyzeFetchItem($token)
     {
-        $rec = ['kind' => null, 'peek' => false,
+        $record = ['kind' => null, 'peek' => false,
             'section' => null, 'fields' => [],
             'partial' => null, 'raw' => $token];
-        $b = strpos($token, '[');
-        if ($b === false) {
-            $rec['kind'] = strtoupper($token);
-            return $rec;
+        $bracket_position = strpos($token, '[');
+        if ($bracket_position === false) {
+            $record['kind'] = strtoupper($token);
+            return $record;
         }
-        $name = substr($token, 0, $b);
+        $name = substr($token, 0, $bracket_position);
         if (substr_compare(strtoupper($name), '.PEEK',
             -5) === 0) {
-            $rec['peek'] = true;
+            $record['peek'] = true;
             $name = substr($name, 0, -5);
         }
-        $rec['kind'] = strtoupper($name);
+        $record['kind'] = strtoupper($name);
         $end = strrpos($token, ']');
         if ($end === false) {
-            return $rec;
+            return $record;
         }
-        $section_full = substr($token, $b + 1, $end - $b - 1);
+        $section_full = substr($token, $bracket_position + 1,
+            $end - $bracket_position - 1);
         /*
             Section may be empty (whole body), HEADER, TEXT,
             HEADER.FIELDS (Subject From), HEADER.FIELDS.NOT
@@ -4306,33 +4403,34 @@ class MailSite
             to whole-message body.
          */
         if ($section_full === '') {
-            $rec['section'] = '';
-            return $rec;
+            $record['section'] = '';
+            return $record;
         }
         $paren = strpos($section_full, '(');
         if ($paren === false) {
-            $rec['section'] = strtoupper(trim($section_full));
-            return $rec;
+            $record['section'] = strtoupper(trim($section_full));
+            return $record;
         }
-        $rec['section'] = strtoupper(trim(substr($section_full,
+        $record['section'] = strtoupper(trim(substr($section_full,
             0, $paren)));
         $field_str = substr($section_full, $paren + 1, -1);
-        foreach (preg_split('/\s+/', trim($field_str)) as $f) {
-            if ($f !== '') {
-                $rec['fields'][] = $f;
+        foreach (preg_split('/\s+/', trim($field_str))
+            as $field_name) {
+            if ($field_name !== '') {
+                $record['fields'][] = $field_name;
             }
         }
-        return $rec;
+        return $record;
     }
     /**
      * Renders one FETCH item to its IMAP-formatted form. The
      * mark_seen flag is set true when a non-PEEK BODY[*] is
      * served and we should set the \Seen flag after responding.
      */
-    protected function imapRenderFetchItem($it, $meta, $body,
+    protected function imapRenderFetchItem($item, $meta, $body,
         &$mark_seen)
     {
-        $kind = $it['kind'];
+        $kind = $item['kind'];
         if ($kind === 'UID') {
             return "UID " . $meta['uid'];
         }
@@ -4349,7 +4447,7 @@ class MailSite
         }
         if ($kind === 'RFC822') {
             return "RFC822 " . $this->imapLiteralOf($body) .
-                ($it ? '' : '');
+                ($item ? '' : '');
         }
         if ($kind === 'RFC822.HEADER') {
             $header_value = $this->imapHeaderBlock($body);
@@ -4358,7 +4456,7 @@ class MailSite
         }
         if ($kind === 'RFC822.TEXT') {
             $text = $this->imapBodyText($body);
-            if (!$it['peek']) {
+            if (!$item['peek']) {
                 $mark_seen = true;
             }
             return "RFC822.TEXT " .
@@ -4368,16 +4466,16 @@ class MailSite
             return "ENVELOPE " . $this->imapEnvelope($body);
         }
         if ($kind === 'BODYSTRUCTURE' || $kind === 'BODY') {
-            if ($kind === 'BODY' && $it['section'] !== null) {
+            if ($kind === 'BODY' && $item['section'] !== null) {
                 $payload = $this->imapBodySection($body,
-                    $it['section'], $it['fields']);
-                if (!$it['peek']) {
+                    $item['section'], $item['fields']);
+                if (!$item['peek']) {
                     $mark_seen = true;
                 }
-                $section_repr = $it['section'];
-                if (!empty($it['fields'])) {
+                $section_repr = $item['section'];
+                if (!empty($item['fields'])) {
                     $section_repr .= ' (' .
-                        implode(' ', $it['fields']) . ')';
+                        implode(' ', $item['fields']) . ')';
                 }
                 return "BODY[$section_repr] " .
                     $this->imapLiteralOf($payload);
@@ -4405,12 +4503,12 @@ class MailSite
      */
     protected function imapHeaderBlock($body)
     {
-        $sep = "\r\n\r\n";
-        $end = strpos($body, $sep);
+        $separator = "\r\n\r\n";
+        $end = strpos($body, $separator);
         if ($end === false) {
-            $alt = strpos($body, "\n\n");
-            return ($alt === false) ? $body :
-                substr($body, 0, $alt + 2);
+            $alternative = strpos($body, "\n\n");
+            return ($alternative === false) ? $body :
+                substr($body, 0, $alternative + 2);
         }
         return substr($body, 0, $end + 4);
     }
@@ -4421,12 +4519,12 @@ class MailSite
      */
     protected function imapBodyText($body)
     {
-        $sep = "\r\n\r\n";
-        $end = strpos($body, $sep);
+        $separator = "\r\n\r\n";
+        $end = strpos($body, $separator);
         if ($end === false) {
-            $alt = strpos($body, "\n\n");
-            return ($alt === false) ? '' :
-                substr($body, $alt + 2);
+            $alternative = strpos($body, "\n\n");
+            return ($alternative === false) ? '' :
+                substr($body, $alternative + 2);
         }
         return substr($body, $end + 4);
     }
@@ -4526,8 +4624,8 @@ class MailSite
         $current = $entity;
         $first = true;
         foreach ($path as $idx_str) {
-            $idx = (int) $idx_str;
-            if ($idx < 1) {
+            $index = (int) $idx_str;
+            if ($index < 1) {
                 return null;
             }
             if ($first && $current['type'] !== 'multipart') {
@@ -4536,7 +4634,7 @@ class MailSite
                     the only part, which IS the entity itself.
                     Anything past 1.X is out of range.
                  */
-                if ($idx !== 1) {
+                if ($index !== 1) {
                     return null;
                 }
                 $first = false;
@@ -4544,10 +4642,10 @@ class MailSite
             }
             $first = false;
             if (empty($current['parts']) ||
-                !isset($current['parts'][$idx - 1])) {
+                !isset($current['parts'][$index - 1])) {
                 return null;
             }
-            $current = $current['parts'][$idx - 1];
+            $current = $current['parts'][$index - 1];
         }
         return $current;
     }
@@ -4562,11 +4660,11 @@ class MailSite
         $invert)
     {
         $wanted = [];
-        foreach ($fields as $f) {
-            $wanted[strtolower($f)] = true;
+        foreach ($fields as $field_name) {
+            $wanted[strtolower($field_name)] = true;
         }
         $lines = preg_split('/\r\n|\n/', $hdr_block);
-        $out = [];
+        $output = [];
         $current_kept = null;
         foreach ($lines as $line) {
             if ($line === '') {
@@ -4574,7 +4672,7 @@ class MailSite
             }
             if ($line[0] === ' ' || $line[0] === "\t") {
                 if ($current_kept) {
-                    $out[] = $line;
+                    $output[] = $line;
                 }
                 continue;
             }
@@ -4587,10 +4685,10 @@ class MailSite
             $match = isset($wanted[$name]);
             $current_kept = $invert ? !$match : $match;
             if ($current_kept) {
-                $out[] = $line;
+                $output[] = $line;
             }
         }
-        return implode("\r\n", $out) . "\r\n\r\n";
+        return implode("\r\n", $output) . "\r\n\r\n";
     }
     /**
      * Returns the IMAP ENVELOPE structure for a message as a
@@ -4636,15 +4734,15 @@ class MailSite
         $block = ($sep_pos === false) ? $message :
             substr($message, 0, $sep_pos);
         $lines = preg_split('/\r\n|\n/', $block);
-        $out = [];
+        $output = [];
         $current = null;
         foreach ($lines as $line) {
             if ($line === '') {
                 continue;
             }
             if ($line[0] === ' ' || $line[0] === "\t") {
-                if ($current !== null && isset($out[$current])) {
-                    $out[$current] .= ' ' . trim($line);
+                if ($current !== null && isset($output[$current])) {
+                    $output[$current] .= ' ' . trim($line);
                 }
                 continue;
             }
@@ -4654,15 +4752,15 @@ class MailSite
                 continue;
             }
             $name = strtolower(trim(substr($line, 0, $colon)));
-            $val = ltrim(substr($line, $colon + 1));
-            if (isset($out[$name])) {
-                $out[$name] .= ', ' . $val;
+            $value = ltrim(substr($line, $colon + 1));
+            if (isset($output[$name])) {
+                $output[$name] .= ', ' . $value;
             } else {
-                $out[$name] = $val;
+                $output[$name] = $value;
             }
             $current = $name;
         }
-        return $out;
+        return $output;
     }
     /**
      * Decodes RFC 2047 encoded-words in a header value back
@@ -4726,13 +4824,13 @@ class MailSite
      * if the value is null/empty. Used for ENVELOPE date,
      * subject, in-reply-to, and message-id slots.
      */
-    protected function imapEnvelopeNString($v)
+    protected function imapEnvelopeNString($value)
     {
-        if ($v === null || $v === '') {
+        if ($value === null || $value === '') {
             return 'NIL';
         }
         $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'],
-            $v);
+            $value);
         return '"' . $escaped . '"';
     }
     /**
@@ -4744,12 +4842,12 @@ class MailSite
      * @ to derive mailbox/host. Display names are extracted
      * from the "Name <email>" form when present.
      */
-    protected function imapEnvelopeAddrs($v)
+    protected function imapEnvelopeAddrs($value)
     {
-        if ($v === null || $v === '') {
+        if ($value === null || $value === '') {
             return 'NIL';
         }
-        $addrs = $this->imapSplitAddressList($v);
+        $addrs = $this->imapSplitAddressList($value);
         if (empty($addrs)) {
             return 'NIL';
         }
@@ -4772,7 +4870,7 @@ class MailSite
      */
     protected function imapSplitAddressList($s)
     {
-        $out = [];
+        $output = [];
         $tokens = [];
         $current = '';
         $in_q = false;
@@ -4805,14 +4903,15 @@ class MailSite
         if (trim($current) !== '') {
             $tokens[] = trim($current);
         }
-        foreach ($tokens as $t) {
-            if ($t === '') {
+        foreach ($tokens as $address_token) {
+            if ($address_token === '') {
                 continue;
             }
             $name = '';
-            $addr = $t;
+            $addr = $address_token;
             if (preg_match(
-                '/^(.*?)\s*<\s*([^<>]+?)\s*>\s*$/', $t, $m)) {
+                '/^(.*?)\s*<\s*([^<>]+?)\s*>\s*$/',
+                $address_token, $m)) {
                 $name = trim($m[1], " \t\"");
                 $addr = $m[2];
             }
@@ -4824,10 +4923,10 @@ class MailSite
                 $local = substr($addr, 0, $at);
                 $host = substr($addr, $at + 1);
             }
-            $out[] = ['name' => $name, 'local' => $local,
+            $output[] = ['name' => $name, 'local' => $local,
                 'host' => $host];
         }
-        return $out;
+        return $output;
     }
     /**
      * Returns an IMAP BODYSTRUCTURE (or BODY) representation
@@ -4875,26 +4974,27 @@ class MailSite
     {
         $sep_pos = strpos($bytes, "\r\n\r\n");
         if ($sep_pos === false) {
-            $alt = strpos($bytes, "\n\n");
-            if ($alt === false) {
+            $alternative = strpos($bytes, "\n\n");
+            if ($alternative === false) {
                 $header_block = $bytes;
                 $body = '';
             } else {
-                $header_block = substr($bytes, 0, $alt + 2);
-                $body = substr($bytes, $alt + 2);
+                $header_block = substr($bytes, 0, $alternative + 2);
+                $body = substr($bytes, $alternative + 2);
             }
         } else {
             $header_block = substr($bytes, 0, $sep_pos + 4);
             $body = substr($bytes, $sep_pos + 4);
         }
         $headers = $this->imapParseHeaders($header_block);
-        $ct = isset($headers['content-type']) ?
+        $content_type = isset($headers['content-type']) ?
             $headers['content-type'] : 'text/plain';
-        $ct_parts = preg_split('/\s*;\s*/', $ct);
+        $content_type_parts = preg_split('/\s*;\s*/',
+            $content_type);
         $type = 'text';
         $subtype = 'plain';
-        if (!empty($ct_parts[0])) {
-            $mime = strtolower(trim($ct_parts[0]));
+        if (!empty($content_type_parts[0])) {
+            $mime = strtolower(trim($content_type_parts[0]));
             $slash = strpos($mime, '/');
             if ($slash !== false) {
                 $type = substr($mime, 0, $slash);
@@ -4902,9 +5002,9 @@ class MailSite
             }
         }
         $params = [];
-        for ($i = 1; $i < count($ct_parts); $i++) {
+        for ($i = 1; $i < count($content_type_parts); $i++) {
             if (preg_match('/^([^=]+)=(.*)$/',
-                trim($ct_parts[$i]), $m)) {
+                trim($content_type_parts[$i]), $m)) {
                 $params[strtolower(trim($m[1]))] =
                     trim($m[2], " \t\"");
             }
@@ -5030,16 +5130,16 @@ class MailSite
                 $part_strs[] =
                     $this->imapRenderBodyStructure($p, $extended);
             }
-            $out = '(' . implode('', $part_strs) . ' "' .
+            $output = '(' . implode('', $part_strs) . ' "' .
                 strtoupper($entity['subtype']) . '"';
             if ($extended) {
-                $out .= ' ' .
+                $output .= ' ' .
                     $this->imapRenderParams($entity['params']);
                 /* disposition language location: NIL placeholders */
-                $out .= ' NIL NIL NIL';
+                $output .= ' NIL NIL NIL';
             }
-            $out .= ')';
-            return $out;
+            $output .= ')';
+            return $output;
         }
         $type_repr = '"' . strtoupper($entity['type']) . '"';
         $subtype_repr = '"' .
@@ -5079,9 +5179,9 @@ class MailSite
             return 'NIL';
         }
         $pairs = [];
-        foreach ($params as $k => $v) {
-            $pairs[] = '"' . strtoupper($k) . '" "' .
-                addslashes($v) . '"';
+        foreach ($params as $param_name => $param_value) {
+            $pairs[] = '"' . strtoupper($param_name) . '" "' .
+                addslashes($param_value) . '"';
         }
         return '(' . implode(' ', $pairs) . ')';
     }
@@ -5097,28 +5197,27 @@ class MailSite
     protected function imapCmdFetch($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $sp = strpos($arguments, ' ');
-        if ($sp === false) {
-            $this->queueWrite($key,
-                "$tag BAD FETCH syntax\r\n");
+        $space_position = strpos($arguments, ' ');
+        if ($space_position === false) {
+            $this->imapResp($key, $tag, "BAD", "FETCH syntax");
             return;
         }
-        $set = substr($arguments, 0, $sp);
-        $items_str = substr($arguments, $sp + 1);
+        $set = substr($arguments, 0, $space_position);
+        $items_str = substr($arguments, $space_position + 1);
         $user = $context['AUTH_USER'];
         $folder = $context['SELECTED'];
         $matched = $this->imapMatchSet($user, $folder, $set,
             $by_uid);
         $verb = $by_uid ? 'UID FETCH' : 'FETCH';
         foreach ($matched as $entry) {
-            list($seq, $meta) = $entry;
+            list($sequence_number, $meta) = $entry;
             $body = $this->mail_storage->fetchMessage($user,
                 $folder, $meta['uid']);
             if ($body === false) {
                 continue;
             }
             $mark_seen = false;
-            $this->imapEmitFetch($key, $seq, $meta, $body,
+            $this->imapEmitFetch($key, $sequence_number, $meta, $body,
                 $items_str, $by_uid, $mark_seen);
             if ($mark_seen &&
                 empty($context['SELECTED_READONLY']) &&
@@ -5146,45 +5245,44 @@ class MailSite
         if (!preg_match(
             '/^(\S+)\s+([+-]?FLAGS(?:\.SILENT)?)\s+(.+)$/i',
             $arguments, $m)) {
-            $this->queueWrite($key,
-                "$tag BAD STORE syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "STORE syntax");
             return;
         }
         $set = $m[1];
-        $op = strtoupper($m[2]);
+        $operator = strtoupper($m[2]);
         $flags_str = trim($m[3]);
         if ($flags_str !== '' && $flags_str[0] === '(' &&
             substr($flags_str, -1) === ')') {
             $flags_str = substr($flags_str, 1, -1);
         }
         $req_flags = [];
-        foreach (preg_split('/\s+/', trim($flags_str)) as $f) {
-            if ($f !== '') {
-                $req_flags[] = $f;
+        foreach (preg_split('/\s+/', trim($flags_str))
+            as $flag) {
+            if ($flag !== '') {
+                $req_flags[] = $flag;
             }
         }
-        $silent = (substr($op, -7) === '.SILENT');
-        $mode = $silent ? substr($op, 0, -7) : $op;
+        $silent = (substr($operator, -7) === '.SILENT');
+        $mode = $silent ? substr($operator, 0, -7) : $operator;
         $user = $context['AUTH_USER'];
         $folder = $context['SELECTED'];
         $matched = $this->imapMatchSet($user, $folder, $set,
             $by_uid);
         $verb = $by_uid ? 'UID STORE' : 'STORE';
         if (!empty($context['SELECTED_READONLY'])) {
-            $this->queueWrite($key,
-                "$tag NO Mailbox is read-only\r\n");
+            $this->imapResp($key, $tag, "NO", "Mailbox is read-only");
             return;
         }
         foreach ($matched as $entry) {
-            list($seq, $meta) = $entry;
+            list($sequence_number, $meta) = $entry;
             $existing = $meta['flags'];
             $new = $existing;
             if ($mode === 'FLAGS') {
                 $new = $req_flags;
             } else if ($mode === '+FLAGS') {
-                foreach ($req_flags as $f) {
-                    if (!in_array($f, $new, true)) {
-                        $new[] = $f;
+                foreach ($req_flags as $flag) {
+                    if (!in_array($flag, $new, true)) {
+                        $new[] = $flag;
                     }
                 }
             } else if ($mode === '-FLAGS') {
@@ -5202,7 +5300,7 @@ class MailSite
                     $extras[] = "UID " . $meta['uid'];
                 }
                 $this->queueWrite($key,
-                    "* $seq FETCH (" .
+                    "* $sequence_number FETCH (" .
                     implode(' ', $extras) . ")\r\n");
             }
         }
@@ -5222,14 +5320,13 @@ class MailSite
     protected function imapCmdCopy($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $sp = strrpos(rtrim($arguments), ' ');
-        if ($sp === false) {
-            $this->queueWrite($key,
-                "$tag BAD COPY syntax\r\n");
+        $space_position = strrpos(rtrim($arguments), ' ');
+        if ($space_position === false) {
+            $this->imapResp($key, $tag, "BAD", "COPY syntax");
             return;
         }
-        $set = trim(substr($arguments, 0, $sp));
-        $folder_tok = trim(substr($arguments, $sp + 1));
+        $set = trim(substr($arguments, 0, $space_position));
+        $folder_tok = trim(substr($arguments, $space_position + 1));
         if ($folder_tok === '' || $folder_tok[0] === '"') {
             $tokens = $this->parseImapTokens($folder_tok);
             $target = $this->tokenString($tokens, 0);
@@ -5239,8 +5336,7 @@ class MailSite
         $user = $context['AUTH_USER'];
         $folder = $context['SELECTED'];
         if ($target === false || $target === '') {
-            $this->queueWrite($key,
-                "$tag BAD COPY syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "COPY syntax");
             return;
         }
         if (!$this->mail_storage->folderExists($user, $target)) {
@@ -5254,7 +5350,7 @@ class MailSite
         $verb = $by_uid ? 'UID COPY' : 'COPY';
         $copied = 0;
         foreach ($matched as $entry) {
-            list($seq, $meta) = $entry;
+            list($sequence_number, $meta) = $entry;
             $body = $this->mail_storage->fetchMessage($user,
                 $folder, $meta['uid']);
             if ($body === false) {
@@ -5281,14 +5377,13 @@ class MailSite
     protected function imapCmdMove($key, $tag, $arguments, &$context,
         $by_uid)
     {
-        $sp = strrpos(rtrim($arguments), ' ');
-        if ($sp === false) {
-            $this->queueWrite($key,
-                "$tag BAD MOVE syntax\r\n");
+        $space_position = strrpos(rtrim($arguments), ' ');
+        if ($space_position === false) {
+            $this->imapResp($key, $tag, "BAD", "MOVE syntax");
             return;
         }
-        $set = trim(substr($arguments, 0, $sp));
-        $folder_tok = trim(substr($arguments, $sp + 1));
+        $set = trim(substr($arguments, 0, $space_position));
+        $folder_tok = trim(substr($arguments, $space_position + 1));
         if ($folder_tok === '' || $folder_tok[0] === '"') {
             $tokens = $this->parseImapTokens($folder_tok);
             $target = $this->tokenString($tokens, 0);
@@ -5298,8 +5393,7 @@ class MailSite
         $user = $context['AUTH_USER'];
         $folder = $context['SELECTED'];
         if ($target === false || $target === '') {
-            $this->queueWrite($key,
-                "$tag BAD MOVE syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "MOVE syntax");
             return;
         }
         if (!$this->mail_storage->folderExists($user, $target)) {
@@ -5321,10 +5415,10 @@ class MailSite
          */
         $seqs_to_expunge = [];
         foreach ($matched as $entry) {
-            list($seq, $meta) = $entry;
+            list($sequence_number, $meta) = $entry;
             if ($this->mail_storage->moveMessage($user, $folder,
                 $target, $meta['uid'])) {
-                $seqs_to_expunge[] = $seq;
+                $seqs_to_expunge[] = $sequence_number;
             }
         }
         if (!empty($seqs_to_expunge)) {
@@ -5332,8 +5426,8 @@ class MailSite
             $this->bumpMailboxChange($user, $target);
         }
         rsort($seqs_to_expunge);
-        foreach ($seqs_to_expunge as $seq) {
-            $this->queueWrite($key, "* $seq EXPUNGE\r\n");
+        foreach ($seqs_to_expunge as $sequence_number) {
+            $this->queueWrite($key, "* $sequence_number EXPUNGE\r\n");
         }
         $this->queueWrite($key,
             "$tag OK $verb completed\r\n");
@@ -5350,8 +5444,7 @@ class MailSite
     protected function imapCmdExpunge($key, $tag, &$context)
     {
         if (!empty($context['SELECTED_READONLY'])) {
-            $this->queueWrite($key,
-                "$tag NO Mailbox is read-only\r\n");
+            $this->imapResp($key, $tag, "NO", "Mailbox is read-only");
             return;
         }
         $user = $context['AUTH_USER'];
@@ -5359,9 +5452,9 @@ class MailSite
         $messages = $this->mail_storage->listMessages($user,
             $folder);
         $seqs_removed = [];
-        foreach ($messages as $idx => $meta) {
+        foreach ($messages as $index => $meta) {
             if (in_array('\Deleted', $meta['flags'], true)) {
-                $seqs_removed[] = $idx + 1;
+                $seqs_removed[] = $index + 1;
             }
         }
         $this->mail_storage->expunge($user, $folder);
@@ -5369,11 +5462,10 @@ class MailSite
             $this->bumpMailboxChange($user, $folder);
         }
         rsort($seqs_removed);
-        foreach ($seqs_removed as $seq) {
-            $this->queueWrite($key, "* $seq EXPUNGE\r\n");
+        foreach ($seqs_removed as $sequence_number) {
+            $this->queueWrite($key, "* $sequence_number EXPUNGE\r\n");
         }
-        $this->queueWrite($key,
-            "$tag OK EXPUNGE completed\r\n");
+        $this->imapOk($key, $tag, "EXPUNGE");
     }
     /**
      * Implements SEARCH and UID SEARCH. Returns one untagged
@@ -5394,8 +5486,7 @@ class MailSite
     {
         $tokens = $this->imapTokenizeSearch($arguments);
         if ($tokens === null) {
-            $this->queueWrite($key,
-                "$tag BAD SEARCH syntax\r\n");
+            $this->imapResp($key, $tag, "BAD", "SEARCH syntax");
             return;
         }
         $user = $context['AUTH_USER'];
@@ -5406,11 +5497,11 @@ class MailSite
         $last_uid = empty($messages) ? 0 :
             end($messages)['uid'];
         $hits = [];
-        foreach ($messages as $idx => $meta) {
-            $seq = $idx + 1;
-            if ($this->imapEvalSearch($tokens, $meta, $seq,
+        foreach ($messages as $index => $meta) {
+            $sequence_number = $index + 1;
+            if ($this->imapEvalSearch($tokens, $meta, $sequence_number,
                 $last_seq, $last_uid, $user, $folder)) {
-                $hits[] = $by_uid ? $meta['uid'] : $seq;
+                $hits[] = $by_uid ? $meta['uid'] : $sequence_number;
             }
         }
         $verb = $by_uid ? 'UID SEARCH' : 'SEARCH';
@@ -5430,7 +5521,7 @@ class MailSite
      */
     protected function imapTokenizeSearch($s)
     {
-        $out = [];
+        $output = [];
         $i = 0;
         $n = strlen($s);
         while ($i < $n) {
@@ -5440,31 +5531,31 @@ class MailSite
                 continue;
             }
             if ($c === '(') {
-                $out[] = ['(', '('];
+                $output[] = ['(', '('];
                 $i++;
                 continue;
             }
             if ($c === ')') {
-                $out[] = [')', ')'];
+                $output[] = [')', ')'];
                 $i++;
                 continue;
             }
             if ($c === '"') {
                 $j = $i + 1;
-                $val = '';
+                $value = '';
                 while ($j < $n && $s[$j] !== '"') {
                     if ($s[$j] === '\\' && $j + 1 < $n) {
-                        $val .= $s[$j + 1];
+                        $value .= $s[$j + 1];
                         $j += 2;
                         continue;
                     }
-                    $val .= $s[$j];
+                    $value .= $s[$j];
                     $j++;
                 }
                 if ($j >= $n) {
                     return null;
                 }
-                $out[] = ['STR', $val];
+                $output[] = ['STR', $value];
                 $i = $j + 1;
                 continue;
             }
@@ -5475,10 +5566,10 @@ class MailSite
                 $j++;
             }
             $token = substr($s, $i, $j - $i);
-            $out[] = ['ATOM', $token];
+            $output[] = ['ATOM', $token];
             $i = $j;
         }
-        return $out;
+        return $output;
     }
     /**
      * Recursive evaluator for a SEARCH key list against one
@@ -5487,7 +5578,7 @@ class MailSite
      * arbitrary boolean trees. Side-loads the message body
      * lazily for keys that need it (BODY, TEXT, HEADER).
      */
-    protected function imapEvalSearch(&$tokens, $meta, $seq,
+    protected function imapEvalSearch(&$tokens, $meta, $sequence_number,
         $last_seq, $last_uid, $user, $folder)
     {
         $cursor = 0;
@@ -5504,12 +5595,12 @@ class MailSite
             return $body_cache;
         };
         $eval_one = function () use (&$cursor, &$tokens, $meta,
-            $seq, $last_seq, $last_uid, $get_body, &$eval_one) {
+            $sequence_number, $last_seq, $last_uid, $get_body, &$eval_one) {
             if ($cursor >= count($tokens)) {
                 return null;
             }
-            $t = $tokens[$cursor++];
-            if ($t[0] === '(') {
+            $token = $tokens[$cursor++];
+            if ($token[0] === '(') {
                 $r = true;
                 while ($cursor < count($tokens) &&
                     $tokens[$cursor][0] !== ')') {
@@ -5520,137 +5611,141 @@ class MailSite
                 }
                 return $r;
             }
-            $kw = strtoupper($t[1]);
-            if ($kw === 'ALL') return true;
-            if ($kw === 'NEW') {
-                return in_array('\Recent', $meta['flags'],
-                        true) &&
-                    !in_array('\Seen', $meta['flags'], true);
+            $keyword = strtoupper($token[1]);
+            /*
+                Flag-presence keywords map to a single
+                in_array check, optionally negated. Folding
+                them into a table cuts a 50-line repeated
+                pattern down to a single lookup so the
+                interpreter does the same work on a fraction
+                of the code.
+             */
+            static $flag_keywords = [
+                'NEW' => ['\Recent', true, '\Seen', false],
+                'OLD' => ['\Recent', false],
+                'RECENT' => ['\Recent', true],
+                'SEEN' => ['\Seen', true],
+                'UNSEEN' => ['\Seen', false],
+                'FLAGGED' => ['\Flagged', true],
+                'UNFLAGGED' => ['\Flagged', false],
+                'DELETED' => ['\Deleted', true],
+                'UNDELETED' => ['\Deleted', false],
+                'ANSWERED' => ['\Answered', true],
+                'UNANSWERED' => ['\Answered', false],
+                'DRAFT' => ['\Draft', true],
+                'UNDRAFT' => ['\Draft', false],
+            ];
+            if ($keyword === 'ALL') {
+                return true;
             }
-            if ($kw === 'OLD') {
-                return !in_array('\Recent', $meta['flags'],
+            if (isset($flag_keywords[$keyword])) {
+                $rule = $flag_keywords[$keyword];
+                $present = in_array($rule[0], $meta['flags'],
                     true);
+                if ($present !== $rule[1]) {
+                    return false;
+                }
+                if (isset($rule[2])) {
+                    $present = in_array($rule[2],
+                        $meta['flags'], true);
+                    if ($present !== $rule[3]) {
+                        return false;
+                    }
+                }
+                return true;
             }
-            if ($kw === 'RECENT') {
-                return in_array('\Recent', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'SEEN') {
-                return in_array('\Seen', $meta['flags'], true);
-            }
-            if ($kw === 'UNSEEN') {
-                return !in_array('\Seen', $meta['flags'], true);
-            }
-            if ($kw === 'FLAGGED') {
-                return in_array('\Flagged', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'UNFLAGGED') {
-                return !in_array('\Flagged', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'DELETED') {
-                return in_array('\Deleted', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'UNDELETED') {
-                return !in_array('\Deleted', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'ANSWERED') {
-                return in_array('\Answered', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'UNANSWERED') {
-                return !in_array('\Answered', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'DRAFT') {
-                return in_array('\Draft', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'UNDRAFT') {
-                return !in_array('\Draft', $meta['flags'],
-                    true);
-            }
-            if ($kw === 'NOT') {
+            if ($keyword === 'NOT') {
                 return !$eval_one();
             }
-            if ($kw === 'OR') {
+            if ($keyword === 'OR') {
                 $a = $eval_one();
                 $b = $eval_one();
                 return $a || $b;
             }
-            if ($kw === 'KEYWORD' || $kw === 'UNKEYWORD') {
-                $arg = $tokens[$cursor++][1] ?? '';
-                $has = in_array($arg, $meta['flags'], true);
-                return $kw === 'KEYWORD' ? $has : !$has;
+            if ($keyword === 'KEYWORD' ||
+                $keyword === 'UNKEYWORD') {
+                $argument = $tokens[$cursor++][1] ?? '';
+                $has = in_array($argument, $meta['flags'],
+                    true);
+                return $keyword === 'KEYWORD' ? $has : !$has;
             }
-            if ($kw === 'FROM' || $kw === 'TO' ||
-                $kw === 'CC' || $kw === 'BCC' ||
-                $kw === 'SUBJECT') {
-                $arg = $tokens[$cursor++][1] ?? '';
-                $header_map = $this->imapParseHeaders($get_body());
-                $hkey = strtolower($kw);
-                $val = $header_map[$hkey] ?? '';
+            if ($keyword === 'FROM' || $keyword === 'TO' ||
+                $keyword === 'CC' || $keyword === 'BCC' ||
+                $keyword === 'SUBJECT') {
+                $argument = $tokens[$cursor++][1] ?? '';
+                $header_map = $this->imapParseHeaders(
+                    $get_body());
+                $header_key = strtolower($keyword);
+                $value = $header_map[$header_key] ?? '';
                 /*
                     Decode RFC 2047 encoded-words before
                     matching so a search for "Café" finds
                     headers stored as "=?UTF-8?Q?Caf=C3=A9?=".
                  */
-                $val = $this->imapDecodeMimeHeader($val);
-                return stripos($val, $arg) !== false;
+                $value = $this->imapDecodeMimeHeader($value);
+                return stripos($value, $argument) !== false;
             }
-            if ($kw === 'HEADER') {
+            if ($keyword === 'HEADER') {
                 $name = $tokens[$cursor++][1] ?? '';
-                $arg = $tokens[$cursor++][1] ?? '';
-                $header_map = $this->imapParseHeaders($get_body());
-                $val = $header_map[strtolower($name)] ?? '';
-                $val = $this->imapDecodeMimeHeader($val);
-                return $arg === '' ? $val !== '' :
-                    stripos($val, $arg) !== false;
+                $argument = $tokens[$cursor++][1] ?? '';
+                $header_map = $this->imapParseHeaders(
+                    $get_body());
+                $value = $header_map[strtolower($name)] ?? '';
+                $value = $this->imapDecodeMimeHeader($value);
+                return $argument === '' ? $value !== '' :
+                    stripos($value, $argument) !== false;
             }
-            if ($kw === 'BODY' || $kw === 'TEXT') {
-                $arg = $tokens[$cursor++][1] ?? '';
-                $hay = ($kw === 'BODY') ?
+            if ($keyword === 'BODY' || $keyword === 'TEXT') {
+                $argument = $tokens[$cursor++][1] ?? '';
+                $haystack = ($keyword === 'BODY') ?
                     $this->imapBodyText($get_body()) :
                     $get_body();
-                return stripos($hay, $arg) !== false;
+                return stripos($haystack, $argument) !== false;
             }
-            if ($kw === 'SINCE' || $kw === 'BEFORE' ||
-                $kw === 'ON') {
-                $arg = $tokens[$cursor++][1] ?? '';
-                $when = strtotime($arg);
-                if ($when === false) return false;
-                $msg_day = strtotime(gmdate('Y-m-d',
-                    $meta['internal_date']));
-                $arg_day = strtotime(gmdate('Y-m-d', $when));
-                if ($kw === 'SINCE') return $msg_day >= $arg_day;
-                if ($kw === 'BEFORE') return $msg_day < $arg_day;
-                return $msg_day === $arg_day;
-            }
-            if ($kw === 'LARGER' || $kw === 'SMALLER') {
-                $arg = (int) ($tokens[$cursor++][1] ?? '0');
-                if ($kw === 'LARGER') {
-                    return $meta['size'] > $arg;
+            if ($keyword === 'SINCE' ||
+                $keyword === 'BEFORE' || $keyword === 'ON') {
+                $argument = $tokens[$cursor++][1] ?? '';
+                $when = strtotime($argument);
+                if ($when === false) {
+                    return false;
                 }
-                return $meta['size'] < $arg;
+                $message_day = strtotime(gmdate('Y-m-d',
+                    $meta['internal_date']));
+                $argument_day = strtotime(gmdate('Y-m-d',
+                    $when));
+                if ($keyword === 'SINCE') {
+                    return $message_day >= $argument_day;
+                }
+                if ($keyword === 'BEFORE') {
+                    return $message_day < $argument_day;
+                }
+                return $message_day === $argument_day;
             }
-            if ($kw === 'UID') {
-                $arg = $tokens[$cursor++][1] ?? '';
-                $matcher = $this->imapParseMessageSet($arg, true);
-                return $matcher($seq, $last_seq, $meta['uid'],
+            if ($keyword === 'LARGER' ||
+                $keyword === 'SMALLER') {
+                $argument = (int)
+                    ($tokens[$cursor++][1] ?? '0');
+                if ($keyword === 'LARGER') {
+                    return $meta['size'] > $argument;
+                }
+                return $meta['size'] < $argument;
+            }
+            if ($keyword === 'UID') {
+                $argument = $tokens[$cursor++][1] ?? '';
+                $matcher = $this->imapParseMessageSet(
+                    $argument, true);
+                return $matcher($sequence_number, $last_seq, $meta['uid'],
                     $last_uid);
             }
             /*
                 Bare numeric or set: treat as sequence-number
                 set per RFC 3501 sec 6.4.4.
              */
-            if (preg_match('/^[0-9*,:]+$/', $t[1])) {
-                $matcher = $this->imapParseMessageSet($t[1],
+            if (preg_match('/^[0-9*,:]+$/', $token[1])) {
+                $matcher = $this->imapParseMessageSet($token[1],
                     false);
-                return $matcher($seq, $last_seq, $meta['uid'],
-                    $last_uid);
+                return $matcher($sequence_number, $last_seq,
+                    $meta['uid'], $last_uid);
             }
             return true;
         };
@@ -5682,13 +5777,11 @@ class MailSite
      */
     protected function imapCmdIdle($key, $tag, &$context)
     {
+        $this->clearImapIdleState($context);
         $context['IMAP_LIT_PENDING'] = [
             'continuation' => 'idle',
             'tag' => $tag,
         ];
-        $context['IDLE_SNAPSHOT'] = null;
-        $context['IDLE_FOLDER'] = null;
-        $context['IDLE_STATE'] = null;
         if (!empty($context['SELECTED'])) {
             $user = $context['AUTH_USER'];
             $folder = $context['SELECTED'];
@@ -5742,13 +5835,11 @@ class MailSite
     protected function dispatchImapStarttls($key, $tag, &$context)
     {
         if (!$this->tls_available) {
-            $this->queueWrite($key,
-                "$tag NO STARTTLS not available\r\n");
+            $this->imapResp($key, $tag, "NO", "STARTTLS not available");
             return;
         }
         if (!empty($context['TLS_ACTIVE'])) {
-            $this->queueWrite($key,
-                "$tag BAD TLS already active\r\n");
+            $this->imapResp($key, $tag, "BAD", "TLS already active");
             return;
         }
         $context['PENDING_STARTTLS'] = true;
@@ -5884,11 +5975,11 @@ class MailSite
             $this->default_server_globals['CONNECTION_TIMEOUT'];
         $now = time();
         foreach ($this->in_streams[self::MODIFIED_TIME]
-            as $key => $t) {
+            as $key => $modified_time) {
             if (in_array($key, $this->immortal_stream_keys)) {
                 continue;
             }
-            if ($now - $t > $timeout) {
+            if ($now - $modified_time > $timeout) {
                 $this->shutdownStream($key);
             }
         }
@@ -5918,16 +6009,17 @@ class MailSite
             if (!isset($this->timers[$id])) {
                 continue;
             }
-            $t = $this->timers[$id];
+            $timer = $this->timers[$id];
             try {
-                call_user_func($t['callback']);
+                call_user_func($timer['callback']);
             } catch (\Throwable $e) {
                 /* keep loop alive */
             }
-            if (!empty($t['repeating']) &&
+            if (!empty($timer['repeating']) &&
                 isset($this->timers[$id])) {
-                $next = microtime(true) + $t['interval'];
-                $this->timer_alarms->insert([$id, $next], -$next);
+                $next = microtime(true) + $timer['interval'];
+                $this->timer_alarms->insert([$id, $next],
+                    -$next);
             } else {
                 unset($this->timers[$id]);
             }
@@ -6004,17 +6096,17 @@ class MailSite
             }
             $expunged_seqs = [];
             $new_seq_by_uid = [];
-            foreach ($fresh['uids'] as $idx => $uid) {
-                $new_seq_by_uid[$uid] = $idx + 1;
+            foreach ($fresh['uids'] as $index => $uid) {
+                $new_seq_by_uid[$uid] = $index + 1;
             }
-            foreach ($old_state['uids'] as $idx => $uid) {
+            foreach ($old_state['uids'] as $index => $uid) {
                 if (!in_array($uid, $fresh['uids'], true)) {
-                    $expunged_seqs[] = $idx + 1;
+                    $expunged_seqs[] = $index + 1;
                 }
             }
             rsort($expunged_seqs);
-            foreach ($expunged_seqs as $seq) {
-                $this->queueWrite($key, "* $seq EXPUNGE\r\n");
+            foreach ($expunged_seqs as $sequence_number) {
+                $this->queueWrite($key, "* $sequence_number EXPUNGE\r\n");
             }
             if ($fresh['count'] !== $old_state['count']) {
                 /*
@@ -6034,9 +6126,9 @@ class MailSite
                 if ($old_state['flags'][$uid] === $flag_str) {
                     continue;
                 }
-                $seq = $new_seq_by_uid[$uid];
+                $sequence_number = $new_seq_by_uid[$uid];
                 $this->queueWrite($key,
-                    "* $seq FETCH (FLAGS (" . $flag_str .
+                    "* $sequence_number FETCH (FLAGS (" . $flag_str .
                     ") UID $uid)\r\n");
             }
             $this->in_streams[self::CONTEXT][$key][

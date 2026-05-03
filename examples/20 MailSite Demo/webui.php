@@ -1856,7 +1856,7 @@ code { background: #eee; padding: 0.1em 0.3em; border-radius: 3px;
 </style>
 </head>
 <body>
-<h1>AttoMail Demo Harness</h1>
+<h1>AttoMail Demo</h1>
 <div class="meta">
 Companion UI to <code>index.php</code>. Each scenario opens a
 short connection to one of the listening ports (SMTP 2525,

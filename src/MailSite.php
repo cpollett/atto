@@ -1739,7 +1739,9 @@ class MailSite
      */
     protected function imapPreAuthCapabilities($tls_active)
     {
-        $parts = ['CAPABILITY', 'IMAP4rev1', 'IDLE'];
+        $parts = ['CAPABILITY', 'IMAP4rev1', 'IDLE',
+            'NAMESPACE', 'ID', 'SPECIAL-USE',
+            'CREATE-SPECIAL-USE', 'MOVE', 'UIDPLUS'];
         $allow_plain =
             !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
         if (!$tls_active && $this->tls_available) {
@@ -2502,6 +2504,10 @@ class MailSite
             $this->dispatchImapStarttls($key, $tag, $ctx);
             return;
         }
+        if ($V === 'ID') {
+            $this->imapCmdId($key, $tag, $args, $ctx);
+            return;
+        }
         /*
             Pre-authenticated commands (only allowed in INIT).
          */
@@ -2524,6 +2530,10 @@ class MailSite
             Most are allowed in either AUTH or SELECTED state;
             CLOSE requires SELECTED.
          */
+        if ($V === 'NAMESPACE') {
+            $this->imapCmdNamespace($key, $tag, $ctx);
+            return;
+        }
         if ($V === 'LIST') {
             $this->imapCmdList($key, $tag, $args, $ctx, false);
             return;
@@ -2634,6 +2644,40 @@ class MailSite
         $this->queueWrite($key, "* $caps\r\n");
         $this->queueWrite($key,
             "$tag OK CAPABILITY completed\r\n");
+    }
+    /**
+     * Handles ID (RFC 2971): a non-protocol-affecting exchange
+     * where the client sends a paren-list of name/value
+     * strings identifying itself, and the server replies with
+     * its own identification. We accept and discard the
+     * client's data (no use for it) and reply with the
+     * server's name and version. NIL is a valid argument
+     * meaning the client wishes to identify nothing; we
+     * accept that and still reply with our own identification.
+     */
+    protected function imapCmdId($key, $tag, $args, $ctx)
+    {
+        $name = $this->default_server_globals['SERVER_NAME'];
+        $sw = $this->default_server_globals['SERVER_SOFTWARE'];
+        $this->queueWrite($key,
+            "* ID (\"name\" \"$sw\" \"vendor\" \"$name\")\r\n");
+        $this->queueWrite($key,
+            "$tag OK ID completed\r\n");
+    }
+    /**
+     * Handles NAMESPACE (RFC 2342): tells the client about
+     * personal, other-users, and shared mailbox namespaces.
+     * We have a single personal namespace using "/" as the
+     * hierarchy delimiter, and no other-users / shared
+     * namespaces. The reply form is three nested paren-lists
+     * separated by spaces.
+     */
+    protected function imapCmdNamespace($key, $tag, $ctx)
+    {
+        $this->queueWrite($key,
+            "* NAMESPACE ((\"\" \"/\")) NIL NIL\r\n");
+        $this->queueWrite($key,
+            "$tag OK NAMESPACE completed\r\n");
     }
     /**
      * Handles "LOGIN <user> <pass>". Refuses if TLS is required
@@ -3004,6 +3048,12 @@ class MailSite
      *     delimiter and root, used by clients to discover the
      *     separator
      *   - "%" with empty reference: returns top-level folders
+     * RFC 5258 extends LIST with selection options preceding
+     * the reference, e.g. "LIST (SPECIAL-USE) "" "*"" to ask
+     * only for special-use folders. We accept these but do not
+     * filter on them; the response includes special-use
+     * attributes either way, which is the point of the
+     * SPECIAL-USE capability.
      * We implement the regex translation locally so we do not
      * need to push wildcard semantics down into MailStorage.
      */
@@ -3011,7 +3061,28 @@ class MailSite
         $is_lsub)
     {
         $verb = $is_lsub ? 'LSUB' : 'LIST';
-        $tokens = $this->parseImapTokens($args);
+        /*
+            Strip an optional leading selection-options list
+            (RFC 5258). We do not currently filter on these,
+            but accepting them is necessary so clients that
+            send "LIST (SPECIAL-USE) ..." do not get a syntax
+            error. We also strip an optional trailing RETURN
+            options list, e.g. "LIST "" "*" RETURN (SUBSCRIBED
+            CHILDREN SPECIAL-USE)".
+         */
+        $args_trimmed = ltrim($args);
+        if ($args_trimmed !== '' && $args_trimmed[0] === '(') {
+            $depth = 1;
+            $i = 1;
+            $n = strlen($args_trimmed);
+            while ($i < $n && $depth > 0) {
+                if ($args_trimmed[$i] === '(') $depth++;
+                else if ($args_trimmed[$i] === ')') $depth--;
+                $i++;
+            }
+            $args_trimmed = ltrim(substr($args_trimmed, $i));
+        }
+        $tokens = $this->parseImapTokens($args_trimmed);
         $ref = $this->tokenString($tokens, 0);
         $pat = $this->tokenString($tokens, 1);
         if ($ref === false || $pat === false) {
@@ -3045,12 +3116,82 @@ class MailSite
         $regex = $this->imapPatternToRegex($combined);
         foreach ($folders as $f) {
             if (preg_match($regex, $f)) {
+                $attrs = $this->imapFolderAttrs($f, $folders);
                 $name = $this->imapEncodeMailboxName($f);
                 $this->queueWrite($key,
-                    "* $verb () \"/\" $name\r\n");
+                    "* $verb ($attrs) \"/\" $name\r\n");
             }
         }
         $this->queueWrite($key, "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Returns the IMAP attribute string for a folder in a
+     * LIST / LSUB response. Combines two flag families:
+     *   1. Children attributes (RFC 3348): \HasChildren or
+     *      \HasNoChildren based on whether any other folder
+     *      starts with "<this>/". Modern clients use these
+     *      to render the folder tree.
+     *   2. Special-use attributes (RFC 6154): \Drafts, \Sent,
+     *      \Trash, \Junk, \Archive, \All for folders whose
+     *      name matches the convention. INBOX is excluded
+     *      since RFC 6154 reserves the special-use flags for
+     *      non-INBOX folders.
+     * The returned string is space-separated and may be empty.
+     */
+    protected function imapFolderAttrs($folder, $all_folders)
+    {
+        $attrs = [];
+        $prefix = $folder . '/';
+        $has_children = false;
+        foreach ($all_folders as $f) {
+            if ($f !== $folder &&
+                strpos($f, $prefix) === 0) {
+                $has_children = true;
+                break;
+            }
+        }
+        $attrs[] = $has_children ? '\HasChildren' :
+            '\HasNoChildren';
+        $special = $this->imapSpecialUseAttr($folder);
+        if ($special !== null) {
+            $attrs[] = $special;
+        }
+        return implode(' ', $attrs);
+    }
+    /**
+     * Returns the RFC 6154 special-use attribute for a
+     * folder, or null if it is not a special folder. The
+     * mapping is by conventional name and is case-
+     * insensitive. INBOX is intentionally not flagged because
+     * RFC 6154 sec 2 says the special-use attributes apply
+     * to non-INBOX folders. Sub-folders under a special-use
+     * parent (e.g. "Archive/2025") are not flagged.
+     */
+    protected function imapSpecialUseAttr($folder)
+    {
+        if (strpos($folder, '/') !== false) {
+            return null;
+        }
+        $name = strtolower($folder);
+        $map = [
+            'inbox' => null,
+            'drafts' => '\Drafts',
+            'draft' => '\Drafts',
+            'sent' => '\Sent',
+            'sent items' => '\Sent',
+            'sent messages' => '\Sent',
+            'trash' => '\Trash',
+            'deleted' => '\Trash',
+            'deleted items' => '\Trash',
+            'deleted messages' => '\Trash',
+            'junk' => '\Junk',
+            'spam' => '\Junk',
+            'archive' => '\Archive',
+            'archives' => '\Archive',
+            'all mail' => '\All',
+            'all' => '\All',
+        ];
+        return isset($map[$name]) ? $map[$name] : null;
     }
     /**
      * Converts an IMAP LIST/LSUB pattern to a PCRE regex.
@@ -3906,12 +4047,96 @@ class MailSite
                 $section === 'HEADER.FIELDS.NOT');
         }
         /*
-            Numeric MIME path or unknown section: serve the
-            whole body. A real multipart parser is a future
-            phase; for the test fixtures used here single-part
-            messages cover the common case.
+            Numeric MIME path: the section is a dotted sequence
+            of 1-based part indices, optionally followed by a
+            sub-section keyword (HEADER, MIME, TEXT, or one of
+            the HEADER.FIELDS variants). Walk the parsed entity
+            tree to find the requested part, then return the
+            requested slice. If the path runs past the actual
+            structure (out-of-range indices) we return the
+            whole-message body as a fallback so well-meaning
+            clients still see something rather than an empty
+            literal.
+         */
+        if (preg_match('/^[0-9]+(\.[0-9]+)*(\.[A-Z.]+)?$/',
+            $section)) {
+            $entity = $this->imapParseEntity($body);
+            $tail = '';
+            $path_str = $section;
+            $dot_alpha = preg_match(
+                '/^([0-9]+(?:\.[0-9]+)*)\.([A-Z.]+)$/',
+                $section, $m);
+            if ($dot_alpha) {
+                $path_str = $m[1];
+                $tail = $m[2];
+            }
+            $path = explode('.', $path_str);
+            $found = $this->imapNavigateEntity($entity, $path);
+            if ($found === null) {
+                return $body;
+            }
+            if ($tail === '' || $tail === 'TEXT') {
+                /*
+                    Default (no tail) returns the part body
+                    bytes; TEXT explicitly the same. RFC 3501
+                    says TEXT excludes the header section.
+                 */
+                return $found['body'];
+            }
+            if ($tail === 'HEADER' || $tail === 'MIME') {
+                return $found['header_block'];
+            }
+            if ($tail === 'HEADER.FIELDS' ||
+                $tail === 'HEADER.FIELDS.NOT') {
+                return $this->imapFilterHeaders(
+                    $found['header_block'], $fields,
+                    $tail === 'HEADER.FIELDS.NOT');
+            }
+            return $found['body'];
+        }
+        /*
+            Unknown section: fall back to whole body so the
+            client at least gets data rather than an error.
          */
         return $body;
+    }
+    /**
+     * Walks a parsed entity tree following a list of 1-based
+     * part indices and returns the leaf entity reached, or
+     * null if the path does not resolve. For a non-multipart
+     * top-level entity, path "1" returns the entity itself
+     * (per RFC 3501 sec 6.4.5: a single-part message has its
+     * entire body addressable as part 1).
+     */
+    protected function imapNavigateEntity($entity, $path)
+    {
+        $current = $entity;
+        $first = true;
+        foreach ($path as $idx_str) {
+            $idx = (int) $idx_str;
+            if ($idx < 1) {
+                return null;
+            }
+            if ($first && $current['type'] !== 'multipart') {
+                /*
+                    Single-part top-level: path "1" refers to
+                    the only part, which IS the entity itself.
+                    Anything past 1.X is out of range.
+                 */
+                if ($idx !== 1) {
+                    return null;
+                }
+                $first = false;
+                continue;
+            }
+            $first = false;
+            if (empty($current['parts']) ||
+                !isset($current['parts'][$idx - 1])) {
+                return null;
+            }
+            $current = $current['parts'][$idx - 1];
+        }
+        return $current;
     }
     /**
      * Returns just the header lines whose names match (or do
@@ -4136,57 +4361,259 @@ class MailSite
     }
     /**
      * Returns an IMAP BODYSTRUCTURE (or BODY) representation
-     * of a message. For non-multipart messages we emit a
-     * single 7-tuple "(type subtype params id desc encoding
-     * size lines)" with content-type sniffed from the
-     * Content-Type header; multipart messages currently
-     * collapse to a single text/plain tuple, which is
-     * suboptimal but sufficient for clients that re-fetch the
-     * raw body for rendering. Real RFC 2046 parsing is a
-     * future phase.
+     * of a message. Walks the multipart MIME tree per RFC 2046
+     * and emits the nested paren-list structure RFC 3501 sec
+     * 7.4.2 specifies. For multipart entities this produces a
+     * properly nested response that lets clients identify
+     * individual parts, their content types, encodings, and
+     * sizes; clients that find an attachment part will then
+     * issue BODY[part-number] to fetch just that part.
+     *   $kind is "BODY" or "BODYSTRUCTURE": both render the
+     * same body fields; BODYSTRUCTURE additionally appends
+     * the extension fields (md5, disposition, language,
+     * location) which are required for that variant.
      */
     protected function imapBodyStructure($body, $kind)
     {
-        $headers = $this->imapParseHeaders($body);
+        $entity = $this->imapParseEntity($body);
+        $extended = ($kind === 'BODYSTRUCTURE');
+        return $this->imapRenderBodyStructure($entity, $extended);
+    }
+    /**
+     * Recursively parses an RFC 5322 / RFC 2045 entity (a
+     * complete message or a single part of a multipart) into
+     * a structured tree. The entity bytes are treated as one
+     * region: the leading header block up to the blank-line
+     * separator, then the body. For a multipart entity the
+     * body is split along the boundary string declared in the
+     * Content-Type, and each part is parsed recursively.
+     *
+     * Returns an associative array:
+     *   type, subtype     -- lowercased MIME type/subtype
+     *   params            -- name => value map
+     *   encoding          -- transfer encoding (lowercased)
+     *   id, description   -- Content-ID, Content-Description
+     *   disposition       -- Content-Disposition raw value
+     *   header_block      -- bytes of the header section
+     *   body              -- bytes of the body section
+     *   size              -- byte length of the body
+     *   lines             -- number of body lines (text only)
+     *   parts             -- list of child entities (multipart
+     *                        only; empty for leaves)
+     */
+    protected function imapParseEntity($bytes)
+    {
+        $sep_pos = strpos($bytes, "\r\n\r\n");
+        if ($sep_pos === false) {
+            $alt = strpos($bytes, "\n\n");
+            if ($alt === false) {
+                $header_block = $bytes;
+                $body = '';
+            } else {
+                $header_block = substr($bytes, 0, $alt + 2);
+                $body = substr($bytes, $alt + 2);
+            }
+        } else {
+            $header_block = substr($bytes, 0, $sep_pos + 4);
+            $body = substr($bytes, $sep_pos + 4);
+        }
+        $headers = $this->imapParseHeaders($header_block);
         $ct = isset($headers['content-type']) ?
             $headers['content-type'] : 'text/plain';
+        $ct_parts = preg_split('/\s*;\s*/', $ct);
         $type = 'text';
         $subtype = 'plain';
-        $params = [];
-        $parts = preg_split('/\s*;\s*/', $ct);
-        if (!empty($parts[0])) {
-            $mime = strtolower(trim($parts[0]));
+        if (!empty($ct_parts[0])) {
+            $mime = strtolower(trim($ct_parts[0]));
             $slash = strpos($mime, '/');
             if ($slash !== false) {
                 $type = substr($mime, 0, $slash);
                 $subtype = substr($mime, $slash + 1);
             }
-            for ($i = 1; $i < count($parts); $i++) {
-                if (preg_match('/^([^=]+)=(.*)$/',
-                    trim($parts[$i]), $m)) {
-                    $params[trim($m[1])] =
-                        trim($m[2], " \t\"");
-                }
-            }
         }
-        $params_repr = 'NIL';
-        if (!empty($params)) {
-            $pp = [];
-            foreach ($params as $k => $v) {
-                $pp[] = '"' . strtoupper($k) . '" "' . $v . '"';
+        $params = [];
+        for ($i = 1; $i < count($ct_parts); $i++) {
+            if (preg_match('/^([^=]+)=(.*)$/',
+                trim($ct_parts[$i]), $m)) {
+                $params[strtolower(trim($m[1]))] =
+                    trim($m[2], " \t\"");
             }
-            $params_repr = '(' . implode(' ', $pp) . ')';
         }
         $encoding = isset($headers['content-transfer-encoding']) ?
-            strtolower($headers['content-transfer-encoding']) :
-            '7bit';
-        $text = $this->imapBodyText($body);
-        $size = strlen($text);
-        $lines = substr_count($text, "\n");
-        return '("' . strtoupper($type) . '" "' .
-            strtoupper($subtype) . '" ' . $params_repr .
-            ' NIL NIL "' . strtoupper($encoding) . '" ' .
-            $size . ' ' . $lines . ')';
+            strtolower(trim($headers[
+                'content-transfer-encoding'])) : '7bit';
+        $entity = [
+            'type' => $type,
+            'subtype' => $subtype,
+            'params' => $params,
+            'encoding' => $encoding,
+            'id' => isset($headers['content-id']) ?
+                $headers['content-id'] : null,
+            'description' => isset($headers[
+                'content-description']) ?
+                $headers['content-description'] : null,
+            'disposition' => isset($headers[
+                'content-disposition']) ?
+                $headers['content-disposition'] : null,
+            'header_block' => $header_block,
+            'body' => $body,
+            'size' => strlen($body),
+            'lines' => substr_count($body, "\n"),
+            'parts' => [],
+        ];
+        if ($type === 'multipart' &&
+            isset($params['boundary'])) {
+            $entity['parts'] = $this->imapSplitMultipart($body,
+                $params['boundary']);
+        }
+        return $entity;
+    }
+    /**
+     * Splits a multipart body into its constituent part
+     * entities along the boundary string. Per RFC 2046 sec
+     * 5.1.1 the delimiter between parts is "\r\n--<boundary>"
+     * and the closing delimiter is "\r\n--<boundary>--". We
+     * tolerate "\n--" as well (some agents emit LF-only
+     * line endings) and accept the leading boundary without
+     * a preceding newline (the very first part).
+     * Preamble text before the first delimiter and epilogue
+     * text after the closing delimiter are discarded per the
+     * RFC. Each part is recursively parsed via imapParseEntity.
+     */
+    protected function imapSplitMultipart($body, $boundary)
+    {
+        $delim = '--' . $boundary;
+        $close = '--' . $boundary . '--';
+        $parts = [];
+        $remaining = $body;
+        $first = strpos($remaining, $delim);
+        if ($first === false) {
+            return [];
+        }
+        $remaining = substr($remaining, $first + strlen($delim));
+        while (true) {
+            /*
+                Eat the trailing CRLF after the boundary line.
+             */
+            if (substr($remaining, 0, 2) === "\r\n") {
+                $remaining = substr($remaining, 2);
+            } else if (substr($remaining, 0, 1) === "\n") {
+                $remaining = substr($remaining, 1);
+            } else if (substr($remaining, 0, 2) === '--') {
+                /* This was the closing delimiter; we are done. */
+                break;
+            }
+            /*
+                Find the next boundary. We search for both the
+                CRLF-prefixed and LF-prefixed forms.
+             */
+            $next_crlf = strpos($remaining, "\r\n--" . $boundary);
+            $next_lf = strpos($remaining, "\n--" . $boundary);
+            $next = false;
+            if ($next_crlf !== false && $next_lf !== false) {
+                $next = min($next_crlf, $next_lf);
+            } else if ($next_crlf !== false) {
+                $next = $next_crlf;
+            } else if ($next_lf !== false) {
+                $next = $next_lf;
+            }
+            if ($next === false) {
+                break;
+            }
+            $part_bytes = substr($remaining, 0, $next);
+            $parts[] = $this->imapParseEntity($part_bytes);
+            /*
+                Advance past the CRLF + delimiter. The
+                delimiter itself is consumed; the next-line
+                eat at the top of the loop handles the trailing
+                CRLF.
+             */
+            $skip = ($remaining[$next] === "\r") ? 2 : 1;
+            $remaining = substr($remaining,
+                $next + $skip + strlen($delim));
+            if (substr($remaining, 0, 2) === '--') {
+                /* Closing delimiter: stop. */
+                break;
+            }
+        }
+        return $parts;
+    }
+    /**
+     * Renders a parsed entity as an IMAP BODYSTRUCTURE
+     * paren-list. Branches by content type:
+     *   multipart:  "(part1 part2 ... \"SUBTYPE\")" with
+     *               extension fields if $extended is true
+     *               (params disposition language location)
+     *   text/*:     8-tuple "(\"TEXT\" \"SUBTYPE\" params id
+     *               desc encoding size lines)" with extension
+     *               fields md5/disposition/language/location
+     *               for $extended
+     *   message/rfc822: rare, treated as a generic part
+     *   other:      7-tuple as text without the lines field
+     */
+    protected function imapRenderBodyStructure($entity, $extended)
+    {
+        if ($entity['type'] === 'multipart' &&
+            !empty($entity['parts'])) {
+            $part_strs = [];
+            foreach ($entity['parts'] as $p) {
+                $part_strs[] =
+                    $this->imapRenderBodyStructure($p, $extended);
+            }
+            $out = '(' . implode('', $part_strs) . ' "' .
+                strtoupper($entity['subtype']) . '"';
+            if ($extended) {
+                $out .= ' ' .
+                    $this->imapRenderParams($entity['params']);
+                /* disposition language location: NIL placeholders */
+                $out .= ' NIL NIL NIL';
+            }
+            $out .= ')';
+            return $out;
+        }
+        $type_repr = '"' . strtoupper($entity['type']) . '"';
+        $subtype_repr = '"' .
+            strtoupper($entity['subtype']) . '"';
+        $params_repr = $this->imapRenderParams($entity['params']);
+        $id_repr = $entity['id'] === null ? 'NIL' :
+            '"' . addslashes($entity['id']) . '"';
+        $desc_repr = $entity['description'] === null ? 'NIL' :
+            '"' . addslashes($entity['description']) . '"';
+        $enc_repr = '"' . strtoupper($entity['encoding']) . '"';
+        $size = $entity['size'];
+        $tuple = "$type_repr $subtype_repr $params_repr " .
+            "$id_repr $desc_repr $enc_repr $size";
+        if ($entity['type'] === 'text') {
+            $tuple .= ' ' . $entity['lines'];
+        }
+        if ($extended) {
+            /*
+                md5, disposition, language, location are all
+                NIL placeholders. A more complete
+                implementation would parse Content-MD5 and
+                Content-Disposition; clients tolerate NIL.
+             */
+            $tuple .= ' NIL NIL NIL NIL';
+        }
+        return "($tuple)";
+    }
+    /**
+     * Renders a params map (lowercased name => value) as the
+     * IMAP NIL-or-paren-list form: NIL if empty, else
+     * (\"NAME\" \"value\" \"NAME2\" \"value2\" ...). Names are
+     * upper-cased per IMAP convention; values keep their case.
+     */
+    protected function imapRenderParams($params)
+    {
+        if (empty($params)) {
+            return 'NIL';
+        }
+        $pairs = [];
+        foreach ($params as $k => $v) {
+            $pairs[] = '"' . strtoupper($k) . '" "' .
+                addslashes($v) . '"';
+        }
+        return '(' . implode(' ', $pairs) . ')';
     }
     /**
      * Implements FETCH and UID FETCH. The $by_uid flag tells

@@ -795,6 +795,102 @@ $scenarios['imap_idle'] = [
         ]);
     },
 ];
+/* ---------- IMAP capabilities + MIME (Phase 5) ---------- */
+$scenarios['imap_special_use'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'SPECIAL-USE attributes in LIST',
+    'desc' => 'Folders named Drafts / Sent / Trash / Junk / ' .
+        'Archive get RFC 6154 special-use attributes in LIST ' .
+        'so clients can auto-discover the right destination ' .
+        'for "Save Sent", "Save Draft", "Move to Trash", etc. ' .
+        '\\HasChildren / \\HasNoChildren are RFC 3348 ' .
+        'children flags clients use to render the tree.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 CREATE Drafts\r\n",
+            "a3 CREATE Sent\r\n",
+            "a4 CREATE Trash\r\n",
+            "a5 CREATE Archive\r\n",
+            "a6 CREATE \"Archive/2025\"\r\n",
+            "a7 LIST \"\" \"*\"\r\n",
+            "a8 LIST (SPECIAL-USE) \"\" \"*\"\r\n",
+            "a9 LIST \"\" \"*\" RETURN (CHILDREN SPECIAL-USE)\r\n",
+            "a10 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_namespace'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'NAMESPACE response',
+    'desc' => 'Tells the client about personal, other-users, ' .
+        'and shared mailbox prefixes. We have a single ' .
+        'personal namespace using "/" as the hierarchy ' .
+        'delimiter, no shared or other-users namespaces.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 NAMESPACE\r\n",
+            "a3 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_id'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'ID exchange (RFC 2971)',
+    'desc' => 'Client sends a paren-list of name/value ' .
+        'identification strings; server replies with its own ' .
+        'identification. Permitted in any state including ' .
+        'before LOGIN.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 ID (\"name\" \"TestClient\" \"version\" \"1.0\")\r\n",
+            "a2 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_multipart'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'Multipart MIME: BODYSTRUCTURE + BODY[1] / BODY[2]',
+    'desc' => 'APPEND a multipart/alternative message ' .
+        '(text/plain + text/html), then FETCH BODYSTRUCTURE ' .
+        'to see the nested structure and BODY[1] / BODY[2] ' .
+        'to fetch each part individually.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        $body = "Subject: multipart demo\r\n" .
+            "From: x@y.com\r\n" .
+            "To: alice@localhost\r\n" .
+            "MIME-Version: 1.0\r\n" .
+            "Content-Type: multipart/alternative; " .
+                "boundary=\"BOUNDARY42\"\r\n\r\n" .
+            "--BOUNDARY42\r\n" .
+            "Content-Type: text/plain; charset=UTF-8\r\n\r\n" .
+            "This is the plain text part.\r\n" .
+            "--BOUNDARY42\r\n" .
+            "Content-Type: text/html; charset=UTF-8\r\n" .
+            "Content-Transfer-Encoding: quoted-printable" .
+                "\r\n\r\n" .
+            "<html><body><p>HTML version.</p></body>" .
+                "</html>\r\n" .
+            "--BOUNDARY42--\r\n";
+        $size = strlen($body);
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 APPEND INBOX {" . $size . "}\r\n",
+            $body,
+            "a3 SELECT INBOX\r\n",
+            "a4 FETCH 1 (BODYSTRUCTURE)\r\n",
+            "a5 FETCH 1 BODY.PEEK[1]\r\n",
+            "a6 FETCH 1 BODY.PEEK[2]\r\n",
+            "a7 FETCH 1 BODY.PEEK[1.MIME]\r\n",
+            "a8 LOGOUT\r\n",
+        ]);
+    },
+];
 /* ---------- Implicit TLS ---------- */
 $scenarios['smtps_banner'] = [
     'group' => 'Implicit TLS',

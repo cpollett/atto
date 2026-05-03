@@ -460,12 +460,40 @@ class FileMailStorage extends MailStorage
 {
     protected $base;
     /**
+     * @var int high-water mark of the last UIDVALIDITY this
+     * process has handed out. Used to guarantee a strictly
+     * monotonic value across rapid delete + recreate cycles
+     * even when they fall within the same wall-clock second
+     * (RFC 3501 sec 2.3.1.1 monotonic requirement).
+     */
+    protected $last_uidvalidity = 0;
+    /**
      * @param string $base directory under which the "users/"
      *      subtree is created
      */
     public function __construct($base)
     {
         $this->base = rtrim($base, "/\\");
+    }
+    /**
+     * Returns a fresh UIDVALIDITY value: time() raised by one
+     * past the previous handout if multiple folders are
+     * created within the same second. Guaranteed strictly
+     * monotonic across all folders in this process so
+     * delete + recreate of the same folder name always
+     * produces a different value, while staying within the
+     * 32-bit unsigned-int range RFC 3501 mandates (good past
+     * 2106 plus however many overruns from rapid reuse, which
+     * is not a real concern in practice).
+     */
+    protected function nextUidValidity()
+    {
+        $now = time();
+        if ($now <= $this->last_uidvalidity) {
+            $now = $this->last_uidvalidity + 1;
+        }
+        $this->last_uidvalidity = $now;
+        return $now;
     }
     /**
      * Returns the absolute directory path for a user's account.
@@ -545,13 +573,14 @@ class FileMailStorage extends MailStorage
             ".uidvalidity";
         if (!is_file($uidvalidity_file)) {
             /*
-                UIDVALIDITY must be a 32-bit unsigned int that
-                strictly increases across recreations of the
-                folder. time() at account creation is the standard
-                trick: monotonic per-user across deletes and fits
-                in 32 bits until 2106.
+                Per-user UIDVALIDITY is a fallback for folders
+                that pre-date the per-folder scheme. The
+                monotonic allocator keeps it strictly larger
+                than every prior handout in this process and
+                still fits in 32-bit unsigned-int range.
              */
-            file_put_contents($uidvalidity_file, (string) time());
+            file_put_contents($uidvalidity_file,
+                (string) $this->nextUidValidity());
         }
         $uidnext_file = $dir . DIRECTORY_SEPARATOR . ".uidnext";
         if (!is_file($uidnext_file)) {
@@ -621,18 +650,19 @@ class FileMailStorage extends MailStorage
         }
         /*
             Stamp a per-folder UIDVALIDITY so a future delete
-            + recreate of the same name produces a different
-            value (RFC 3501 sec 2.3.1.1). microtime gives
-            sub-second resolution, which matters for tests
-            that delete-and-recreate within the same second;
-            the value is cast to int for the IMAP wire form
-            via dechex of the microsecond fragment combined
-            with the second.
+            + recreate of the same name always produces a
+            different value (RFC 3501 sec 2.3.1.1). The
+            allocator is monotonic-by-construction across the
+            life of the process, so even rapid recreate cycles
+            in the same wall-clock second still bump the
+            counter. The value stays in 32-bit unsigned-int
+            range and reads as a Unix timestamp for any whole
+            second; sub-second reuses appear as the timestamp
+            plus a small offset.
          */
-        $stamp = (int) (microtime(true) * 1000);
         @file_put_contents(
             $path . DIRECTORY_SEPARATOR . ".uidvalidity",
-            (string) $stamp);
+            (string) $this->nextUidValidity());
         return true;
     }
     /**
@@ -5905,22 +5935,28 @@ class MailSite
     }
     /**
      * Walks every active connection and emits IDLE push
-     * notifications for any that are idling and whose
-     * subscribed folder has changed since the snapshot. The
-     * notification is "* N EXISTS" carrying the current
-     * message count, which lets the client decide whether to
-     * issue a follow-up FETCH for the new messages. We update
-     * the snapshot to the current value so each delta is
-     * reported exactly once.
+     * notifications (EXISTS, EXPUNGE, FETCH FLAGS) for any
+     * that are idling and whose subscribed folder has changed
+     * since their snapshot. The notification set captures
+     * RFC 2177 / RFC 3501 expectations: clients see the same
+     * untagged responses they would have seen if they had
+     * SELECTed the folder fresh.
      *
      * Called once per main-loop iteration. Cheap when no
-     * connections are idling (early-exit on empty contexts).
+     * folder has changed: the change-counter compare is O(1)
+     * per subscriber. Folder state is read from disk at most
+     * once per (user, folder) per tick via $folder_state_cache,
+     * so N idle subscribers on the same active folder share a
+     * single listMessages walk instead of doing N independent
+     * walks. Worst case improves from O(messages * subscribers)
+     * to O(messages + subscribers) per tick.
      */
     protected function processIdleNotifications()
     {
         if (empty($this->in_streams[self::CONTEXT])) {
             return;
         }
+        $folder_state_cache = [];
         foreach ($this->in_streams[self::CONTEXT] as $key =>
             $context) {
             if (empty($context['IDLE_FOLDER'])) {
@@ -5943,21 +5979,21 @@ class MailSite
             }
             /*
                 The folder has changed since the last tick.
-                Capture fresh state and diff against the per-
-                connection IDLE_STATE to figure out exactly
-                which untagged responses to push:
-                  * EXPUNGE for every UID gone, descending so
-                    sequence numbers shift down consistently
-                  * EXISTS for the new total count if it has
-                    grown
-                  * FETCH (FLAGS ...) for each UID whose flags
-                    changed (using the new sequence number,
-                    not the old)
-                After emitting, save the fresh state and bump
-                the counter so the next tick has a stable
-                baseline.
+                Reuse a tick-scoped cache of the fresh state
+                so multiple subscribers on the same folder do
+                a single listMessages walk together. Each
+                subscriber then runs the diff against its own
+                IDLE_STATE to emit personalized untagged
+                responses (different subscribers may have
+                joined idle at different points and need
+                different deltas).
              */
-            $fresh = $this->captureFolderState($user, $folder);
+            $cache_key = $user . '|' . $folder;
+            if (!isset($folder_state_cache[$cache_key])) {
+                $folder_state_cache[$cache_key] =
+                    $this->captureFolderState($user, $folder);
+            }
+            $fresh = $folder_state_cache[$cache_key];
             $old_state = $context['IDLE_STATE'];
             if ($old_state === null) {
                 $old_state = [

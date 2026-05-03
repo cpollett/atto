@@ -542,6 +542,259 @@ $scenarios['imap_bad_password'] = [
         ]);
     },
 ];
+/*
+    Helper used by the message-ops scenarios below: deliver a
+    couple of test messages to alice/INBOX via SMTP so each
+    scenario starts with something to operate on. Idempotent;
+    if the scenarios are re-run after a Reset, the deliveries
+    re-populate INBOX.
+ */
+$prep_inbox = function () use ($cfg) {
+    runScript($cfg['host'], $cfg['smtp'], [
+        "EHLO test\r\n",
+        "MAIL FROM:<x@y.com>\r\n",
+        "RCPT TO:<alice@localhost>\r\n",
+        "DATA\r\n",
+        "Subject: hello\r\n" .
+            "From: x@y.com\r\n" .
+            "To: alice@localhost\r\n" .
+            "Message-ID: <hello@y.com>\r\n" .
+            "Date: Mon, 01 Jan 2026 12:00:00 +0000\r\n\r\n" .
+            "First test message body.\r\n.\r\n",
+        "QUIT\r\n",
+    ]);
+    runScript($cfg['host'], $cfg['smtp'], [
+        "EHLO test\r\n",
+        "MAIL FROM:<pizza@shop.com>\r\n",
+        "RCPT TO:<alice@localhost>\r\n",
+        "DATA\r\n",
+        "Subject: hot pizza\r\n" .
+            "From: pizza@shop.com\r\n" .
+            "To: alice@localhost\r\n\r\n" .
+            "yummy body content\r\n.\r\n",
+        "QUIT\r\n",
+    ]);
+};
+/* ---------- IMAP message operations (Phase 4) ---------- */
+$scenarios['imap_fetch_basic'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'FETCH 1:* (FLAGS UID INTERNALDATE RFC822.SIZE)',
+    'desc' => 'The standard message-list query a webmail UI ' .
+        'issues right after SELECT. One untagged FETCH ' .
+        'response per message.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 FETCH 1:* (FLAGS UID INTERNALDATE " .
+                "RFC822.SIZE)\r\n",
+            "a4 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_fetch_envelope'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'FETCH 1 (ENVELOPE)',
+    'desc' => 'IMAP-parsed envelope: date, subject, from, ' .
+        'sender, reply-to, to, cc, bcc, in-reply-to, ' .
+        'message-id. Each address is a paren-list of ' .
+        '(name source-route mailbox-local host).',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 FETCH 1 (ENVELOPE)\r\n",
+            "a4 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_fetch_body'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'FETCH 1 BODY[HEADER.FIELDS (Subject From)]',
+    'desc' => 'Selective header fetch. PEEK form would not ' .
+        'set \\Seen; using non-PEEK BODY[HEADER.FIELDS] ' .
+        'leaves \\Seen untouched per RFC 3501 since only ' .
+        'BODY[] / BODY[TEXT] / BODY[<part>] without HEADER ' .
+        'is considered "viewing" the body.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 FETCH 1 BODY.PEEK[HEADER.FIELDS " .
+                "(Subject From Date)]\r\n",
+            "a4 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_store_seen'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'STORE +FLAGS (\\Seen) and -FLAGS (\\Recent)',
+    'desc' => 'Add or remove flags on a message set. .SILENT ' .
+        'variant suppresses the per-message FETCH response.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 STORE 1 +FLAGS (\\Seen \\Flagged)\r\n",
+            "a4 STORE 2 FLAGS.SILENT (\\Deleted)\r\n",
+            "a5 FETCH 1:* (FLAGS)\r\n",
+            "a6 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_uid_fetch'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'UID FETCH 1:* (FLAGS) -- UID auto-included',
+    'desc' => 'UID-prefixed FETCH operates on UIDs rather ' .
+        'than sequence numbers. Per RFC 3501 sec 6.4.8 the ' .
+        'response MUST include a UID data item even when ' .
+        'the client did not request one.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 UID FETCH 1:* (FLAGS)\r\n",
+            "a4 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_copy'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'COPY 1:2 to a sibling folder',
+    'desc' => 'COPY allocates fresh UIDs in the target ' .
+        'because each message file gets a new UID from the ' .
+        'per-user counter. Flags carry over.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 CREATE Saved\r\n",
+            "a3 SELECT INBOX\r\n",
+            "a4 COPY 1:2 Saved\r\n",
+            "a5 EXAMINE Saved\r\n",
+            "a6 FETCH 1:* (UID FLAGS)\r\n",
+            "a7 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_move'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'MOVE 1 to Junk (UID preserved)',
+    'desc' => 'MOVE (RFC 6851) relocates files in place, so ' .
+        'UIDs are preserved across the move. The source ' .
+        'mailbox sees an EXPUNGE response per moved msg.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 MOVE 1 Junk\r\n",
+            "a4 EXAMINE Junk\r\n",
+            "a5 FETCH 1:* (UID FLAGS)\r\n",
+            "a6 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_expunge'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'STORE \\Deleted then EXPUNGE',
+    'desc' => 'Mark a message \\Deleted, then EXPUNGE to ' .
+        'permanently remove. The server emits one ' .
+        '"* N EXPUNGE" per removed message in descending ' .
+        'sequence order so client counts stay consistent.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 STORE 2 +FLAGS (\\Deleted)\r\n",
+            "a4 EXPUNGE\r\n",
+            "a5 FETCH 1:* (UID FLAGS)\r\n",
+            "a6 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_search'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'SEARCH boolean queries',
+    'desc' => 'A few common SEARCH forms: UNSEEN, FROM ' .
+        'substring, SUBJECT substring, BODY substring, NOT, ' .
+        'OR, and a sequence-set predicate.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg, $prep_inbox) {
+        $prep_inbox();
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 SEARCH ALL\r\n",
+            "a4 SEARCH UNSEEN\r\n",
+            "a5 SEARCH FROM \"pizza\"\r\n",
+            "a6 SEARCH SUBJECT \"hello\"\r\n",
+            "a7 SEARCH BODY \"yummy\"\r\n",
+            "a8 SEARCH OR FLAGGED FROM \"pizza\"\r\n",
+            "a9 SEARCH NOT SEEN\r\n",
+            "a10 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_append'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'APPEND a literal-bodied message',
+    'desc' => 'APPEND with a (\\Seen) flag list and a ' .
+        'synchronizing literal {N} body. Server replies ' .
+        '"+ Ready", consumes the byte-counted body across ' .
+        'TCP fragments, and finishes with "OK [APPENDUID ' .
+        'validity uid]".',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        $body = "Subject: from APPEND\r\n" .
+            "From: x@y.com\r\n" .
+            "To: alice@localhost\r\n\r\n" .
+            "Body delivered via APPEND, not SMTP.\r\n";
+        $size = strlen($body);
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 APPEND INBOX (\\Seen) {" . $size . "}\r\n",
+            $body,
+            "a3 SELECT INBOX\r\n",
+            "a4 FETCH 1:* (UID FLAGS)\r\n",
+            "a5 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_idle'] = [
+    'group' => 'IMAP message ops (Phase 4)',
+    'label' => 'IDLE / DONE round-trip',
+    'desc' => 'Client says IDLE, server replies "+ idling" ' .
+        'and parks. Client sends "DONE" on its own line to ' .
+        'terminate. Server-side push of new-mail ' .
+        'notifications during the idle window is not yet ' .
+        'implemented; the round-trip is exercised here.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 SELECT INBOX\r\n",
+            "a3 IDLE\r\n",
+            "DONE\r\n",
+            "a4 NOOP\r\n",
+            "a5 LOGOUT\r\n",
+        ]);
+    },
+];
 /* ---------- Implicit TLS ---------- */
 $scenarios['smtps_banner'] = [
     'group' => 'Implicit TLS',
@@ -775,6 +1028,41 @@ $scenarios['api_movemessage'] = [
             $tx .= "(could not find UID $uid in Junk after " .
                 "move)\n";
         }
+        return $tx;
+    },
+];
+$scenarios['api_uidnext'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'uidNext / uidValidity for INBOX',
+    'desc' => '$mail->uidNext() and $mail->uidValidity() ' .
+        'expose the same UIDNEXT and UIDVALIDITY a webmail ' .
+        'cache uses for invalidation.',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir) {
+        $m = shareMail($users_file, $store_dir);
+        return "uidNext('alice', 'INBOX')     = " .
+            $m->uidNext('alice', 'INBOX') . "\n" .
+            "uidValidity('alice', 'INBOX') = " .
+            $m->uidValidity('alice', 'INBOX') . "\n";
+    },
+];
+$scenarios['api_folder_exists'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'folderExists probe',
+    'desc' => '$mail->folderExists() returns a boolean ' .
+        'without scanning the full folder list.',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir) {
+        $m = shareMail($users_file, $store_dir);
+        $tx = "folderExists('alice', 'INBOX')   = " .
+            ($m->folderExists('alice', 'INBOX') ? 'true' :
+                'false') . "\n";
+        $tx .= "folderExists('alice', 'NoSuch')  = " .
+            ($m->folderExists('alice', 'NoSuch') ? 'true' :
+                'false') . "\n";
+        $tx .= "folderExists('alice', 'Junk')    = " .
+            ($m->folderExists('alice', 'Junk') ? 'true' :
+                'false') . "\n";
         return $tx;
     },
 ];

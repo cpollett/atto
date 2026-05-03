@@ -1349,6 +1349,55 @@ class MailSite
         return $this->mail_storage->messageCount($user, $folder);
     }
     /**
+     * Returns whether a folder exists for a user. Slightly more
+     * efficient than fetching listFolders() and checking
+     * membership when the caller only needs a yes/no answer.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool
+     */
+    public function folderExists($user, $folder)
+    {
+        return $this->mail_storage->folderExists($user, $folder);
+    }
+    /**
+     * Returns the UID that will be assigned to the next message
+     * appended to this folder for this user. The value is the
+     * direct-call equivalent of the IMAP UIDNEXT response code
+     * returned by SELECT/STATUS, suitable for a webmail UI that
+     * wants to detect new messages by comparing against a
+     * cached high-water mark. The value is a prediction; under
+     * concurrent appends the actual UID handed out may be
+     * larger by the time the caller acts on it.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
+    public function uidNext($user, $folder)
+    {
+        return $this->mail_storage->uidNext($user, $folder);
+    }
+    /**
+     * Returns the UIDVALIDITY value for a folder, the stable
+     * per-folder integer IMAP clients use to tell whether their
+     * cached UIDs are still valid. A change in this value
+     * signals that the client must discard its UID cache and
+     * resync. We assign one stable value per user account at
+     * provisioning and reuse it for every folder, which is a
+     * legal IMAP choice and avoids the complication of
+     * tracking per-folder validity stamps.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
+    public function uidValidity($user, $folder)
+    {
+        return $this->mail_storage->uidValidity($user, $folder);
+    }
+    /**
      * Resolves a recipient address to a local username, or false
      * if the recipient is not local. The local part is returned
      * in its lowercased form because storage is case-insensitive.
@@ -1806,6 +1855,49 @@ class MailSite
         $buf = & $this->in_streams[self::DATA][$key];
         if ($proto === 'SMTP' && $ctx['STATE'] === 'DATA') {
             return $this->consumeSmtpDataPhase($key, $buf, $ctx);
+        }
+        /*
+            IMAP APPEND literal: when a synchronizing literal is
+            outstanding for an APPEND command, the next bytes are
+            the message body, not a command line. Drain exactly
+            'remaining' bytes from the buffer regardless of CRLFs
+            inside, then once the literal is fully collected let
+            the literal continuation handler complete the APPEND.
+            Returns true to let the outer loop process whatever
+            is left in the buffer (typically a CRLF + the next
+            command, or just a CRLF that we silently consume).
+         */
+        if ($proto === 'IMAP' &&
+            !empty($ctx['IMAP_LIT_PENDING']) &&
+            isset($ctx['IMAP_LIT_PENDING']['continuation']) &&
+            $ctx['IMAP_LIT_PENDING']['continuation'] === 'append'
+            ) {
+            $pend = & $ctx['IMAP_LIT_PENDING'];
+            $avail = strlen($buf);
+            if ($avail === 0) {
+                return false;
+            }
+            $take = min($pend['remaining'], $avail);
+            $pend['collected'] .= substr($buf, 0, $take);
+            $buf = substr($buf, $take);
+            $pend['remaining'] -= $take;
+            if ($pend['remaining'] > 0) {
+                return false;
+            }
+            /*
+                Body fully collected. Strip an optional trailing
+                CRLF that some clients append AFTER the literal
+                bytes (between the body and the next command);
+                without this the next processOne would see an
+                empty line and reply BAD.
+             */
+            if (substr($buf, 0, 2) === "\r\n") {
+                $buf = substr($buf, 2);
+            } else if (substr($buf, 0, 1) === "\n") {
+                $buf = substr($buf, 1);
+            }
+            $this->continueImapLiteral($key, '', $ctx);
+            return true;
         }
         $eol = strpos($buf, "\r\n");
         if ($eol === false) {
@@ -2476,6 +2568,54 @@ class MailSite
             $this->imapCmdClose($key, $tag, $ctx);
             return;
         }
+        if ($V === 'APPEND') {
+            $this->imapCmdAppend($key, $tag, $args, $ctx);
+            return;
+        }
+        if ($V === 'IDLE') {
+            $this->imapCmdIdle($key, $tag, $ctx);
+            return;
+        }
+        /*
+            Selected-state commands. FETCH, STORE, COPY, MOVE,
+            EXPUNGE, SEARCH, and the UID-prefixed variants
+            require a SELECTED mailbox.
+         */
+        if ($V === 'UID') {
+            $this->imapCmdUid($key, $tag, $args, $ctx);
+            return;
+        }
+        $needs_selected = in_array($V, ['FETCH', 'STORE', 'COPY',
+            'MOVE', 'EXPUNGE', 'SEARCH'], true);
+        if ($needs_selected && $ctx['STATE'] !== 'SELECTED') {
+            $this->queueWrite($key,
+                "$tag NO No mailbox selected\r\n");
+            return;
+        }
+        if ($V === 'FETCH') {
+            $this->imapCmdFetch($key, $tag, $args, $ctx, false);
+            return;
+        }
+        if ($V === 'STORE') {
+            $this->imapCmdStore($key, $tag, $args, $ctx, false);
+            return;
+        }
+        if ($V === 'COPY') {
+            $this->imapCmdCopy($key, $tag, $args, $ctx, false);
+            return;
+        }
+        if ($V === 'MOVE') {
+            $this->imapCmdMove($key, $tag, $args, $ctx, false);
+            return;
+        }
+        if ($V === 'EXPUNGE') {
+            $this->imapCmdExpunge($key, $tag, $ctx);
+            return;
+        }
+        if ($V === 'SEARCH') {
+            $this->imapCmdSearch($key, $tag, $args, $ctx, false);
+            return;
+        }
         $this->queueWrite($key,
             "$tag BAD command not implemented in this build\r\n");
     }
@@ -2666,6 +2806,68 @@ class MailSite
              */
             $this->queueWrite($key,
                 "$tag BAD literal LOGIN not fully implemented\r\n");
+            return;
+        }
+        if ($cont === 'append') {
+            /*
+                APPEND finalization. processOne has already
+                drained the byte-counted body into the pending
+                record's 'collected' slot and stripped the
+                trailing CRLF, so all that's left is to deliver
+                the message and emit the tagged OK with a
+                [APPENDUID validity uid] response code so the
+                client can update its UID cache.
+             */
+            $folder = $pend['folder'];
+            $flags = $pend['flags'];
+            $internal_date = $pend['internal_date'];
+            $bytes = $pend['collected'];
+            $ctx['IMAP_LIT_PENDING'] = null;
+            $user = $ctx['AUTH_USER'];
+            if (!$this->mail_storage->folderExists($user,
+                $folder)) {
+                $this->queueWrite($key,
+                    "$tag NO [TRYCREATE] Mailbox does not " .
+                    "exist\r\n");
+                return;
+            }
+            $uid = $this->mail_storage->appendMessage($user,
+                $folder, $bytes, $flags, $internal_date);
+            if ($uid === false) {
+                $this->queueWrite($key,
+                    "$tag NO APPEND failed\r\n");
+                return;
+            }
+            $validity = $this->mail_storage->uidValidity($user,
+                $folder);
+            $this->queueWrite($key,
+                "$tag OK [APPENDUID $validity $uid] " .
+                "APPEND completed\r\n");
+            return;
+        }
+        if ($cont === 'idle') {
+            /*
+                RFC 2177: while idling, the client sends "DONE"
+                on its own line to terminate. Anything else
+                during idle is a protocol error per the RFC,
+                but we are lenient and just keep waiting if the
+                client sends an empty line; non-empty non-DONE
+                lines get a BAD response and the idle ends.
+             */
+            $up = strtoupper(trim($line));
+            if ($up === 'DONE') {
+                $ctx['IMAP_LIT_PENDING'] = null;
+                $this->queueWrite($key,
+                    "$tag OK IDLE terminated\r\n");
+                return;
+            }
+            if ($up === '') {
+                /* keep idling */
+                return;
+            }
+            $ctx['IMAP_LIT_PENDING'] = null;
+            $this->queueWrite($key,
+                "$tag BAD Expected DONE\r\n");
             return;
         }
         $ctx['IMAP_LIT_PENDING'] = null;
@@ -3193,6 +3395,1354 @@ class MailSite
         $ctx['SELECTED_READONLY'] = false;
         $ctx['STATE'] = 'AUTH';
         $this->queueWrite($key, "$tag OK CLOSE completed\r\n");
+    }
+    /**
+     * Handles UID-prefixed variants of FETCH, STORE, COPY,
+     * MOVE, and SEARCH. RFC 3501 sec 6.4.8 defines these as
+     * "operate by UID rather than by sequence number"; the
+     * argument syntax after the verb is identical, only the
+     * interpretation of the message-set numbers changes. We
+     * dispatch to the same handlers as the non-UID variants
+     * with a flag set so they treat the message-set as UIDs
+     * and emit "* N FETCH (... UID U ...)" with both the
+     * sequence number AND the UID, as required by RFC 3501
+     * sec 6.4.8: "any data items returned MUST include the
+     * UID data item".
+     */
+    protected function imapCmdUid($key, $tag, $args, &$ctx)
+    {
+        if ($ctx['STATE'] !== 'SELECTED') {
+            $this->queueWrite($key,
+                "$tag NO No mailbox selected\r\n");
+            return;
+        }
+        $sp = strpos($args, ' ');
+        $sub_verb = ($sp === false) ? $args :
+            substr($args, 0, $sp);
+        $sub_args = ($sp === false) ? "" :
+            substr($args, $sp + 1);
+        $V = strtoupper($sub_verb);
+        if ($V === 'FETCH') {
+            $this->imapCmdFetch($key, $tag, $sub_args, $ctx, true);
+            return;
+        }
+        if ($V === 'STORE') {
+            $this->imapCmdStore($key, $tag, $sub_args, $ctx, true);
+            return;
+        }
+        if ($V === 'COPY') {
+            $this->imapCmdCopy($key, $tag, $sub_args, $ctx, true);
+            return;
+        }
+        if ($V === 'MOVE') {
+            $this->imapCmdMove($key, $tag, $sub_args, $ctx, true);
+            return;
+        }
+        if ($V === 'SEARCH') {
+            $this->imapCmdSearch($key, $tag, $sub_args, $ctx, true);
+            return;
+        }
+        $this->queueWrite($key,
+            "$tag BAD UID $V not supported\r\n");
+    }
+    /**
+     * Parses an IMAP message-set string ("1", "1:5", "1:*",
+     * "*", "1,3,5", "1:3,5:7") into a closure that tests
+     * membership. The closure takes (sequence_number, last_seq,
+     * uid) and returns true if the message is in the set; the
+     * $by_uid flag tells the closure whether to test the
+     * sequence or the UID against the parsed ranges. The
+     * "*" token expands to last_seq when used in by-sequence
+     * mode and to a sentinel large number in by-uid mode (the
+     * IMAP grammar treats "*" as "the largest UID currently in
+     * use" for UID FETCH purposes).
+     */
+    protected function imapParseMessageSet($spec, $by_uid)
+    {
+        $ranges = [];
+        foreach (explode(',', $spec) as $piece) {
+            $piece = trim($piece);
+            if ($piece === '') {
+                continue;
+            }
+            if (strpos($piece, ':') === false) {
+                $ranges[] = [$piece, $piece];
+            } else {
+                $parts = explode(':', $piece, 2);
+                $ranges[] = [trim($parts[0]), trim($parts[1])];
+            }
+        }
+        return function ($seq, $last_seq, $uid, $last_uid)
+            use ($ranges, $by_uid) {
+            $val = $by_uid ? $uid : $seq;
+            $last = $by_uid ? $last_uid : $last_seq;
+            foreach ($ranges as $r) {
+                $lo = ($r[0] === '*') ? $last : (int) $r[0];
+                $hi = ($r[1] === '*') ? $last : (int) $r[1];
+                if ($lo > $hi) {
+                    $tmp = $lo;
+                    $lo = $hi;
+                    $hi = $tmp;
+                }
+                if ($val >= $lo && $val <= $hi) {
+                    return true;
+                }
+            }
+            return false;
+        };
+    }
+    /**
+     * Resolves the currently selected folder's messages into a
+     * filtered list of [seq, meta] pairs that match the given
+     * message-set. Used as the front end of FETCH, STORE,
+     * COPY, MOVE, and SEARCH. The list is in sequence-number
+     * order (which is also UID order, since UIDs are assigned
+     * monotonically).
+     */
+    protected function imapMatchSet($user, $folder, $set, $by_uid)
+    {
+        $messages = $this->mail_storage->listMessages($user,
+            $folder);
+        if (empty($messages)) {
+            return [];
+        }
+        $last_seq = count($messages);
+        $last_uid = end($messages)['uid'];
+        $matcher = $this->imapParseMessageSet($set, $by_uid);
+        $out = [];
+        foreach ($messages as $idx => $meta) {
+            $seq = $idx + 1;
+            if ($matcher($seq, $last_seq, $meta['uid'],
+                $last_uid)) {
+                $out[] = [$seq, $meta];
+            }
+        }
+        return $out;
+    }
+    /**
+     * Handles APPEND <mailbox> [(<flags>)] [<date-time>]
+     * <literal>. The literal byte count triggers the
+     * synchronizing-literal continuation: server replies "+
+     * Ready", client streams the message body, server
+     * accepts and assigns a UID. We extend the
+     * IMAP_LIT_PENDING infrastructure with a 'append'
+     * continuation kind that collects the literal bytes
+     * across multiple readClient ticks (the body usually
+     * arrives in many TCP fragments).
+     */
+    protected function imapCmdAppend($key, $tag, $args, &$ctx)
+    {
+        $tokens = $this->parseImapTokens($args);
+        $folder = $this->tokenString($tokens, 0);
+        if ($folder === false || $folder === '') {
+            $this->queueWrite($key,
+                "$tag BAD APPEND syntax\r\n");
+            return;
+        }
+        $flags = [];
+        $internal_date = 0;
+        $literal_idx = -1;
+        for ($i = 1; $i < count($tokens); $i++) {
+            $t = $tokens[$i];
+            if ($t[0] === 'literal') {
+                $literal_idx = $i;
+                break;
+            }
+            if ($t[0] === 'list') {
+                /*
+                    Parenthesized flag list, e.g. "(\Seen \Draft)".
+                 */
+                foreach (preg_split('/\s+/', trim($t[1])) as $f) {
+                    if ($f !== '') {
+                        $flags[] = $f;
+                    }
+                }
+                continue;
+            }
+            if ($t[0] === 'quoted' || $t[0] === 'atom') {
+                /*
+                    Date-time argument, e.g.
+                    "07-Feb-1994 21:52:25 -0800". We accept and
+                    parse with strtotime; if parsing fails the
+                    server falls back to "now" at delivery time.
+                 */
+                $maybe = strtotime($t[1]);
+                if ($maybe !== false) {
+                    $internal_date = $maybe;
+                }
+                continue;
+            }
+        }
+        if ($literal_idx === -1) {
+            $this->queueWrite($key,
+                "$tag BAD APPEND requires a literal body\r\n");
+            return;
+        }
+        $count = $tokens[$literal_idx][1];
+        $ctx['IMAP_LIT_PENDING'] = [
+            'continuation' => 'append',
+            'tag' => $tag,
+            'folder' => $folder,
+            'flags' => $flags,
+            'internal_date' => $internal_date,
+            'remaining' => $count,
+            'collected' => '',
+        ];
+        $this->queueWrite($key,
+            "+ Ready for $count octets\r\n");
+    }
+    /**
+     * Sends a single FETCH response line for one message,
+     * formatting the requested items in the order the client
+     * asked for them. The $items_str is the raw paren-list
+     * payload, e.g. "(FLAGS UID INTERNALDATE RFC822.SIZE
+     * BODY.PEEK[HEADER.FIELDS (Date Subject)])". We parse it
+     * by walking and recognizing each top-level item.
+     */
+    protected function imapEmitFetch($key, $seq, $meta, $body,
+        $items_str, $is_uid_variant, &$mark_seen)
+    {
+        $items = $this->imapParseFetchItems($items_str);
+        /*
+            UID FETCH responses MUST include the UID data item
+            even if the client did not request it.
+         */
+        if ($is_uid_variant) {
+            $has_uid = false;
+            foreach ($items as $it) {
+                if (strtoupper($it['kind']) === 'UID') {
+                    $has_uid = true;
+                    break;
+                }
+            }
+            if (!$has_uid) {
+                $items[] = ['kind' => 'UID', 'raw' => 'UID',
+                    'section' => null, 'fields' => []];
+            }
+        }
+        $parts = [];
+        foreach ($items as $it) {
+            $rendered = $this->imapRenderFetchItem($it, $meta,
+                $body, $mark_seen);
+            if ($rendered !== null) {
+                $parts[] = $rendered;
+            }
+        }
+        $this->queueWrite($key,
+            "* $seq FETCH (" . implode(' ', $parts) . ")\r\n");
+    }
+    /**
+     * Parses the items list of a FETCH command. Accepts both
+     * the bare form ("FLAGS"), the macro shortcuts (FAST, ALL,
+     * FULL), and the parenthesized list. Returns a list of
+     * record arrays:
+     *   ['kind' => 'BODY', 'section' => 'HEADER',
+     *    'fields' => ['Subject','From'], 'raw' => 'BODY[...]',
+     *    'peek' => true]
+     */
+    protected function imapParseFetchItems($items_str)
+    {
+        $items_str = trim($items_str);
+        if ($items_str === '') {
+            return [];
+        }
+        if ($items_str[0] === '(' &&
+            substr($items_str, -1) === ')') {
+            $items_str = substr($items_str, 1, -1);
+        }
+        /*
+            Macro shortcuts per RFC 3501 sec 6.4.5. We expand
+            them inline before tokenizing.
+         */
+        $upper = strtoupper(trim($items_str));
+        if ($upper === 'FAST') {
+            $items_str = 'FLAGS INTERNALDATE RFC822.SIZE';
+        } else if ($upper === 'ALL') {
+            $items_str = 'FLAGS INTERNALDATE RFC822.SIZE ENVELOPE';
+        } else if ($upper === 'FULL') {
+            $items_str = 'FLAGS INTERNALDATE RFC822.SIZE ' .
+                'ENVELOPE BODY';
+        }
+        $out = [];
+        $i = 0;
+        $n = strlen($items_str);
+        while ($i < $n) {
+            $c = $items_str[$i];
+            if ($c === ' ' || $c === "\t") {
+                $i++;
+                continue;
+            }
+            /*
+                An item is a name optionally followed by a
+                bracketed section spec ("BODY[HEADER]") or
+                ".PEEK" infix ("BODY.PEEK[]"). We greedy-match
+                up to the first whitespace not inside [] or ().
+             */
+            $start = $i;
+            $depth_b = 0;
+            $depth_p = 0;
+            while ($i < $n) {
+                $ch = $items_str[$i];
+                if ($ch === '[') $depth_b++;
+                else if ($ch === ']') $depth_b--;
+                else if ($ch === '(') $depth_p++;
+                else if ($ch === ')') $depth_p--;
+                else if (($ch === ' ' || $ch === "\t") &&
+                    $depth_b === 0 && $depth_p === 0) {
+                    break;
+                }
+                $i++;
+            }
+            $tok = substr($items_str, $start, $i - $start);
+            $out[] = $this->imapAnalyzeFetchItem($tok);
+        }
+        return $out;
+    }
+    /**
+     * Decomposes one FETCH item token like "BODY.PEEK[HEADER.
+     * FIELDS (Subject From)]" into its kind, peek flag,
+     * section spec, and field list. The kind is always upper-
+     * cased; field names preserve their original case so the
+     * response matches the request.
+     */
+    protected function imapAnalyzeFetchItem($tok)
+    {
+        $rec = ['kind' => null, 'peek' => false,
+            'section' => null, 'fields' => [],
+            'partial' => null, 'raw' => $tok];
+        $b = strpos($tok, '[');
+        if ($b === false) {
+            $rec['kind'] = strtoupper($tok);
+            return $rec;
+        }
+        $name = substr($tok, 0, $b);
+        if (substr_compare(strtoupper($name), '.PEEK',
+            -5) === 0) {
+            $rec['peek'] = true;
+            $name = substr($name, 0, -5);
+        }
+        $rec['kind'] = strtoupper($name);
+        $end = strrpos($tok, ']');
+        if ($end === false) {
+            return $rec;
+        }
+        $section_full = substr($tok, $b + 1, $end - $b - 1);
+        /*
+            Section may be empty (whole body), HEADER, TEXT,
+            HEADER.FIELDS (Subject From), HEADER.FIELDS.NOT
+            (...), MIME, or a numeric MIME part path. We
+            recognize the textual variants; numeric paths are
+            stored as the section name and currently fall back
+            to whole-message body.
+         */
+        if ($section_full === '') {
+            $rec['section'] = '';
+            return $rec;
+        }
+        $paren = strpos($section_full, '(');
+        if ($paren === false) {
+            $rec['section'] = strtoupper(trim($section_full));
+            return $rec;
+        }
+        $rec['section'] = strtoupper(trim(substr($section_full,
+            0, $paren)));
+        $field_str = substr($section_full, $paren + 1, -1);
+        foreach (preg_split('/\s+/', trim($field_str)) as $f) {
+            if ($f !== '') {
+                $rec['fields'][] = $f;
+            }
+        }
+        return $rec;
+    }
+    /**
+     * Renders one FETCH item to its IMAP-formatted form. The
+     * mark_seen flag is set true when a non-PEEK BODY[*] is
+     * served and we should set the \Seen flag after responding.
+     */
+    protected function imapRenderFetchItem($it, $meta, $body,
+        &$mark_seen)
+    {
+        $kind = $it['kind'];
+        if ($kind === 'UID') {
+            return "UID " . $meta['uid'];
+        }
+        if ($kind === 'FLAGS') {
+            return "FLAGS (" . implode(' ', $meta['flags']) . ")";
+        }
+        if ($kind === 'INTERNALDATE') {
+            return 'INTERNALDATE "' .
+                gmdate('d-M-Y H:i:s', $meta['internal_date']) .
+                ' +0000"';
+        }
+        if ($kind === 'RFC822.SIZE') {
+            return "RFC822.SIZE " . $meta['size'];
+        }
+        if ($kind === 'RFC822') {
+            return "RFC822 " . $this->imapLiteralOf($body) .
+                ($it ? '' : '');
+        }
+        if ($kind === 'RFC822.HEADER') {
+            $hdr = $this->imapHeaderBlock($body);
+            return "RFC822.HEADER " .
+                $this->imapLiteralOf($hdr);
+        }
+        if ($kind === 'RFC822.TEXT') {
+            $text = $this->imapBodyText($body);
+            if (!$it['peek']) {
+                $mark_seen = true;
+            }
+            return "RFC822.TEXT " .
+                $this->imapLiteralOf($text);
+        }
+        if ($kind === 'ENVELOPE') {
+            return "ENVELOPE " . $this->imapEnvelope($body);
+        }
+        if ($kind === 'BODYSTRUCTURE' || $kind === 'BODY') {
+            if ($kind === 'BODY' && $it['section'] !== null) {
+                $payload = $this->imapBodySection($body,
+                    $it['section'], $it['fields']);
+                if (!$it['peek']) {
+                    $mark_seen = true;
+                }
+                $section_repr = $it['section'];
+                if (!empty($it['fields'])) {
+                    $section_repr .= ' (' .
+                        implode(' ', $it['fields']) . ')';
+                }
+                return "BODY[$section_repr] " .
+                    $this->imapLiteralOf($payload);
+            }
+            return "BODYSTRUCTURE " .
+                $this->imapBodyStructure($body, $kind);
+        }
+        return null;
+    }
+    /**
+     * Wraps a string as an IMAP "{N}\r\n<bytes>" literal.
+     * Used for any FETCH response data that is not a quoted
+     * atom; the client reads exactly N bytes after the {N}\r\n
+     * before resuming line-based parsing.
+     */
+    protected function imapLiteralOf($s)
+    {
+        return "{" . strlen($s) . "}\r\n" . $s;
+    }
+    /**
+     * Returns the header block of a message: bytes up to and
+     * including the blank line CRLF that terminates the header
+     * section. If the message has no body separator the entire
+     * message is treated as headers.
+     */
+    protected function imapHeaderBlock($body)
+    {
+        $sep = "\r\n\r\n";
+        $end = strpos($body, $sep);
+        if ($end === false) {
+            $alt = strpos($body, "\n\n");
+            return ($alt === false) ? $body :
+                substr($body, 0, $alt + 2);
+        }
+        return substr($body, 0, $end + 4);
+    }
+    /**
+     * Returns the body text of a message: everything after the
+     * header-section separator. Empty string if there is no
+     * separator (a malformed message with only headers).
+     */
+    protected function imapBodyText($body)
+    {
+        $sep = "\r\n\r\n";
+        $end = strpos($body, $sep);
+        if ($end === false) {
+            $alt = strpos($body, "\n\n");
+            return ($alt === false) ? '' :
+                substr($body, $alt + 2);
+        }
+        return substr($body, $end + 4);
+    }
+    /**
+     * Returns the bytes for one BODY[<section>] request.
+     * Recognizes empty (whole message), HEADER (header block),
+     * TEXT (body text), HEADER.FIELDS (selected headers),
+     * HEADER.FIELDS.NOT (all but selected headers), and MIME
+     * (currently same as HEADER for non-multipart). Numeric
+     * MIME-part paths fall back to the whole body since
+     * multipart parsing is out of scope for this phase.
+     */
+    protected function imapBodySection($body, $section, $fields)
+    {
+        if ($section === '') {
+            return $body;
+        }
+        if ($section === 'HEADER') {
+            return $this->imapHeaderBlock($body);
+        }
+        if ($section === 'TEXT') {
+            return $this->imapBodyText($body);
+        }
+        if ($section === 'MIME') {
+            return $this->imapHeaderBlock($body);
+        }
+        if ($section === 'HEADER.FIELDS' ||
+            $section === 'HEADER.FIELDS.NOT') {
+            $hdr = $this->imapHeaderBlock($body);
+            return $this->imapFilterHeaders($hdr, $fields,
+                $section === 'HEADER.FIELDS.NOT');
+        }
+        /*
+            Numeric MIME path or unknown section: serve the
+            whole body. A real multipart parser is a future
+            phase; for the test fixtures used here single-part
+            messages cover the common case.
+         */
+        return $body;
+    }
+    /**
+     * Returns just the header lines whose names match (or do
+     * NOT match, when $invert is true) any of the names in
+     * $fields, preserving the original line content and
+     * terminating with the standard blank line CRLF that
+     * RFC 3501 sec 6.4.5 says clients expect.
+     */
+    protected function imapFilterHeaders($hdr_block, $fields,
+        $invert)
+    {
+        $wanted = [];
+        foreach ($fields as $f) {
+            $wanted[strtolower($f)] = true;
+        }
+        $lines = preg_split('/\r\n|\n/', $hdr_block);
+        $out = [];
+        $current_kept = null;
+        foreach ($lines as $line) {
+            if ($line === '') {
+                break;
+            }
+            if ($line[0] === ' ' || $line[0] === "\t") {
+                if ($current_kept) {
+                    $out[] = $line;
+                }
+                continue;
+            }
+            $colon = strpos($line, ':');
+            if ($colon === false) {
+                $current_kept = false;
+                continue;
+            }
+            $name = strtolower(trim(substr($line, 0, $colon)));
+            $match = isset($wanted[$name]);
+            $current_kept = $invert ? !$match : $match;
+            if ($current_kept) {
+                $out[] = $line;
+            }
+        }
+        return implode("\r\n", $out) . "\r\n\r\n";
+    }
+    /**
+     * Returns the IMAP ENVELOPE structure for a message as a
+     * paren-list. Per RFC 3501 sec 7.4.2 the order is date,
+     * subject, from, sender, reply-to, to, cc, bcc, in-reply-
+     * to, message-id. Address lists are nested paren-lists
+     * containing (name source-route mailbox-name host-name)
+     * tuples; absent fields are NIL.
+     */
+    protected function imapEnvelope($body)
+    {
+        $headers = $this->imapParseHeaders($body);
+        $get = function ($name) use ($headers) {
+            $key = strtolower($name);
+            return isset($headers[$key]) ? $headers[$key] : null;
+        };
+        $date = $this->imapEnvelopeNString($get('Date'));
+        $subj = $this->imapEnvelopeNString($get('Subject'));
+        $from = $this->imapEnvelopeAddrs($get('From'));
+        $sender = $this->imapEnvelopeAddrs($get('Sender') ??
+            $get('From'));
+        $reply = $this->imapEnvelopeAddrs($get('Reply-To') ??
+            $get('From'));
+        $to = $this->imapEnvelopeAddrs($get('To'));
+        $cc = $this->imapEnvelopeAddrs($get('Cc'));
+        $bcc = $this->imapEnvelopeAddrs($get('Bcc'));
+        $inreply = $this->imapEnvelopeNString(
+            $get('In-Reply-To'));
+        $msgid = $this->imapEnvelopeNString($get('Message-ID'));
+        return "($date $subj $from $sender $reply $to $cc " .
+            "$bcc $inreply $msgid)";
+    }
+    /**
+     * Parses RFC 5322 headers into a name => value map (case-
+     * insensitive, lower-cased keys). Continuation lines are
+     * unfolded with a single space. Repeated headers are
+     * concatenated with comma+space (sufficient for envelope
+     * use; full fidelity would need an array per name).
+     */
+    protected function imapParseHeaders($msg)
+    {
+        $sep_pos = strpos($msg, "\r\n\r\n");
+        $block = ($sep_pos === false) ? $msg :
+            substr($msg, 0, $sep_pos);
+        $lines = preg_split('/\r\n|\n/', $block);
+        $out = [];
+        $current = null;
+        foreach ($lines as $line) {
+            if ($line === '') {
+                continue;
+            }
+            if ($line[0] === ' ' || $line[0] === "\t") {
+                if ($current !== null && isset($out[$current])) {
+                    $out[$current] .= ' ' . trim($line);
+                }
+                continue;
+            }
+            $colon = strpos($line, ':');
+            if ($colon === false) {
+                $current = null;
+                continue;
+            }
+            $name = strtolower(trim(substr($line, 0, $colon)));
+            $val = ltrim(substr($line, $colon + 1));
+            if (isset($out[$name])) {
+                $out[$name] .= ', ' . $val;
+            } else {
+                $out[$name] = $val;
+            }
+            $current = $name;
+        }
+        return $out;
+    }
+    /**
+     * Renders a string as either an IMAP quoted string or NIL
+     * if the value is null/empty. Used for ENVELOPE date,
+     * subject, in-reply-to, and message-id slots.
+     */
+    protected function imapEnvelopeNString($v)
+    {
+        if ($v === null || $v === '') {
+            return 'NIL';
+        }
+        $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'],
+            $v);
+        return '"' . $escaped . '"';
+    }
+    /**
+     * Renders an address-list header value as an IMAP
+     * paren-list of address tuples, or NIL if the value is
+     * absent. Each tuple is (display-name source-route
+     * mailbox-local host). source-route is always NIL since
+     * RFC 5321 deprecated source routes; we just split on the
+     * @ to derive mailbox/host. Display names are extracted
+     * from the "Name <email>" form when present.
+     */
+    protected function imapEnvelopeAddrs($v)
+    {
+        if ($v === null || $v === '') {
+            return 'NIL';
+        }
+        $addrs = $this->imapSplitAddressList($v);
+        if (empty($addrs)) {
+            return 'NIL';
+        }
+        $parts = [];
+        foreach ($addrs as $addr) {
+            $name = $this->imapEnvelopeNString($addr['name']);
+            $local = $this->imapEnvelopeNString($addr['local']);
+            $host = $this->imapEnvelopeNString($addr['host']);
+            $parts[] = "($name NIL $local $host)";
+        }
+        return '(' . implode(' ', $parts) . ')';
+    }
+    /**
+     * Splits a header value containing one or more email
+     * addresses into structured records. Recognizes the
+     * "Display Name <local@host>" form and the bare "local@
+     * host" form. Quoted display names with embedded commas
+     * are handled; comments in parentheses are not preserved.
+     * Returns a list of ['name','local','host'] records.
+     */
+    protected function imapSplitAddressList($s)
+    {
+        $out = [];
+        $tokens = [];
+        $cur = '';
+        $in_q = false;
+        $in_b = 0;
+        $n = strlen($s);
+        for ($i = 0; $i < $n; $i++) {
+            $c = $s[$i];
+            if ($c === '"' && ($i === 0 || $s[$i-1] !== '\\')) {
+                $in_q = !$in_q;
+                $cur .= $c;
+                continue;
+            }
+            if (!$in_q && $c === '<') {
+                $in_b++;
+                $cur .= $c;
+                continue;
+            }
+            if (!$in_q && $c === '>') {
+                $in_b--;
+                $cur .= $c;
+                continue;
+            }
+            if (!$in_q && $in_b === 0 && $c === ',') {
+                $tokens[] = trim($cur);
+                $cur = '';
+                continue;
+            }
+            $cur .= $c;
+        }
+        if (trim($cur) !== '') {
+            $tokens[] = trim($cur);
+        }
+        foreach ($tokens as $t) {
+            if ($t === '') {
+                continue;
+            }
+            $name = '';
+            $addr = $t;
+            if (preg_match(
+                '/^(.*?)\s*<\s*([^<>]+?)\s*>\s*$/', $t, $m)) {
+                $name = trim($m[1], " \t\"");
+                $addr = $m[2];
+            }
+            $at = strrpos($addr, '@');
+            if ($at === false) {
+                $local = $addr;
+                $host = '';
+            } else {
+                $local = substr($addr, 0, $at);
+                $host = substr($addr, $at + 1);
+            }
+            $out[] = ['name' => $name, 'local' => $local,
+                'host' => $host];
+        }
+        return $out;
+    }
+    /**
+     * Returns an IMAP BODYSTRUCTURE (or BODY) representation
+     * of a message. For non-multipart messages we emit a
+     * single 7-tuple "(type subtype params id desc encoding
+     * size lines)" with content-type sniffed from the
+     * Content-Type header; multipart messages currently
+     * collapse to a single text/plain tuple, which is
+     * suboptimal but sufficient for clients that re-fetch the
+     * raw body for rendering. Real RFC 2046 parsing is a
+     * future phase.
+     */
+    protected function imapBodyStructure($body, $kind)
+    {
+        $headers = $this->imapParseHeaders($body);
+        $ct = isset($headers['content-type']) ?
+            $headers['content-type'] : 'text/plain';
+        $type = 'text';
+        $subtype = 'plain';
+        $params = [];
+        $parts = preg_split('/\s*;\s*/', $ct);
+        if (!empty($parts[0])) {
+            $mime = strtolower(trim($parts[0]));
+            $slash = strpos($mime, '/');
+            if ($slash !== false) {
+                $type = substr($mime, 0, $slash);
+                $subtype = substr($mime, $slash + 1);
+            }
+            for ($i = 1; $i < count($parts); $i++) {
+                if (preg_match('/^([^=]+)=(.*)$/',
+                    trim($parts[$i]), $m)) {
+                    $params[trim($m[1])] =
+                        trim($m[2], " \t\"");
+                }
+            }
+        }
+        $params_repr = 'NIL';
+        if (!empty($params)) {
+            $pp = [];
+            foreach ($params as $k => $v) {
+                $pp[] = '"' . strtoupper($k) . '" "' . $v . '"';
+            }
+            $params_repr = '(' . implode(' ', $pp) . ')';
+        }
+        $encoding = isset($headers['content-transfer-encoding']) ?
+            strtolower($headers['content-transfer-encoding']) :
+            '7bit';
+        $text = $this->imapBodyText($body);
+        $size = strlen($text);
+        $lines = substr_count($text, "\n");
+        return '("' . strtoupper($type) . '" "' .
+            strtoupper($subtype) . '" ' . $params_repr .
+            ' NIL NIL "' . strtoupper($encoding) . '" ' .
+            $size . ' ' . $lines . ')';
+    }
+    /**
+     * Implements FETCH and UID FETCH. The $by_uid flag tells
+     * us whether the message-set is sequence numbers or UIDs
+     * and whether to auto-include the UID data item. Each
+     * message gets one untagged "* N FETCH (...)" response
+     * line; the tagged OK is sent after the loop. \Seen flag
+     * is set on messages whose body was served via a non-PEEK
+     * BODY request.
+     */
+    protected function imapCmdFetch($key, $tag, $args, &$ctx,
+        $by_uid)
+    {
+        $sp = strpos($args, ' ');
+        if ($sp === false) {
+            $this->queueWrite($key,
+                "$tag BAD FETCH syntax\r\n");
+            return;
+        }
+        $set = substr($args, 0, $sp);
+        $items_str = substr($args, $sp + 1);
+        $user = $ctx['AUTH_USER'];
+        $folder = $ctx['SELECTED'];
+        $matched = $this->imapMatchSet($user, $folder, $set,
+            $by_uid);
+        $verb = $by_uid ? 'UID FETCH' : 'FETCH';
+        foreach ($matched as $entry) {
+            list($seq, $meta) = $entry;
+            $body = $this->mail_storage->fetchMessage($user,
+                $folder, $meta['uid']);
+            if ($body === false) {
+                continue;
+            }
+            $mark_seen = false;
+            $this->imapEmitFetch($key, $seq, $meta, $body,
+                $items_str, $by_uid, $mark_seen);
+            if ($mark_seen &&
+                empty($ctx['SELECTED_READONLY']) &&
+                !in_array('\Seen', $meta['flags'], true)) {
+                $new_flags = $meta['flags'];
+                $new_flags[] = '\Seen';
+                $this->mail_storage->setFlags($user, $folder,
+                    $meta['uid'], $new_flags);
+            }
+        }
+        $this->queueWrite($key,
+            "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Implements STORE and UID STORE. Handles the three
+     * mutation modes: FLAGS (replace), +FLAGS (add), -FLAGS
+     * (remove), each with optional .SILENT suffix that
+     * suppresses the per-message FETCH response. The flag
+     * list itself is a parenthesized atom list.
+     */
+    protected function imapCmdStore($key, $tag, $args, &$ctx,
+        $by_uid)
+    {
+        if (!preg_match(
+            '/^(\S+)\s+([+-]?FLAGS(?:\.SILENT)?)\s+(.+)$/i',
+            $args, $m)) {
+            $this->queueWrite($key,
+                "$tag BAD STORE syntax\r\n");
+            return;
+        }
+        $set = $m[1];
+        $op = strtoupper($m[2]);
+        $flags_str = trim($m[3]);
+        if ($flags_str !== '' && $flags_str[0] === '(' &&
+            substr($flags_str, -1) === ')') {
+            $flags_str = substr($flags_str, 1, -1);
+        }
+        $req_flags = [];
+        foreach (preg_split('/\s+/', trim($flags_str)) as $f) {
+            if ($f !== '') {
+                $req_flags[] = $f;
+            }
+        }
+        $silent = (substr($op, -7) === '.SILENT');
+        $mode = $silent ? substr($op, 0, -7) : $op;
+        $user = $ctx['AUTH_USER'];
+        $folder = $ctx['SELECTED'];
+        $matched = $this->imapMatchSet($user, $folder, $set,
+            $by_uid);
+        $verb = $by_uid ? 'UID STORE' : 'STORE';
+        if (!empty($ctx['SELECTED_READONLY'])) {
+            $this->queueWrite($key,
+                "$tag NO Mailbox is read-only\r\n");
+            return;
+        }
+        foreach ($matched as $entry) {
+            list($seq, $meta) = $entry;
+            $existing = $meta['flags'];
+            $new = $existing;
+            if ($mode === 'FLAGS') {
+                $new = $req_flags;
+            } else if ($mode === '+FLAGS') {
+                foreach ($req_flags as $f) {
+                    if (!in_array($f, $new, true)) {
+                        $new[] = $f;
+                    }
+                }
+            } else if ($mode === '-FLAGS') {
+                $new = array_values(array_diff($new,
+                    $req_flags));
+            }
+            $this->mail_storage->setFlags($user, $folder,
+                $meta['uid'], $new);
+            if (!$silent) {
+                $extras = [];
+                $extras[] = "FLAGS (" .
+                    implode(' ', $new) . ")";
+                if ($by_uid) {
+                    $extras[] = "UID " . $meta['uid'];
+                }
+                $this->queueWrite($key,
+                    "* $seq FETCH (" .
+                    implode(' ', $extras) . ")\r\n");
+            }
+        }
+        $this->queueWrite($key,
+            "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Implements COPY and UID COPY. Each matched message is
+     * appended to the target folder via the storage backend's
+     * appendMessage, preserving flags but assigning a fresh
+     * UID in the target. Note: this differs from MOVE, which
+     * preserves UIDs (because moveMessage just renames the
+     * file). Copying inherently allocates new UIDs because
+     * the same per-user UID counter is used for the new
+     * message.
+     */
+    protected function imapCmdCopy($key, $tag, $args, &$ctx,
+        $by_uid)
+    {
+        $sp = strrpos(rtrim($args), ' ');
+        if ($sp === false) {
+            $this->queueWrite($key,
+                "$tag BAD COPY syntax\r\n");
+            return;
+        }
+        $set = trim(substr($args, 0, $sp));
+        $folder_tok = trim(substr($args, $sp + 1));
+        if ($folder_tok === '' || $folder_tok[0] === '"') {
+            $tokens = $this->parseImapTokens($folder_tok);
+            $target = $this->tokenString($tokens, 0);
+        } else {
+            $target = $folder_tok;
+        }
+        $user = $ctx['AUTH_USER'];
+        $folder = $ctx['SELECTED'];
+        if ($target === false || $target === '') {
+            $this->queueWrite($key,
+                "$tag BAD COPY syntax\r\n");
+            return;
+        }
+        if (!$this->mail_storage->folderExists($user, $target)) {
+            $this->queueWrite($key,
+                "$tag NO [TRYCREATE] Target mailbox " .
+                "does not exist\r\n");
+            return;
+        }
+        $matched = $this->imapMatchSet($user, $folder, $set,
+            $by_uid);
+        $verb = $by_uid ? 'UID COPY' : 'COPY';
+        foreach ($matched as $entry) {
+            list($seq, $meta) = $entry;
+            $body = $this->mail_storage->fetchMessage($user,
+                $folder, $meta['uid']);
+            if ($body === false) {
+                continue;
+            }
+            $this->mail_storage->appendMessage($user, $target,
+                $body, $meta['flags'], $meta['internal_date']);
+        }
+        $this->queueWrite($key,
+            "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Implements MOVE and UID MOVE (RFC 6851). Unlike COPY,
+     * MOVE preserves the source UID in the target folder
+     * because the storage layer's moveMessage operation
+     * relocates the same file rather than allocating a new
+     * UID. Per the RFC the server emits an EXPUNGE response
+     * for each removed source message after the move.
+     */
+    protected function imapCmdMove($key, $tag, $args, &$ctx,
+        $by_uid)
+    {
+        $sp = strrpos(rtrim($args), ' ');
+        if ($sp === false) {
+            $this->queueWrite($key,
+                "$tag BAD MOVE syntax\r\n");
+            return;
+        }
+        $set = trim(substr($args, 0, $sp));
+        $folder_tok = trim(substr($args, $sp + 1));
+        if ($folder_tok === '' || $folder_tok[0] === '"') {
+            $tokens = $this->parseImapTokens($folder_tok);
+            $target = $this->tokenString($tokens, 0);
+        } else {
+            $target = $folder_tok;
+        }
+        $user = $ctx['AUTH_USER'];
+        $folder = $ctx['SELECTED'];
+        if ($target === false || $target === '') {
+            $this->queueWrite($key,
+                "$tag BAD MOVE syntax\r\n");
+            return;
+        }
+        if (!$this->mail_storage->folderExists($user, $target)) {
+            $this->queueWrite($key,
+                "$tag NO [TRYCREATE] Target mailbox " .
+                "does not exist\r\n");
+            return;
+        }
+        $matched = $this->imapMatchSet($user, $folder, $set,
+            $by_uid);
+        $verb = $by_uid ? 'UID MOVE' : 'MOVE';
+        /*
+            Emit EXPUNGE responses in descending sequence order
+            so the client's count of remaining messages stays
+            consistent as each is removed. The IMAP convention
+            is that an EXPUNGE for sequence N implies the
+            message was deleted and all sequence numbers > N
+            shift down by one.
+         */
+        $seqs_to_expunge = [];
+        foreach ($matched as $entry) {
+            list($seq, $meta) = $entry;
+            if ($this->mail_storage->moveMessage($user, $folder,
+                $target, $meta['uid'])) {
+                $seqs_to_expunge[] = $seq;
+            }
+        }
+        rsort($seqs_to_expunge);
+        foreach ($seqs_to_expunge as $seq) {
+            $this->queueWrite($key, "* $seq EXPUNGE\r\n");
+        }
+        $this->queueWrite($key,
+            "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Implements EXPUNGE: permanently removes every message
+     * in the selected folder that has the \Deleted flag set.
+     * Emits an untagged EXPUNGE response per removed message,
+     * in descending sequence order so the client's running
+     * count stays consistent as each removal shifts higher
+     * sequences down. Not allowed on read-only mailboxes
+     * (EXAMINE).
+     */
+    protected function imapCmdExpunge($key, $tag, &$ctx)
+    {
+        if (!empty($ctx['SELECTED_READONLY'])) {
+            $this->queueWrite($key,
+                "$tag NO Mailbox is read-only\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        $folder = $ctx['SELECTED'];
+        $messages = $this->mail_storage->listMessages($user,
+            $folder);
+        $seqs_removed = [];
+        foreach ($messages as $idx => $meta) {
+            if (in_array('\Deleted', $meta['flags'], true)) {
+                $seqs_removed[] = $idx + 1;
+            }
+        }
+        $this->mail_storage->expunge($user, $folder);
+        rsort($seqs_removed);
+        foreach ($seqs_removed as $seq) {
+            $this->queueWrite($key, "* $seq EXPUNGE\r\n");
+        }
+        $this->queueWrite($key,
+            "$tag OK EXPUNGE completed\r\n");
+    }
+    /**
+     * Implements SEARCH and UID SEARCH. Returns one untagged
+     * "* SEARCH ..." response listing the matching sequence
+     * numbers (or UIDs, in UID SEARCH mode), then a tagged
+     * OK. Supports the common single-key forms (ALL, SEEN/
+     * UNSEEN, FLAGGED/UNFLAGGED, DELETED/UNDELETED, RECENT/
+     * OLD, ANSWERED/UNANSWERED, DRAFT/UNDRAFT, KEYWORD/
+     * UNKEYWORD), header substring searches (FROM, TO, CC,
+     * BCC, SUBJECT, BODY, TEXT, HEADER), date predicates
+     * (SINCE, BEFORE, ON), size predicates (LARGER, SMALLER),
+     * and the boolean operators NOT and OR. AND is implicit
+     * (juxtaposed keys are conjuncted). Sequence-set and
+     * UID-set restrictions also work.
+     */
+    protected function imapCmdSearch($key, $tag, $args, &$ctx,
+        $by_uid)
+    {
+        $tokens = $this->imapTokenizeSearch($args);
+        if ($tokens === null) {
+            $this->queueWrite($key,
+                "$tag BAD SEARCH syntax\r\n");
+            return;
+        }
+        $user = $ctx['AUTH_USER'];
+        $folder = $ctx['SELECTED'];
+        $messages = $this->mail_storage->listMessages($user,
+            $folder);
+        $last_seq = count($messages);
+        $last_uid = empty($messages) ? 0 :
+            end($messages)['uid'];
+        $hits = [];
+        foreach ($messages as $idx => $meta) {
+            $seq = $idx + 1;
+            if ($this->imapEvalSearch($tokens, $meta, $seq,
+                $last_seq, $last_uid, $user, $folder)) {
+                $hits[] = $by_uid ? $meta['uid'] : $seq;
+            }
+        }
+        $verb = $by_uid ? 'UID SEARCH' : 'SEARCH';
+        $this->queueWrite($key,
+            "* SEARCH" . ($hits ? ' ' . implode(' ', $hits) :
+                '') . "\r\n");
+        $this->queueWrite($key,
+            "$tag OK $verb completed\r\n");
+    }
+    /**
+     * Tokenizes a SEARCH argument string into a flat list of
+     * uppercased keyword atoms and their string operands.
+     * Quoted strings are unwrapped, parenthesized subgroups
+     * are bracketed with synthetic '(' and ')' markers, and
+     * literal forms are collapsed to their string content.
+     * Returns null on a parse error.
+     */
+    protected function imapTokenizeSearch($s)
+    {
+        $out = [];
+        $i = 0;
+        $n = strlen($s);
+        while ($i < $n) {
+            $c = $s[$i];
+            if ($c === ' ' || $c === "\t") {
+                $i++;
+                continue;
+            }
+            if ($c === '(') {
+                $out[] = ['(', '('];
+                $i++;
+                continue;
+            }
+            if ($c === ')') {
+                $out[] = [')', ')'];
+                $i++;
+                continue;
+            }
+            if ($c === '"') {
+                $j = $i + 1;
+                $val = '';
+                while ($j < $n && $s[$j] !== '"') {
+                    if ($s[$j] === '\\' && $j + 1 < $n) {
+                        $val .= $s[$j + 1];
+                        $j += 2;
+                        continue;
+                    }
+                    $val .= $s[$j];
+                    $j++;
+                }
+                if ($j >= $n) {
+                    return null;
+                }
+                $out[] = ['STR', $val];
+                $i = $j + 1;
+                continue;
+            }
+            $j = $i;
+            while ($j < $n && $s[$j] !== ' ' &&
+                $s[$j] !== "\t" && $s[$j] !== '(' &&
+                $s[$j] !== ')') {
+                $j++;
+            }
+            $tok = substr($s, $i, $j - $i);
+            $out[] = ['ATOM', $tok];
+            $i = $j;
+        }
+        return $out;
+    }
+    /**
+     * Recursive evaluator for a SEARCH key list against one
+     * message. Conjuncts adjacent keys; OR <a> <b> as a
+     * disjunction; NOT <key> as inversion; (...) grouping for
+     * arbitrary boolean trees. Side-loads the message body
+     * lazily for keys that need it (BODY, TEXT, HEADER).
+     */
+    protected function imapEvalSearch(&$tokens, $meta, $seq,
+        $last_seq, $last_uid, $user, $folder)
+    {
+        $cursor = 0;
+        $body_cache = null;
+        $get_body = function () use (&$body_cache, $user,
+            $folder, $meta) {
+            if ($body_cache === null) {
+                $body_cache = $this->mail_storage->fetchMessage(
+                    $user, $folder, $meta['uid']);
+                if ($body_cache === false) {
+                    $body_cache = '';
+                }
+            }
+            return $body_cache;
+        };
+        $eval_one = function () use (&$cursor, &$tokens, $meta,
+            $seq, $last_seq, $last_uid, $get_body, &$eval_one) {
+            if ($cursor >= count($tokens)) {
+                return null;
+            }
+            $t = $tokens[$cursor++];
+            if ($t[0] === '(') {
+                $r = true;
+                while ($cursor < count($tokens) &&
+                    $tokens[$cursor][0] !== ')') {
+                    $r = $r && $eval_one();
+                }
+                if ($cursor < count($tokens)) {
+                    $cursor++;
+                }
+                return $r;
+            }
+            $kw = strtoupper($t[1]);
+            if ($kw === 'ALL') return true;
+            if ($kw === 'NEW') {
+                return in_array('\Recent', $meta['flags'],
+                        true) &&
+                    !in_array('\Seen', $meta['flags'], true);
+            }
+            if ($kw === 'OLD') {
+                return !in_array('\Recent', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'RECENT') {
+                return in_array('\Recent', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'SEEN') {
+                return in_array('\Seen', $meta['flags'], true);
+            }
+            if ($kw === 'UNSEEN') {
+                return !in_array('\Seen', $meta['flags'], true);
+            }
+            if ($kw === 'FLAGGED') {
+                return in_array('\Flagged', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'UNFLAGGED') {
+                return !in_array('\Flagged', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'DELETED') {
+                return in_array('\Deleted', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'UNDELETED') {
+                return !in_array('\Deleted', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'ANSWERED') {
+                return in_array('\Answered', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'UNANSWERED') {
+                return !in_array('\Answered', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'DRAFT') {
+                return in_array('\Draft', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'UNDRAFT') {
+                return !in_array('\Draft', $meta['flags'],
+                    true);
+            }
+            if ($kw === 'NOT') {
+                return !$eval_one();
+            }
+            if ($kw === 'OR') {
+                $a = $eval_one();
+                $b = $eval_one();
+                return $a || $b;
+            }
+            if ($kw === 'KEYWORD' || $kw === 'UNKEYWORD') {
+                $arg = $tokens[$cursor++][1] ?? '';
+                $has = in_array($arg, $meta['flags'], true);
+                return $kw === 'KEYWORD' ? $has : !$has;
+            }
+            if ($kw === 'FROM' || $kw === 'TO' ||
+                $kw === 'CC' || $kw === 'BCC' ||
+                $kw === 'SUBJECT') {
+                $arg = $tokens[$cursor++][1] ?? '';
+                $hdrs = $this->imapParseHeaders($get_body());
+                $hkey = strtolower($kw);
+                $val = $hdrs[$hkey] ?? '';
+                return stripos($val, $arg) !== false;
+            }
+            if ($kw === 'HEADER') {
+                $name = $tokens[$cursor++][1] ?? '';
+                $arg = $tokens[$cursor++][1] ?? '';
+                $hdrs = $this->imapParseHeaders($get_body());
+                $val = $hdrs[strtolower($name)] ?? '';
+                return $arg === '' ? $val !== '' :
+                    stripos($val, $arg) !== false;
+            }
+            if ($kw === 'BODY' || $kw === 'TEXT') {
+                $arg = $tokens[$cursor++][1] ?? '';
+                $hay = ($kw === 'BODY') ?
+                    $this->imapBodyText($get_body()) :
+                    $get_body();
+                return stripos($hay, $arg) !== false;
+            }
+            if ($kw === 'SINCE' || $kw === 'BEFORE' ||
+                $kw === 'ON') {
+                $arg = $tokens[$cursor++][1] ?? '';
+                $when = strtotime($arg);
+                if ($when === false) return false;
+                $msg_day = strtotime(gmdate('Y-m-d',
+                    $meta['internal_date']));
+                $arg_day = strtotime(gmdate('Y-m-d', $when));
+                if ($kw === 'SINCE') return $msg_day >= $arg_day;
+                if ($kw === 'BEFORE') return $msg_day < $arg_day;
+                return $msg_day === $arg_day;
+            }
+            if ($kw === 'LARGER' || $kw === 'SMALLER') {
+                $arg = (int) ($tokens[$cursor++][1] ?? '0');
+                if ($kw === 'LARGER') {
+                    return $meta['size'] > $arg;
+                }
+                return $meta['size'] < $arg;
+            }
+            if ($kw === 'UID') {
+                $arg = $tokens[$cursor++][1] ?? '';
+                $matcher = $this->imapParseMessageSet($arg, true);
+                return $matcher($seq, $last_seq, $meta['uid'],
+                    $last_uid);
+            }
+            /*
+                Bare numeric or set: treat as sequence-number
+                set per RFC 3501 sec 6.4.4.
+             */
+            if (preg_match('/^[0-9*,:]+$/', $t[1])) {
+                $matcher = $this->imapParseMessageSet($t[1],
+                    false);
+                return $matcher($seq, $last_seq, $meta['uid'],
+                    $last_uid);
+            }
+            return true;
+        };
+        $r = true;
+        while ($cursor < count($tokens)) {
+            $r = $r && $eval_one();
+        }
+        return $r;
+    }
+    /**
+     * Implements IDLE (RFC 2177): the client says IDLE, the
+     * server replies with "+ idling" and keeps the connection
+     * open until the client sends DONE on its own line, at
+     * which point we ack with the tagged OK. We do not
+     * currently push untagged updates during the idle window;
+     * that requires server-side change notification which
+     * Phase 4 does not include. The command still completes
+     * successfully so well-behaved clients accept us.
+     */
+    protected function imapCmdIdle($key, $tag, &$ctx)
+    {
+        $ctx['IMAP_LIT_PENDING'] = [
+            'continuation' => 'idle',
+            'tag' => $tag,
+        ];
+        $this->queueWrite($key, "+ idling\r\n");
     }
     /**
      * Handles IMAP STARTTLS (RFC 2595). Same deferred-upgrade

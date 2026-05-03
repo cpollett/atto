@@ -874,8 +874,8 @@ $scenarios['imap_multipart'] = [
             "Content-Type: text/html; charset=UTF-8\r\n" .
             "Content-Transfer-Encoding: quoted-printable" .
                 "\r\n\r\n" .
-            "<html><body><p>HTML version.</p></body>" .
-                "</html>\r\n" .
+            "<html><body><h1 style='font-size:30pt;color:blue'>".
+                "Mail using HTML</h1></body></html>\r\n" .
             "--BOUNDARY42--\r\n";
         $size = strlen($body);
         return runScript($cfg['host'], $cfg['imap'], [
@@ -1779,7 +1779,7 @@ $site->get('/', function () use ($scenarios) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>AttoMail Demo Harness</title>
+<title>AttoMail Demo</title>
 <style>
 body { font-family: -apple-system, BlinkMacSystemFont, sans-serif;
     max-width: 920px; margin: 1.5em auto; padding: 0 1em;

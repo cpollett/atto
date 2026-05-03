@@ -1157,15 +1157,16 @@ $scenarios['imap_search_unicode'] = [
             /*
                 Reach into the same decoder MailSite uses for
                 IMAP SEARCH so the demo cannot drift from the
-                real behavior. We invoke it through reflection
-                because it is protected; the important thing
-                is the demo and the wire path agree on what
-                "decoded" means.
+                real behavior. The decoder is protected, but
+                ReflectionMethod can invoke it directly without
+                a setAccessible() call (that helper has been a
+                no-op since PHP 8.1 and was deprecated in 8.5;
+                calling it produces a Deprecated notice that
+                breaks JSON output when display_errors is on).
              */
             $reflection = new ReflectionClass($mail);
             $method = $reflection->getMethod(
                 'imapDecodeMimeHeader');
-            $method->setAccessible(true);
             $subject_decoded = $method->invoke($mail,
                 $subject_raw);
             $rows[] = [

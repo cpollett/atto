@@ -384,6 +384,49 @@ abstract class MailStorage
      * @return int
      */
     abstract public function uidNext($user, $folder);
+    /**
+     * Returns true if the user has explicitly subscribed to a
+     * folder. INBOX is treated as subscribed by convention even
+     * if no SUBSCRIBE command has been issued, since RFC 3501
+     * sec 6.3.6 says it is not an error to subscribe an already
+     * subscribed mailbox and clients expect INBOX to be listed
+     * by LSUB at connect time. Other folders are subscribed
+     * only after an explicit SUBSCRIBE.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool
+     */
+    abstract public function isSubscribed($user, $folder);
+    /**
+     * Marks a folder as subscribed for a user. The folder need
+     * not exist; RFC 3501 sec 6.3.6 explicitly allows
+     * subscribing to non-existent mailboxes (a remote-shared
+     * folder might be unmounted at the moment). Idempotent.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool true on success
+     */
+    abstract public function subscribe($user, $folder);
+    /**
+     * Removes a subscription. Idempotent: unsubscribing a
+     * folder that is not subscribed succeeds silently.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return bool true on success
+     */
+    abstract public function unsubscribe($user, $folder);
+    /**
+     * Returns the list of folders this user has subscribed to,
+     * sorted ascending. INBOX is always present in the result
+     * even if the per-user state file does not list it.
+     *
+     * @param string $user
+     * @return string[]
+     */
+    abstract public function listSubscribed($user);
 }
 /**
  * Filesystem-backed MailStorage. Directory layout under the
@@ -885,6 +928,117 @@ class FileMailStorage extends MailStorage
         }
         return (int) trim((string) @file_get_contents($file));
     }
+    /**
+     * Returns the absolute path to the per-user subscription
+     * state file. The file holds one folder name per line; an
+     * empty or missing file means only INBOX is subscribed.
+     */
+    protected function subscriptionFile($user)
+    {
+        return $this->userDir($user) . DIRECTORY_SEPARATOR .
+            ".subscribed";
+    }
+    /**
+     * Reads the subscription file into a deduplicated array
+     * with INBOX always present. The file format is one folder
+     * name per line; blank lines and leading/trailing whitespace
+     * are ignored. INBOX is treated as implicitly subscribed
+     * even if not listed (RFC 3501 sec 6.3.6 idempotency).
+     */
+    protected function readSubscriptions($user)
+    {
+        $file = $this->subscriptionFile($user);
+        $names = ['INBOX'];
+        if (is_file($file)) {
+            $lines = @file($file, FILE_IGNORE_NEW_LINES |
+                FILE_SKIP_EMPTY_LINES);
+            if (is_array($lines)) {
+                foreach ($lines as $line) {
+                    $line = trim($line);
+                    if ($line !== '' &&
+                        !in_array($line, $names, true)) {
+                        $names[] = $line;
+                    }
+                }
+            }
+        }
+        return $names;
+    }
+    /**
+     * Writes a list of folder names to the subscription file
+     * atomically (write-temp-then-rename) to avoid leaving a
+     * half-written state file if the process is interrupted.
+     */
+    protected function writeSubscriptions($user, $folders)
+    {
+        $this->ensureUser($user);
+        $file = $this->subscriptionFile($user);
+        $temp_path = $file . '.tmp';
+        $payload = '';
+        foreach ($folders as $f) {
+            $payload .= $f . "\n";
+        }
+        if (file_put_contents($temp_path, $payload) === false) {
+            return false;
+        }
+        if (!@rename($temp_path, $file)) {
+            @unlink($temp_path);
+            return false;
+        }
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function isSubscribed($user, $folder)
+    {
+        return in_array($folder,
+            $this->readSubscriptions($user), true);
+    }
+    /**
+     * @inheritdoc
+     */
+    public function subscribe($user, $folder)
+    {
+        $current = $this->readSubscriptions($user);
+        if (in_array($folder, $current, true)) {
+            return true;
+        }
+        $current[] = $folder;
+        return $this->writeSubscriptions($user, $current);
+    }
+    /**
+     * @inheritdoc
+     */
+    public function unsubscribe($user, $folder)
+    {
+        if (strcasecmp($folder, 'INBOX') === 0) {
+            /*
+                INBOX cannot be unsubscribed (it is implicitly
+                in every result); we accept the request and
+                return success per RFC 3501 sec 6.3.7
+                idempotency, but do not actually remove it.
+             */
+            return true;
+        }
+        $current = $this->readSubscriptions($user);
+        $idx = array_search($folder, $current, true);
+        if ($idx === false) {
+            return true;
+        }
+        unset($current[$idx]);
+        return $this->writeSubscriptions($user,
+            array_values($current));
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listSubscribed($user)
+    {
+        $names = $this->readSubscriptions($user);
+        sort($names);
+        return $names;
+    }
 }
 /**
  * The mail server itself. Single instance per process; binds one
@@ -972,6 +1126,16 @@ class MailSite
     protected $server_context_array = [];
     /** @var bool whether listen() detected an SSL config */
     protected $tls_available = false;
+    /**
+     * @var array per-folder change counter for IDLE push.
+     * Indexed as $mailbox_changes[$user][$folder] = int.
+     * Bumped on every storage mutation that adds, removes, or
+     * relocates a message. Idling connections snapshot the
+     * counter on entry and the per-tick notification step
+     * compares the current value to the snapshot to decide
+     * whether to emit "* N EXISTS".
+     */
+    protected $mailbox_changes = [];
     /**
      * Constructs a MailSite. The instance starts unconfigured;
      * the caller must wire an Authenticator via auth(), a
@@ -1175,8 +1339,12 @@ class MailSite
             }
         }
         $this->mail_storage->ensureUser($local);
-        return $this->mail_storage->appendMessage($local, $folder,
+        $uid = $this->mail_storage->appendMessage($local, $folder,
             $bytes, $flags);
+        if ($uid !== false) {
+            $this->bumpMailboxChange($local, $folder);
+        }
+        return $uid;
     }
     /**
      * Returns the list of folder names for a user, including
@@ -1247,8 +1415,12 @@ class MailSite
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $date = 0)
     {
-        return $this->mail_storage->appendMessage($user, $folder,
+        $uid = $this->mail_storage->appendMessage($user, $folder,
             $bytes, $flags, $date);
+        if ($uid !== false) {
+            $this->bumpMailboxChange($user, $folder);
+        }
+        return $uid;
     }
     /**
      * Returns the raw RFC 5322 bytes of a single message.
@@ -1304,8 +1476,12 @@ class MailSite
      */
     public function setFlags($user, $folder, $uid, $flags)
     {
-        return $this->mail_storage->setFlags($user, $folder, $uid,
+        $ok = $this->mail_storage->setFlags($user, $folder, $uid,
             $flags);
+        if ($ok) {
+            $this->bumpMailboxChange($user, $folder);
+        }
+        return $ok;
     }
     /**
      * Permanently removes every message in a folder that has the
@@ -1318,7 +1494,11 @@ class MailSite
      */
     public function expunge($user, $folder)
     {
-        return $this->mail_storage->expunge($user, $folder);
+        $removed = $this->mail_storage->expunge($user, $folder);
+        if (!empty($removed)) {
+            $this->bumpMailboxChange($user, $folder);
+        }
+        return $removed;
     }
     /**
      * Moves a message between folders. The UID is preserved
@@ -1333,8 +1513,13 @@ class MailSite
      */
     public function moveMessage($user, $from, $to, $uid)
     {
-        return $this->mail_storage->moveMessage($user, $from, $to,
+        $ok = $this->mail_storage->moveMessage($user, $from, $to,
             $uid);
+        if ($ok) {
+            $this->bumpMailboxChange($user, $from);
+            $this->bumpMailboxChange($user, $to);
+        }
+        return $ok;
     }
     /**
      * Returns the number of messages currently in a folder.
@@ -1396,6 +1581,46 @@ class MailSite
     public function uidValidity($user, $folder)
     {
         return $this->mail_storage->uidValidity($user, $folder);
+    }
+    /**
+     * Increments the per-folder change counter that drives
+     * IDLE push notifications. Called after any storage
+     * operation that changes the visible message count of a
+     * folder. The counter is per-process and in-memory only;
+     * it does not need to persist because IDLE subscribers
+     * snapshot the current value at IDLE time and only care
+     * about deltas during the idle window.
+     *
+     * @param string $user
+     * @param string $folder
+     */
+    protected function bumpMailboxChange($user, $folder)
+    {
+        if (!isset($this->mailbox_changes[$user])) {
+            $this->mailbox_changes[$user] = [];
+        }
+        if (!isset($this->mailbox_changes[$user][$folder])) {
+            $this->mailbox_changes[$user][$folder] = 0;
+        }
+        $this->mailbox_changes[$user][$folder]++;
+    }
+    /**
+     * Returns the current change-counter value for a folder,
+     * defaulting to 0 if no mutations have happened in this
+     * process. Used by imapCmdIdle to snapshot the value at
+     * idle entry, and by processIdleNotifications to compare
+     * later.
+     *
+     * @param string $user
+     * @param string $folder
+     * @return int
+     */
+    protected function currentChangeCounter($user, $folder)
+    {
+        if (!isset($this->mailbox_changes[$user][$folder])) {
+            return 0;
+        }
+        return $this->mailbox_changes[$user][$folder];
     }
     /**
      * Resolves a recipient address to a local username, or false
@@ -1587,14 +1812,27 @@ class MailSite
         while (true) {
             $reads = $this->in_streams[self::CONNECTION];
             $writes = $this->out_streams[self::CONNECTION];
-            $timeout = null;
+            /*
+                Cap the select timeout at 5 seconds so the loop
+                wakes regularly even when nothing is happening.
+                IDLE push notifications are emitted on the post-
+                select tick, so a long sleep here would delay
+                "* N EXISTS" pushes by however long the server
+                slept. Five seconds bounds notification latency
+                while keeping the idle CPU cost negligible.
+             */
+            $timeout = 5;
             $microtimeout = 0;
             if (!$this->timer_alarms->isEmpty()) {
                 $top = $this->timer_alarms->top();
                 $when = $top['data'][1];
                 $delta = max(0.0, $when - microtime(true));
-                $timeout = (int) floor($delta);
-                $microtimeout = (int) (($delta - $timeout) * 1e6);
+                $timer_secs = (int) floor($delta);
+                if ($timer_secs < $timeout) {
+                    $timeout = $timer_secs;
+                    $microtimeout =
+                        (int) (($delta - $timeout) * 1e6);
+                }
             }
             $n = @stream_select($reads, $writes, $excepts,
                 $timeout, $microtimeout);
@@ -1613,6 +1851,7 @@ class MailSite
                     $this->writeClient($stream);
                 }
             }
+            $this->processIdleNotifications();
             $this->cullDeadStreams();
         }
     }
@@ -2932,6 +3171,7 @@ class MailSite
                     "$tag NO APPEND failed\r\n");
                 return;
             }
+            $this->bumpMailboxChange($user, $folder);
             $validity = $this->mail_storage->uidValidity($user,
                 $folder);
             $this->queueWrite($key,
@@ -2951,6 +3191,8 @@ class MailSite
             $up = strtoupper(trim($line));
             if ($up === 'DONE') {
                 $context['IMAP_LIT_PENDING'] = null;
+                $context['IDLE_SNAPSHOT'] = null;
+                $context['IDLE_FOLDER'] = null;
                 $this->queueWrite($key,
                     "$tag OK IDLE terminated\r\n");
                 return;
@@ -2960,6 +3202,8 @@ class MailSite
                 return;
             }
             $context['IMAP_LIT_PENDING'] = null;
+            $context['IDLE_SNAPSHOT'] = null;
+            $context['IDLE_FOLDER'] = null;
             $this->queueWrite($key,
                 "$tag BAD Expected DONE\r\n");
             return;
@@ -3162,6 +3406,23 @@ class MailSite
             $folders[] = 'INBOX';
             sort($folders);
         }
+        if ($is_lsub) {
+            /*
+                LSUB filters to the subscribed set per RFC 3501
+                sec 6.3.9. INBOX is implicitly subscribed even
+                without a SUBSCRIBE command. We intersect the
+                subscribed list with the existing-folders list
+                so that LSUB does not advertise folders the
+                user has subscribed to but which no longer
+                exist (RFC 3501 actually permits returning
+                non-existent subscribed folders as well, but
+                most clients render them awkwardly).
+             */
+            $subscribed = $this->mail_storage->listSubscribed(
+                $user);
+            $folders = array_values(array_intersect($folders,
+                $subscribed));
+        }
         $combined = $ref === '' ? $pat : $ref . $pat;
         $regex = $this->imapPatternToRegex($combined);
         foreach ($folders as $f) {
@@ -3285,28 +3546,31 @@ class MailSite
         return '"' . $escaped . '"';
     }
     /**
-     * Stub SUBSCRIBE/UNSUBSCRIBE: since we do not maintain a
-     * per-user subscription list, accept any folder name that
-     * names an existing mailbox and return OK. This is what a
-     * client sees as "all folders are subscribed", which is the
-     * simplest correct behavior for a server without subscription
-     * state.
+     * Handles SUBSCRIBE and UNSUBSCRIBE: persists the
+     * subscription decision through the storage layer's
+     * subscribe / unsubscribe methods. RFC 3501 sec 6.3.6
+     * says SUBSCRIBE may target a non-existent mailbox (a
+     * remote-shared folder might be temporarily offline);
+     * we follow that: SUBSCRIBE returns OK regardless of
+     * whether the mailbox exists, while UNSUBSCRIBE on a
+     * never-subscribed folder returns OK as a no-op
+     * (idempotency per RFC 3501 sec 6.3.7).
      */
     protected function imapCmdSubscribe($key, $tag, $arguments, $verb,
         &$context)
     {
         $tokens = $this->parseImapTokens($arguments);
         $name = $this->tokenString($tokens, 0);
-        if ($name === false) {
+        if ($name === false || $name === '') {
             $this->queueWrite($key,
                 "$tag BAD $verb syntax\r\n");
             return;
         }
         $user = $context['AUTH_USER'];
-        if (!$this->mail_storage->folderExists($user, $name)) {
-            $this->queueWrite($key,
-                "$tag NO Mailbox does not exist\r\n");
-            return;
+        if ($verb === 'SUBSCRIBE') {
+            $this->mail_storage->subscribe($user, $name);
+        } else {
+            $this->mail_storage->unsubscribe($user, $name);
         }
         $this->queueWrite($key, "$tag OK $verb completed\r\n");
     }
@@ -3433,6 +3697,15 @@ class MailSite
                 "$tag NO CREATE failed\r\n");
             return;
         }
+        /*
+            Auto-subscribe newly created folders. Most clients
+            (Apple Mail, Thunderbird) issue a SUBSCRIBE right
+            after CREATE anyway, but doing it server-side
+            covers the case of CREATE via the direct API and
+            ensures LSUB advertises new folders without any
+            extra round-trip.
+         */
+        $this->mail_storage->subscribe($user, $name);
         $this->queueWrite($key, "$tag OK CREATE completed\r\n");
     }
     /**
@@ -3461,6 +3734,11 @@ class MailSite
                 "non-empty parent, or I/O error)\r\n");
             return;
         }
+        /*
+            Folder is gone; remove any matching subscription so
+            LSUB does not advertise a non-existent folder.
+         */
+        $this->mail_storage->unsubscribe($user, $name);
         /*
             If the deleted mailbox was the currently selected
             one, drop selection so subsequent message-level
@@ -3501,6 +3779,14 @@ class MailSite
             $this->queueWrite($key,
                 "$tag NO RENAME failed\r\n");
             return;
+        }
+        /*
+            Migrate the subscription state with the rename so
+            the user's view of LSUB stays consistent.
+         */
+        if ($this->mail_storage->isSubscribed($user, $old)) {
+            $this->mail_storage->unsubscribe($user, $old);
+            $this->mail_storage->subscribe($user, $new);
         }
         if (!empty($context['SELECTED']) &&
             $context['SELECTED'] === $old) {
@@ -4302,6 +4588,63 @@ class MailSite
         return $out;
     }
     /**
+     * Decodes RFC 2047 encoded-words in a header value back
+     * to plain text. Encoded-words have the form
+     *      =?charset?encoding?text?=
+     * where encoding is "B" (base64) or "Q" (quoted-printable
+     * with "_" meaning space). Multiple consecutive encoded-
+     * words separated only by whitespace are concatenated
+     * with the whitespace stripped, per RFC 2047 sec 6.2.
+     * Bytes outside encoded-words are passed through verbatim.
+     * The result is a UTF-8 string when the input charsets
+     * are recognized; unrecognized charsets fall back to
+     * leaving the text uninterpreted but still removing the
+     * encoded-word wrapper, which is good enough for
+     * substring searches.
+     */
+    protected function imapDecodeMimeHeader($value)
+    {
+        if (strpos($value, '=?') === false) {
+            return $value;
+        }
+        $pattern = '/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/';
+        /*
+            First pass: replace each encoded-word with a marker
+            holding the decoded text, then collapse whitespace
+            that sits BETWEEN two markers (RFC 2047 sec 6.2:
+            whitespace between adjacent encoded-words is not
+            significant). We then unwrap the markers.
+         */
+        $value = preg_replace_callback($pattern,
+            function ($m) {
+                $charset = strtoupper(trim($m[1]));
+                $enc = strtoupper($m[2]);
+                $text = $m[3];
+                if ($enc === 'B') {
+                    $decoded = (string) base64_decode($text,
+                        true);
+                } else {
+                    $text = str_replace('_', ' ', $text);
+                    $decoded = quoted_printable_decode($text);
+                }
+                if ($charset !== 'UTF-8' &&
+                    $charset !== 'US-ASCII' &&
+                    function_exists('mb_convert_encoding')) {
+                    $converted = @mb_convert_encoding($decoded,
+                        'UTF-8', $charset);
+                    if ($converted !== false) {
+                        $decoded = $converted;
+                    }
+                }
+                return "\x01EW\x01" . $decoded . "\x01/EW\x01";
+            }, $value);
+        $value = preg_replace(
+            '/\x01\/EW\x01\s+\x01EW\x01/', '', $value);
+        $value = str_replace(["\x01EW\x01", "\x01/EW\x01"], '',
+            $value);
+        return $value;
+    }
+    /**
      * Renders a string as either an IMAP quoted string or NIL
      * if the value is null/empty. Used for ENVELOPE date,
      * subject, in-reply-to, and message-id slots.
@@ -4707,6 +5050,7 @@ class MailSite
                 $new_flags[] = '\Seen';
                 $this->mail_storage->setFlags($user, $folder,
                     $meta['uid'], $new_flags);
+                $this->bumpMailboxChange($user, $folder);
             }
         }
         $this->queueWrite($key,
@@ -4772,6 +5116,7 @@ class MailSite
             }
             $this->mail_storage->setFlags($user, $folder,
                 $meta['uid'], $new);
+            $this->bumpMailboxChange($user, $folder);
             if (!$silent) {
                 $extras = [];
                 $extras[] = "FLAGS (" .
@@ -4830,6 +5175,7 @@ class MailSite
         $matched = $this->imapMatchSet($user, $folder, $set,
             $by_uid);
         $verb = $by_uid ? 'UID COPY' : 'COPY';
+        $copied = 0;
         foreach ($matched as $entry) {
             list($seq, $meta) = $entry;
             $body = $this->mail_storage->fetchMessage($user,
@@ -4839,6 +5185,10 @@ class MailSite
             }
             $this->mail_storage->appendMessage($user, $target,
                 $body, $meta['flags'], $meta['internal_date']);
+            $copied++;
+        }
+        if ($copied > 0) {
+            $this->bumpMailboxChange($user, $target);
         }
         $this->queueWrite($key,
             "$tag OK $verb completed\r\n");
@@ -4900,6 +5250,10 @@ class MailSite
                 $seqs_to_expunge[] = $seq;
             }
         }
+        if (!empty($seqs_to_expunge)) {
+            $this->bumpMailboxChange($user, $folder);
+            $this->bumpMailboxChange($user, $target);
+        }
         rsort($seqs_to_expunge);
         foreach ($seqs_to_expunge as $seq) {
             $this->queueWrite($key, "* $seq EXPUNGE\r\n");
@@ -4934,6 +5288,9 @@ class MailSite
             }
         }
         $this->mail_storage->expunge($user, $folder);
+        if (!empty($seqs_removed)) {
+            $this->bumpMailboxChange($user, $folder);
+        }
         rsort($seqs_removed);
         foreach ($seqs_removed as $seq) {
             $this->queueWrite($key, "* $seq EXPUNGE\r\n");
@@ -5159,6 +5516,12 @@ class MailSite
                 $header_map = $this->imapParseHeaders($get_body());
                 $hkey = strtolower($kw);
                 $val = $header_map[$hkey] ?? '';
+                /*
+                    Decode RFC 2047 encoded-words before
+                    matching so a search for "Café" finds
+                    headers stored as "=?UTF-8?Q?Caf=C3=A9?=".
+                 */
+                $val = $this->imapDecodeMimeHeader($val);
                 return stripos($val, $arg) !== false;
             }
             if ($kw === 'HEADER') {
@@ -5166,6 +5529,7 @@ class MailSite
                 $arg = $tokens[$cursor++][1] ?? '';
                 $header_map = $this->imapParseHeaders($get_body());
                 $val = $header_map[strtolower($name)] ?? '';
+                $val = $this->imapDecodeMimeHeader($val);
                 return $arg === '' ? $val !== '' :
                     stripos($val, $arg) !== false;
             }
@@ -5222,19 +5586,30 @@ class MailSite
     /**
      * Implements IDLE (RFC 2177): the client says IDLE, the
      * server replies with "+ idling" and keeps the connection
-     * open until the client sends DONE on its own line, at
-     * which point we ack with the tagged OK. We do not
-     * currently push untagged updates during the idle window;
-     * that requires server-side change notification which
-     * Phase 4 does not include. The command still completes
-     * successfully so well-behaved clients accept us.
+     * open. While idling, processIdleNotifications walks the
+     * idle subscribers each main-loop tick and emits untagged
+     * "* N EXISTS" responses to any whose folder has changed
+     * since IDLE began (snapshotted in IDLE_SNAPSHOT). The
+     * client terminates idle by sending "DONE" on its own
+     * line, after which we ack with the tagged OK and clear
+     * the pending state. Push notifications only fire while
+     * the connection is in the SELECTED state with a snapshot
+     * recorded, so out-of-state IDLE just round-trips without
+     * push behavior.
      */
     protected function imapCmdIdle($key, $tag, &$context)
     {
+        $snapshot = null;
+        if (!empty($context['SELECTED'])) {
+            $snapshot = $this->currentChangeCounter(
+                $context['AUTH_USER'], $context['SELECTED']);
+        }
         $context['IMAP_LIT_PENDING'] = [
             'continuation' => 'idle',
             'tag' => $tag,
         ];
+        $context['IDLE_SNAPSHOT'] = $snapshot;
+        $context['IDLE_FOLDER'] = $context['SELECTED'] ?? null;
         $this->queueWrite($key, "+ idling\r\n");
     }
     /**
@@ -5437,6 +5812,59 @@ class MailSite
             } else {
                 unset($this->timers[$id]);
             }
+        }
+    }
+    /**
+     * Walks every active connection and emits IDLE push
+     * notifications for any that are idling and whose
+     * subscribed folder has changed since the snapshot. The
+     * notification is "* N EXISTS" carrying the current
+     * message count, which lets the client decide whether to
+     * issue a follow-up FETCH for the new messages. We update
+     * the snapshot to the current value so each delta is
+     * reported exactly once.
+     *
+     * Called once per main-loop iteration. Cheap when no
+     * connections are idling (early-exit on empty contexts).
+     */
+    protected function processIdleNotifications()
+    {
+        if (empty($this->in_streams[self::CONTEXT])) {
+            return;
+        }
+        foreach ($this->in_streams[self::CONTEXT] as $key =>
+            $context) {
+            if (empty($context['IDLE_FOLDER'])) {
+                continue;
+            }
+            if (empty($context['IMAP_LIT_PENDING']) ||
+                !isset($context['IMAP_LIT_PENDING'][
+                    'continuation']) ||
+                $context['IMAP_LIT_PENDING']['continuation'] !==
+                    'idle') {
+                continue;
+            }
+            $user = $context['AUTH_USER'];
+            $folder = $context['IDLE_FOLDER'];
+            $current = $this->currentChangeCounter($user,
+                $folder);
+            $snapshot = $context['IDLE_SNAPSHOT'];
+            if ($snapshot === null || $current <= $snapshot) {
+                continue;
+            }
+            /*
+                Folder has changed; emit the current message
+                count as "* N EXISTS" and update the snapshot.
+                We modify the live context by reference via the
+                in_streams array; storing back through $key
+                ensures the in-memory state reflects the new
+                snapshot for the next tick.
+             */
+            $count = $this->mail_storage->messageCount($user,
+                $folder);
+            $this->queueWrite($key, "* $count EXISTS\r\n");
+            $this->in_streams[self::CONTEXT][$key][
+                'IDLE_SNAPSHOT'] = $current;
         }
     }
 }

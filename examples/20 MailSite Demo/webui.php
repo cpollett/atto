@@ -937,6 +937,153 @@ $scenarios['imap_attachment'] = [
         ]);
     },
 ];
+$scenarios['imap_subscription'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'SUBSCRIBE / UNSUBSCRIBE persistence and LSUB',
+    'desc' => 'CREATE auto-subscribes new folders. UNSUBSCRIBE ' .
+        'removes a folder from LSUB without deleting it; ' .
+        'SUBSCRIBE puts it back. The state persists across ' .
+        'connections in a per-user .subscribed file. INBOX is ' .
+        'always implicitly subscribed.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 CREATE Folder1\r\n",
+            "a3 CREATE Folder2\r\n",
+            "a4 LSUB \"\" \"*\"\r\n",
+            "a5 UNSUBSCRIBE Folder2\r\n",
+            "a6 LIST \"\" \"*\"\r\n",
+            "a7 LSUB \"\" \"*\"\r\n",
+            "a8 SUBSCRIBE Folder2\r\n",
+            "a9 LSUB \"\" \"*\"\r\n",
+            "a10 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_encoded_words'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'RFC 2047 encoded-word SEARCH',
+    'desc' => 'APPEND a message with a Subject containing ' .
+        'an =?UTF-8?Q?...?= encoded word, then SEARCH for ' .
+        'the decoded plain text. The server decodes the ' .
+        'header before substring matching, so a search for ' .
+        '"Café" matches a header stored as ' .
+        '"=?UTF-8?Q?Caf=C3=A9_reservation?=".',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        $body = "Subject: =?UTF-8?Q?Caf=C3=A9_reservation?=" .
+            "\r\n" .
+            "From: x@y.com\r\n" .
+            "To: alice@localhost\r\n\r\n" .
+            "body\r\n";
+        $size = strlen($body);
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 APPEND INBOX {" . $size . "}\r\n",
+            $body,
+            "a3 SELECT INBOX\r\n",
+            "a4 SEARCH SUBJECT \"Caf\"\r\n",
+            "a5 SEARCH SUBJECT \"reservation\"\r\n",
+            "a6 SEARCH SUBJECT \"Café\"\r\n",
+            "a7 LOGOUT\r\n",
+        ]);
+    },
+];
+$scenarios['imap_idle_push'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'IDLE push: untagged * N EXISTS on new mail',
+    'desc' => 'Two-connection demo. Connection 1 logs in, ' .
+        'SELECTs INBOX, and enters IDLE. Connection 2 ' .
+        'delivers a message via SMTP. Connection 1 receives ' .
+        'an untagged "* N EXISTS" push notification before ' .
+        'sending DONE, so a real client (Apple Mail / ' .
+        'Thunderbird) shows new mail instantly without a ' .
+        'manual refresh.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        /*
+            Custom two-connection runner: opens an IMAP
+            connection, parks it in IDLE, opens a second SMTP
+            connection in parallel to deliver a message, then
+            reads from the IMAP connection to capture the push.
+            The transcript splices both sides for clarity.
+         */
+        $host = $cfg['host'];
+        $imap_port = $cfg['imap'];
+        $smtp_port = $cfg['smtp'];
+        $transcript = "";
+        $imap = @stream_socket_client(
+            "tcp://$host:$imap_port", $errno, $errstr, 5);
+        if (!$imap) {
+            return "ERROR: IMAP connect: $errstr\n";
+        }
+        stream_set_blocking($imap, 0);
+        $drain = function ($sock, $secs) use (&$transcript) {
+            $deadline = microtime(true) + $secs;
+            while (microtime(true) < $deadline) {
+                $r = [$sock]; $w = $e = null;
+                $remaining = $deadline - microtime(true);
+                if ($remaining <= 0) break;
+                $tv_us = (int) min(200000, $remaining * 1e6);
+                $n = @stream_select($r, $w, $e, 0, $tv_us);
+                if ($n > 0) {
+                    $chunk = @fread($sock, 8192);
+                    if ($chunk === false || $chunk === '') {
+                        if (feof($sock)) break;
+                        continue;
+                    }
+                    $transcript .= $chunk;
+                }
+            }
+        };
+        $send = function ($sock, $line) use (&$transcript) {
+            @fwrite($sock, $line);
+            $transcript .= ">>> " . $line;
+        };
+        $drain($imap, 0.5);
+        $send($imap, "a1 LOGIN alice hunter2\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a2 SELECT INBOX\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a3 IDLE\r\n");
+        $drain($imap, 0.5);
+        /*
+            Connection 2: deliver via SMTP. We use the
+            single-connection runScript helper inline; its
+            output is appended to the transcript so the
+            reader sees both sides.
+         */
+        $transcript .= "\n--- SMTP delivery on connection 2 ---\n";
+        $smtp_tx = runScript($host, $smtp_port, [
+            "EHLO test\r\n",
+            "MAIL FROM:<x@y.com>\r\n",
+            "RCPT TO:<alice@localhost>\r\n",
+            "DATA\r\n",
+            "Subject: pushed via IDLE\r\n" .
+                "From: x@y.com\r\n" .
+                "To: alice@localhost\r\n\r\n" .
+                "Body of the pushed message.\r\n.\r\n",
+            "QUIT\r\n",
+        ]);
+        $transcript .= $smtp_tx;
+        $transcript .=
+            "\n--- back on connection 1 (idling) ---\n";
+        /*
+            Wait up to ~6 seconds for the push. The server
+            wakes its select loop every 5 seconds at most so
+            push latency is bounded by that interval. In
+            practice it is sub-second once new bytes arrive.
+         */
+        $drain($imap, 6.0);
+        $send($imap, "DONE\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a4 LOGOUT\r\n");
+        $drain($imap, 0.5);
+        @fclose($imap);
+        return $transcript;
+    },
+];
 /* ---------- Implicit TLS ---------- */
 $scenarios['smtps_banner'] = [
     'group' => 'Implicit TLS',

@@ -1084,6 +1084,327 @@ $scenarios['imap_idle_push'] = [
         return $transcript;
     },
 ];
+$scenarios['imap_search_unicode'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'Webmail-style Unicode search (Café, 日本語)',
+    'desc' => 'Lighter-weight UI demo of RFC 2047 search. ' .
+        'Three messages are seeded: an ASCII subject, a ' .
+        'UTF-8 quoted-printable subject ("Café"), and a ' .
+        'UTF-8 base64 subject ("日本語"). For each search ' .
+        'term you see the raw bytes as stored on disk ' .
+        '(encoded form) next to the decoded subject the ' .
+        'user actually sees, with the rows that matched ' .
+        'a given query highlighted.',
+    'kind' => 'webmail',
+    'run' => function () use ($users_file, $store_dir) {
+        $mail = shareMail($users_file, $store_dir);
+        /*
+            Seed three messages directly via the direct API,
+            with subjects that exercise plain ASCII, UTF-8
+            quoted-printable, and UTF-8 base64 forms. We use
+            timestamps spaced one second apart so the message
+            list has a stable, predictable order.
+            appendMessage auto-creates the folder (and the
+            user directory) on first write, so there is no
+            need to ensureUser explicitly.
+         */
+        $seeds = [
+            [
+                'subject_raw' => 'Hello world',
+                'subject_decoded' => 'Hello world',
+                'from' => 'noreply@example.com',
+            ],
+            [
+                'subject_raw' =>
+                    '=?UTF-8?Q?Caf=C3=A9_reservation?=',
+                'subject_decoded' => 'Café reservation',
+                'from' => 'concierge@hotel.example.com',
+            ],
+            [
+                'subject_raw' => '=?UTF-8?B?5pel5pys6Kqe?=',
+                'subject_decoded' => '日本語',
+                'from' => 'pen-pal@language.example.com',
+            ],
+        ];
+        $now = time();
+        foreach ($seeds as $i => $seed) {
+            $bytes = "Subject: " . $seed['subject_raw'] .
+                "\r\n" .
+                "From: " . $seed['from'] . "\r\n" .
+                "To: alice@localhost\r\n" .
+                "Date: " . gmdate('r', $now + $i) . "\r\n\r\n" .
+                "Body of message " . ($i + 1) . ".\r\n";
+            $mail->appendMessage('alice', 'INBOX', $bytes);
+        }
+        /*
+            Build the search-results panel for three queries.
+            For each query we walk every message in INBOX,
+            parse its Subject header, RFC 2047-decode it, and
+            substring-match (case-insensitive). This mirrors
+            what a webmail UI would do for a global search
+            box that operates over indexed message metadata.
+         */
+        $messages = $mail->listMessages('alice', 'INBOX');
+        $rows = [];
+        foreach ($messages as $meta) {
+            $bytes = $mail->fetchMessage('alice', 'INBOX',
+                $meta['uid']);
+            $subject_raw = '';
+            if (preg_match('/^Subject:\s*(.*?)\r?\n(?!\s)/sm',
+                $bytes, $m)) {
+                $subject_raw = trim($m[1]);
+            }
+            /*
+                Reach into the same decoder MailSite uses for
+                IMAP SEARCH so the demo cannot drift from the
+                real behavior. We invoke it through reflection
+                because it is protected; the important thing
+                is the demo and the wire path agree on what
+                "decoded" means.
+             */
+            $reflection = new ReflectionClass($mail);
+            $method = $reflection->getMethod(
+                'imapDecodeMimeHeader');
+            $method->setAccessible(true);
+            $subject_decoded = $method->invoke($mail,
+                $subject_raw);
+            $rows[] = [
+                'uid' => $meta['uid'],
+                'raw' => $subject_raw,
+                'decoded' => $subject_decoded,
+            ];
+        }
+        $queries = ['Hello', 'Café', '日本語'];
+        $html = '<h3>alice@localhost / INBOX search</h3>';
+        foreach ($queries as $q) {
+            $html .= '<div class="query-section">';
+            $html .= '<div class="search-box">';
+            $html .= '<label>Search:</label>';
+            $html .= '<input value="' .
+                htmlspecialchars($q,
+                    ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') .
+                '" readonly>';
+            $html .= '<button disabled>Search</button>';
+            $html .= '</div>';
+            $any_match = false;
+            $html .= '<table>';
+            $html .= '<tr><th>UID</th>' .
+                '<th>Raw subject (on disk)</th>' .
+                '<th>Decoded subject (what you see)</th>' .
+                '</tr>';
+            foreach ($rows as $r) {
+                $matched = stripos($r['decoded'], $q) !==
+                    false;
+                if (!$matched) {
+                    continue;
+                }
+                $any_match = true;
+                $html .= '<tr>';
+                $html .= '<td>' . (int) $r['uid'] . '</td>';
+                $html .= '<td class="encoded">' .
+                    htmlspecialchars($r['raw'],
+                        ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') .
+                    '</td>';
+                $html .= '<td class="decoded">' .
+                    htmlspecialchars($r['decoded'],
+                        ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') .
+                    '</td>';
+                $html .= '</tr>';
+            }
+            $html .= '</table>';
+            if (!$any_match) {
+                $html .= '<div class="empty">' .
+                    '(no matches)</div>';
+            }
+            $html .= '</div>';
+        }
+        return ['html' => $html];
+    },
+];
+$scenarios['imap_idle_flag_push'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'IDLE push: flag change on another connection',
+    'desc' => 'Two-connection demo. Connection 1 IDLEs on ' .
+        'INBOX. Connection 2 issues "STORE +FLAGS \\Flagged" ' .
+        'on a message. Connection 1 receives an untagged ' .
+        '"* N FETCH (FLAGS (...) UID U)" push so its ' .
+        'message-list view stays in sync without polling.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        $host = $cfg['host'];
+        $imap_port = $cfg['imap'];
+        /*
+            Pre-seed one message so STORE has something to
+            target; this is independent of the IDLE flow.
+         */
+        runScript($host, $cfg['smtp'], [
+            "EHLO test\r\n",
+            "MAIL FROM:<x@y.com>\r\n",
+            "RCPT TO:<alice@localhost>\r\n",
+            "DATA\r\n",
+            "Subject: pre-seeded\r\nFrom: x@y.com\r\nTo: " .
+                "alice@localhost\r\n\r\nbody\r\n.\r\n",
+            "QUIT\r\n",
+        ]);
+        $transcript = "";
+        $imap = @stream_socket_client(
+            "tcp://$host:$imap_port", $errno, $errstr, 5);
+        if (!$imap) {
+            return "ERROR: IMAP connect: $errstr\n";
+        }
+        stream_set_blocking($imap, 0);
+        $drain = function ($sock, $secs) use (&$transcript) {
+            $deadline = microtime(true) + $secs;
+            while (microtime(true) < $deadline) {
+                $r = [$sock]; $w = $e = null;
+                $remaining = $deadline - microtime(true);
+                if ($remaining <= 0) break;
+                $tv_us = (int) min(200000, $remaining * 1e6);
+                $n = @stream_select($r, $w, $e, 0, $tv_us);
+                if ($n > 0) {
+                    $chunk = @fread($sock, 8192);
+                    if ($chunk === false || $chunk === '') {
+                        if (feof($sock)) break;
+                        continue;
+                    }
+                    $transcript .= $chunk;
+                }
+            }
+        };
+        $send = function ($sock, $line) use (&$transcript) {
+            @fwrite($sock, $line);
+            $transcript .= ">>> " . $line;
+        };
+        $drain($imap, 0.5);
+        $send($imap, "a1 LOGIN alice hunter2\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a2 SELECT INBOX\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a3 IDLE\r\n");
+        $drain($imap, 0.5);
+        $transcript .= "\n--- STORE on connection 2 ---\n";
+        $smtp_tx = runScript($host, $imap_port, [
+            "b1 LOGIN alice hunter2\r\n",
+            "b2 SELECT INBOX\r\n",
+            "b3 STORE 1 +FLAGS (\\Flagged)\r\n",
+            "b4 LOGOUT\r\n",
+        ]);
+        $transcript .= $smtp_tx;
+        $transcript .=
+            "\n--- back on connection 1 (idling) ---\n";
+        $drain($imap, 6.0);
+        $send($imap, "DONE\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a4 LOGOUT\r\n");
+        $drain($imap, 0.5);
+        @fclose($imap);
+        return $transcript;
+    },
+];
+$scenarios['imap_idle_expunge_push'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'IDLE push: EXPUNGE on another connection',
+    'desc' => 'Two-connection demo. Connection 1 IDLEs on ' .
+        'INBOX with two messages. Connection 2 marks one ' .
+        '\\Deleted then EXPUNGEs. Connection 1 receives ' .
+        '"* N FETCH (FLAGS \\Deleted ...)" for the flag set, ' .
+        'then "* N EXPUNGE" when the message is removed, ' .
+        'then "* M EXISTS" with the new total count.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        $host = $cfg['host'];
+        $imap_port = $cfg['imap'];
+        for ($i = 1; $i <= 2; $i++) {
+            runScript($host, $cfg['smtp'], [
+                "EHLO test\r\n",
+                "MAIL FROM:<x@y.com>\r\n",
+                "RCPT TO:<alice@localhost>\r\n",
+                "DATA\r\n",
+                "Subject: msg $i\r\nFrom: x@y.com\r\nTo: " .
+                    "alice@localhost\r\n\r\nbody $i\r\n.\r\n",
+                "QUIT\r\n",
+            ]);
+        }
+        $transcript = "";
+        $imap = @stream_socket_client(
+            "tcp://$host:$imap_port", $errno, $errstr, 5);
+        if (!$imap) {
+            return "ERROR: IMAP connect: $errstr\n";
+        }
+        stream_set_blocking($imap, 0);
+        $drain = function ($sock, $secs) use (&$transcript) {
+            $deadline = microtime(true) + $secs;
+            while (microtime(true) < $deadline) {
+                $r = [$sock]; $w = $e = null;
+                $remaining = $deadline - microtime(true);
+                if ($remaining <= 0) break;
+                $tv_us = (int) min(200000, $remaining * 1e6);
+                $n = @stream_select($r, $w, $e, 0, $tv_us);
+                if ($n > 0) {
+                    $chunk = @fread($sock, 8192);
+                    if ($chunk === false || $chunk === '') {
+                        if (feof($sock)) break;
+                        continue;
+                    }
+                    $transcript .= $chunk;
+                }
+            }
+        };
+        $send = function ($sock, $line) use (&$transcript) {
+            @fwrite($sock, $line);
+            $transcript .= ">>> " . $line;
+        };
+        $drain($imap, 0.5);
+        $send($imap, "a1 LOGIN alice hunter2\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a2 SELECT INBOX\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a3 IDLE\r\n");
+        $drain($imap, 0.5);
+        $transcript .=
+            "\n--- STORE + EXPUNGE on connection 2 ---\n";
+        $other = runScript($host, $imap_port, [
+            "b1 LOGIN alice hunter2\r\n",
+            "b2 SELECT INBOX\r\n",
+            "b3 STORE 1 +FLAGS (\\Deleted)\r\n",
+            "b4 EXPUNGE\r\n",
+            "b5 LOGOUT\r\n",
+        ]);
+        $transcript .= $other;
+        $transcript .=
+            "\n--- back on connection 1 (idling) ---\n";
+        $drain($imap, 6.0);
+        $send($imap, "DONE\r\n");
+        $drain($imap, 0.5);
+        $send($imap, "a4 LOGOUT\r\n");
+        $drain($imap, 0.5);
+        @fclose($imap);
+        return $transcript;
+    },
+];
+$scenarios['imap_uidvalidity_change'] = [
+    'group' => 'IMAP capabilities + MIME (Phase 5)',
+    'label' => 'UIDVALIDITY changes on folder delete + recreate',
+    'desc' => 'RFC 3501 sec 2.3.1.1: UIDVALIDITY must change ' .
+        'when a server reassigns UIDs for a mailbox. CREATE ' .
+        'a folder and SELECT it (note the value), then ' .
+        'DELETE and re-CREATE the same name; the second ' .
+        'SELECT shows a different UIDVALIDITY so cached ' .
+        'client state is invalidated.',
+    'kind' => 'wire',
+    'run' => function () use ($cfg) {
+        return runScript($cfg['host'], $cfg['imap'], [
+            "a1 LOGIN alice hunter2\r\n",
+            "a2 CREATE TempFolder\r\n",
+            "a3 SELECT TempFolder\r\n",
+            "a4 CLOSE\r\n",
+            "a5 DELETE TempFolder\r\n",
+            "a6 CREATE TempFolder\r\n",
+            "a7 SELECT TempFolder\r\n",
+            "a8 LOGOUT\r\n",
+        ]);
+    },
+];
 /* ---------- Implicit TLS ---------- */
 $scenarios['smtps_banner'] = [
     'group' => 'Implicit TLS',
@@ -1365,9 +1686,23 @@ $site->post('/run', function () use ($site, $scenarios) {
         ]);
         return;
     }
-    $tx = call_user_func($scenarios[$id]['run']);
+    $result = call_user_func($scenarios[$id]['run']);
+    /*
+        Run callbacks return either a string (a wire transcript
+        or formatted text) or an associative array with an
+        'html' key for rendering an inline UI panel. The latter
+        is used by webmail-kind scenarios to demonstrate a
+        feature in a product context rather than a wire view.
+     */
+    if (is_array($result) && isset($result['html'])) {
+        echo json_encode([
+            'html' => $result['html'],
+            'label' => $scenarios[$id]['label'],
+        ]);
+        return;
+    }
     echo json_encode([
-        'transcript' => $tx,
+        'transcript' => $result,
         'label' => $scenarios[$id]['label'],
     ]);
 });
@@ -1473,6 +1808,37 @@ h2 { font-size: 1.05em; margin-top: 1.6em; padding-bottom: 0.2em;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
     max-height: 360px; overflow: auto; }
 .scenario .transcript.visible { display: block; }
+.scenario .webmail { display: none; margin-top: 0.7em;
+    background: #fff; padding: 0.8em; border-radius: 4px;
+    border: 1px solid #ddd; font-size: 0.9em; }
+.scenario .webmail.visible { display: block; }
+.scenario .webmail h3 { margin: 0 0 0.4em 0; font-size: 0.95em;
+    color: #06c; }
+.scenario .webmail .search-box { margin: 0.6em 0;
+    display: flex; gap: 0.5em; align-items: center; }
+.scenario .webmail .search-box input { font: inherit;
+    padding: 0.35em 0.5em; border: 1px solid #bbb;
+    border-radius: 3px; flex-grow: 1; }
+.scenario .webmail .search-box button { font: inherit;
+    padding: 0.35em 0.9em; background: #06c; color: white;
+    border: 0; border-radius: 3px; cursor: pointer; }
+.scenario .webmail table { width: 100%;
+    border-collapse: collapse; margin-top: 0.5em; }
+.scenario .webmail th, .scenario .webmail td {
+    text-align: left; padding: 0.35em 0.5em;
+    border-bottom: 1px solid #eee; vertical-align: top; }
+.scenario .webmail th { background: #f4f4f4;
+    font-weight: 600; font-size: 0.85em; }
+.scenario .webmail td.encoded {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8em; color: #666; }
+.scenario .webmail td.decoded { font-weight: 500; }
+.scenario .webmail .empty { color: #999; font-style: italic;
+    padding: 0.5em; }
+.scenario .webmail .query-section { margin-top: 1em;
+    padding-top: 0.7em; border-top: 1px dashed #ddd; }
+.scenario .webmail .query-section:first-child {
+    margin-top: 0; padding-top: 0; border-top: 0; }
 .note { color: #555; font-size: 0.88em; }
 .reset-bar { display: flex; align-items: center; gap: 1em;
     margin: 1em 0 1.5em; padding: 0.7em 0.9em;
@@ -1519,6 +1885,7 @@ The committed <code>users.htpasswd</code> is left in place.
 <button type="button">Run</button>
 </div>
 <pre class="transcript"></pre>
+<div class="webmail"></div>
 </div>
 <?php endforeach; endforeach; ?>
 <script>
@@ -1535,6 +1902,7 @@ document.querySelectorAll('.scenario').forEach(function (el) {
     var btn = el.querySelector('button');
     var id = el.dataset.id;
     var pre = el.querySelector('.transcript');
+    var web = el.querySelector('.webmail');
     function showRun() {
         btn.textContent = 'Run';
         btn.classList.remove('close');
@@ -1550,14 +1918,20 @@ document.querySelectorAll('.scenario').forEach(function (el) {
         btn.classList.remove('close');
         btn.disabled = true;
     }
+    function hideAll() {
+        pre.classList.remove('visible');
+        pre.textContent = '';
+        web.classList.remove('visible');
+        web.innerHTML = '';
+    }
     btn.addEventListener('click', function () {
         if (btn.classList.contains('close')) {
-            pre.classList.remove('visible');
-            pre.textContent = '';
+            hideAll();
             showRun();
             return;
         }
         showBusy();
+        hideAll();
         pre.classList.add('visible');
         pre.textContent = '(running...)';
         var body = new URLSearchParams();
@@ -1574,6 +1948,16 @@ document.querySelectorAll('.scenario').forEach(function (el) {
         }).then(function (data) {
             if (data.error) {
                 pre.textContent = 'ERROR: ' + data.error;
+            } else if (data.html) {
+                /*
+                    Webmail-kind scenario: render the inline
+                    HTML in the lighter panel and hide the
+                    monospace transcript pane.
+                 */
+                pre.classList.remove('visible');
+                pre.textContent = '';
+                web.classList.add('visible');
+                web.innerHTML = data.html;
             } else {
                 pre.textContent = data.transcript ||
                     '(empty transcript)';

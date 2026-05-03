@@ -604,8 +604,36 @@ class FileMailStorage extends MailStorage
         }
         if (!is_dir($this->userDir($user))) {
             $this->ensureUser($user);
+            /*
+                ensureUser provisions INBOX as a side effect.
+                If the caller asked for a folder that
+                ensureUser just created, treat the create as
+                already done; otherwise we would fall through
+                to mkdir, which would fail on the (now
+                existing) path and incorrectly return false.
+             */
+            if (is_dir($path)) {
+                return true;
+            }
         }
-        return @mkdir($path, 0700, true);
+        if (!@mkdir($path, 0700, true)) {
+            return false;
+        }
+        /*
+            Stamp a per-folder UIDVALIDITY so a future delete
+            + recreate of the same name produces a different
+            value (RFC 3501 sec 2.3.1.1). microtime gives
+            sub-second resolution, which matters for tests
+            that delete-and-recreate within the same second;
+            the value is cast to int for the IMAP wire form
+            via dechex of the microsecond fragment combined
+            with the second.
+         */
+        $stamp = (int) (microtime(true) * 1000);
+        @file_put_contents(
+            $path . DIRECTORY_SEPARATOR . ".uidvalidity",
+            (string) $stamp);
+        return true;
     }
     /**
      * @inheritdoc
@@ -906,15 +934,32 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     *
+     * UIDVALIDITY is stored per folder so a delete+recreate
+     * cycle assigns a fresh value, signaling clients that
+     * their cached UID-to-content mapping is stale and must
+     * be discarded. The per-user .uidvalidity file remains
+     * the fallback for folders that pre-date this scheme so
+     * existing message stores keep working without
+     * intervention.
      */
     public function uidValidity($user, $folder)
     {
-        $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
+        $folder_file = $this->folderDir($user, $folder) .
+            DIRECTORY_SEPARATOR . ".uidvalidity";
+        if (is_file($folder_file)) {
+            $value = (int) trim((string)
+                @file_get_contents($folder_file));
+            if ($value > 0) {
+                return $value;
+            }
+        }
+        $user_file = $this->userDir($user) . DIRECTORY_SEPARATOR .
             ".uidvalidity";
-        if (!is_file($file)) {
+        if (!is_file($user_file)) {
             $this->ensureUser($user);
         }
-        return (int) @file_get_contents($file);
+        return (int) @file_get_contents($user_file);
     }
     /**
      * @inheritdoc
@@ -3193,6 +3238,7 @@ class MailSite
                 $context['IMAP_LIT_PENDING'] = null;
                 $context['IDLE_SNAPSHOT'] = null;
                 $context['IDLE_FOLDER'] = null;
+                $context['IDLE_STATE'] = null;
                 $this->queueWrite($key,
                     "$tag OK IDLE terminated\r\n");
                 return;
@@ -3204,6 +3250,7 @@ class MailSite
             $context['IMAP_LIT_PENDING'] = null;
             $context['IDLE_SNAPSHOT'] = null;
             $context['IDLE_FOLDER'] = null;
+            $context['IDLE_STATE'] = null;
             $this->queueWrite($key,
                 "$tag BAD Expected DONE\r\n");
             return;
@@ -5588,29 +5635,71 @@ class MailSite
      * server replies with "+ idling" and keeps the connection
      * open. While idling, processIdleNotifications walks the
      * idle subscribers each main-loop tick and emits untagged
-     * "* N EXISTS" responses to any whose folder has changed
-     * since IDLE began (snapshotted in IDLE_SNAPSHOT). The
-     * client terminates idle by sending "DONE" on its own
-     * line, after which we ack with the tagged OK and clear
-     * the pending state. Push notifications only fire while
-     * the connection is in the SELECTED state with a snapshot
-     * recorded, so out-of-state IDLE just round-trips without
-     * push behavior.
+     * responses for changes that have happened to the
+     * selected folder since IDLE began. The push set covers
+     * three event types per RFC 2177 / RFC 3501:
+     *   * N EXISTS         -- a new message was added
+     *   * N EXPUNGE        -- a message was permanently
+     *                          removed
+     *   * N FETCH (FLAGS)  -- flag changes on an existing
+     *                          message
+     * The IDLE_STATE entry holds a per-message map and the
+     * change-counter snapshot taken at IDLE entry so the
+     * tick-side code can compute the delta cheaply: when the
+     * counter has not moved, no diff is needed. The client
+     * terminates by sending "DONE", after which we ack with
+     * the tagged OK and clear all idle state.
      */
     protected function imapCmdIdle($key, $tag, &$context)
     {
-        $snapshot = null;
-        if (!empty($context['SELECTED'])) {
-            $snapshot = $this->currentChangeCounter(
-                $context['AUTH_USER'], $context['SELECTED']);
-        }
         $context['IMAP_LIT_PENDING'] = [
             'continuation' => 'idle',
             'tag' => $tag,
         ];
-        $context['IDLE_SNAPSHOT'] = $snapshot;
-        $context['IDLE_FOLDER'] = $context['SELECTED'] ?? null;
+        $context['IDLE_SNAPSHOT'] = null;
+        $context['IDLE_FOLDER'] = null;
+        $context['IDLE_STATE'] = null;
+        if (!empty($context['SELECTED'])) {
+            $user = $context['AUTH_USER'];
+            $folder = $context['SELECTED'];
+            $context['IDLE_FOLDER'] = $folder;
+            $context['IDLE_SNAPSHOT'] =
+                $this->currentChangeCounter($user, $folder);
+            $context['IDLE_STATE'] =
+                $this->captureFolderState($user, $folder);
+        }
         $this->queueWrite($key, "+ idling\r\n");
+    }
+    /**
+     * Captures the per-message state of a folder for IDLE
+     * diff purposes. Returns:
+     *   uids   -- ordered list of UIDs in the folder, in the
+     *             same order listMessages returns them (which
+     *             is also sequence-number order)
+     *   flags  -- map UID => flag-string (sorted, joined) so
+     *             a flag change shows up as a string change
+     *             rather than requiring deep array compare
+     *   count  -- number of messages, kept separate so the
+     *             EXISTS push can use the new count without
+     *             a second listMessages call
+     */
+    protected function captureFolderState($user, $folder)
+    {
+        $messages = $this->mail_storage->listMessages($user,
+            $folder);
+        $uids = [];
+        $flags = [];
+        foreach ($messages as $meta) {
+            $uids[] = $meta['uid'];
+            $sorted = $meta['flags'];
+            sort($sorted);
+            $flags[$meta['uid']] = implode(' ', $sorted);
+        }
+        return [
+            'uids' => $uids,
+            'flags' => $flags,
+            'count' => count($messages),
+        ];
     }
     /**
      * Handles IMAP STARTTLS (RFC 2595). Same deferred-upgrade
@@ -5853,18 +5942,71 @@ class MailSite
                 continue;
             }
             /*
-                Folder has changed; emit the current message
-                count as "* N EXISTS" and update the snapshot.
-                We modify the live context by reference via the
-                in_streams array; storing back through $key
-                ensures the in-memory state reflects the new
-                snapshot for the next tick.
+                The folder has changed since the last tick.
+                Capture fresh state and diff against the per-
+                connection IDLE_STATE to figure out exactly
+                which untagged responses to push:
+                  * EXPUNGE for every UID gone, descending so
+                    sequence numbers shift down consistently
+                  * EXISTS for the new total count if it has
+                    grown
+                  * FETCH (FLAGS ...) for each UID whose flags
+                    changed (using the new sequence number,
+                    not the old)
+                After emitting, save the fresh state and bump
+                the counter so the next tick has a stable
+                baseline.
              */
-            $count = $this->mail_storage->messageCount($user,
-                $folder);
-            $this->queueWrite($key, "* $count EXISTS\r\n");
+            $fresh = $this->captureFolderState($user, $folder);
+            $old_state = $context['IDLE_STATE'];
+            if ($old_state === null) {
+                $old_state = [
+                    'uids' => [],
+                    'flags' => [],
+                    'count' => 0,
+                ];
+            }
+            $expunged_seqs = [];
+            $new_seq_by_uid = [];
+            foreach ($fresh['uids'] as $idx => $uid) {
+                $new_seq_by_uid[$uid] = $idx + 1;
+            }
+            foreach ($old_state['uids'] as $idx => $uid) {
+                if (!in_array($uid, $fresh['uids'], true)) {
+                    $expunged_seqs[] = $idx + 1;
+                }
+            }
+            rsort($expunged_seqs);
+            foreach ($expunged_seqs as $seq) {
+                $this->queueWrite($key, "* $seq EXPUNGE\r\n");
+            }
+            if ($fresh['count'] !== $old_state['count']) {
+                /*
+                    The EXISTS count is the post-expunge total.
+                    Clients update their local view by issuing
+                    UID FETCH for the gap between old and new
+                    UIDNEXT, which they already track.
+                 */
+                $this->queueWrite($key,
+                    "* " . $fresh['count'] . " EXISTS\r\n");
+            }
+            foreach ($fresh['flags'] as $uid => $flag_str) {
+                if (!isset($old_state['flags'][$uid])) {
+                    /* newly arrived; covered by EXISTS above */
+                    continue;
+                }
+                if ($old_state['flags'][$uid] === $flag_str) {
+                    continue;
+                }
+                $seq = $new_seq_by_uid[$uid];
+                $this->queueWrite($key,
+                    "* $seq FETCH (FLAGS (" . $flag_str .
+                    ") UID $uid)\r\n");
+            }
             $this->in_streams[self::CONTEXT][$key][
                 'IDLE_SNAPSHOT'] = $current;
+            $this->in_streams[self::CONTEXT][$key][
+                'IDLE_STATE'] = $fresh;
         }
     }
 }

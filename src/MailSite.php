@@ -195,6 +195,66 @@ class FileAuthenticator extends Authenticator
     }
 }
 /**
+ * Authenticator that accepts every username with a single
+ * shared password. Designed for anonymous-mailbox demos
+ * where the address itself is the only identity (e.g. a
+ * disposable inbox service): any HTTP visitor can adopt
+ * any local-part on a hosted domain, the webmail UI then
+ * uses IMAP loopback with the shared password to read that
+ * mailbox. Do NOT use this in any deployment where mail
+ * confidentiality matters; the design is "the address is
+ * the credential" and anyone who guesses or learns the
+ * address can read its mail.
+ */
+class AnonAuthenticator extends Authenticator
+{
+    /**
+     * @var string the shared password every account uses.
+     */
+    protected $shared_password;
+    /**
+     * @param string $shared_password password accepted for
+     *      every username
+     */
+    public function __construct($shared_password)
+    {
+        $this->shared_password = (string) $shared_password;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function userExists($username)
+    {
+        return is_string($username) && $username !== "";
+    }
+    /**
+     * @inheritdoc
+     */
+    public function getPasswordHash($username)
+    {
+        /*
+            Returning a single static hash means verifyPassword
+            (inherited) calls password_verify with that hash
+            against whatever the client sent; the bcrypt
+            comparison is constant-time and the shared
+            password is the only thing that succeeds.
+         */
+        if (!$this->userExists($username)) {
+            return false;
+        }
+        if ($this->cached_hash === null) {
+            $this->cached_hash = password_hash(
+                $this->shared_password, PASSWORD_BCRYPT);
+        }
+        return $this->cached_hash;
+    }
+    /**
+     * @var string|null bcrypt hash of $shared_password,
+     * computed on first use and reused thereafter.
+     */
+    protected $cached_hash = null;
+}
+/**
  * Abstract storage backend for mail folders and messages.
  *
  * The interface is shaped around what IMAP4rev1 needs but is

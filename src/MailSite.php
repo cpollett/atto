@@ -427,6 +427,76 @@ abstract class MailStorage
      * @return string[]
      */
     abstract public function listSubscribed($user);
+    /**
+     * High-water mark of the last UIDVALIDITY this storage
+     * instance has handed out. Subclasses use this to ensure
+     * a strictly monotonic sequence even when two folders are
+     * created in the same wall-clock second (RFC 3501 sec
+     * 2.3.1.1 monotonic requirement).
+     */
+    protected $last_uidvalidity = 0;
+    /**
+     * Returns a fresh UIDVALIDITY value that is strictly
+     * greater than any value previously returned by this
+     * storage instance. Implementations should call this when
+     * a folder is created or recreated.
+     */
+    protected function nextUidValidity()
+    {
+        $now = time();
+        if ($now <= $this->last_uidvalidity) {
+            $now = $this->last_uidvalidity + 1;
+        }
+        $this->last_uidvalidity = $now;
+        return $now;
+    }
+    /**
+     * Canonicalizes a folder path: collapses repeated slashes,
+     * strips leading/trailing slashes, and rejects components
+     * that could escape the folder root or clobber metadata
+     * files. INBOX is normalized to all-uppercase per RFC
+     * 3501. Throws InvalidArgumentException on:
+     *      empty / "." / ".."  components (path traversal)
+     *      NUL byte             (older C-level path injection)
+     *      control character    (corrupts line-oriented
+     *                            metadata files)
+     *      dot-prefixed         (clobbers .uidvalidity, .uidnext,
+     *                            .subscribed metadata files)
+     */
+    protected function normalizeFolder($folder)
+    {
+        $folder = (string) $folder;
+        if (strpos($folder, "\0") !== false) {
+            throw new \InvalidArgumentException(
+                "folder name contains NUL byte");
+        }
+        if (preg_match('/[\x00-\x1F\x7F]/', $folder)) {
+            throw new \InvalidArgumentException(
+                "folder name contains control character");
+        }
+        $folder = trim($folder, "/");
+        if ($folder === "") {
+            return "INBOX";
+        }
+        if (strcasecmp($folder, "INBOX") === 0) {
+            return "INBOX";
+        }
+        $parts = preg_split('#/+#', $folder);
+        $clean = [];
+        foreach ($parts as $part) {
+            if ($part === "" || $part === "." ||
+                $part === "..") {
+                throw new \InvalidArgumentException(
+                    "invalid folder component: '$part'");
+            }
+            if ($part[0] === '.') {
+                throw new \InvalidArgumentException(
+                    "folder name may not start with '.'");
+            }
+            $clean[] = $part;
+        }
+        return implode("/", $clean);
+    }
 }
 /**
  * Filesystem-backed MailStorage. Directory layout under the
@@ -460,40 +530,12 @@ class FileMailStorage extends MailStorage
 {
     protected $base;
     /**
-     * @var int high-water mark of the last UIDVALIDITY this
-     * process has handed out. Used to guarantee a strictly
-     * monotonic value across rapid delete + recreate cycles
-     * even when they fall within the same wall-clock second
-     * (RFC 3501 sec 2.3.1.1 monotonic requirement).
-     */
-    protected $last_uidvalidity = 0;
-    /**
      * @param string $base directory under which the "users/"
      *      subtree is created
      */
     public function __construct($base)
     {
         $this->base = rtrim($base, "/\\");
-    }
-    /**
-     * Returns a fresh UIDVALIDITY value: time() raised by one
-     * past the previous handout if multiple folders are
-     * created within the same second. Guaranteed strictly
-     * monotonic across all folders in this process so
-     * delete + recreate of the same folder name always
-     * produces a different value, while staying within the
-     * 32-bit unsigned-int range RFC 3501 mandates (good past
-     * 2106 plus however many overruns from rapid reuse, which
-     * is not a real concern in practice).
-     */
-    protected function nextUidValidity()
-    {
-        $now = time();
-        if ($now <= $this->last_uidvalidity) {
-            $now = $this->last_uidvalidity + 1;
-        }
-        $this->last_uidvalidity = $now;
-        return $now;
     }
     /**
      * Returns the absolute directory path for a user's account.
@@ -539,63 +581,6 @@ class FileMailStorage extends MailStorage
             $user = "_invalid_";
         }
         return $user;
-    }
-    /**
-     * Canonicalizes a folder path: collapses repeated slashes,
-     * strips leading/trailing slashes, and rejects components
-     * that could escape the folder root or clobber metadata
-     * files. INBOX is normalized to all-uppercase per RFC
-     * 3501. Throws InvalidArgumentException on:
-     *      empty / "." / ".."  components (path traversal)
-     *      NUL byte             (older C-level path injection)
-     *      dot-prefixed         (clobbers .uidvalidity, .uidnext,
-     *                            .subscribed metadata files)
-     *      leading "%"          (after rawurlencode, would
-     *                            collide with literal-percent
-     *                            encoding of a real folder name)
-     */
-    protected function normalizeFolder($folder)
-    {
-        $folder = (string) $folder;
-        if (strpos($folder, "\0") !== false) {
-            throw new \InvalidArgumentException(
-                "folder name contains NUL byte");
-        }
-        /*
-            Reject every byte below 0x20 except for the
-            implicit none. CR, LF, and TAB inside a folder
-            name would corrupt the subscription file format
-            (one name per line) and any line-oriented metadata
-            file we add later. Folders with control characters
-            are not useful in any real mail client and
-            allowing them widens the abuse surface.
-         */
-        if (preg_match('/[\x00-\x1F\x7F]/', $folder)) {
-            throw new \InvalidArgumentException(
-                "folder name contains control character");
-        }
-        $folder = trim($folder, "/");
-        if ($folder === "") {
-            return "INBOX";
-        }
-        if (strcasecmp($folder, "INBOX") === 0) {
-            return "INBOX";
-        }
-        $parts = preg_split('#/+#', $folder);
-        $clean = [];
-        foreach ($parts as $part) {
-            if ($part === "" || $part === "." ||
-                $part === "..") {
-                throw new \InvalidArgumentException(
-                    "invalid folder component: '$part'");
-            }
-            if ($part[0] === '.') {
-                throw new \InvalidArgumentException(
-                    "folder name may not start with '.'");
-            }
-            $clean[] = $part;
-        }
-        return implode("/", $clean);
     }
     /**
      * @inheritdoc
@@ -1149,6 +1134,484 @@ class FileMailStorage extends MailStorage
     public function listSubscribed($user)
     {
         $names = $this->readSubscriptions($user);
+        sort($names);
+        return $names;
+    }
+}
+/**
+ * In-memory MailStorage. State lives entirely in PHP arrays
+ * on the storage instance; no filesystem access at all.
+ * Everything disappears when the process exits, which is the
+ * point: this backend is for ephemeral demos (anonymous mail
+ * drops, integration tests, throwaway environments) where
+ * persistence would be a bug rather than a feature.
+ *
+ * Internal layout:
+ *
+ *      $this->users[$user] = [
+ *          'uidnext'       => int,
+ *          'uidvalidity'   => int,    // user-level fallback
+ *          'subscribed'    => array,  // folder names
+ *          'folders'       => [
+ *              $folder_name => [
+ *                  'uidvalidity' => int,
+ *                  'messages'    => [
+ *                      $uid => [
+ *                          'bytes'         => string,
+ *                          'flags'         => array,
+ *                          'internal_date' => int,
+ *                      ],
+ *                  ],
+ *              ],
+ *          ],
+ *      ];
+ *
+ * UIDs are per-user and monotonic, mirroring FileMailStorage
+ * so move-across-folders preserves the UID. UIDVALIDITY is
+ * per-folder so deleting and recreating a folder produces a
+ * different value (RFC 3501 sec 2.3.1.1). Both counters use
+ * the inherited nextUidValidity() helper for monotonicity.
+ */
+class RamMailStorage extends MailStorage
+{
+    /**
+     * @var array per-user state map; see class docblock for
+     * the nested shape.
+     */
+    protected $users = [];
+    /**
+     * Returns a reference to the user record, creating it if
+     * necessary. The reference shape is documented on the
+     * class. Helper used by every mutator so a fresh
+     * username gets a real, mutable record on first touch.
+     */
+    protected function & userRef($user)
+    {
+        if (!isset($this->users[$user])) {
+            $this->users[$user] = [
+                'uidnext' => 1,
+                'uidvalidity' => $this->nextUidValidity(),
+                'subscribed' => ['INBOX'],
+                'folders' => [
+                    'INBOX' => [
+                        'uidvalidity' => $this->nextUidValidity(),
+                        'messages' => [],
+                    ],
+                ],
+            ];
+        }
+        return $this->users[$user];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function ensureUser($user)
+    {
+        $this->userRef($user);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listFolders($user)
+    {
+        if (!isset($this->users[$user])) {
+            return [];
+        }
+        $names = array_keys($this->users[$user]['folders']);
+        sort($names);
+        return $names;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function createFolder($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $u = & $this->userRef($user);
+        if (isset($u['folders'][$folder])) {
+            return true;
+        }
+        $u['folders'][$folder] = [
+            'uidvalidity' => $this->nextUidValidity(),
+            'messages' => [],
+        ];
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function deleteFolder($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if ($folder === "INBOX") {
+            return false;
+        }
+        if (!isset($this->users[$user]['folders'][$folder])) {
+            return false;
+        }
+        /*
+            Refuse if subfolders exist, matching FileMailStorage
+            and the IMAP convention that delete is a leaf
+            operation; clients walk the subtree themselves.
+         */
+        $prefix = $folder . "/";
+        foreach (array_keys($this->users[$user]['folders'])
+            as $other) {
+            if (strpos($other, $prefix) === 0) {
+                return false;
+            }
+        }
+        unset($this->users[$user]['folders'][$folder]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function renameFolder($user, $old, $new)
+    {
+        try {
+            $old = $this->normalizeFolder($old);
+            $new = $this->normalizeFolder($new);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if ($old === "INBOX" || $new === "INBOX") {
+            return false;
+        }
+        if (!isset($this->users[$user]['folders'][$old])) {
+            return false;
+        }
+        if (isset($this->users[$user]['folders'][$new])) {
+            return false;
+        }
+        $this->users[$user]['folders'][$new] =
+            $this->users[$user]['folders'][$old];
+        unset($this->users[$user]['folders'][$old]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function folderExists($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        return isset(
+            $this->users[$user]['folders'][$folder]);
+    }
+    /**
+     * @inheritdoc
+     */
+    public function appendMessage($user, $folder, $bytes,
+        $flags = [], $internal_date = 0)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $u = & $this->userRef($user);
+        if (!isset($u['folders'][$folder])) {
+            if (!$this->createFolder($user, $folder)) {
+                return false;
+            }
+        }
+        if ($internal_date <= 0) {
+            $internal_date = time();
+        }
+        $clean = [];
+        foreach ($flags as $flag) {
+            $flag = trim((string) $flag);
+            if ($flag !== "") {
+                $clean[] = $flag;
+            }
+        }
+        $uid = $u['uidnext']++;
+        $u['folders'][$folder]['messages'][$uid] = [
+            'bytes' => (string) $bytes,
+            'flags' => $clean,
+            'internal_date' => (int) $internal_date,
+        ];
+        return $uid;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function fetchMessage($user, $folder, $uid)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $uid = (int) $uid;
+        if (!isset($this->users[$user]['folders'][$folder]
+            ['messages'][$uid])) {
+            return false;
+        }
+        return $this->users[$user]['folders'][$folder]
+            ['messages'][$uid]['bytes'];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listMessages($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return [];
+        }
+        if (!isset($this->users[$user]['folders'][$folder])) {
+            return [];
+        }
+        $messages = $this->users[$user]['folders'][$folder]
+            ['messages'];
+        ksort($messages);
+        $output = [];
+        foreach ($messages as $uid => $record) {
+            $output[] = [
+                'uid' => (int) $uid,
+                'size' => strlen($record['bytes']),
+                'flags' => $record['flags'],
+                'internal_date' => $record['internal_date'],
+            ];
+        }
+        return $output;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function messageMeta($user, $folder, $uid)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $uid = (int) $uid;
+        if (!isset($this->users[$user]['folders'][$folder]
+            ['messages'][$uid])) {
+            return false;
+        }
+        $record = $this->users[$user]['folders'][$folder]
+            ['messages'][$uid];
+        return [
+            'uid' => $uid,
+            'size' => strlen($record['bytes']),
+            'flags' => $record['flags'],
+            'internal_date' => $record['internal_date'],
+        ];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function setFlags($user, $folder, $uid, $flags)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        if (!isset($this->users[$user]['folders'][$folder]
+            ['messages'][$uid])) {
+            return false;
+        }
+        $clean = [];
+        foreach ($flags as $flag) {
+            $flag = trim((string) $flag);
+            if ($flag !== "") {
+                $clean[] = $flag;
+            }
+        }
+        $this->users[$user]['folders'][$folder]['messages']
+            [$uid]['flags'] = $clean;
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function expunge($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return [];
+        }
+        if (!isset($this->users[$user]['folders'][$folder])) {
+            return [];
+        }
+        $expunged = [];
+        $messages = & $this->users[$user]['folders'][$folder]
+            ['messages'];
+        ksort($messages);
+        foreach ($messages as $uid => $record) {
+            if (in_array('\\Deleted', $record['flags'],
+                true)) {
+                $expunged[] = (int) $uid;
+                unset($messages[$uid]);
+            }
+        }
+        return $expunged;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function moveMessage($user, $from, $to, $uid)
+    {
+        try {
+            $from = $this->normalizeFolder($from);
+            $to = $this->normalizeFolder($to);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $uid = (int) $uid;
+        if (!isset($this->users[$user]['folders'][$from]
+            ['messages'][$uid])) {
+            return false;
+        }
+        if (!isset($this->users[$user]['folders'][$to])) {
+            if (!$this->createFolder($user, $to)) {
+                return false;
+            }
+        }
+        $record = $this->users[$user]['folders'][$from]
+            ['messages'][$uid];
+        $this->users[$user]['folders'][$to]['messages'][$uid]
+            = $record;
+        unset($this->users[$user]['folders'][$from]
+            ['messages'][$uid]);
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function messageCount($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return 0;
+        }
+        if (!isset($this->users[$user]['folders'][$folder])) {
+            return 0;
+        }
+        return count($this->users[$user]['folders'][$folder]
+            ['messages']);
+    }
+    /**
+     * @inheritdoc
+     */
+    public function uidValidity($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return 0;
+        }
+        if (isset($this->users[$user]['folders'][$folder]
+            ['uidvalidity'])) {
+            return $this->users[$user]['folders'][$folder]
+                ['uidvalidity'];
+        }
+        $u = & $this->userRef($user);
+        return $u['uidvalidity'];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function uidNext($user, $folder)
+    {
+        $u = & $this->userRef($user);
+        return $u['uidnext'];
+    }
+    /**
+     * @inheritdoc
+     */
+    public function isSubscribed($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if ($folder === "INBOX") {
+            return true;
+        }
+        if (!isset($this->users[$user])) {
+            return false;
+        }
+        return in_array($folder,
+            $this->users[$user]['subscribed'], true);
+    }
+    /**
+     * @inheritdoc
+     */
+    public function subscribe($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $u = & $this->userRef($user);
+        if (!in_array($folder, $u['subscribed'], true)) {
+            $u['subscribed'][] = $folder;
+        }
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function unsubscribe($user, $folder)
+    {
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if (!isset($this->users[$user])) {
+            return true;
+        }
+        $u = & $this->users[$user];
+        $index = array_search($folder, $u['subscribed'],
+            true);
+        if ($index !== false) {
+            unset($u['subscribed'][$index]);
+            $u['subscribed'] = array_values($u['subscribed']);
+        }
+        return true;
+    }
+    /**
+     * @inheritdoc
+     */
+    public function listSubscribed($user)
+    {
+        $names = ['INBOX'];
+        if (isset($this->users[$user])) {
+            foreach ($this->users[$user]['subscribed']
+                as $name) {
+                if (!in_array($name, $names, true)) {
+                    $names[] = $name;
+                }
+            }
+        }
         sort($names);
         return $names;
     }

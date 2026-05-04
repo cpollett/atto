@@ -54,18 +54,16 @@ $cfg = [
 $users_file = __DIR__ . '/users.htpasswd';
 $store_dir = __DIR__ . '/maildata';
 /*
-    Read the running server's storage backend selection. Same
-    .engine file index.php reads at startup; the dropdown in
-    the UI rewrites it before triggering a server restart.
-    Default to "file" if absent or unknown so the demo
-    behaves like the original example 20 on a fresh checkout.
+    Path to the storage-backend selection file. Index.php
+    reads it at startup; the storage-engine dropdown in the
+    UI rewrites it then asks the operator to relaunch. The
+    file is plain text containing one of "file", "ram", or
+    "sql"; an absent or unrecognized value is treated as
+    "file" so a fresh checkout behaves like the original
+    example 20.
  */
-$engine_file = __DIR__ . '/.engine';
-$engine = is_file($engine_file) ?
-    trim((string) file_get_contents($engine_file)) : 'file';
-if (!in_array($engine, ['file', 'ram', 'sql'], true)) {
-    $engine = 'file';
-}
+$engine_file = __DIR__ . '/engine.txt';
+$engine = readEngineNow();
 $engine_labels = [
     'file' => 'File (per-user directories on disk)',
     'ram' => 'RAM (in-memory, evaporates on restart)',
@@ -216,9 +214,9 @@ function runScript($host, $port, $script, $tls_mode = 'none')
 }
 /*
 /*
-    Re-read .engine from disk every time. The startup-time
+    Re-read engine.txt from disk every time. The startup-time
     $engine variable could be stale if a prior request
-    rewrote .engine without restarting the server (the
+    rewrote engine.txt without restarting the server (the
     dropdown's intent IS to restart, but if anything in
     that chain misfired the operator might be staring at a
     page rendered by a webui process whose captured
@@ -229,7 +227,7 @@ function runScript($host, $port, $script, $tls_mode = 'none')
  */
 function readEngineNow()
 {
-    $engine_file = __DIR__ . '/.engine';
+    $engine_file = __DIR__ . '/engine.txt';
     $engine = is_file($engine_file) ?
         trim((string) file_get_contents($engine_file)) :
         'file';
@@ -1774,7 +1772,7 @@ $scenarios['api_dedup_demo'] = [
             scenario reports would otherwise be silent and
             confusing; reading at call time means the line
             "Engine: ..." in the output below always tells
-            the truth as the .engine file knows it right
+            the truth as the engine.txt file knows it right
             now.
          */
         $engine = readEngineNow();
@@ -1923,7 +1921,7 @@ $site->post('/reset', function () use ($site, $store_dir) {
 });
 /*
     Engine switch handler. Writes the chosen backend name to
-    .engine in the example directory, then schedules a
+    engine.txt in the example directory, then schedules a
     delayed kill of the running index.php parent process so
     the response reaches the browser before the server goes
     away. Once the parent exits its register_shutdown_function
@@ -1946,7 +1944,7 @@ $site->post('/engine', function () use (
         $chosen . "\n");
     if ($written === false) {
         $site->header('HTTP/1.1 500 Server Error');
-        echo "Could not write .engine";
+        echo "Could not write engine.txt";
         return;
     }
     /*
@@ -2305,7 +2303,7 @@ document.querySelectorAll('.scenario').forEach(function (el) {
     the server (the running storage instance has to be torn
     down and a new one constructed in its place). Rather
     than coordinate a hot-swap, this page writes the new
-    selection to .engine and asks the operator to relaunch
+    selection to engine.txt and asks the operator to relaunch
     "php index.php" by hand. The /engine endpoint signals
     the running server to shut down on a brief delay so the
     response has time to reach the browser before the

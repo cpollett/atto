@@ -146,7 +146,7 @@ if (!is_file($users_file)) {
 /*
     Storage backend selection. The webmail demo page lets
     the operator switch backends at runtime via a dropdown;
-    that write goes into .engine in this directory, which
+    that write goes into engine.txt in this directory, which
     we read here on startup. Switching engines requires
     restarting this server (the dropdown handler kills
     index.php after writing the new selection so the
@@ -165,7 +165,7 @@ $store_dir = __DIR__ . '/maildata';
 if (!is_dir($store_dir)) {
     mkdir($store_dir, 0700, true);
 }
-$engine_file = __DIR__ . '/.engine';
+$engine_file = __DIR__ . '/engine.txt';
 $engine = is_file($engine_file) ?
     trim((string) file_get_contents($engine_file)) : 'file';
 if (!in_array($engine, ['file', 'ram', 'sql'], true)) {

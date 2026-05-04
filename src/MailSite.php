@@ -542,16 +542,23 @@ abstract class MailStorage
     }
     /**
      * Canonicalizes a folder path: collapses repeated slashes,
-     * strips leading/trailing slashes, and rejects components
-     * that could escape the folder root or clobber metadata
-     * files. INBOX is normalized to all-uppercase per RFC
-     * 3501. Throws InvalidArgumentException on:
+     * strips leading/trailing slashes, strips leading dots from
+     * each component, and rejects components that could escape
+     * the folder root. INBOX is normalized to all-uppercase per
+     * RFC 3501. Backends that map folder names to filesystem
+     * paths layer additional checks on top of this -- see
+     * FileMailStorage::folderDir for the reserved-basename
+     * check that prevents folder names from colliding with per-
+     * user metadata files. Throws InvalidArgumentException on:
      *      empty / "." / ".."  components (path traversal)
      *      NUL byte             (older C-level path injection)
      *      control character    (corrupts line-oriented
      *                            metadata files)
-     *      dot-prefixed         (clobbers .uidvalidity, .uidnext,
-     *                            .subscribed metadata files)
+     * Leading dots in a component are silently stripped rather
+     * than rejected: ".foo" becomes "foo", "...bar" becomes
+     * "bar". A component that is nothing but dots (other than
+     * "." or ".." caught above) reduces to the empty string
+     * after stripping and is then rejected.
      */
     protected function normalizeFolder($folder)
     {
@@ -579,9 +586,10 @@ abstract class MailStorage
                 throw new \InvalidArgumentException(
                     "invalid folder component: '$part'");
             }
-            if ($part[0] === '.') {
+            $part = ltrim($part, '.');
+            if ($part === "") {
                 throw new \InvalidArgumentException(
-                    "folder name may not start with '.'");
+                    "folder component is all dots");
             }
             $clean[] = $part;
         }
@@ -595,8 +603,9 @@ abstract class MailStorage
  *      $base/
  *          users/
  *              <username>/
- *                  .uidvalidity   (single integer, fixed at create)
- *                  .uidnext       (single integer, monotonic)
+ *                  uidvalidity.txt  (single integer, fixed at create)
+ *                  uidnext.txt      (single integer, monotonic)
+ *                  subscribed.txt   (one folder name per line)
  *                  INBOX/
  *                      <uid>.eml
  *                      <uid>.flags    (one flag per line)
@@ -618,6 +627,22 @@ abstract class MailStorage
  */
 class FileMailStorage extends MailStorage
 {
+    /**
+     * Per-folder file holding a single integer UIDVALIDITY
+     * (RFC 3501 sec 2.3.1.1). Fixed at folder-create time.
+     */
+    const FOLDER_UIDVALIDITY_FILE = "uidvalidity.txt";
+    /**
+     * Per-user file holding a single integer counter for the
+     * next UID to assign. Bumped under flock so concurrent
+     * appends never hand out the same UID.
+     */
+    const USER_UIDNEXT_FILE = "uidnext.txt";
+    /**
+     * Per-user file listing subscribed folder names, one per
+     * line. Absent or empty means only INBOX is subscribed.
+     */
+    const USER_SUBSCRIBED_FILE = "subscribed.txt";
     protected $base;
     /**
      * @param string $base directory under which the "users/"
@@ -639,14 +664,40 @@ class FileMailStorage extends MailStorage
     /**
      * Returns the absolute directory path for a folder. Folder
      * names are encoded so "/" in a folder name becomes "%2F" in
-     * the directory name.
+     * the directory name. Rejects folder names that would
+     * collide with the per-user metadata files (uidvalidity.txt,
+     * uidnext.txt, subscribed.txt) since both live as siblings
+     * under the same user directory.
      */
     protected function folderDir($user, $folder)
     {
         $folder = $this->normalizeFolder($folder);
+        $reserved = [
+            self::FOLDER_UIDVALIDITY_FILE,
+            self::USER_UIDNEXT_FILE,
+            self::USER_SUBSCRIBED_FILE,
+        ];
+        foreach (explode("/", $folder) as $part) {
+            if (in_array($part, $reserved, true)) {
+                throw new \InvalidArgumentException(
+                    "folder name '$part' is reserved");
+            }
+        }
         $encoded = rawurlencode($folder);
         return $this->userDir($user) . DIRECTORY_SEPARATOR .
             $encoded;
+    }
+    /**
+     * Returns the path of a per-message file. Each message
+     * has three sibling files inside its folder directory:
+     * <uid>.eml (raw bytes), <uid>.flags (flag list), and
+     * <uid>.date (internal-date timestamp). Callers pass the
+     * extension as a string without the leading dot.
+     */
+    protected function messagePath($folder_dir, $uid, $ext)
+    {
+        return $folder_dir . DIRECTORY_SEPARATOR .
+            $uid . "." . $ext;
     }
     /**
      * Strips path separators, dot-prefixed components, and
@@ -682,7 +733,7 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $uidvalidity_file = $dir . DIRECTORY_SEPARATOR .
-            ".uidvalidity";
+            self::FOLDER_UIDVALIDITY_FILE;
         if (!is_file($uidvalidity_file)) {
             /*
                 Per-user UIDVALIDITY is a fallback for folders
@@ -694,7 +745,8 @@ class FileMailStorage extends MailStorage
             file_put_contents($uidvalidity_file,
                 (string) $this->nextUidValidity());
         }
-        $uidnext_file = $dir . DIRECTORY_SEPARATOR . ".uidnext";
+        $uidnext_file = $dir . DIRECTORY_SEPARATOR .
+            self::USER_UIDNEXT_FILE;
         if (!is_file($uidnext_file)) {
             file_put_contents($uidnext_file, "1");
         }
@@ -716,17 +768,18 @@ class FileMailStorage extends MailStorage
             return [];
         }
         foreach ($entries as $entry) {
-            if ($entry === "." || $entry === ".." ||
-                $entry[0] === ".") {
-                /*
-                    Hide dotfiles such as .uidvalidity and
-                    .uidnext from the folder listing; they are
-                    metadata, not folders.
-                 */
+            if ($entry === "." || $entry === "..") {
                 continue;
             }
             $sub = $dir . DIRECTORY_SEPARATOR . $entry;
             if (is_dir($sub)) {
+                /*
+                    Sibling metadata files (uidvalidity.txt,
+                    uidnext.txt, subscribed.txt) live in the
+                    same directory as the folder
+                    subdirectories; the is_dir filter excludes
+                    them from the listing automatically.
+                 */
                 $folders[] = rawurldecode($entry);
             }
         }
@@ -773,7 +826,8 @@ class FileMailStorage extends MailStorage
             plus a small offset.
          */
         @file_put_contents(
-            $path . DIRECTORY_SEPARATOR . ".uidvalidity",
+            $path . DIRECTORY_SEPARATOR .
+                self::FOLDER_UIDVALIDITY_FILE,
             (string) $this->nextUidValidity());
         return true;
     }
@@ -838,13 +892,13 @@ class FileMailStorage extends MailStorage
     }
     /**
      * Atomically allocates and returns the next per-user UID.
-     * Uses an exclusive flock on .uidnext so two concurrent
+     * Uses an exclusive flock on uidnext.txt so two concurrent
      * appendMessage calls cannot hand out the same number.
      */
     protected function allocUid($user)
     {
         $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
-            ".uidnext";
+            self::USER_UIDNEXT_FILE;
         $file_handle = @fopen($file, "c+");
         if ($file_handle === false) {
             return false;
@@ -887,7 +941,7 @@ class FileMailStorage extends MailStorage
             $internal_date = time();
         }
         $dir = $this->folderDir($user, $folder);
-        $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
+        $eml = $this->messagePath($dir, $uid, "eml");
         $temp_path = $eml . ".tmp";
         if (file_put_contents($temp_path, $bytes) === false) {
             return false;
@@ -897,10 +951,10 @@ class FileMailStorage extends MailStorage
             return false;
         }
         file_put_contents(
-            $dir . DIRECTORY_SEPARATOR . "$uid.flags",
+            $this->messagePath($dir, $uid, "flags"),
             implode("\n", $flags));
         file_put_contents(
-            $dir . DIRECTORY_SEPARATOR . "$uid.date",
+            $this->messagePath($dir, $uid, "date"),
             (string) $internal_date);
         return $uid;
     }
@@ -913,8 +967,8 @@ class FileMailStorage extends MailStorage
         if ($uid < 1) {
             return false;
         }
-        $eml = $this->folderDir($user, $folder) .
-            DIRECTORY_SEPARATOR . "$uid.eml";
+        $eml = $this->messagePath(
+            $this->folderDir($user, $folder), $uid, "eml");
         if (!is_file($eml)) {
             return false;
         }
@@ -963,12 +1017,12 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $dir = $this->folderDir($user, $folder);
-        $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
+        $eml = $this->messagePath($dir, $uid, "eml");
         if (!is_file($eml)) {
             return false;
         }
         $size = (int) @filesize($eml);
-        $flags_file = $dir . DIRECTORY_SEPARATOR . "$uid.flags";
+        $flags_file = $this->messagePath($dir, $uid, "flags");
         $flags = [];
         if (is_file($flags_file)) {
             $contents = (string) @file_get_contents($flags_file);
@@ -980,7 +1034,7 @@ class FileMailStorage extends MailStorage
                 }
             }
         }
-        $date_file = $dir . DIRECTORY_SEPARATOR . "$uid.date";
+        $date_file = $this->messagePath($dir, $uid, "date");
         $date = is_file($date_file) ?
             (int) @file_get_contents($date_file) : 0;
         if ($date <= 0) {
@@ -1003,7 +1057,7 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $dir = $this->folderDir($user, $folder);
-        $eml = $dir . DIRECTORY_SEPARATOR . "$uid.eml";
+        $eml = $this->messagePath($dir, $uid, "eml");
         if (!is_file($eml)) {
             return false;
         }
@@ -1015,7 +1069,7 @@ class FileMailStorage extends MailStorage
             }
         }
         $written = @file_put_contents(
-            $dir . DIRECTORY_SEPARATOR . "$uid.flags",
+            $this->messagePath($dir, $uid, "flags"),
             implode("\n", $clean));
         return $written !== false;
     }
@@ -1060,8 +1114,8 @@ class FileMailStorage extends MailStorage
             $to_dir = $this->folderDir($user, $to);
         }
         foreach (['eml', 'flags', 'date'] as $ext) {
-            $src = $from_dir . DIRECTORY_SEPARATOR . "$uid.$ext";
-            $dst = $to_dir . DIRECTORY_SEPARATOR . "$uid.$ext";
+            $src = $this->messagePath($from_dir, $uid, $ext);
+            $dst = $this->messagePath($to_dir, $uid, $ext);
             if (is_file($src) && !@rename($src, $dst)) {
                 return false;
             }
@@ -1081,7 +1135,7 @@ class FileMailStorage extends MailStorage
      * UIDVALIDITY is stored per folder so a delete+recreate
      * cycle assigns a fresh value, signaling clients that
      * their cached UID-to-content mapping is stale and must
-     * be discarded. The per-user .uidvalidity file remains
+     * be discarded. The per-user uidvalidity.txt file remains
      * the fallback for folders that pre-date this scheme so
      * existing message stores keep working without
      * intervention.
@@ -1089,7 +1143,7 @@ class FileMailStorage extends MailStorage
     public function uidValidity($user, $folder)
     {
         $folder_file = $this->folderDir($user, $folder) .
-            DIRECTORY_SEPARATOR . ".uidvalidity";
+            DIRECTORY_SEPARATOR . self::FOLDER_UIDVALIDITY_FILE;
         if (is_file($folder_file)) {
             $value = (int) trim((string)
                 @file_get_contents($folder_file));
@@ -1098,7 +1152,7 @@ class FileMailStorage extends MailStorage
             }
         }
         $user_file = $this->userDir($user) . DIRECTORY_SEPARATOR .
-            ".uidvalidity";
+            self::FOLDER_UIDVALIDITY_FILE;
         if (!is_file($user_file)) {
             $this->ensureUser($user);
         }
@@ -1110,7 +1164,7 @@ class FileMailStorage extends MailStorage
     public function uidNext($user, $folder)
     {
         $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
-            ".uidnext";
+            self::USER_UIDNEXT_FILE;
         if (!is_file($file)) {
             $this->ensureUser($user);
         }
@@ -1124,7 +1178,7 @@ class FileMailStorage extends MailStorage
     protected function subscriptionFile($user)
     {
         return $this->userDir($user) . DIRECTORY_SEPARATOR .
-            ".subscribed";
+            self::USER_SUBSCRIBED_FILE;
     }
     /**
      * Reads the subscription file into a deduplicated array
@@ -1247,8 +1301,8 @@ class FileMailStorage extends MailStorage
         } catch (\InvalidArgumentException $e) {
             return false;
         }
-        $eml = $this->folderDir($user, $folder) .
-            DIRECTORY_SEPARATOR . "$uid.eml";
+        $eml = $this->messagePath(
+            $this->folderDir($user, $folder), $uid, "eml");
         if (!is_file($eml)) {
             return false;
         }
@@ -1779,16 +1833,13 @@ class RamMailStorage extends MailStorage
 }
 /**
  * Database-backed MailStorage. Mail metadata (users, folders,
- * messages, subscriptions) lives in a relational store via PDO
- * (PHP Data Objects, the standard PHP database abstraction);
- * message bodies live on disk in a content-addressed blob store
- * with refcounted dedup. The database stores body hashes only,
- * never the bytes themselves, so two messages with byte-identical
- * bodies share one on-disk file regardless of how many users
- * received the message or which folders it lives in. Refcounts
- * are kept in a sidecar metadata file next to each blob; when a
- * refcount drops to zero on expunge or delete, both files are
- * unlinked.
+ * messages, subscriptions, blob refcounts) lives in a relational
+ * store via PDO (PHP Data Objects, the standard PHP database
+ * abstraction); message bodies live on disk in a content-addressed
+ * blob store with refcounted dedup. The database stores body
+ * hashes only, never the bytes themselves, so two messages with
+ * byte-identical bodies share one on-disk file regardless of how
+ * many users received the message or which folders it lives in.
  *
  * Construction.
  *
@@ -1801,10 +1852,7 @@ class RamMailStorage extends MailStorage
  * already-constructed PDO instance. The PDO-instance form lets a
  * host application that already maintains its own connection
  * pool (Yioop's DatasourceManager being a concrete example) hand
- * the existing connection in rather than open a second one. To
- * adapt a Yioop PdoManager call site, pass its underlying PDO
- * (Yioop's PdoManager exposes it as $pdo->pdo) into this
- * constructor.
+ * the existing connection in rather than open a second one.
  *
  * The second argument is the directory under which content-
  * addressed blobs are stored. For SQLite DSNs of the form
@@ -1821,10 +1869,11 @@ class RamMailStorage extends MailStorage
  * ON DUPLICATE KEY UPDATE, AUTOINCREMENT, LIMIT/OFFSET in places
  * Oracle would reject, and other dialect-specific syntax. Per-
  * DBMS differences (the integer-PK column declaration, big-int
- * type name, post-connect pragmas) are pulled from a per-driver
- * dialect array; pre-populated entries cover sqlite, mysql, and
- * pgsql. Anyone running against db2 or oci passes a dialect
- * override into the constructor.
+ * type name, INSERT-or-ignore prefix/suffix, post-connect
+ * pragmas) are pulled from a per-driver dialect array; pre-
+ * populated entries cover sqlite, mysql, and pgsql. Anyone
+ * running against db2 or oci passes a dialect override into
+ * the constructor.
  *
  * Schema auto-creation.
  *
@@ -1835,24 +1884,22 @@ class RamMailStorage extends MailStorage
  * if the schema needs to change in a later phase the caller
  * will need to drop the tables manually.
  *
- * Blob layout.
+ * Blob layout and refcount integrity.
  *
  *      $blobs_dir/ab/cd/abcd1234...ef.eml   -- raw message bytes
  *      mail_blobs (body_hash, refcount,     -- transactional
  *                  size, created_at)           refcount table
  *
  * The two-byte / two-byte directory prefix bounds the maximum
- * fan-out of any one directory to about 65,536 entries even
- * under extreme load. Refcounts live in the database alongside
- * the message rows that reference them, so an appendMessage
- * commits the refcount bump and the mail_messages INSERT in
- * one transaction; on a crash the database recovery restores
- * a consistent state without sidecar metadata files to
- * reconcile. The .eml file write is outside the transaction
- * (filesystems are not transactional); a transaction rollback
- * can therefore leave an orphan .eml file with no row
- * referencing it. A periodic reaper that compares the
- * filesystem against mail_blobs.body_hash recovers these.
+ * fan-out of any one directory. Refcounts live in the database
+ * alongside the message rows that reference them, so each
+ * appendMessage commits its refcount bump and the
+ * mail_messages INSERT in a single transaction. The .eml file
+ * write is outside the transaction (filesystems are not
+ * transactional); a rollback can therefore leave an orphan
+ * .eml file with no row referencing it. A periodic reaper that
+ * compares the filesystem against mail_blobs.body_hash
+ * recovers these orphans.
  */
 class SqlMailStorage extends MailStorage
 {

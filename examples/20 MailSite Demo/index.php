@@ -19,7 +19,7 @@
  *
  * That single command boots the mail listeners and spawns a
  * companion WebSite on http://localhost:8080/ that exposes a
- * click-through harness for driving the mail server. Open the
+ * click-through demo for driving the mail server. Open the
  * browser to that URL after launching. Bind to 25/143/465/993
  * in production (you will need root or setcap on the php
  * binary).
@@ -144,15 +144,16 @@ if (!is_file($users_file)) {
         "password 'hunter2'\n";
 }
 /*
-    Storage backend selection. The webmail harness lets the
-    operator switch backends at runtime via a dropdown; that
-    write goes into .engine in this directory, which we read
-    here on startup. Switching engines requires restarting
-    this server (the dropdown handler kills index.php after
-    writing the new selection so the operator just relaunches
-    "php index.php" to see the change). Default is "file" --
-    the on-disk backend that example 20 originally shipped
-    with -- so existing users see no behavior change.
+    Storage backend selection. The webmail demo page lets
+    the operator switch backends at runtime via a dropdown;
+    that write goes into .engine in this directory, which
+    we read here on startup. Switching engines requires
+    restarting this server (the dropdown handler kills
+    index.php after writing the new selection so the
+    operator just relaunches "php index.php" to see the
+    change). Default is "file" -- the on-disk backend that
+    example 20 originally shipped with -- so existing users
+    see no behavior change.
 
     Each backend is a drop-in implementation of the same
     MailStorage abstract class; only the storage() call below

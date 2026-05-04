@@ -57,7 +57,7 @@ $store_dir = __DIR__ . '/maildata';
     Read the running server's storage backend selection. Same
     .engine file index.php reads at startup; the dropdown in
     the UI rewrites it before triggering a server restart.
-    Default to "file" if absent or unknown so the harness
+    Default to "file" if absent or unknown so the demo
     behaves like the original example 20 on a fresh checkout.
  */
 $engine_file = __DIR__ . '/.engine';
@@ -216,16 +216,39 @@ function runScript($host, $port, $script, $tls_mode = 'none')
 }
 /*
 /*
+    Re-read .engine from disk every time. The startup-time
+    $engine variable could be stale if a prior request
+    rewrote .engine without restarting the server (the
+    dropdown's intent IS to restart, but if anything in
+    that chain misfired the operator might be staring at a
+    page rendered by a webui process whose captured
+    $engine no longer matches what index.php is actually
+    running). The api_dedup_demo scenario uses this so its
+    "Engine: ..." line always reflects what the file
+    actually says, never what was cached at startup.
+ */
+function readEngineNow()
+{
+    $engine_file = __DIR__ . '/.engine';
+    $engine = is_file($engine_file) ?
+        trim((string) file_get_contents($engine_file)) :
+        'file';
+    if (!in_array($engine, ['file', 'ram', 'sql'], true)) {
+        $engine = 'file';
+    }
+    return $engine;
+}
+/*
     Build a freshly-constructed MailSite that shares state
     with the running server. We do NOT call ->listen() on
     this instance; we only use its public methods to drive
     the direct-API scenarios.
 
     The backend chosen here MUST match what index.php is
-    currently running, otherwise the harness sees an empty,
-    parallel state instead of the live server's. For the
-    file and SQL backends both processes can read the same
-    underlying store (filesystem files / SQLite database
+    currently running, otherwise this peer instance sees an
+    empty, parallel state instead of the live server's. For
+    the file and SQL backends both processes can read the
+    same underlying store (filesystem files / SQLite database
     file in WAL mode); for RAM there is no shared state at
     all because the messages live entirely in the running
     server process's PHP heap. Direct-API scenarios are
@@ -243,7 +266,7 @@ function shareMail($users_file, $store_dir, $engine)
             database file. WAL mode (set by the dialect's
             post_connect hook) lets readers and writers
             coexist without blocking each other, so this
-            harness instance can fetch and inspect the
+            peer instance can fetch and inspect the
             live server's state mid-flight.
          */
         $m->storage(new SqlMailStorage(
@@ -1743,7 +1766,18 @@ $scenarios['api_dedup_demo'] = [
         'file backend reports separate paths; RAM reports ' .
         'separate slots with the same content hash.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir, $engine) {
+    'run' => function () use ($users_file, $store_dir) {
+        /*
+            Read the current engine fresh rather than using
+            the value captured at webui startup. Any drift
+            between the dropdown selection and what this
+            scenario reports would otherwise be silent and
+            confusing; reading at call time means the line
+            "Engine: ..." in the output below always tells
+            the truth as the .engine file knows it right
+            now.
+         */
+        $engine = readEngineNow();
         $m = shareMail($users_file, $store_dir, $engine);
         $body = "Subject: Newsletter Issue 47\r\n" .
             "From: list@example.com\r\n" .
@@ -1968,8 +2002,9 @@ $site->get('/', function () use (
         open the same SQLite database; WAL mode allows the
         concurrent access). It does NOT work for the RAM
         backend, whose state lives entirely in the running
-        server process's PHP heap; the harness's peer
-        instance would see a separate, empty mailbox.
+        server process's PHP heap; this page's peer
+        MailSite instance would see a separate, empty
+        mailbox.
      */
     $by_group = [];
     foreach ($scenarios as $id => $s) {
@@ -2068,7 +2103,7 @@ code { background: #eee; padding: 0.1em 0.3em; border-radius: 3px;
 </style>
 </head>
 <body>
-<h1>AttoMail Demo Harness</h1>
+<h1>AttoMail Demo</h1>
 <div class="meta">
 Companion UI to <code>index.php</code>. Each scenario opens a
 short connection to one of the listening ports (SMTP 2525,
@@ -2269,7 +2304,7 @@ document.querySelectorAll('.scenario').forEach(function (el) {
     Engine selector: switching backends requires restarting
     the server (the running storage instance has to be torn
     down and a new one constructed in its place). Rather
-    than coordinate a hot-swap, the harness writes the new
+    than coordinate a hot-swap, this page writes the new
     selection to .engine and asks the operator to relaunch
     "php index.php" by hand. The /engine endpoint signals
     the running server to shut down on a brief delay so the

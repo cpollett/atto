@@ -489,11 +489,12 @@ abstract class MailStorage
     abstract public function listSubscribed($user);
     /**
      * Returns metadata describing where the body bytes for
-     * (user, folder, uid) physically live. Used by the demo
-     * harness to make content-addressed storage visible: two
-     * messages with byte-identical bodies on a deduplicating
-     * backend report the same path / hash, while a non-
-     * deduplicating backend reports per-message paths.
+     * (user, folder, uid) physically live. Used by callers
+     * that need to make content-addressed storage visible:
+     * two messages with byte-identical bodies on a
+     * deduplicating backend report the same path / hash,
+     * while a non-deduplicating backend reports per-message
+     * paths.
      *
      * Returns an associative array on success, false if the
      * message does not exist.
@@ -1746,9 +1747,9 @@ class RamMailStorage extends MailStorage
      * The RAM backend keeps every message body as its own
      * separate string on the storage instance. There is no
      * dedup, no on-disk path, and no refcount; we report the
-     * computed hash for the demo's benefit so the harness
-     * can show that two RAM messages with identical bodies
-     * have the same content but different storage slots.
+     * computed hash for callers that want to compare bodies
+     * across messages even though storage slots are not
+     * shared.
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -1872,9 +1873,9 @@ class SqlMailStorage extends MailStorage
     protected $dialect;
     /**
      * @var array name => SQL template string. Each call to
-     * stmt() prepares a fresh PDOStatement from these to
+     * prepareStatement() prepares a fresh PDOStatement from these to
      * avoid cursor-state leakage between unrelated callers
-     * (see stmt()'s docblock for the full reasoning).
+     * (see prepareStatement()'s docblock for the full reasoning).
      */
     protected $sql_templates;
     /**
@@ -2180,7 +2181,7 @@ class SqlMailStorage extends MailStorage
         /*
             Splice in the dialect-correct INSERT IGNORE shape
             for blob_insert_or_ignore. We could do this in
-            stmt() but doing it here keeps the resulting
+            prepareStatement() but doing it here keeps the resulting
             prepared statement cleaner and the splicing work
             one-shot rather than per-call.
          */
@@ -2210,7 +2211,7 @@ class SqlMailStorage extends MailStorage
      * dominating mail-server throughput. The clarity is
      * worth more than the saved milliseconds.
      */
-    protected function stmt($name)
+    protected function prepareStatement($name)
     {
         if (!isset($this->sql_templates[$name])) {
             throw new \LogicException(
@@ -2258,7 +2259,7 @@ class SqlMailStorage extends MailStorage
      */
     protected function userRow($user)
     {
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $row = $stmt->fetch();
         if ($row !== false) {
@@ -2266,11 +2267,11 @@ class SqlMailStorage extends MailStorage
         }
         $now = time();
         $uv = $this->nextUidValidity();
-        $this->stmt('user_insert')->execute(
+        $this->prepareStatement('user_insert')->execute(
             [$user, 1, $uv, $now]);
         $user_id = (int) $this->pdo->lastInsertId();
         $inbox_uv = $this->nextUidValidity();
-        $this->stmt('folder_insert')->execute(
+        $this->prepareStatement('folder_insert')->execute(
             [$user_id, 'INBOX', $inbox_uv, $now]);
         return [
             'id' => $user_id,
@@ -2286,13 +2287,13 @@ class SqlMailStorage extends MailStorage
      */
     protected function folderRow($user, $folder)
     {
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row === false) {
             return false;
         }
-        $stmt = $this->stmt('folder_by_user_name');
+        $stmt = $this->prepareStatement('folder_by_user_name');
         $stmt->execute([$user_row['id'], $folder]);
         $folder_row = $stmt->fetch();
         if ($folder_row === false) {
@@ -2314,13 +2315,13 @@ class SqlMailStorage extends MailStorage
      */
     public function listFolders($user)
     {
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row === false) {
             return [];
         }
-        $stmt = $this->stmt('folders_by_user');
+        $stmt = $this->prepareStatement('folders_by_user');
         $stmt->execute([$user_row['id']]);
         $names = [];
         while ($row = $stmt->fetch()) {
@@ -2339,12 +2340,12 @@ class SqlMailStorage extends MailStorage
             return false;
         }
         $u = $this->userRow($user);
-        $stmt = $this->stmt('folder_by_user_name');
+        $stmt = $this->prepareStatement('folder_by_user_name');
         $stmt->execute([$u['id'], $folder]);
         if ($stmt->fetch() !== false) {
             return true;
         }
-        $this->stmt('folder_insert')->execute([
+        $this->prepareStatement('folder_insert')->execute([
             $u['id'], $folder, $this->nextUidValidity(), time()
         ]);
         return true;
@@ -2366,7 +2367,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return false;
         }
-        $stmt = $this->stmt('folder_children');
+        $stmt = $this->prepareStatement('folder_children');
         $stmt->execute([$row['user_id'], $folder . '/%']);
         if ($stmt->fetch() !== false) {
             return false;
@@ -2380,7 +2381,7 @@ class SqlMailStorage extends MailStorage
          */
         $this->pdo->beginTransaction();
         try {
-            $msgs = $this->stmt('messages_by_folder');
+            $msgs = $this->prepareStatement('messages_by_folder');
             $msgs->execute([$row['id']]);
             $hashes = [];
             while ($m = $msgs->fetch()) {
@@ -2391,7 +2392,7 @@ class SqlMailStorage extends MailStorage
             }
             $this->pdo->exec("DELETE FROM mail_messages " .
                 "WHERE folder_id = " . (int) $row['id']);
-            $this->stmt('folder_delete')->execute([$row['id']]);
+            $this->prepareStatement('folder_delete')->execute([$row['id']]);
             $this->pdo->commit();
         } catch (\Throwable $e) {
             $this->pdo->rollBack();
@@ -2420,7 +2421,7 @@ class SqlMailStorage extends MailStorage
         if ($this->folderRow($user, $new) !== false) {
             return false;
         }
-        $this->stmt('folder_rename')->execute(
+        $this->prepareStatement('folder_rename')->execute(
             [$new, $row['id']]);
         return true;
     }
@@ -2491,13 +2492,13 @@ class SqlMailStorage extends MailStorage
                 $this->pdo->rollBack();
                 return false;
             }
-            $stmt = $this->stmt('user_by_name');
+            $stmt = $this->prepareStatement('user_by_name');
             $stmt->execute([$user]);
             $fresh = $stmt->fetch();
             $uid = (int) $fresh['uidnext'];
-            $this->stmt('user_update_uidnext')->execute(
+            $this->prepareStatement('user_update_uidnext')->execute(
                 [$uid + 1, $u['id']]);
-            $this->stmt('message_insert')->execute([
+            $this->prepareStatement('message_insert')->execute([
                 $row['id'], $uid, implode(' ', $clean),
                 (int) $internal_date, strlen($bytes), $hash
             ]);
@@ -2522,7 +2523,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return false;
         }
-        $stmt = $this->stmt('message_by_uid');
+        $stmt = $this->prepareStatement('message_by_uid');
         $stmt->execute([$row['id'], (int) $uid]);
         $msg = $stmt->fetch();
         if ($msg === false) {
@@ -2544,7 +2545,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return [];
         }
-        $stmt = $this->stmt('messages_by_folder');
+        $stmt = $this->prepareStatement('messages_by_folder');
         $stmt->execute([$row['id']]);
         $output = [];
         while ($msg = $stmt->fetch()) {
@@ -2566,7 +2567,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return false;
         }
-        $stmt = $this->stmt('message_by_uid');
+        $stmt = $this->prepareStatement('message_by_uid');
         $stmt->execute([$row['id'], (int) $uid]);
         $msg = $stmt->fetch();
         if ($msg === false) {
@@ -2608,7 +2609,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return false;
         }
-        $stmt = $this->stmt('message_by_uid');
+        $stmt = $this->prepareStatement('message_by_uid');
         $stmt->execute([$row['id'], $uid]);
         $msg = $stmt->fetch();
         if ($msg === false) {
@@ -2621,7 +2622,7 @@ class SqlMailStorage extends MailStorage
                 $clean[] = $flag;
             }
         }
-        $this->stmt('message_update_flags')->execute(
+        $this->prepareStatement('message_update_flags')->execute(
             [implode(' ', $clean), $msg['id']]);
         return true;
     }
@@ -2639,7 +2640,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return [];
         }
-        $stmt = $this->stmt('messages_in_folder_with_deleted');
+        $stmt = $this->prepareStatement('messages_in_folder_with_deleted');
         $stmt->execute([$row['id']]);
         $expunged = [];
         $to_drop = [];
@@ -2665,7 +2666,7 @@ class SqlMailStorage extends MailStorage
         $this->pdo->beginTransaction();
         try {
             foreach ($to_drop as $msg) {
-                $this->stmt('message_delete')->execute(
+                $this->prepareStatement('message_delete')->execute(
                     [$msg['id']]);
                 $this->blobDecRef($msg['body_hash']);
             }
@@ -2693,7 +2694,7 @@ class SqlMailStorage extends MailStorage
         if ($from_row === false) {
             return false;
         }
-        $stmt = $this->stmt('message_by_uid');
+        $stmt = $this->prepareStatement('message_by_uid');
         $stmt->execute([$from_row['id'], $uid]);
         $msg = $stmt->fetch();
         if ($msg === false) {
@@ -2709,7 +2710,7 @@ class SqlMailStorage extends MailStorage
                 return false;
             }
         }
-        $this->stmt('message_move')->execute(
+        $this->prepareStatement('message_move')->execute(
             [$to_row['id'], $msg['id']]);
         return true;
     }
@@ -2727,7 +2728,7 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return 0;
         }
-        $stmt = $this->stmt('message_count');
+        $stmt = $this->prepareStatement('message_count');
         $stmt->execute([$row['id']]);
         $count_row = $stmt->fetch();
         return (int) $count_row['c'];
@@ -2746,7 +2747,7 @@ class SqlMailStorage extends MailStorage
         if ($row !== false) {
             return (int) $row['uidvalidity'];
         }
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row === false) {
@@ -2759,7 +2760,7 @@ class SqlMailStorage extends MailStorage
      */
     public function uidNext($user, $folder)
     {
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row === false) {
@@ -2781,13 +2782,13 @@ class SqlMailStorage extends MailStorage
         if ($folder === "INBOX") {
             return true;
         }
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row === false) {
             return false;
         }
-        $stmt = $this->stmt('subscription_check');
+        $stmt = $this->prepareStatement('subscription_check');
         $stmt->execute([$user_row['id'], $folder]);
         return $stmt->fetch() !== false;
     }
@@ -2802,12 +2803,12 @@ class SqlMailStorage extends MailStorage
             return false;
         }
         $u = $this->userRow($user);
-        $stmt = $this->stmt('subscription_check');
+        $stmt = $this->prepareStatement('subscription_check');
         $stmt->execute([$u['id'], $folder]);
         if ($stmt->fetch() !== false) {
             return true;
         }
-        $this->stmt('subscription_insert')->execute(
+        $this->prepareStatement('subscription_insert')->execute(
             [$u['id'], $folder]);
         return true;
     }
@@ -2821,13 +2822,13 @@ class SqlMailStorage extends MailStorage
         } catch (\InvalidArgumentException $e) {
             return false;
         }
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row === false) {
             return true;
         }
-        $this->stmt('subscription_delete')->execute(
+        $this->prepareStatement('subscription_delete')->execute(
             [$user_row['id'], $folder]);
         return true;
     }
@@ -2837,11 +2838,11 @@ class SqlMailStorage extends MailStorage
     public function listSubscribed($user)
     {
         $names = ['INBOX'];
-        $stmt = $this->stmt('user_by_name');
+        $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
         if ($user_row !== false) {
-            $stmt = $this->stmt('subscriptions_by_user');
+            $stmt = $this->prepareStatement('subscriptions_by_user');
             $stmt->execute([$user_row['id']]);
             while ($row = $stmt->fetch()) {
                 if (!in_array($row['folder'], $names, true)) {
@@ -2859,10 +2860,9 @@ class SqlMailStorage extends MailStorage
      * star of this method: two messages with byte-identical
      * bodies report the same path and hash, and the refcount
      * field shows how many other messages share the blob.
-     * That is the "demo of dedup" the harness exposes -- the
-     * harness fetches messageBodyLocation for two messages
-     * delivered to different users and shows visually that
-     * the storage location coincides.
+     * Callers can fetch messageBodyLocation for two messages
+     * delivered to different users and observe that the
+     * storage location coincides.
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -2879,14 +2879,14 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return false;
         }
-        $stmt = $this->stmt('message_by_uid');
+        $stmt = $this->prepareStatement('message_by_uid');
         $stmt->execute([$row['id'], $uid]);
         $msg = $stmt->fetch();
         if ($msg === false) {
             return false;
         }
         $hash = $msg['body_hash'];
-        $blob_stmt = $this->stmt('blob_select');
+        $blob_stmt = $this->prepareStatement('blob_select');
         $blob_stmt->execute([$hash]);
         $blob = $blob_stmt->fetch();
         return [
@@ -2941,11 +2941,11 @@ class SqlMailStorage extends MailStorage
             the row's refcount accurately tracks the new
             reference.
          */
-        $stmt = $this->stmt('blob_insert_or_ignore');
+        $stmt = $this->prepareStatement('blob_insert_or_ignore');
         $stmt->execute([$hash, strlen($bytes), time()]);
         $inserted = $stmt->rowCount();
         if ($inserted === 0) {
-            $this->stmt('blob_increment')->execute([$hash]);
+            $this->prepareStatement('blob_increment')->execute([$hash]);
         }
         $eml_path = $this->blobPath($hash);
         if (!is_file($eml_path)) {
@@ -2973,8 +2973,8 @@ class SqlMailStorage extends MailStorage
      */
     protected function blobDecRef($hash)
     {
-        $this->stmt('blob_decrement')->execute([$hash]);
-        $stmt = $this->stmt('blob_select');
+        $this->prepareStatement('blob_decrement')->execute([$hash]);
+        $stmt = $this->prepareStatement('blob_select');
         $stmt->execute([$hash]);
         $row = $stmt->fetch();
         if ($row === false) {
@@ -2983,7 +2983,7 @@ class SqlMailStorage extends MailStorage
         if ((int) $row['refcount'] > 0) {
             return true;
         }
-        $this->stmt('blob_delete_zero')->execute([$hash]);
+        $this->prepareStatement('blob_delete_zero')->execute([$hash]);
         @unlink($this->blobPath($hash));
         return true;
     }
@@ -3400,8 +3400,8 @@ class MailSite
     /**
      * Returns metadata describing where the body bytes for
      * (user, folder, uid) physically live. Used by direct-API
-     * callers (e.g. the demo harness) to make backend-specific
-     * storage details visible -- particularly content-addressed
+     * callers that need to make backend-specific storage
+     * details visible -- particularly content-addressed
      * dedup, where two messages with byte-identical bodies
      * report the same path on the SQL backend. See
      * MailStorage::messageBodyLocation for the return shape.

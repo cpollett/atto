@@ -24,6 +24,8 @@ use seekquarry\atto\WebSite;
 use seekquarry\atto\MailSite;
 use seekquarry\atto\FileAuthenticator;
 use seekquarry\atto\FileMailStorage;
+use seekquarry\atto\RamMailStorage;
+use seekquarry\atto\SqlMailStorage;
 if (!defined("seekquarry\\atto\\RUN")) {
     define("seekquarry\\atto\\RUN", true);
 }
@@ -51,6 +53,24 @@ $cfg = [
 ];
 $users_file = __DIR__ . '/users.htpasswd';
 $store_dir = __DIR__ . '/maildata';
+/*
+    Read the running server's storage backend selection. Same
+    .engine file index.php reads at startup; the dropdown in
+    the UI rewrites it before triggering a server restart.
+    Default to "file" if absent or unknown so the harness
+    behaves like the original example 20 on a fresh checkout.
+ */
+$engine_file = __DIR__ . '/.engine';
+$engine = is_file($engine_file) ?
+    trim((string) file_get_contents($engine_file)) : 'file';
+if (!in_array($engine, ['file', 'ram', 'sql'], true)) {
+    $engine = 'file';
+}
+$engine_labels = [
+    'file' => 'File (per-user directories on disk)',
+    'ram' => 'RAM (in-memory, evaporates on restart)',
+    'sql' => 'SQL (SQLite + content-addressed body store)',
+];
 /*
     Catalog of scenarios. Each entry has:
       id       - URL-safe slug used in the form POST
@@ -195,18 +215,54 @@ function runScript($host, $port, $script, $tls_mode = 'none')
     return $transcript;
 }
 /*
-    Build a freshly-constructed MailSite that shares the on-
-    disk store and password file with the running server. We
-    do NOT call ->listen() on it; we only use its public
-    methods. Both processes touch the same files, so the view
-    is consistent (file-locked UID counter handles concurrent
-    appends should they happen).
+/*
+    Build a freshly-constructed MailSite that shares state
+    with the running server. We do NOT call ->listen() on
+    this instance; we only use its public methods to drive
+    the direct-API scenarios.
+
+    The backend chosen here MUST match what index.php is
+    currently running, otherwise the harness sees an empty,
+    parallel state instead of the live server's. For the
+    file and SQL backends both processes can read the same
+    underlying store (filesystem files / SQLite database
+    file in WAL mode); for RAM there is no shared state at
+    all because the messages live entirely in the running
+    server process's PHP heap. Direct-API scenarios are
+    therefore filtered out for the RAM backend at render
+    time -- see the api_* availability check in the GET /
+    handler.
  */
-function shareMail($users_file, $store_dir)
+function shareMail($users_file, $store_dir, $engine)
 {
     $m = new MailSite();
     $m->auth(new FileAuthenticator($users_file));
-    $m->storage(new FileMailStorage($store_dir));
+    if ($engine === 'sql') {
+        /*
+            Open a separate PDO against the same SQLite
+            database file. WAL mode (set by the dialect's
+            post_connect hook) lets readers and writers
+            coexist without blocking each other, so this
+            harness instance can fetch and inspect the
+            live server's state mid-flight.
+         */
+        $m->storage(new SqlMailStorage(
+            'sqlite:' . $store_dir . '/mail.db',
+            $store_dir . '/blobs'));
+    } else if ($engine === 'ram') {
+        /*
+            RAM has no peer-process access pattern. We
+            still construct a backend so the helper does
+            not crash if accidentally invoked, but the
+            instance is empty: every operation will see
+            an unknown user, and api_* scenarios that rely
+            on this helper are filtered out at render
+            time for the RAM backend.
+         */
+        $m->storage(new RamMailStorage());
+    } else {
+        $m->storage(new FileMailStorage($store_dir));
+    }
     $m->domains(['localhost', 'example.test']);
     return $m;
 }
@@ -336,7 +392,7 @@ $scenarios['hook_spam'] = [
     'desc' => 'Subject starting with [SPAM] gets routed to ' .
         'alice/Junk. Junk count is shown after delivery.',
     'kind' => 'wire',
-    'run' => function () use ($cfg, $users_file, $store_dir) {
+    'run' => function () use ($cfg, $users_file, $store_dir, $engine) {
         $tx = runScript($cfg['host'], $cfg['smtp'], [
             "EHLO test\r\n",
             "MAIL FROM:<x@y.com>\r\n",
@@ -345,7 +401,7 @@ $scenarios['hook_spam'] = [
             "Subject: [SPAM] cheap pills\r\n\r\nbody\r\n.\r\n",
             "QUIT\r\n",
         ]);
-        $m = shareMail($users_file, $store_dir);
+        $m = shareMail($users_file, $store_dir, $engine);
         $tx .= "\n--- direct API after delivery ---\n";
         $tx .= "alice/Junk count: " .
             $m->messageCount('alice', 'Junk') . "\n";
@@ -358,8 +414,8 @@ $scenarios['hook_drop'] = [
     'desc' => 'noreply@ sender is dropped silently. Server ' .
         'still says 250 (does not leak filter behavior).',
     'kind' => 'wire',
-    'run' => function () use ($cfg, $users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($cfg, $users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $before = $m->messageCount('alice', 'INBOX');
         $tx = runScript($cfg['host'], $cfg['smtp'], [
             "EHLO test\r\n",
@@ -1096,8 +1152,8 @@ $scenarios['imap_search_unicode'] = [
         'user actually sees, with the rows that matched ' .
         'a given query highlighted.',
     'kind' => 'webmail',
-    'run' => function () use ($users_file, $store_dir) {
-        $mail = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $mail = shareMail($users_file, $store_dir, $engine);
         /*
             Seed three messages directly via the direct API,
             with subjects that exercise plain ASCII, UTF-8
@@ -1440,8 +1496,8 @@ $scenarios['api_folders'] = [
     'desc' => '$mail->listFolders("alice") -- the same call ' .
         'a webmail UI would make.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $folders = $m->listFolders('alice');
         if (empty($folders)) {
             return "(alice has no folders yet; deliver some " .
@@ -1456,8 +1512,8 @@ $scenarios['api_inbox'] = [
     'desc' => '$mail->listMessages("alice", "INBOX") -- ' .
         'returns uid, size, flags, internal_date.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $msgs = $m->listMessages('alice', 'INBOX');
         if (empty($msgs)) {
             return "(no messages in alice/INBOX)\n";
@@ -1480,8 +1536,8 @@ $scenarios['api_show'] = [
         'returns raw RFC 5322 bytes, including the Received: ' .
         'trace header we stamped on inbound.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $msgs = $m->listMessages('alice', 'INBOX');
         if (empty($msgs)) {
             return "(no messages in alice/INBOX)\n";
@@ -1498,8 +1554,8 @@ $scenarios['api_junk_count'] = [
     'label' => 'alice/Junk message count',
     'desc' => '$mail->messageCount("alice", "Junk").',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         return "alice/Junk: " .
             $m->messageCount('alice', 'Junk') . "\n";
     },
@@ -1511,8 +1567,8 @@ $scenarios['api_create_folder'] = [
         'idempotent; calling on an existing folder is a ' .
         'successful no-op.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $m->createFolder('alice', 'Notes');
         $tx = "Folders after createFolder('Notes'):\n";
         foreach ($m->listFolders('alice') as $f) {
@@ -1533,8 +1589,8 @@ $scenarios['api_lifecycle'] = [
         'deleteFolder, listing folders at each step. ' .
         'deleteFolder("alice", "INBOX") is refused.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $tx = "";
         $list = function ($label) use ($m, &$tx) {
             $tx .= "$label:\n";
@@ -1577,8 +1633,8 @@ $scenarios['api_setflags'] = [
         '["\\Seen", "\\Flagged"]) replaces the flag set. ' .
         'Pass [] to clear all flags.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $msgs = $m->listMessages('alice', 'INBOX');
         if (empty($msgs)) {
             return "(no messages in alice/INBOX; deliver " .
@@ -1607,8 +1663,8 @@ $scenarios['api_movemessage'] = [
         'UIDs are per-user, not per-folder (matches IMAP ' .
         'UIDPLUS semantics).',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $msgs = $m->listMessages('alice', 'INBOX');
         if (empty($msgs)) {
             return "(no messages in alice/INBOX; deliver " .
@@ -1649,8 +1705,8 @@ $scenarios['api_uidnext'] = [
         'expose the same UIDNEXT and UIDVALIDITY a webmail ' .
         'cache uses for invalidation.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         return "uidNext('alice', 'INBOX')     = " .
             $m->uidNext('alice', 'INBOX') . "\n" .
             "uidValidity('alice', 'INBOX') = " .
@@ -1663,8 +1719,8 @@ $scenarios['api_folder_exists'] = [
     'desc' => '$mail->folderExists() returns a boolean ' .
         'without scanning the full folder list.',
     'kind' => 'api',
-    'run' => function () use ($users_file, $store_dir) {
-        $m = shareMail($users_file, $store_dir);
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
         $tx = "folderExists('alice', 'INBOX')   = " .
             ($m->folderExists('alice', 'INBOX') ? 'true' :
                 'false') . "\n";
@@ -1674,6 +1730,71 @@ $scenarios['api_folder_exists'] = [
         $tx .= "folderExists('alice', 'Junk')    = " .
             ($m->folderExists('alice', 'Junk') ? 'true' :
                 'false') . "\n";
+        return $tx;
+    },
+];
+$scenarios['api_dedup_demo'] = [
+    'group' => 'Direct API (no wire protocol)',
+    'label' => 'Body dedup demo: same body, two recipients',
+    'desc' => 'Delivers a byte-identical message to alice ' .
+        'and bob, then asks each backend where the body ' .
+        'physically lives. SQL backend reports the same ' .
+        'on-disk path for both recipients (refcount=2); ' .
+        'file backend reports separate paths; RAM reports ' .
+        'separate slots with the same content hash.',
+    'kind' => 'api',
+    'run' => function () use ($users_file, $store_dir, $engine) {
+        $m = shareMail($users_file, $store_dir, $engine);
+        $body = "Subject: Newsletter Issue 47\r\n" .
+            "From: list@example.com\r\n" .
+            "Date: Sat, 03 May 2026 12:00:00 +0000\r\n" .
+            "\r\n" .
+            "This is the same article body delivered to " .
+            "every subscriber.\r\n" .
+            "On a deduplicating backend the bytes are " .
+            "stored once.\r\n";
+        $alice_uid = $m->appendMessage('alice', 'INBOX',
+            $body);
+        $bob_uid = $m->appendMessage('bob', 'INBOX', $body);
+        $alice_loc = $m->messageBodyLocation('alice',
+            'INBOX', $alice_uid);
+        $bob_loc = $m->messageBodyLocation('bob', 'INBOX',
+            $bob_uid);
+        $tx = "Engine: " . strtoupper($engine) . "\n";
+        $tx .= "Body delivered to alice (uid $alice_uid) " .
+            "and bob (uid $bob_uid).\n\n";
+        $tx .= "alice body location:\n";
+        $tx .= "  path:     " .
+            ($alice_loc['path'] ?? '(in process memory)') .
+            "\n";
+        $tx .= "  hash:     " . $alice_loc['hash'] . "\n";
+        $tx .= "  refcount: " . $alice_loc['refcount'] .
+            "\n";
+        $tx .= "  size:     " . $alice_loc['size'] .
+            " bytes\n\n";
+        $tx .= "bob body location:\n";
+        $tx .= "  path:     " .
+            ($bob_loc['path'] ?? '(in process memory)') .
+            "\n";
+        $tx .= "  hash:     " . $bob_loc['hash'] . "\n";
+        $tx .= "  refcount: " . $bob_loc['refcount'] .
+            "\n";
+        $tx .= "  size:     " . $bob_loc['size'] .
+            " bytes\n\n";
+        $same_hash = $alice_loc['hash'] === $bob_loc['hash'];
+        $same_path = $alice_loc['path'] !== null &&
+            $alice_loc['path'] === $bob_loc['path'];
+        $tx .= "VERDICT:\n";
+        $tx .= "  Same content hash: " .
+            ($same_hash ? "yes" : "no") . "\n";
+        if ($alice_loc['path'] !== null) {
+            $tx .= "  Same on-disk path: " .
+                ($same_path ? "yes (DEDUP)" :
+                    "no (separate copies)") . "\n";
+        } else {
+            $tx .= "  On-disk path:      n/a (RAM " .
+                "backend has no on-disk store)\n";
+        }
         return $tx;
     },
 ];
@@ -1766,14 +1887,94 @@ $site->post('/reset', function () use ($site, $store_dir) {
         'errors' => $errors,
     ]);
 });
-$site->get('/', function () use ($scenarios) {
+/*
+    Engine switch handler. Writes the chosen backend name to
+    .engine in the example directory, then schedules a
+    delayed kill of the running index.php parent process so
+    the response reaches the browser before the server goes
+    away. Once the parent exits its register_shutdown_function
+    will SIGTERM this webui process too, so the whole pair
+    goes down together; the operator restarts with a manual
+    "php index.php" to come back up on the new backend.
+ */
+$site->post('/engine', function () use (
+    $site, $engine_file, $engine_labels
+) {
+    $site->header('Content-Type: text/plain; charset=utf-8');
+    $chosen = isset($_POST['engine']) ?
+        (string) $_POST['engine'] : '';
+    if (!isset($engine_labels[$chosen])) {
+        $site->header('HTTP/1.1 400 Bad Request');
+        echo "Unknown engine: $chosen";
+        return;
+    }
+    $written = @file_put_contents($engine_file,
+        $chosen . "\n");
+    if ($written === false) {
+        $site->header('HTTP/1.1 500 Server Error');
+        echo "Could not write .engine";
+        return;
+    }
+    /*
+        The detached shell sleeps briefly so the response
+        reaches the browser before the server dies, then
+        sends SIGTERM to BOTH index.php and this webui
+        process. We learn index.php's PID from the
+        ATTOMAIL_SERVER_PID environment variable that
+        index.php exports when spawning us; posix_getppid()
+        does not work here because the shell wrapper that
+        backgrounded webui.php detached it from index.php,
+        so its real parent at runtime is init (PID 1). The
+        env var survives the detach.
+
+        We kill the webui ourselves rather than relying on
+        index.php's register_shutdown_function chain,
+        because PHP does not run shutdown functions when
+        the process receives SIGTERM unless an explicit
+        pcntl_signal handler is installed. Killing both
+        directly is simpler and works without depending on
+        signal-handler setup in index.php.
+     */
+    $server_pid = isset($_SERVER['ATTOMAIL_SERVER_PID']) ?
+        (int) $_SERVER['ATTOMAIL_SERVER_PID'] : 0;
+    $self_pid = getmypid();
+    $kill_cmd = '(sleep 1';
+    if ($server_pid > 1) {
+        $kill_cmd .= '; kill ' . $server_pid;
+    }
+    if ($self_pid > 1) {
+        /* a beat after index.php so atto's response flush
+           has time to push our reply down to the wire */
+        $kill_cmd .= '; sleep 1; kill ' . $self_pid;
+    }
+    $kill_cmd .= ') > /dev/null 2>&1 &';
+    @exec($kill_cmd);
+    echo "Engine written: $chosen. Server shutting down.";
+});
+$site->get('/', function () use (
+    $scenarios, $engine, $engine_labels
+) {
     /*
         Group scenarios by their 'group' field for rendering.
         Stable order: keys are inserted in scenario-list
         declaration order, so the first group seen leads.
+
+        Also annotate each scenario with whether it is
+        runnable under the current storage engine. The api_*
+        scenarios use shareMail() to spin up a peer-process
+        MailSite instance pointing at the live store. That
+        works for the file backend (both processes read the
+        same files) and for the SQL backend (both processes
+        open the same SQLite database; WAL mode allows the
+        concurrent access). It does NOT work for the RAM
+        backend, whose state lives entirely in the running
+        server process's PHP heap; the harness's peer
+        instance would see a separate, empty mailbox.
      */
     $by_group = [];
     foreach ($scenarios as $id => $s) {
+        $s['available'] = !(strpos($id, 'api_') === 0 &&
+            $engine === 'ram');
         $by_group[$s['group']][$id] = $s;
     }
     ?><!DOCTYPE html>
@@ -1851,12 +2052,23 @@ h2 { font-size: 1.05em; margin-top: 1.6em; padding-bottom: 0.2em;
 .reset-bar button:hover { background: #b85f04; }
 .reset-bar button:disabled { background: #888; cursor: default; }
 .reset-bar .reset-status { color: #555; font-size: 0.9em; }
+.engine-bar { display: flex; align-items: center; gap: 1em;
+    margin: 0 0 1.5em; padding: 0.7em 0.9em;
+    background: #ecf3ff; border: 1px solid #b8c8e8;
+    border-radius: 4px; }
+.engine-bar select { font: inherit; padding: 0.3em 0.5em;
+    border-radius: 4px; border: 1px solid #b8c8e8;
+    background: #fff; }
+.engine-bar .engine-status { color: #555; font-size: 0.9em;
+    flex-grow: 1; }
+.scenario.unavailable { opacity: 0.55; }
+.scenario.unavailable button { cursor: not-allowed; }
 code { background: #eee; padding: 0.1em 0.3em; border-radius: 3px;
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 </style>
 </head>
 <body>
-<h1>AttoMail Demo</h1>
+<h1>AttoMail Demo Harness</h1>
 <div class="meta">
 Companion UI to <code>index.php</code>. Each scenario opens a
 short connection to one of the listening ports (SMTP 2525,
@@ -1874,16 +2086,44 @@ Wipes <code>maildata/</code> so every scenario starts fresh.
 The committed <code>users.htpasswd</code> is left in place.
 </span>
 </div>
+<div class="engine-bar">
+<label for="engine-select">Storage engine:</label>
+<select id="engine-select">
+<?php foreach ($engine_labels as $key => $label): ?>
+<option value="<?= htmlspecialchars($key) ?>"
+    <?= $key === $engine ? 'selected' : '' ?>>
+    <?= htmlspecialchars($label) ?>
+</option>
+<?php endforeach; ?>
+</select>
+<span class="engine-status" id="engine-status">
+Switching engines stops the server. Relaunch
+<code>php index.php</code> after the switch to see the
+new backend in action.
+</span>
+</div>
 <?php foreach ($by_group as $group => $items): ?>
 <h2><?= htmlspecialchars($group) ?></h2>
 <?php foreach ($items as $id => $s): ?>
-<div class="scenario" data-id="<?= htmlspecialchars($id) ?>">
+<div class="scenario<?= $s['available'] ? '' : ' unavailable' ?>"
+    data-id="<?= htmlspecialchars($id) ?>"
+    data-available="<?= $s['available'] ? '1' : '0' ?>">
 <div class="row">
 <div>
 <div class="label"><?= htmlspecialchars($s['label']) ?></div>
 <div class="desc"><?= htmlspecialchars($s['desc']) ?></div>
+<?php if (!$s['available']): ?>
+<div class="desc" style="color:#a55;font-style:italic;">
+Direct API scenarios spin up a peer-process MailSite that
+shares state with the running server. RAM state lives only
+inside the server process, so the peer would see an empty
+mailbox -- this scenario is unavailable on the RAM backend.
+Switch to file or SQL to run it.
 </div>
-<button type="button">Run</button>
+<?php endif; ?>
+</div>
+<button type="button"<?= $s['available'] ? '' :
+    ' disabled' ?>>Run</button>
 </div>
 <pre class="transcript"></pre>
 <div class="webmail"></div>
@@ -2022,6 +2262,64 @@ document.querySelectorAll('.scenario').forEach(function (el) {
                 setTimeout(function () {
                     resetStatus.innerHTML = defaultStatus;
                 }, 6000);
+            });
+    });
+})();
+/*
+    Engine selector: switching backends requires restarting
+    the server (the running storage instance has to be torn
+    down and a new one constructed in its place). Rather
+    than coordinate a hot-swap, the harness writes the new
+    selection to .engine and asks the operator to relaunch
+    "php index.php" by hand. The /engine endpoint signals
+    the running server to shut down on a brief delay so the
+    response has time to reach the browser before the
+    process dies.
+ */
+(function () {
+    var sel = document.getElementById('engine-select');
+    var status = document.getElementById('engine-status');
+    var defaultStatus = status.innerHTML;
+    var current = sel.value;
+    sel.addEventListener('change', function () {
+        if (sel.value === current) {
+            return;
+        }
+        if (!window.confirm(
+            'Switch the storage backend to "' + sel.value +
+            '"?\n\nThe server will stop after this request. ' +
+            'You will need to run "php index.php" again ' +
+            'in the terminal to see the example with the ' +
+            'new backend.')) {
+            sel.value = current;
+            return;
+        }
+        sel.disabled = true;
+        var fd = new FormData();
+        fd.append('engine', sel.value);
+        fetch('/engine', { method: 'POST', body: fd })
+            .then(function (r) { return r.text(); })
+            .then(function (msg) {
+                document.body.innerHTML =
+                    '<h1>Storage engine switched</h1>' +
+                    '<p>The server has been asked to ' +
+                    'shut down. Once it exits in your ' +
+                    'terminal, run:</p>' +
+                    '<pre style="background:#1e1e1e;' +
+                    'color:#ddd;padding:1em;' +
+                    'border-radius:4px;">php index.php' +
+                    '</pre>' +
+                    '<p>and reload this page to see the ' +
+                    'demo with the <code>' + sel.value +
+                    '</code> backend.</p>' +
+                    '<p>(Server response: <em>' +
+                    msg.replace(/[<>&]/g, '') +
+                    '</em>)</p>';
+            })
+            .catch(function (err) {
+                status.textContent = 'ERROR: ' + err;
+                sel.value = current;
+                sel.disabled = false;
             });
     });
 })();

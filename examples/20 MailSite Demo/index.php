@@ -124,6 +124,8 @@ require '../../src/MailSite.php';
 use seekquarry\atto\MailSite;
 use seekquarry\atto\FileAuthenticator;
 use seekquarry\atto\FileMailStorage;
+use seekquarry\atto\RamMailStorage;
+use seekquarry\atto\SqlMailStorage;
 if (!defined("seekquarry\\atto\\RUN")) {
     define("seekquarry\\atto\\RUN", true);
 }
@@ -142,17 +144,49 @@ if (!is_file($users_file)) {
         "password 'hunter2'\n";
 }
 /*
-    On-disk mail store under maildata/. The directory is
-    created lazily on first delivery. Per-user state lives
-    under maildata/users/<username>/.
+    Storage backend selection. The webmail harness lets the
+    operator switch backends at runtime via a dropdown; that
+    write goes into .engine in this directory, which we read
+    here on startup. Switching engines requires restarting
+    this server (the dropdown handler kills index.php after
+    writing the new selection so the operator just relaunches
+    "php index.php" to see the change). Default is "file" --
+    the on-disk backend that example 20 originally shipped
+    with -- so existing users see no behavior change.
+
+    Each backend is a drop-in implementation of the same
+    MailStorage abstract class; only the storage() call below
+    differs between them. The IMAP, SMTP, hook, and webmail
+    surfaces are identical regardless of which backend is
+    serving the bytes.
  */
 $store_dir = __DIR__ . '/maildata';
 if (!is_dir($store_dir)) {
     mkdir($store_dir, 0700, true);
 }
+$engine_file = __DIR__ . '/.engine';
+$engine = is_file($engine_file) ?
+    trim((string) file_get_contents($engine_file)) : 'file';
+if (!in_array($engine, ['file', 'ram', 'sql'], true)) {
+    /* tolerate corrupt or unknown values: fall back to file */
+    $engine = 'file';
+}
 $mail = new MailSite();
 $mail->auth(new FileAuthenticator($users_file));
-$mail->storage(new FileMailStorage($store_dir));
+if ($engine === 'ram') {
+    $mail->storage(new RamMailStorage());
+    echo "Storage backend: RAM (state evaporates on exit)\n";
+} else if ($engine === 'sql') {
+    $sqlite_path = $store_dir . '/mail.db';
+    $blobs_path = $store_dir . '/blobs';
+    $mail->storage(new SqlMailStorage(
+        'sqlite:' . $sqlite_path, $blobs_path));
+    echo "Storage backend: SQL (sqlite:$sqlite_path, " .
+        "blobs in $blobs_path)\n";
+} else {
+    $mail->storage(new FileMailStorage($store_dir));
+    echo "Storage backend: file ($store_dir/users/...)\n";
+}
 $mail->domains(['localhost', 'example.test']);
 /*
     onConnect: an IP-based allow-list / deny-list lives here.
@@ -232,8 +266,26 @@ if (strstr(PHP_OS, "WIN")) {
         subshell. Without this wrapper, $! would point at the
         subshell that wrapped the redirection and the kill
         below would silently miss the actual webui process.
+
+        ATTOMAIL_SERVER_PID is exported into the spawned
+        webui's environment so the engine-switch handler in
+        webui.php can signal index.php to shut down. The
+        default posix_getppid() does not work for this
+        because the wrapper subshell detaches webui from
+        index.php (its parent becomes init); the env var
+        survives the detach.
      */
-    $job = "{ exec $php $webui ; } < /dev/null > /dev/null " .
+    $self_pid = getmypid();
+    /*
+        Shell syntax detail: setting VAR=value before a {...}
+        brace group does NOT propagate the variable into the
+        commands inside the group (POSIX shells only apply
+        the prefix-assignment form to simple commands). Use
+        an inline export instead so the variable is visible
+        to the exec'd webui process.
+     */
+    $job = "{ export ATTOMAIL_SERVER_PID=$self_pid; " .
+        "exec $php $webui ; } < /dev/null > /dev/null " .
         "2>&1 & echo PID=\$!";
     $h = popen($job, "r");
     $webui_pid = 0;

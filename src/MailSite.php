@@ -488,6 +488,35 @@ abstract class MailStorage
      */
     abstract public function listSubscribed($user);
     /**
+     * Returns metadata describing where the body bytes for
+     * (user, folder, uid) physically live. Used by the demo
+     * harness to make content-addressed storage visible: two
+     * messages with byte-identical bodies on a deduplicating
+     * backend report the same path / hash, while a non-
+     * deduplicating backend reports per-message paths.
+     *
+     * Returns an associative array on success, false if the
+     * message does not exist.
+     *
+     * Keys returned (all backends):
+     *   'backend'     - one of 'file', 'ram', 'sql'
+     *   'path'        - on-disk path, or null for in-memory
+     *
+     * Keys returned where applicable:
+     *   'hash'        - sha256 of body bytes (sql, ram)
+     *   'refcount'    - shared-with count (sql only); always
+     *                   1 on the file backend (no dedup);
+     *                   not exposed on ram (no shared store)
+     *   'size'        - body length in bytes
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @return array|false
+     */
+    abstract public function messageBodyLocation($user,
+        $folder, $uid);
+    /**
      * High-water mark of the last UIDVALIDITY this storage
      * instance has handed out. Subclasses use this to ensure
      * a strictly monotonic sequence even when two folders are
@@ -1197,6 +1226,42 @@ class FileMailStorage extends MailStorage
         sort($names);
         return $names;
     }
+    /**
+     * @inheritdoc
+     *
+     * The file backend stores each message as its own .eml
+     * file under the per-user folder directory. There is no
+     * dedup -- two messages with byte-identical bodies use
+     * two separate files -- so refcount is always 1 and the
+     * hash is computed on demand from the file's bytes.
+     */
+    public function messageBodyLocation($user, $folder, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $eml = $this->folderDir($user, $folder) .
+            DIRECTORY_SEPARATOR . "$uid.eml";
+        if (!is_file($eml)) {
+            return false;
+        }
+        $size = @filesize($eml);
+        $bytes = @file_get_contents($eml);
+        $hash = $bytes === false ? null : hash('sha256', $bytes);
+        return [
+            'backend' => 'file',
+            'path' => $eml,
+            'hash' => $hash,
+            'refcount' => 1,
+            'size' => $size === false ? null : (int) $size,
+        ];
+    }
 }
 /**
  * In-memory MailStorage. State lives entirely in PHP arrays
@@ -1675,6 +1740,41 @@ class RamMailStorage extends MailStorage
         sort($names);
         return $names;
     }
+    /**
+     * @inheritdoc
+     *
+     * The RAM backend keeps every message body as its own
+     * separate string on the storage instance. There is no
+     * dedup, no on-disk path, and no refcount; we report the
+     * computed hash for the demo's benefit so the harness
+     * can show that two RAM messages with identical bodies
+     * have the same content but different storage slots.
+     */
+    public function messageBodyLocation($user, $folder, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        if (!isset($this->users[$user]['folders'][$folder]
+            ['messages'][$uid])) {
+            return false;
+        }
+        $msg = $this->users[$user]['folders'][$folder]
+            ['messages'][$uid];
+        return [
+            'backend' => 'ram',
+            'path' => null,
+            'hash' => hash('sha256', $msg['bytes']),
+            'refcount' => 1,
+            'size' => strlen($msg['bytes']),
+        ];
+    }
 }
 /**
  * Database-backed MailStorage. Mail metadata (users, folders,
@@ -1727,22 +1827,31 @@ class RamMailStorage extends MailStorage
  *
  * Schema auto-creation.
  *
- * On construction we issue CREATE TABLE IF NOT EXISTS for each
- * of mail_users, mail_folders, mail_messages, mail_subscriptions.
- * Subsequent runs see existing tables and skip the create. There
- * is no migration story yet; if the schema needs to change in a
- * later phase the caller will need to drop the tables manually.
+ * On construction we issue CREATE TABLE IF NOT EXISTS for the
+ * five tables we use: mail_users, mail_folders, mail_messages,
+ * mail_subscriptions, mail_blobs. Subsequent runs see existing
+ * tables and skip the create. There is no migration story yet;
+ * if the schema needs to change in a later phase the caller
+ * will need to drop the tables manually.
  *
  * Blob layout.
  *
- *      $blobs_dir/ab/cd/abcd1234...ef.eml      -- raw message bytes
- *      $blobs_dir/ab/cd/abcd1234...ef.meta     -- "refcount\n<n>"
+ *      $blobs_dir/ab/cd/abcd1234...ef.eml   -- raw message bytes
+ *      mail_blobs (body_hash, refcount,     -- transactional
+ *                  size, created_at)           refcount table
  *
  * The two-byte / two-byte directory prefix bounds the maximum
  * fan-out of any one directory to about 65,536 entries even
- * under extreme load. Refcount files are read/locked/written
- * under flock LOCK_EX so concurrent appendMessage and expunge
- * calls cannot lose updates.
+ * under extreme load. Refcounts live in the database alongside
+ * the message rows that reference them, so an appendMessage
+ * commits the refcount bump and the mail_messages INSERT in
+ * one transaction; on a crash the database recovery restores
+ * a consistent state without sidecar metadata files to
+ * reconcile. The .eml file write is outside the transaction
+ * (filesystems are not transactional); a transaction rollback
+ * can therefore leave an orphan .eml file with no row
+ * referencing it. A periodic reaper that compares the
+ * filesystem against mail_blobs.body_hash recovers these.
  */
 class SqlMailStorage extends MailStorage
 {
@@ -1861,6 +1970,20 @@ class SqlMailStorage extends MailStorage
                 'pk_int' => 'INTEGER PRIMARY KEY AUTOINCREMENT',
                 'big_int' => 'INTEGER',
                 'text' => 'TEXT',
+                /*
+                    Per-dialect INSERT-or-ignore syntax,
+                    factored after Yioop's DatasourceManager::
+                    insertIgnore. Pattern: a plain
+                    "INSERT INTO t (a,b) VALUES (?,?)" is
+                    rewritten using these two strings into the
+                    DBMS-specific form. SQLite uses the verb
+                    prefix "INSERT OR IGNORE INTO ..."; MySQL
+                    uses "INSERT IGNORE INTO ..."; Postgres
+                    keeps the verb but appends "ON CONFLICT
+                    DO NOTHING" at the end.
+                 */
+                'insert_ignore_prefix' => 'INSERT OR IGNORE',
+                'insert_ignore_suffix' => '',
                 'post_connect' => function ($pdo) {
                     /*
                         WAL (write-ahead logging) makes
@@ -1881,6 +2004,8 @@ class SqlMailStorage extends MailStorage
                     'BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY',
                 'big_int' => 'BIGINT',
                 'text' => 'TEXT',
+                'insert_ignore_prefix' => 'INSERT IGNORE',
+                'insert_ignore_suffix' => '',
                 'post_connect' => function ($pdo) {
                     $pdo->exec("SET NAMES 'utf8mb4'");
                 },
@@ -1889,6 +2014,8 @@ class SqlMailStorage extends MailStorage
                 'pk_int' => 'BIGSERIAL PRIMARY KEY',
                 'big_int' => 'BIGINT',
                 'text' => 'TEXT',
+                'insert_ignore_prefix' => 'INSERT',
+                'insert_ignore_suffix' => 'ON CONFLICT DO NOTHING',
                 'post_connect' => null,
             ],
         ];
@@ -1938,6 +2065,12 @@ class SqlMailStorage extends MailStorage
                 CONSTRAINT mail_subscriptions_pk
                     PRIMARY KEY (user_id, folder)
             )",
+            "CREATE TABLE IF NOT EXISTS mail_blobs (
+                body_hash CHAR(64) NOT NULL PRIMARY KEY,
+                refcount $big NOT NULL,
+                size $big NOT NULL,
+                created_at $big NOT NULL
+            )",
         ];
         foreach ($statements as $sql) {
             $this->pdo->exec($sql);
@@ -1952,7 +2085,7 @@ class SqlMailStorage extends MailStorage
      */
     protected function buildSqlTemplates()
     {
-        return [
+        $templates = [
             'user_by_name' =>
                 "SELECT * FROM mail_users WHERE username = ?",
             'user_insert' =>
@@ -2016,7 +2149,49 @@ class SqlMailStorage extends MailStorage
             'subscriptions_by_user' =>
                 "SELECT folder FROM mail_subscriptions " .
                 "WHERE user_id = ? ORDER BY folder",
+            'blob_select' =>
+                "SELECT body_hash, refcount, size, " .
+                "created_at FROM mail_blobs " .
+                "WHERE body_hash = ?",
+            'blob_insert_or_ignore' =>
+                /*
+                    The insert_ignore_prefix and suffix get
+                    spliced in at prepare() time inside
+                    buildSqlTemplates so the prepared form is
+                    already the dialect-correct shape. The
+                    prefix replaces "INSERT" and the suffix is
+                    appended after VALUES (...).
+                 */
+                "__insert_ignore__ INTO mail_blobs " .
+                "(body_hash, refcount, size, created_at) " .
+                "VALUES (?, 1, ?, ?) __insert_ignore_suffix__",
+            'blob_increment' =>
+                "UPDATE mail_blobs " .
+                "SET refcount = refcount + 1 " .
+                "WHERE body_hash = ?",
+            'blob_decrement' =>
+                "UPDATE mail_blobs " .
+                "SET refcount = refcount - 1 " .
+                "WHERE body_hash = ?",
+            'blob_delete_zero' =>
+                "DELETE FROM mail_blobs " .
+                "WHERE body_hash = ? AND refcount <= 0",
         ];
+        /*
+            Splice in the dialect-correct INSERT IGNORE shape
+            for blob_insert_or_ignore. We could do this in
+            stmt() but doing it here keeps the resulting
+            prepared statement cleaner and the splicing work
+            one-shot rather than per-call.
+         */
+        $templates['blob_insert_or_ignore'] = str_replace(
+            ['__insert_ignore__', '__insert_ignore_suffix__'],
+            [
+                $this->dialect['insert_ignore_prefix'],
+                $this->dialect['insert_ignore_suffix'],
+            ],
+            $templates['blob_insert_or_ignore']);
+        return $templates;
     }
     /**
      * Returns a freshly-prepared PDOStatement for the named
@@ -2043,6 +2218,35 @@ class SqlMailStorage extends MailStorage
         }
         return $this->pdo->prepare(
             $this->sql_templates[$name]);
+    }
+    /**
+     * Returns a dialect-correct INSERT-or-ignore form of
+     * $insert_sql, which must begin with "INSERT INTO ...".
+     * The semantics: if the row's primary or unique key is
+     * already present, the statement is silently a no-op
+     * (rowCount() == 0) rather than raising a duplicate-key
+     * error. Followed by a discriminating UPDATE this gives
+     * portable INSERT-or-UPDATE behaviour.
+     *
+     * Pattern follows Yioop's DatasourceManager::insertIgnore:
+     * SQLite swaps "INSERT" for "INSERT OR IGNORE", MySQL uses
+     * "INSERT IGNORE", Postgres keeps the leading verb and
+     * appends "ON CONFLICT DO NOTHING".
+     */
+    protected function insertIgnoreSql($insert_sql)
+    {
+        $insert_sql = ltrim($insert_sql);
+        if (substr($insert_sql, 0, 6) !== 'INSERT') {
+            throw new \InvalidArgumentException(
+                "insertIgnoreSql expects an INSERT statement");
+        }
+        $prefix = $this->dialect['insert_ignore_prefix'];
+        $suffix = $this->dialect['insert_ignore_suffix'];
+        $rewritten = $prefix . substr($insert_sql, 6);
+        if ($suffix !== '') {
+            $rewritten .= ' ' . $suffix;
+        }
+        return $rewritten;
     }
     /**
      * Returns the user record (id, uidnext, uidvalidity) for
@@ -2168,19 +2372,31 @@ class SqlMailStorage extends MailStorage
             return false;
         }
         /*
-            Decrement refcounts for every message in the folder
-            before dropping its rows; expunge does the same
-            thing on a per-message basis but here we are wiping
-            wholesale.
+            Wholesale folder drop: decrement refcounts for every
+            message, then drop the message rows, then drop the
+            folder row, all inside one transaction so a crash
+            mid-drop cannot leave a partially-deleted folder
+            with stale refcounts.
          */
-        $msgs = $this->stmt('messages_by_folder');
-        $msgs->execute([$row['id']]);
-        while ($m = $msgs->fetch()) {
-            $this->blobDecRef($m['body_hash']);
+        $this->pdo->beginTransaction();
+        try {
+            $msgs = $this->stmt('messages_by_folder');
+            $msgs->execute([$row['id']]);
+            $hashes = [];
+            while ($m = $msgs->fetch()) {
+                $hashes[] = $m['body_hash'];
+            }
+            foreach ($hashes as $hash) {
+                $this->blobDecRef($hash);
+            }
+            $this->pdo->exec("DELETE FROM mail_messages " .
+                "WHERE folder_id = " . (int) $row['id']);
+            $this->stmt('folder_delete')->execute([$row['id']]);
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            return false;
         }
-        $this->pdo->exec("DELETE FROM mail_messages " .
-            "WHERE folder_id = " . (int) $row['id']);
-        $this->stmt('folder_delete')->execute([$row['id']]);
         return true;
     }
     /**
@@ -2254,19 +2470,27 @@ class SqlMailStorage extends MailStorage
         }
         $bytes = (string) $bytes;
         $hash = hash('sha256', $bytes);
-        if (!$this->blobIncRef($hash, $bytes)) {
-            return false;
-        }
         /*
-            Allocate the next per-user UID by reading the
-            current uidnext, incrementing, and writing back.
-            We do this inside a transaction so two concurrent
-            appendMessage calls cannot hand out the same UID;
-            the UNIQUE (folder_id, uid) constraint would
-            otherwise reject the second insert.
+            One transaction across the whole append: the blob
+            refcount bump, the user's UID counter advance, and
+            the mail_messages insert all live in the same
+            database now, so they can commit together. The
+            UNIQUE (folder_id, uid) constraint prevents UID
+            collisions if two appends race; if anything fails,
+            ROLLBACK undoes everything except the .eml file
+            on disk (filesystems are not transactional). An
+            orphaned .eml from a rolled-back transaction does
+            not corrupt anything -- the blob just has no
+            referencing rows -- and a periodic reaper that
+            compares filesystem against mail_blobs.body_hash
+            recovers them.
          */
         $this->pdo->beginTransaction();
         try {
+            if (!$this->blobIncRef($hash, $bytes)) {
+                $this->pdo->rollBack();
+                return false;
+            }
             $stmt = $this->stmt('user_by_name');
             $stmt->execute([$user]);
             $fresh = $stmt->fetch();
@@ -2280,7 +2504,6 @@ class SqlMailStorage extends MailStorage
             $this->pdo->commit();
         } catch (\Throwable $e) {
             $this->pdo->rollBack();
-            $this->blobDecRef($hash);
             return false;
         }
         return $uid;
@@ -2429,10 +2652,27 @@ class SqlMailStorage extends MailStorage
             $expunged[] = (int) $msg['uid'];
             $to_drop[] = $msg;
         }
-        foreach ($to_drop as $msg) {
-            $this->stmt('message_delete')->execute(
-                [$msg['id']]);
-            $this->blobDecRef($msg['body_hash']);
+        if (empty($to_drop)) {
+            return $expunged;
+        }
+        /*
+            Wrap the per-message DELETE plus refcount drop in
+            a single transaction so a partial expunge cannot
+            leave the database with mail_messages rows
+            removed but their refcounts still elevated, or
+            vice versa.
+         */
+        $this->pdo->beginTransaction();
+        try {
+            foreach ($to_drop as $msg) {
+                $this->stmt('message_delete')->execute(
+                    [$msg['id']]);
+                $this->blobDecRef($msg['body_hash']);
+            }
+            $this->pdo->commit();
+        } catch (\Throwable $e) {
+            $this->pdo->rollBack();
+            return [];
         }
         sort($expunged);
         return $expunged;
@@ -2613,120 +2853,149 @@ class SqlMailStorage extends MailStorage
         return $names;
     }
     /**
+     * @inheritdoc
+     *
+     * The SQL backend's content-addressed body store is the
+     * star of this method: two messages with byte-identical
+     * bodies report the same path and hash, and the refcount
+     * field shows how many other messages share the blob.
+     * That is the "demo of dedup" the harness exposes -- the
+     * harness fetches messageBodyLocation for two messages
+     * delivered to different users and shows visually that
+     * the storage location coincides.
+     */
+    public function messageBodyLocation($user, $folder, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        try {
+            $folder = $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return false;
+        }
+        $stmt = $this->stmt('message_by_uid');
+        $stmt->execute([$row['id'], $uid]);
+        $msg = $stmt->fetch();
+        if ($msg === false) {
+            return false;
+        }
+        $hash = $msg['body_hash'];
+        $blob_stmt = $this->stmt('blob_select');
+        $blob_stmt->execute([$hash]);
+        $blob = $blob_stmt->fetch();
+        return [
+            'backend' => 'sql',
+            'path' => $this->blobPath($hash),
+            'hash' => $hash,
+            'refcount' => $blob === false ? 0 :
+                (int) $blob['refcount'],
+            'size' => (int) $msg['size'],
+        ];
+    }
+    /**
      * Returns the on-disk path to the blob for $hash. Layout
      * is two-byte / two-byte directory prefix to bound the
      * fan-out of any one directory; a hash starting with
-     * "abcd1234..." goes under "ab/cd/abcd1234...".
+     * "abcd1234..." goes under "ab/cd/abcd1234.eml".
+     *
+     * The blob store now contains only .eml files; refcounts
+     * moved into the mail_blobs database table in this phase
+     * so crash-recovery follows the database's ACID semantics
+     * rather than racing a sidecar metadata file's flock.
      */
-    protected function blobPath($hash, $suffix)
+    protected function blobPath($hash)
     {
         return $this->blobs_dir . '/' .
             substr($hash, 0, 2) . '/' .
             substr($hash, 2, 2) . '/' .
-            $hash . $suffix;
+            $hash . '.eml';
     }
     /**
      * Increments the refcount for $hash, creating the blob
-     * file from $bytes if it does not already exist.
-     * Concurrent appendMessage calls flock the metadata file
-     * so refcount updates serialize correctly.
+     * file from $bytes if it does not already exist. Returns
+     * true on success.
+     *
+     * The caller is responsible for wrapping this in the same
+     * transaction as the corresponding mail_messages INSERT,
+     * so that a crash in the middle never leaves a refcount
+     * out of sync with its referencing rows. The .eml file
+     * write is intentionally outside the transaction --
+     * filesystems are not transactional and a torn write is
+     * impossible because we use temp-then-atomic-rename. If
+     * the transaction later rolls back, the orphaned blob
+     * file leaks on disk; a periodic reaper that compares
+     * filesystem against mail_blobs.body_hash recovers them.
      */
     protected function blobIncRef($hash, $bytes)
     {
-        $eml_path = $this->blobPath($hash, '.eml');
-        $meta_path = $this->blobPath($hash, '.meta');
-        $dir = dirname($eml_path);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0700, true);
+        /*
+            Try to create the row at refcount=1; if it
+            already exists, the IGNORE makes that a no-op
+            and we increment instead. Whichever path wins,
+            the row's refcount accurately tracks the new
+            reference.
+         */
+        $stmt = $this->stmt('blob_insert_or_ignore');
+        $stmt->execute([$hash, strlen($bytes), time()]);
+        $inserted = $stmt->rowCount();
+        if ($inserted === 0) {
+            $this->stmt('blob_increment')->execute([$hash]);
         }
-        $handle = @fopen($meta_path, 'c+');
-        if (!$handle) {
-            return false;
-        }
-        if (!flock($handle, LOCK_EX)) {
-            fclose($handle);
-            return false;
-        }
-        rewind($handle);
-        $current = stream_get_contents($handle);
-        $count = 0;
-        if (preg_match('/^refcount\s+(\d+)/', $current, $m)) {
-            $count = (int) $m[1];
-        }
-        if ($count === 0) {
-            /*
-                First reference; we are responsible for the
-                actual bytes. Write to a temp file and
-                atomically rename so a crash mid-write cannot
-                leave a torn blob behind.
-             */
+        $eml_path = $this->blobPath($hash);
+        if (!is_file($eml_path)) {
+            $dir = dirname($eml_path);
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0700, true);
+            }
             $temp = $eml_path . '.tmp';
             $written = @file_put_contents($temp, $bytes);
             if ($written === false ||
                 !@rename($temp, $eml_path)) {
                 @unlink($temp);
-                flock($handle, LOCK_UN);
-                fclose($handle);
                 return false;
             }
         }
-        $count++;
-        ftruncate($handle, 0);
-        rewind($handle);
-        fwrite($handle, "refcount $count\n");
-        fflush($handle);
-        flock($handle, LOCK_UN);
-        fclose($handle);
         return true;
     }
     /**
      * Decrements the refcount for $hash. When the count
-     * reaches zero both the blob and its metadata are
-     * removed. Locking matches blobIncRef.
+     * reaches zero the row is deleted and the .eml file is
+     * unlinked. The caller wraps this in the same transaction
+     * as the mail_messages DELETE that triggered the drop,
+     * so a crash mid-expunge cannot leave a row orphaned
+     * with a stale refcount.
      */
     protected function blobDecRef($hash)
     {
-        $eml_path = $this->blobPath($hash, '.eml');
-        $meta_path = $this->blobPath($hash, '.meta');
-        $handle = @fopen($meta_path, 'c+');
-        if (!$handle) {
-            return false;
-        }
-        if (!flock($handle, LOCK_EX)) {
-            fclose($handle);
-            return false;
-        }
-        rewind($handle);
-        $current = stream_get_contents($handle);
-        $count = 0;
-        if (preg_match('/^refcount\s+(\d+)/', $current, $m)) {
-            $count = (int) $m[1];
-        }
-        $count = max(0, $count - 1);
-        if ($count === 0) {
-            @unlink($eml_path);
-            flock($handle, LOCK_UN);
-            fclose($handle);
-            @unlink($meta_path);
+        $this->stmt('blob_decrement')->execute([$hash]);
+        $stmt = $this->stmt('blob_select');
+        $stmt->execute([$hash]);
+        $row = $stmt->fetch();
+        if ($row === false) {
             return true;
         }
-        ftruncate($handle, 0);
-        rewind($handle);
-        fwrite($handle, "refcount $count\n");
-        fflush($handle);
-        flock($handle, LOCK_UN);
-        fclose($handle);
+        if ((int) $row['refcount'] > 0) {
+            return true;
+        }
+        $this->stmt('blob_delete_zero')->execute([$hash]);
+        @unlink($this->blobPath($hash));
         return true;
     }
     /**
      * Reads the bytes of the blob identified by $hash, or
-     * returns false if the blob is missing (which would
-     * indicate database/filesystem desynchronization, a
-     * bug rather than an expected condition).
+     * returns false if the blob is missing (a bug rather
+     * than an expected condition once mail_blobs is the
+     * authoritative refcount).
      */
     protected function blobRead($hash)
     {
-        $eml_path = $this->blobPath($hash, '.eml');
+        $eml_path = $this->blobPath($hash);
         if (!is_file($eml_path)) {
             return false;
         }
@@ -3127,6 +3396,25 @@ class MailSite
     {
         return $this->mail_storage->fetchMessage($user, $folder,
             $uid);
+    }
+    /**
+     * Returns metadata describing where the body bytes for
+     * (user, folder, uid) physically live. Used by direct-API
+     * callers (e.g. the demo harness) to make backend-specific
+     * storage details visible -- particularly content-addressed
+     * dedup, where two messages with byte-identical bodies
+     * report the same path on the SQL backend. See
+     * MailStorage::messageBodyLocation for the return shape.
+     *
+     * @param string $user
+     * @param string $folder
+     * @param int $uid
+     * @return array|false
+     */
+    public function messageBodyLocation($user, $folder, $uid)
+    {
+        return $this->mail_storage->messageBodyLocation(
+            $user, $folder, $uid);
     }
     /**
      * Returns metadata records for every message in a folder,

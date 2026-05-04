@@ -78,6 +78,19 @@
  *   QUIT
  *   221 Bye
  *
+ * On Windows where telnet is not enabled by default, run
+ * the same session interactively from PowerShell with:
+ *
+ *   PS> $c = New-Object Net.Sockets.TcpClient localhost,2525
+ *   PS> $r = New-Object IO.StreamReader $c.GetStream()
+ *   PS> $w = New-Object IO.StreamWriter $c.GetStream()
+ *   PS> $w.NewLine = "`r`n"; $w.AutoFlush = $true
+ *   PS> $r.ReadLine()                  # 220 banner
+ *   PS> $w.WriteLine('EHLO test')
+ *   PS> 1..4 | % { $r.ReadLine() }     # multi-line 250
+ *   PS> ...                            # continue MAIL/RCPT/...
+ *   PS> $c.Close()
+ *
  * Bare-word MAIL FROM / RCPT TO (no angle brackets) is
  * accepted as a tolerance for clumsy hand-typing.
  *
@@ -257,9 +270,26 @@ $mail->onMessage(function ($info, $context) {
 $php = escapeshellarg(PHP_BINARY);
 $webui = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . "webui.php");
 if (strstr(PHP_OS, "WIN")) {
-    $job = "start /B $php $webui > NUL 2>&1";
+    /*
+        Windows path: "start /B" detaches the child but does
+        NOT surface its PID, so we cannot tear it down on
+        graceful shutdown -- the user closes the cmd window
+        or kills php.exe via Task Manager. We DO export
+        ATTOMAIL_SERVER_PID into the child's environment so
+        the engine-switch handler in webui.php can signal
+        index.php (us) to shut down via taskkill. cmd's "set"
+        before "start" propagates variables to the spawned
+        process.
+     */
+    $self_pid = getmypid();
+    $job = "set ATTOMAIL_SERVER_PID=$self_pid && " .
+        "start /B $php $webui > NUL 2>&1";
     pclose(popen($job, "r"));
-    echo "Spawned webui.php (Windows; close cmd window to stop)\n";
+    echo "Spawned webui.php (Windows). Open " .
+        "http://localhost:8080/\n";
+    echo "  To stop, click 'switch engine' in the UI, or " .
+        "close this cmd window, or end php.exe in Task " .
+        "Manager.\n";
 } else {
     /*
         { exec ... } & echo $! gives us the exact PID of the

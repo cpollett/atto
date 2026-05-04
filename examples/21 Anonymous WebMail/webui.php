@@ -43,7 +43,8 @@ $cfg = [
     'imap' => 1143,
     'domain' => 'anon.test',
 ];
-$shared_pw_file = __DIR__ . '/.shared_password';
+$shared_pw_file = __DIR__ . DIRECTORY_SEPARATOR .
+    'shared_password.txt';
 $cfg['shared_password'] = is_file($shared_pw_file) ?
     trim((string) file_get_contents($shared_pw_file)) :
     '';
@@ -672,24 +673,37 @@ $site->get('/', function () use (
     $smtp_host = '127.0.0.1';
     $smtp_port = 2525;
     /*
-        Build the SMTP transaction as a single-line printf
-        invocation rather than a multi-line nc pipeline.
-        Two reasons. First, multi-line shell commands with
-        literal CR bytes survive a copy-paste round-trip
-        as broken text in many terminals; users in tcsh
-        and zsh see the {} brace group execute line-by-line
-        with CR-laden input which breaks parsing. Second, a
-        single-line form works identically across sh, bash,
-        zsh, fish, and tcsh; brace groups do not.
+        Build the SMTP transaction in two copy-pasteable
+        forms: a one-line printf-piped-to-nc for users on
+        macOS, Linux, BSD, or WSL; and a PowerShell block
+        for native Windows users (who do not have nc by
+        default). Both walk through the same SMTP wire
+        protocol -- EHLO, MAIL FROM, RCPT TO, DATA, body,
+        ".", QUIT -- so reading either teaches the same
+        lesson.
 
-        We escape the angle-brackets and quotes for HTML
-        once via h(); the actual \r\n escape sequences
-        below are LITERAL backslash-r-backslash-n in the
-        rendered output, NOT real CR/LF bytes. printf
-        interprets them at run time. This is what makes
-        the line copy-paste safe.
+        On the Unix side: a single line works identically
+        across sh, bash, zsh, fish, and tcsh; brace groups
+        do not, and multi-line shell commands with literal
+        CR bytes break copy-paste in many terminals.
+        printf interprets the \r\n escapes as CRLF at run
+        time, which is the line ending SMTP requires.
+
+        On the Windows side: PowerShell creates a real
+        TcpClient and writes through a StreamWriter whose
+        NewLine is set to CRLF. The %-pipeline emits each
+        command line; Start-Sleep 1 lets the server flush
+        its 250 response before we close the socket so the
+        user sees "Ok: message accepted" in their terminal
+        echo.
+
+        We escape angle-brackets and quotes for HTML once
+        via h(); the \r\n in the printf string and the
+        backtick-r-backtick-n in the PowerShell string are
+        both LITERAL escape sequences in the rendered
+        output, not real CR/LF bytes.
      */
-    $cmd =
+    $unix_cmd =
         "printf '" .
         'EHLO test\r\n' .
         "MAIL FROM:<friend@example.com>" . '\r\n' .
@@ -702,20 +716,57 @@ $site->get('/', function () use (
         '.\r\n' .
         'QUIT\r\n' .
         "' | nc $smtp_host $smtp_port";
+    /*
+        PowerShell version: multi-line for readability.
+        Modern Windows Terminal / pwsh / powershell.exe
+        accept multi-line paste correctly. The script is
+        written so it runs identically in Windows
+        PowerShell 5.1 and PowerShell 7+.
+     */
+    $ps_cmd =
+        "\$client = New-Object " .
+        "Net.Sockets.TcpClient '$smtp_host', $smtp_port\n" .
+        "\$writer = New-Object IO.StreamWriter " .
+        "\$client.GetStream()\n" .
+        "\$writer.NewLine = \"`r`n\"\n" .
+        "\$writer.AutoFlush = \$true\n" .
+        "@(\n" .
+        "    'EHLO test',\n" .
+        "    'MAIL FROM:<friend@example.com>',\n" .
+        "    'RCPT TO:<" . $address . ">',\n" .
+        "    'DATA',\n" .
+        "    'From: friend@example.com',\n" .
+        "    'Subject: hello there',\n" .
+        "    '',\n" .
+        "    'Just testing this disposable inbox.',\n" .
+        "    '.',\n" .
+        "    'QUIT'\n" .
+        ") | ForEach-Object { \$writer.WriteLine(\$_) }\n" .
+        "Start-Sleep 1\n" .
+        "\$client.Close()";
     echo "<details>\n";
     echo "<summary>How do I send a test message to this " .
         "address?</summary>\n";
-    echo "<p>Paste this into a terminal:</p>\n";
-    echo "<pre>" . h($cmd) . "</pre>\n";
+    echo "<p><strong>macOS, Linux, WSL, or any Unix " .
+        "shell.</strong> Paste this one line:</p>\n";
+    echo "<pre>" . h($unix_cmd) . "</pre>\n";
     echo "<p>The whole transaction is one line so it " .
-        "survives a copy-paste round-trip and works the " .
-        "same in sh, bash, zsh, fish, and tcsh. " .
-        "<code>printf</code> interprets the " .
-        "<code>\\r\\n</code> escapes as CRLF bytes when " .
-        "the command runs, which is the line ending SMTP " .
-        "requires. After the " .
-        "<code>250 2.0.0 Ok: message accepted</code> " .
-        "response, refresh your inbox to see it arrive.</p>\n";
+        "survives copy-paste and works the same in sh, " .
+        "bash, zsh, fish, and tcsh. <code>printf</code> " .
+        "interprets the <code>\\r\\n</code> escapes as " .
+        "CRLF bytes at run time, which is the line ending " .
+        "SMTP requires.</p>\n";
+    echo "<p><strong>Windows (PowerShell).</strong> " .
+        "Native Windows does not ship with " .
+        "<code>nc</code>, so paste this PowerShell block " .
+        "instead:</p>\n";
+    echo "<pre>" . h($ps_cmd) . "</pre>\n";
+    echo "<p>This opens a real TCP connection and sends " .
+        "the same SMTP wire transaction byte-for-byte. " .
+        "Works in both Windows PowerShell 5.1 (built " .
+        "into Windows 10/11) and PowerShell 7+. After " .
+        "<code>Close()</code> returns, refresh the inbox " .
+        "to see the message arrive.</p>\n";
     echo "<p>From a real mail client, point the SMTP " .
         "submission settings at <code>$smtp_host:" .
         "$smtp_port</code> with no authentication and no " .

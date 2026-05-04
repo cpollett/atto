@@ -52,12 +52,42 @@
  *      http://localhost:8080/
  *
  *
- * --- TESTING WITH dig ---
+ * --- TESTING WITH dig (macOS / Linux / WSL) ---
  *
  *      dig @127.0.0.1 -p 15353 www.example.test A
- *      dig @127.0.0.1 -p 15353 example.test MX
+ *      dig @127.0.0.1 -p 15353 mail-heavy.test MX
+ *      dig @127.0.0.1 -p 15353 ipv6-only.v6.test AAAA
+ *      dig @127.0.0.1 -p 15353 1.2.0.192.in-addr.arpa PTR
  *      dig @127.0.0.1 -p 15353 ftp.example.test A
  *      dig @127.0.0.1 -p 15353 +tcp example.test ANY
+ *
+ *
+ * --- TESTING ON WINDOWS ---
+ *
+ * Windows ships nslookup by default. The non-standard port
+ * is set with -port= as the first argument, the server IP
+ * is the trailing argument:
+ *
+ *      nslookup -port=15353 -type=A www.example.test 127.0.0.1
+ *      nslookup -port=15353 -type=MX mail-heavy.test 127.0.0.1
+ *      nslookup -port=15353 -type=AAAA ipv6-only.v6.test 127.0.0.1
+ *      nslookup -port=15353 -type=PTR 1.2.0.192.in-addr.arpa 127.0.0.1
+ *
+ * Or the equivalent interactively (better for several
+ * lookups in a row, since it skips the per-query startup):
+ *
+ *      C:\> nslookup
+ *      > server 127.0.0.1
+ *      > set port=15353
+ *      > set type=MX
+ *      > mail-heavy.test
+ *
+ * Note: Windows PowerShell's Resolve-DnsName cmdlet does
+ * NOT support a -Port parameter, so it can only hit the
+ * standard port 53. Use nslookup for non-standard ports.
+ *
+ * If you have installed BIND tools on Windows, the dig
+ * commands above work identically.
  *
  *
  * --- A REAL DEPLOYMENT WOULD ALSO ---
@@ -85,15 +115,23 @@ $authority = new FileDnsAuthority($zone_dir);
 $dns = new DnsSite($authority);
 /*
     Spawn the companion web UI exactly like example 21.
-    Detached child so killing the DNS server cleans up the
-    UI; UI URL is the conventional http://localhost:8080/.
+    Detached child so the parent process is free to run the
+    DNS event loop. On Unix we capture the child PID and
+    kill it on shutdown via register_shutdown_function. On
+    Windows, "start /B" does not surface the PID, so the
+    user has to close the cmd window (or kill php.exe via
+    Task Manager) to stop the webui after stopping the DNS
+    server. UI URL is http://localhost:8080/.
  */
 $php = escapeshellarg(PHP_BINARY);
 $webui = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . "webui.php");
 if (strstr(PHP_OS, "WIN")) {
     $job = "start /B $php $webui > NUL 2>&1";
     pclose(popen($job, "r"));
-    echo "Spawned webui.php (Windows; close cmd window to stop)\n";
+    echo "Spawned webui.php (Windows). Open " .
+        "http://localhost:8080/\n";
+    echo "  To stop, close this cmd window or end php.exe " .
+        "in Task Manager.\n";
 } else {
     $job = "{ exec $php $webui ; } < /dev/null > /dev/null " .
         "2>&1 & echo PID=\$!";
@@ -126,12 +164,16 @@ $config = [
 ];
 /*
     DNS-over-TLS (RFC 7858) needs a server certificate. We
-    read it from cert/ if present; absence means DoT is
-    silently skipped. The cert and key files are not shipped
-    with atto -- generate a self-signed pair like:
+    read it from this directory if present; absence means
+    DoT is silently skipped. The cert and key files are not
+    shipped with atto -- generate a self-signed pair like:
         openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem
             -out cert.pem -days 365 -subj "/CN=atto-dns-demo"
     and drop them in this directory next to index.php.
+    Windows users without openssl on PATH can use the bundled
+    one inside Git for Windows (C:\Program Files\Git\usr\bin\
+    openssl.exe), the WSL openssl, or any of the various
+    Windows OpenSSL builds (e.g. from slproweb.com).
  */
 $cert = __DIR__ . DIRECTORY_SEPARATOR . 'cert.pem';
 $key = __DIR__ . DIRECTORY_SEPARATOR . 'key.pem';

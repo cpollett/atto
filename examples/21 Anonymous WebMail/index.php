@@ -50,11 +50,14 @@
  *
  * The webmail UI's landing page includes a one-line
  * "How do I send a test message" block with the visitor's
- * assigned address pre-filled into a copy-pasteable
- * printf | nc command. That is the easiest way to verify
- * delivery end to end.
+ * assigned address pre-filled. The block shows two
+ * variants: a printf | nc one-liner for Unix-like shells
+ * (macOS, Linux, BSD, WSL), and a PowerShell block for
+ * native Windows. Both walk through the same SMTP wire
+ * protocol; pick whichever your shell supports.
  *
- * If you would rather drive it interactively by hand:
+ * If you would rather drive it interactively by hand on a
+ * Unix shell:
  *
  *      $ telnet localhost 2525
  *      220 anon.test AttoMail ESMTP ready
@@ -74,6 +77,22 @@
  *      250 2.0.0 Ok: message accepted
  *      QUIT
  *      221 Bye
+ *
+ * On Windows where telnet is not installed by default, an
+ * interactive equivalent is:
+ *
+ *      PS> $c = New-Object Net.Sockets.TcpClient localhost,2525
+ *      PS> $r = New-Object IO.StreamReader $c.GetStream()
+ *      PS> $w = New-Object IO.StreamWriter $c.GetStream()
+ *      PS> $w.NewLine = "`r`n"; $w.AutoFlush = $true
+ *      PS> $r.ReadLine()       # banner
+ *      PS> $w.WriteLine('EHLO test')
+ *      PS> $r.ReadLine()       # 250-anon.test Hello
+ *      PS> ...                 # continue with MAIL/RCPT/DATA
+ *      PS> $c.Close()
+ *
+ * which behaves identically to telnet for line-oriented
+ * protocols.
  *
  *
  * --- A REAL DEPLOYMENT WOULD ALSO ---
@@ -112,11 +131,20 @@ if (!defined("seekquarry\\atto\\RUN")) {
     deterministic. The file is created with mode 0600 so
     only the running user can read it.
  */
-$shared_pw_file = __DIR__ . '/.shared_password';
+$shared_pw_file = __DIR__ . DIRECTORY_SEPARATOR .
+    'shared_password.txt';
 if (!is_file($shared_pw_file)) {
     $pw = bin2hex(random_bytes(16));
     file_put_contents($shared_pw_file, $pw);
-    chmod($shared_pw_file, 0600);
+    /*
+        chmod with mode 0600 is a no-op on Windows (which uses
+        ACLs rather than POSIX bits); on Unix it makes the
+        file readable only by the user that started the
+        server. Either way we suppress errors so the demo
+        does not abort on a filesystem that does not
+        support chmod at all.
+     */
+    @chmod($shared_pw_file, 0600);
 }
 $shared_password = trim((string) file_get_contents($shared_pw_file));
 /*
@@ -164,9 +192,18 @@ $mail->onMailFrom(function ($info, $context) {
 $php = escapeshellarg(PHP_BINARY);
 $webui = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . "webui.php");
 if (strstr(PHP_OS, "WIN")) {
+    /*
+        Windows path: "start /B" detaches the child but does
+        NOT surface its PID, so we cannot kill it from the
+        parent on a graceful Ctrl+C. The user closes the cmd
+        window or kills php.exe via Task Manager when done.
+     */
     $job = "start /B $php $webui > NUL 2>&1";
     pclose(popen($job, "r"));
-    echo "Spawned webui.php (Windows; close cmd window to stop)\n";
+    echo "Spawned webui.php (Windows). Open " .
+        "http://localhost:8080/\n";
+    echo "  To stop, close this cmd window or end php.exe " .
+        "in Task Manager.\n";
 } else {
     $job = "{ exec $php $webui ; } < /dev/null > /dev/null " .
         "2>&1 & echo PID=\$!";

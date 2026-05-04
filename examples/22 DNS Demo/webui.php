@@ -34,9 +34,9 @@ if (!defined("seekquarry\\atto\\RUN")) {
 $site = new WebSite(".");
 $cfg = [
     'host' => '127.0.0.1',
-    'udp_port' => 5353,
-    'tcp_port' => 5353,
-    'tls_port' => 8853,
+    'udp_port' => 15353,
+    'tcp_port' => 15353,
+    'tls_port' => 18853,
     'zone_dir' => __DIR__ . DIRECTORY_SEPARATOR . 'zones',
 ];
 /*
@@ -602,7 +602,7 @@ function dnsScenarioList()
         'dot' => [
             'title' => 'DNS-over-TLS (RFC 7858)',
             'desc' => 'The same TCP wire format inside a ' .
-                'TLS connection on port 8853. Requires a ' .
+                'TLS connection on port 18853. Requires a ' .
                 'cert.pem/key.pem in the demo directory; ' .
                 'absent that, this scenario is unavailable.',
         ],

@@ -1138,9 +1138,9 @@ class DnsMessage
  *
  * Configuration keys recognized by listen():
  *   BIND          interface to bind, default 0.0.0.0
- *   DNS_UDP_PORT  default 5353 (low ports require root)
- *   DNS_TCP_PORT  default 5353
- *   DNS_TLS_PORT  default 8853 (DoT)
+ *   DNS_UDP_PORT  default 15353 (low ports require root)
+ *   DNS_TCP_PORT  default 15353
+ *   DNS_TLS_PORT  default 18853 (DoT)
  *   SERVER_NAME   string for trace headers
  *   MAX_TCP_LEN   maximum bytes per TCP-framed message
  *                 (default 65535, the on-wire max)
@@ -1153,9 +1153,9 @@ class DnsMessage
  *      $authority = new FileDnsAuthority(__DIR__ . "/zones");
  *      $dns = new DnsSite($authority);
  *      $dns->listen([
- *          'DNS_UDP_PORT' => 5353,
- *          'DNS_TCP_PORT' => 5353,
- *          'DNS_TLS_PORT' => 8853,
+ *          'DNS_UDP_PORT' => 15353,
+ *          'DNS_TCP_PORT' => 15353,
+ *          'DNS_TLS_PORT' => 18853,
  *          'SERVER_CONTEXT' => ['ssl' => [
  *              'local_cert' => 'cert.pem',
  *              'local_pk' => 'key.pem',
@@ -1269,9 +1269,9 @@ class DnsSite
     {
         $defaults = [
             'BIND' => '0.0.0.0',
-            'DNS_UDP_PORT' => 5353,
-            'DNS_TCP_PORT' => 5353,
-            'DNS_TLS_PORT' => 8853,
+            'DNS_UDP_PORT' => 15353,
+            'DNS_TCP_PORT' => 15353,
+            'DNS_TLS_PORT' => 18853,
             'SERVER_NAME' => 'atto-dns',
             'MAX_TCP_LEN' => 65535,
         ];

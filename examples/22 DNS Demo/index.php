@@ -31,15 +31,21 @@
  *
  * The demo binds:
  *
- *      UDP 5353    -- standard DNS over UDP
- *      TCP 5353    -- standard DNS over TCP (large responses,
+ *      UDP 15353    -- standard DNS over UDP
+ *      TCP 15353    -- standard DNS over TCP (large responses,
  *                     truncation fallback)
- *      TCP 8853    -- DNS-over-TLS (DoT) when a SERVER_CONTEXT
+ *      TCP 18853    -- DNS-over-TLS (DoT) when a SERVER_CONTEXT
  *                     ssl block is configured below
  *
- * High ports are used so the demo runs without root. A real
- * deployment would bind UDP 53 and TCP 53 (privileged) and
- * TCP 853 for DoT.
+ * High ports are used so the demo runs without root. We pick
+ * 15353 / 18853 specifically because UDP 5353 is camped by
+ * mDNSResponder on macOS (used for multicast DNS / Bonjour),
+ * and binding to it can either fail outright or silently
+ * have packets stolen by the system resolver. The "1" prefix
+ * keeps the mnemonic ("port 53" -> "port 5353" -> "port
+ * 15353") while staying clear of every well-known service.
+ * A real deployment would bind UDP 53 and TCP 53 (privileged)
+ * and TCP 853 for DoT.
  *
  * The companion web UI is spawned automatically and lives at
  *
@@ -48,10 +54,10 @@
  *
  * --- TESTING WITH dig ---
  *
- *      dig @127.0.0.1 -p 5353 www.example.test A
- *      dig @127.0.0.1 -p 5353 example.test MX
- *      dig @127.0.0.1 -p 5353 ftp.example.test A
- *      dig @127.0.0.1 -p 5353 +tcp example.test ANY
+ *      dig @127.0.0.1 -p 15353 www.example.test A
+ *      dig @127.0.0.1 -p 15353 example.test MX
+ *      dig @127.0.0.1 -p 15353 ftp.example.test A
+ *      dig @127.0.0.1 -p 15353 +tcp example.test ANY
  *
  *
  * --- A REAL DEPLOYMENT WOULD ALSO ---
@@ -113,9 +119,9 @@ if (strstr(PHP_OS, "WIN")) {
 }
 $config = [
     'BIND' => '127.0.0.1',
-    'DNS_UDP_PORT' => 5353,
-    'DNS_TCP_PORT' => 5353,
-    'DNS_TLS_PORT' => 8853,
+    'DNS_UDP_PORT' => 15353,
+    'DNS_TCP_PORT' => 15353,
+    'DNS_TLS_PORT' => 18853,
     'SERVER_NAME' => 'atto-dns-demo',
 ];
 /*

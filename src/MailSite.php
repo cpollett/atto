@@ -546,19 +546,15 @@ abstract class MailStorage
      * each component, and rejects components that could escape
      * the folder root. INBOX is normalized to all-uppercase per
      * RFC 3501. Backends that map folder names to filesystem
-     * paths layer additional checks on top of this -- see
+     * paths layer additional checks on top of this; see
      * FileMailStorage::folderDir for the reserved-basename
-     * check that prevents folder names from colliding with per-
-     * user metadata files. Throws InvalidArgumentException on:
+     * collision check. Throws InvalidArgumentException on:
      *      empty / "." / ".."  components (path traversal)
-     *      NUL byte             (older C-level path injection)
-     *      control character    (corrupts line-oriented
-     *                            metadata files)
-     * Leading dots in a component are silently stripped rather
-     * than rejected: ".foo" becomes "foo", "...bar" becomes
-     * "bar". A component that is nothing but dots (other than
-     * "." or ".." caught above) reduces to the empty string
-     * after stripping and is then rejected.
+     *      NUL byte             (path injection)
+     *      control character    (corrupts metadata files)
+     * Leading dots in a component are silently stripped:
+     * ".foo" -> "foo", "...bar" -> "bar". A component that
+     * reduces to empty after stripping is rejected.
      */
     protected function normalizeFolder($folder)
     {
@@ -594,6 +590,21 @@ abstract class MailStorage
             $clean[] = $part;
         }
         return implode("/", $clean);
+    }
+    /**
+     * Convenience wrapper around normalizeFolder that returns
+     * false on rejection rather than throwing. Saves a 5-line
+     * try/catch at every public-method entry point. Callers
+     * pattern: $folder = $this->safeNormalizeFolder($folder);
+     * if ($folder === false) { return <appropriate sentinel>; }
+     */
+    protected function safeNormalizeFolder($folder)
+    {
+        try {
+            return $this->normalizeFolder($folder);
+        } catch (\InvalidArgumentException $e) {
+            return false;
+        }
     }
 }
 /**
@@ -736,11 +747,8 @@ class FileMailStorage extends MailStorage
             self::FOLDER_UIDVALIDITY_FILE;
         if (!is_file($uidvalidity_file)) {
             /*
-                Per-user UIDVALIDITY is a fallback for folders
-                that pre-date the per-folder scheme. The
-                monotonic allocator keeps it strictly larger
-                than every prior handout in this process and
-                still fits in 32-bit unsigned-int range.
+                Per-user UIDVALIDITY: fallback for folders that
+                pre-date the per-folder scheme.
              */
             file_put_contents($uidvalidity_file,
                 (string) $this->nextUidValidity());
@@ -799,12 +807,8 @@ class FileMailStorage extends MailStorage
         if (!is_dir($this->userDir($user))) {
             $this->ensureUser($user);
             /*
-                ensureUser provisions INBOX as a side effect.
-                If the caller asked for a folder that
-                ensureUser just created, treat the create as
-                already done; otherwise we would fall through
-                to mkdir, which would fail on the (now
-                existing) path and incorrectly return false.
+                ensureUser provisions INBOX as a side effect;
+                if that's the folder requested, we are done.
              */
             if (is_dir($path)) {
                 return true;
@@ -817,13 +821,8 @@ class FileMailStorage extends MailStorage
             Stamp a per-folder UIDVALIDITY so a future delete
             + recreate of the same name always produces a
             different value (RFC 3501 sec 2.3.1.1). The
-            allocator is monotonic-by-construction across the
-            life of the process, so even rapid recreate cycles
-            in the same wall-clock second still bump the
-            counter. The value stays in 32-bit unsigned-int
-            range and reads as a Unix timestamp for any whole
-            second; sub-second reuses appear as the timestamp
-            plus a small offset.
+            allocator is monotonic-by-construction even across
+            recreate cycles in the same wall-clock second.
          */
         @file_put_contents(
             $path . DIRECTORY_SEPARATOR .
@@ -883,9 +882,8 @@ class FileMailStorage extends MailStorage
      */
     public function folderExists($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         return is_dir($this->folderDir($user, $folder));
@@ -1296,9 +1294,8 @@ class FileMailStorage extends MailStorage
         if ($uid < 1) {
             return false;
         }
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $eml = $this->messagePath(
@@ -1407,9 +1404,8 @@ class RamMailStorage extends MailStorage
      */
     public function createFolder($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $u = & $this->userRef($user);
@@ -1427,9 +1423,8 @@ class RamMailStorage extends MailStorage
      */
     public function deleteFolder($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         if ($folder === "INBOX") {
@@ -1458,10 +1453,9 @@ class RamMailStorage extends MailStorage
      */
     public function renameFolder($user, $old, $new)
     {
-        try {
-            $old = $this->normalizeFolder($old);
-            $new = $this->normalizeFolder($new);
-        } catch (\InvalidArgumentException $e) {
+        $old = $this->safeNormalizeFolder($old);
+        $new = $this->safeNormalizeFolder($new);
+        if ($old === false || $new === false) {
             return false;
         }
         if ($old === "INBOX" || $new === "INBOX") {
@@ -1483,9 +1477,8 @@ class RamMailStorage extends MailStorage
      */
     public function folderExists($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         return isset(
@@ -1497,9 +1490,8 @@ class RamMailStorage extends MailStorage
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $u = & $this->userRef($user);
@@ -1531,9 +1523,8 @@ class RamMailStorage extends MailStorage
      */
     public function fetchMessage($user, $folder, $uid)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $uid = (int) $uid;
@@ -1549,9 +1540,8 @@ class RamMailStorage extends MailStorage
      */
     public function listMessages($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return [];
         }
         if (!isset($this->users[$user]['folders'][$folder])) {
@@ -1576,9 +1566,8 @@ class RamMailStorage extends MailStorage
      */
     public function messageMeta($user, $folder, $uid)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $uid = (int) $uid;
@@ -1600,9 +1589,8 @@ class RamMailStorage extends MailStorage
      */
     public function setFlags($user, $folder, $uid, $flags)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $uid = (int) $uid;
@@ -1629,9 +1617,8 @@ class RamMailStorage extends MailStorage
      */
     public function expunge($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return [];
         }
         if (!isset($this->users[$user]['folders'][$folder])) {
@@ -1655,10 +1642,9 @@ class RamMailStorage extends MailStorage
      */
     public function moveMessage($user, $from, $to, $uid)
     {
-        try {
-            $from = $this->normalizeFolder($from);
-            $to = $this->normalizeFolder($to);
-        } catch (\InvalidArgumentException $e) {
+        $from = $this->safeNormalizeFolder($from);
+        $to = $this->safeNormalizeFolder($to);
+        if ($from === false || $to === false) {
             return false;
         }
         $uid = (int) $uid;
@@ -1684,9 +1670,8 @@ class RamMailStorage extends MailStorage
      */
     public function messageCount($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return 0;
         }
         if (!isset($this->users[$user]['folders'][$folder])) {
@@ -1700,9 +1685,8 @@ class RamMailStorage extends MailStorage
      */
     public function uidValidity($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return 0;
         }
         if (isset($this->users[$user]['folders'][$folder]
@@ -1726,9 +1710,8 @@ class RamMailStorage extends MailStorage
      */
     public function isSubscribed($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         if ($folder === "INBOX") {
@@ -1745,9 +1728,8 @@ class RamMailStorage extends MailStorage
      */
     public function subscribe($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $u = & $this->userRef($user);
@@ -1761,9 +1743,8 @@ class RamMailStorage extends MailStorage
      */
     public function unsubscribe($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         if (!isset($this->users[$user])) {
@@ -1811,9 +1792,8 @@ class RamMailStorage extends MailStorage
         if ($uid < 1) {
             return false;
         }
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         if (!isset($this->users[$user]['folders'][$folder]
@@ -1834,12 +1814,11 @@ class RamMailStorage extends MailStorage
 /**
  * Database-backed MailStorage. Mail metadata (users, folders,
  * messages, subscriptions, blob refcounts) lives in a relational
- * store via PDO (PHP Data Objects, the standard PHP database
- * abstraction); message bodies live on disk in a content-addressed
- * blob store with refcounted dedup. The database stores body
- * hashes only, never the bytes themselves, so two messages with
- * byte-identical bodies share one on-disk file regardless of how
- * many users received the message or which folders it lives in.
+ * store via PDO; message bodies live on disk in a content-
+ * addressed blob store with refcounted dedup. The database
+ * stores body hashes only, so two messages with byte-identical
+ * bodies share one on-disk file regardless of how many users
+ * received the message or which folders it lives in.
  *
  * Construction.
  *
@@ -1847,42 +1826,32 @@ class RamMailStorage extends MailStorage
  *          $username = null, $password = null,
  *          $dialect_overrides = []);
  *
- * The first argument is either a PDO data-source name string
- * ("sqlite:/path/to.db", "mysql:host=h;dbname=d", etc.) or an
- * already-constructed PDO instance. The PDO-instance form lets a
- * host application that already maintains its own connection
- * pool (Yioop's DatasourceManager being a concrete example) hand
- * the existing connection in rather than open a second one.
+ * $dsn_or_pdo is either a PDO DSN string ("sqlite:/path/to.db",
+ * "mysql:host=h;dbname=d", etc.) or an already-constructed PDO
+ * instance (lets a host app like Yioop hand in its existing
+ * pooled connection instead of opening a second one).
  *
- * The second argument is the directory under which content-
- * addressed blobs are stored. For SQLite DSNs of the form
- * "sqlite:/path/to.db" we default to "/path/to.db.blobs/" if
- * $blobs_dir is left null; for any other DSN or for a PDO
- * instance the caller MUST pass an explicit directory because
- * we have no sensible default.
+ * $blobs_dir is the directory under which content-addressed
+ * blobs are stored. For "sqlite:<path>" DSNs we default to
+ * "<path>.blobs/" if null; for any other DSN or PDO instance
+ * the caller MUST pass an explicit directory.
  *
  * SQL portability.
  *
- * The schema and every DML (data-manipulation language) statement
- * in this class is the intersection of SQL accepted by SQLite,
- * MySQL, PostgreSQL, DB2, and Oracle. We avoid INSERT OR REPLACE,
- * ON DUPLICATE KEY UPDATE, AUTOINCREMENT, LIMIT/OFFSET in places
- * Oracle would reject, and other dialect-specific syntax. Per-
- * DBMS differences (the integer-PK column declaration, big-int
- * type name, INSERT-or-ignore prefix/suffix, post-connect
- * pragmas) are pulled from a per-driver dialect array; pre-
- * populated entries cover sqlite, mysql, and pgsql. Anyone
- * running against db2 or oci passes a dialect override into
- * the constructor.
+ * The schema and every DML statement is the intersection of SQL
+ * accepted by SQLite, MySQL, PostgreSQL, DB2, and Oracle. Per-
+ * DBMS differences (integer-PK column declaration, big-int type
+ * name, INSERT-or-ignore prefix/suffix, post-connect pragmas)
+ * live in a per-driver dialect array; built-in entries cover
+ * sqlite, mysql, and pgsql. Anyone running against db2 or oci
+ * passes a dialect override into the constructor.
  *
  * Schema auto-creation.
  *
- * On construction we issue CREATE TABLE IF NOT EXISTS for the
- * five tables we use: mail_users, mail_folders, mail_messages,
- * mail_subscriptions, mail_blobs. Subsequent runs see existing
- * tables and skip the create. There is no migration story yet;
- * if the schema needs to change in a later phase the caller
- * will need to drop the tables manually.
+ * On construction CREATE TABLE IF NOT EXISTS runs for
+ * mail_users, mail_folders, mail_messages, mail_subscriptions,
+ * mail_blobs. There is no migration story yet; schema changes
+ * require dropping tables manually.
  *
  * Blob layout and refcount integrity.
  *
@@ -1890,16 +1859,12 @@ class RamMailStorage extends MailStorage
  *      mail_blobs (body_hash, refcount,     -- transactional
  *                  size, created_at)           refcount table
  *
- * The two-byte / two-byte directory prefix bounds the maximum
- * fan-out of any one directory. Refcounts live in the database
- * alongside the message rows that reference them, so each
- * appendMessage commits its refcount bump and the
- * mail_messages INSERT in a single transaction. The .eml file
- * write is outside the transaction (filesystems are not
- * transactional); a rollback can therefore leave an orphan
- * .eml file with no row referencing it. A periodic reaper that
- * compares the filesystem against mail_blobs.body_hash
- * recovers these orphans.
+ * Refcounts live in the database alongside the message rows
+ * that reference them, so each appendMessage commits the
+ * refcount bump and the mail_messages INSERT in one
+ * transaction. The .eml write is outside the transaction; a
+ * rollback can leave an orphan .eml file, recovered by a
+ * periodic filesystem-vs-mail_blobs reaper.
  */
 class SqlMailStorage extends MailStorage
 {
@@ -2019,29 +1984,20 @@ class SqlMailStorage extends MailStorage
                 'big_int' => 'INTEGER',
                 'text' => 'TEXT',
                 /*
-                    Per-dialect INSERT-or-ignore syntax,
-                    factored after Yioop's DatasourceManager::
-                    insertIgnore. Pattern: a plain
-                    "INSERT INTO t (a,b) VALUES (?,?)" is
-                    rewritten using these two strings into the
-                    DBMS-specific form. SQLite uses the verb
-                    prefix "INSERT OR IGNORE INTO ..."; MySQL
-                    uses "INSERT IGNORE INTO ..."; Postgres
-                    keeps the verb but appends "ON CONFLICT
-                    DO NOTHING" at the end.
+                    Per-dialect INSERT-or-ignore. See
+                    insertIgnoreSql() for the rewrite logic
+                    (Yioop's DatasourceManager::insertIgnore
+                    is the design reference).
                  */
                 'insert_ignore_prefix' => 'INSERT OR IGNORE',
                 'insert_ignore_suffix' => '',
                 'post_connect' => function ($pdo) {
                     /*
-                        WAL (write-ahead logging) makes
-                        readers and writers non-blocking
-                        relative to each other, which matters
-                        once IDLE clients sit on SELECT
-                        forever. foreign_keys=ON gets the
-                        cascade behaviour we expect from
-                        FOREIGN KEY clauses (SQLite ignores
-                        them by default).
+                        WAL (write-ahead logging) lets readers
+                        and writers run concurrently -- matters
+                        once IDLE clients camp on a SELECT.
+                        foreign_keys=ON enables FK cascade
+                        (off by default in SQLite).
                      */
                     $pdo->exec('PRAGMA journal_mode=WAL');
                     $pdo->exec('PRAGMA foreign_keys=ON');
@@ -2202,14 +2158,7 @@ class SqlMailStorage extends MailStorage
                 "created_at FROM mail_blobs " .
                 "WHERE body_hash = ?",
             'blob_insert_or_ignore' =>
-                /*
-                    The insert_ignore_prefix and suffix get
-                    spliced in at prepare() time inside
-                    buildSqlTemplates so the prepared form is
-                    already the dialect-correct shape. The
-                    prefix replaces "INSERT" and the suffix is
-                    appended after VALUES (...).
-                 */
+                /* placeholders spliced by buildSqlTemplates */
                 "__insert_ignore__ INTO mail_blobs " .
                 "(body_hash, refcount, size, created_at) " .
                 "VALUES (?, 1, ?, ?) __insert_ignore_suffix__",
@@ -2226,11 +2175,9 @@ class SqlMailStorage extends MailStorage
                 "WHERE body_hash = ? AND refcount <= 0",
         ];
         /*
-            Splice in the dialect-correct INSERT IGNORE shape
-            for blob_insert_or_ignore. We could do this in
-            prepareStatement() but doing it here keeps the resulting
-            prepared statement cleaner and the splicing work
-            one-shot rather than per-call.
+            Splice the dialect-correct INSERT IGNORE shape
+            into the template once, here, rather than on
+            every prepareStatement() call.
          */
         $templates['blob_insert_or_ignore'] = str_replace(
             ['__insert_ignore__', '__insert_ignore_suffix__'],
@@ -2244,19 +2191,13 @@ class SqlMailStorage extends MailStorage
     /**
      * Returns a freshly-prepared PDOStatement for the named
      * template. We deliberately do NOT cache prepared
-     * statements across calls. PDO holds an open cursor on a
+     * statements across calls: PDO holds an open cursor on a
      * statement after execute() returns until every row is
-     * consumed via fetch() or closeCursor() is called; a
-     * single-row lookup like "SELECT * FROM mail_users
-     * WHERE username = ?" looks fine to the calling code
-     * but leaves a cursor pending in the driver until the
-     * next execute() forcibly resets it. With cached
-     * statements that pending state survives between scenario
-     * runs and breaks unrelated callers under sustained load.
-     * Per-call preparation costs ~50 microseconds in SQLite
-     * and is irrelevant against the disk and network costs
-     * dominating mail-server throughput. The clarity is
-     * worth more than the saved milliseconds.
+     * consumed via fetch() or closeCursor() is called, and
+     * cached prepared statements leak that cursor state
+     * between unrelated callers. Per-call preparation costs
+     * ~50 microseconds in SQLite, irrelevant against the disk
+     * and network costs dominating mail-server throughput.
      */
     protected function prepareStatement($name)
     {
@@ -2381,9 +2322,8 @@ class SqlMailStorage extends MailStorage
      */
     public function createFolder($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $u = $this->userRow($user);
@@ -2402,9 +2342,8 @@ class SqlMailStorage extends MailStorage
      */
     public function deleteFolder($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         if ($folder === "INBOX") {
@@ -2452,10 +2391,9 @@ class SqlMailStorage extends MailStorage
      */
     public function renameFolder($user, $old, $new)
     {
-        try {
-            $old = $this->normalizeFolder($old);
-            $new = $this->normalizeFolder($new);
-        } catch (\InvalidArgumentException $e) {
+        $old = $this->safeNormalizeFolder($old);
+        $new = $this->safeNormalizeFolder($new);
+        if ($old === false || $new === false) {
             return false;
         }
         if ($old === "INBOX" || $new === "INBOX") {
@@ -2477,9 +2415,8 @@ class SqlMailStorage extends MailStorage
      */
     public function folderExists($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         return $this->folderRow($user, $folder) !== false;
@@ -2490,9 +2427,8 @@ class SqlMailStorage extends MailStorage
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $u = $this->userRow($user);
@@ -2519,19 +2455,13 @@ class SqlMailStorage extends MailStorage
         $bytes = (string) $bytes;
         $hash = hash('sha256', $bytes);
         /*
-            One transaction across the whole append: the blob
-            refcount bump, the user's UID counter advance, and
-            the mail_messages insert all live in the same
-            database now, so they can commit together. The
-            UNIQUE (folder_id, uid) constraint prevents UID
-            collisions if two appends race; if anything fails,
-            ROLLBACK undoes everything except the .eml file
-            on disk (filesystems are not transactional). An
-            orphaned .eml from a rolled-back transaction does
-            not corrupt anything -- the blob just has no
-            referencing rows -- and a periodic reaper that
-            compares filesystem against mail_blobs.body_hash
-            recovers them.
+            One transaction across blob refcount, UID counter,
+            and mail_messages insert. The UNIQUE (folder_id,
+            uid) constraint prevents collisions if two appends
+            race. The .eml file write happens inside
+            blobIncRef and is not transactional; an orphan .eml
+            after a rollback is recovered by a filesystem-vs-
+            mail_blobs reaper -- see blobIncRef's docblock.
          */
         $this->pdo->beginTransaction();
         try {
@@ -2561,9 +2491,8 @@ class SqlMailStorage extends MailStorage
      */
     public function fetchMessage($user, $folder, $uid)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $row = $this->folderRow($user, $folder);
@@ -2583,9 +2512,8 @@ class SqlMailStorage extends MailStorage
      */
     public function listMessages($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return [];
         }
         $row = $this->folderRow($user, $folder);
@@ -2605,9 +2533,8 @@ class SqlMailStorage extends MailStorage
      */
     public function messageMeta($user, $folder, $uid)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $row = $this->folderRow($user, $folder);
@@ -2643,9 +2570,8 @@ class SqlMailStorage extends MailStorage
      */
     public function setFlags($user, $folder, $uid, $flags)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $uid = (int) $uid;
@@ -2678,9 +2604,8 @@ class SqlMailStorage extends MailStorage
      */
     public function expunge($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return [];
         }
         $row = $this->folderRow($user, $folder);
@@ -2730,10 +2655,9 @@ class SqlMailStorage extends MailStorage
      */
     public function moveMessage($user, $from, $to, $uid)
     {
-        try {
-            $from = $this->normalizeFolder($from);
-            $to = $this->normalizeFolder($to);
-        } catch (\InvalidArgumentException $e) {
+        $from = $this->safeNormalizeFolder($from);
+        $to = $this->safeNormalizeFolder($to);
+        if ($from === false || $to === false) {
             return false;
         }
         $uid = (int) $uid;
@@ -2766,9 +2690,8 @@ class SqlMailStorage extends MailStorage
      */
     public function messageCount($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return 0;
         }
         $row = $this->folderRow($user, $folder);
@@ -2785,9 +2708,8 @@ class SqlMailStorage extends MailStorage
      */
     public function uidValidity($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return 0;
         }
         $row = $this->folderRow($user, $folder);
@@ -2821,9 +2743,8 @@ class SqlMailStorage extends MailStorage
      */
     public function isSubscribed($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         if ($folder === "INBOX") {
@@ -2844,9 +2765,8 @@ class SqlMailStorage extends MailStorage
      */
     public function subscribe($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $u = $this->userRow($user);
@@ -2864,9 +2784,8 @@ class SqlMailStorage extends MailStorage
      */
     public function unsubscribe($user, $folder)
     {
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $stmt = $this->prepareStatement('user_by_name');
@@ -2917,9 +2836,8 @@ class SqlMailStorage extends MailStorage
         if ($uid < 1) {
             return false;
         }
-        try {
-            $folder = $this->normalizeFolder($folder);
-        } catch (\InvalidArgumentException $e) {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
             return false;
         }
         $row = $this->folderRow($user, $folder);
@@ -2949,12 +2867,9 @@ class SqlMailStorage extends MailStorage
      * Returns the on-disk path to the blob for $hash. Layout
      * is two-byte / two-byte directory prefix to bound the
      * fan-out of any one directory; a hash starting with
-     * "abcd1234..." goes under "ab/cd/abcd1234.eml".
-     *
-     * The blob store now contains only .eml files; refcounts
-     * moved into the mail_blobs database table in this phase
-     * so crash-recovery follows the database's ACID semantics
-     * rather than racing a sidecar metadata file's flock.
+     * "abcd1234..." goes under "ab/cd/abcd1234.eml". The blob
+     * store contains only .eml files; refcounts live in the
+     * mail_blobs table for ACID crash-recovery.
      */
     protected function blobPath($hash)
     {
@@ -2966,26 +2881,20 @@ class SqlMailStorage extends MailStorage
     /**
      * Increments the refcount for $hash, creating the blob
      * file from $bytes if it does not already exist. Returns
-     * true on success.
-     *
-     * The caller is responsible for wrapping this in the same
-     * transaction as the corresponding mail_messages INSERT,
-     * so that a crash in the middle never leaves a refcount
-     * out of sync with its referencing rows. The .eml file
-     * write is intentionally outside the transaction --
-     * filesystems are not transactional and a torn write is
-     * impossible because we use temp-then-atomic-rename. If
-     * the transaction later rolls back, the orphaned blob
-     * file leaks on disk; a periodic reaper that compares
-     * filesystem against mail_blobs.body_hash recovers them.
+     * true on success. Caller wraps in the same transaction
+     * as the corresponding mail_messages INSERT so a crash
+     * never leaves the refcount out of sync. The .eml write
+     * is outside the transaction (filesystems are not
+     * transactional; we use temp-then-atomic-rename to avoid
+     * torn writes). A rolled-back transaction can leave an
+     * orphan .eml; a periodic reaper recovers it.
      */
     protected function blobIncRef($hash, $bytes)
     {
         /*
-            Try to create the row at refcount=1; if it
-            already exists, the IGNORE makes that a no-op
-            and we increment instead. Whichever path wins,
-            the row's refcount accurately tracks the new
+            Insert at refcount=1; if a row already exists
+            the IGNORE makes that a no-op and we UPDATE
+            instead. Either way the refcount tracks the new
             reference.
          */
         $stmt = $this->prepareStatement('blob_insert_or_ignore');
@@ -3309,19 +3218,17 @@ class MailSite
     }
     /**
      * Delivers a message into a local user's mailbox, running
-     * the configured filter exactly as the SMTP path would. This
-     * is the entry point for non-SMTP message ingestion (e.g. a
-     * webmail "Save Draft" action, a CLI import tool, an HTTP
-     * webhook from a transactional sender). The recipient must
-     * be a local user; this method does NOT do outbound queueing.
+     * the configured filter as the SMTP path would. Entry
+     * point for non-SMTP ingestion (webmail "Save Draft", CLI
+     * import, HTTP webhook from a transactional sender). The
+     * recipient must be a local user; no outbound queueing.
      *
      * @param string $from RFC 5321 reverse-path (envelope sender)
-     * @param string $to RFC 5321 forward-path (one envelope
-     *      recipient; multi-recipient delivery should call this
-     *      method once per recipient)
+     * @param string $to one envelope recipient (call once per
+     *      recipient for multi-recipient delivery)
      * @param string $bytes the full RFC 5322 message
-     * @param array $context optional context array passed to the
-     *      onMessage hook (caller supplies arbitrary fields)
+     * @param array $context optional context array passed to
+     *      the onMessage hook
      * @return int|false UID of the delivered message, or false
      *      on hook-drop, hook-reject, or unknown recipient
      */
@@ -3446,11 +3353,7 @@ class MailSite
     }
     /**
      * Returns metadata describing where the body bytes for
-     * (user, folder, uid) physically live. Used by direct-API
-     * callers that need to make backend-specific storage
-     * details visible -- particularly content-addressed
-     * dedup, where two messages with byte-identical bodies
-     * report the same path on the SQL backend. See
+     * (user, folder, uid) physically live. See
      * MailStorage::messageBodyLocation for the return shape.
      *
      * @param string $user
@@ -3575,14 +3478,13 @@ class MailSite
         return $this->mail_storage->folderExists($user, $folder);
     }
     /**
-     * Returns the UID that will be assigned to the next message
-     * appended to this folder for this user. The value is the
-     * direct-call equivalent of the IMAP UIDNEXT response code
-     * returned by SELECT/STATUS, suitable for a webmail UI that
-     * wants to detect new messages by comparing against a
-     * cached high-water mark. The value is a prediction; under
-     * concurrent appends the actual UID handed out may be
-     * larger by the time the caller acts on it.
+     * Returns the UID that will be assigned to the next
+     * message appended to this folder. Direct-call equivalent
+     * of the IMAP UIDNEXT response from SELECT/STATUS; useful
+     * for webmail UIs detecting new mail by comparing against
+     * a cached high-water mark. Under concurrent appends the
+     * actual UID handed out may be larger by the time the
+     * caller acts on it.
      *
      * @param string $user
      * @param string $folder
@@ -3593,14 +3495,12 @@ class MailSite
         return $this->mail_storage->uidNext($user, $folder);
     }
     /**
-     * Returns the UIDVALIDITY value for a folder, the stable
-     * per-folder integer IMAP clients use to tell whether their
-     * cached UIDs are still valid. A change in this value
-     * signals that the client must discard its UID cache and
-     * resync. We assign one stable value per user account at
-     * provisioning and reuse it for every folder, which is a
-     * legal IMAP choice and avoids the complication of
-     * tracking per-folder validity stamps.
+     * Returns the UIDVALIDITY value for a folder. IMAP
+     * clients compare this against their cached value to
+     * decide whether their UID cache is still valid; a
+     * change forces resync. UIDVALIDITY is stamped per
+     * folder at create time, so deleting and recreating a
+     * folder hands out a fresh value.
      *
      * @param string $user
      * @param string $folder
@@ -3613,11 +3513,10 @@ class MailSite
     /**
      * Increments the per-folder change counter that drives
      * IDLE push notifications. Called after any storage
-     * operation that changes the visible message count of a
-     * folder. The counter is per-process and in-memory only;
-     * it does not need to persist because IDLE subscribers
-     * snapshot the current value at IDLE time and only care
-     * about deltas during the idle window.
+     * operation that changes a folder's visible state. In-
+     * memory and per-process; persistence isn't needed
+     * because IDLE subscribers only care about deltas during
+     * the idle window.
      *
      * @param string $user
      * @param string $folder
@@ -3747,12 +3646,9 @@ class MailSite
             'MAX_COMMAND_LEN' => 2048,
             'MAX_MESSAGE_LEN' => 25 * 1024 * 1024,
             /*
-                If true, AUTH PLAIN/LOGIN on the plaintext SMTP
-                and the IMAP LOGIN command are accepted before
-                TLS is negotiated. Default false because credentials
-                in cleartext are a security hazard on real
-                networks; flip on for development against
-                127.0.0.1 where there is no eavesdropper.
+                Accept AUTH PLAIN/LOGIN before TLS. Default
+                false; flip on for loopback dev where there
+                is no eavesdropper.
              */
             'ALLOW_PLAINTEXT_AUTH' => false,
         ];
@@ -3770,71 +3666,54 @@ class MailSite
         $listeners = [];
         $listener_streams = [];
         $announce = [];
-        /* plaintext SMTP listener */
-        $smtp_addr = "tcp://$bind:" .
-            $this->default_server_globals['SMTP_PORT'];
-        $smtp = @stream_socket_server($smtp_addr, $errno, $errstr,
-            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+        /*
+            bindOne() opens a TCP listener, registers it,
+            and returns the stream resource. Null return
+            means the bind failed; required listeners
+            (plaintext SMTP/IMAP) treat that as fatal,
+            optional ones (implicit-TLS variants) warn and
+            continue.
+         */
+        $bindOne = function ($port_key, $protocol, $tls_implicit,
+            $label) use (
+            $bind, &$listeners, &$listener_streams, &$announce
+        ) {
+            if (empty($this->default_server_globals[$port_key])) {
+                return null;
+            }
+            $address = "tcp://$bind:" .
+                $this->default_server_globals[$port_key];
+            $stream = @stream_socket_server($address,
+                $errno, $errstr,
+                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+            if (!$stream) {
+                echo "Failed to bind $label $address: $errstr\n";
+                return null;
+            }
+            stream_set_blocking($stream, 0);
+            $listeners[(int) $stream] = [
+                'protocol' => $protocol,
+                'tls_implicit' => $tls_implicit,
+            ];
+            $listener_streams[(int) $stream] = $stream;
+            $suffix = $tls_implicit ? " (implicit TLS)" : "";
+            $announce[] = "$label at $address$suffix";
+            return $stream;
+        };
+        /* plaintext SMTP and IMAP are required */
+        $smtp = $bindOne('SMTP_PORT', 'SMTP', false, 'SMTP');
         if (!$smtp) {
-            echo "Failed to bind SMTP $smtp_addr: $errstr\n";
             return false;
         }
-        stream_set_blocking($smtp, 0);
-        $listeners[(int) $smtp] = ['protocol' => 'SMTP',
-            'tls_implicit' => false];
-        $listener_streams[(int) $smtp] = $smtp;
-        $announce[] = "SMTP at $smtp_addr";
-        /* plaintext IMAP listener */
-        $imap_addr = "tcp://$bind:" .
-            $this->default_server_globals['IMAP_PORT'];
-        $imap = @stream_socket_server($imap_addr, $errno, $errstr,
-            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+        $imap = $bindOne('IMAP_PORT', 'IMAP', false, 'IMAP');
         if (!$imap) {
-            echo "Failed to bind IMAP $imap_addr: $errstr\n";
             fclose($smtp);
             return false;
         }
-        stream_set_blocking($imap, 0);
-        $listeners[(int) $imap] = ['protocol' => 'IMAP',
-            'tls_implicit' => false];
-        $listener_streams[(int) $imap] = $imap;
-        $announce[] = "IMAP at $imap_addr";
-        /* implicit-TLS sockets, if configured */
-        if ($tls_available &&
-            !empty($this->default_server_globals['SMTPS_PORT'])) {
-            $smtps_addr = "tcp://$bind:" .
-                $this->default_server_globals['SMTPS_PORT'];
-            $smtps = @stream_socket_server($smtps_addr,
-                $errno, $errstr,
-                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
-            if ($smtps) {
-                stream_set_blocking($smtps, 0);
-                $listeners[(int) $smtps] = ['protocol' => 'SMTP',
-                    'tls_implicit' => true];
-                $listener_streams[(int) $smtps] = $smtps;
-                $announce[] = "SMTPS at $smtps_addr (implicit TLS)";
-            } else {
-                echo "Warning: failed to bind SMTPS $smtps_addr:" .
-                    " $errstr\n";
-            }
-        }
-        if ($tls_available &&
-            !empty($this->default_server_globals['IMAPS_PORT'])) {
-            $imaps_addr = "tcp://$bind:" .
-                $this->default_server_globals['IMAPS_PORT'];
-            $imaps = @stream_socket_server($imaps_addr,
-                $errno, $errstr,
-                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
-            if ($imaps) {
-                stream_set_blocking($imaps, 0);
-                $listeners[(int) $imaps] = ['protocol' => 'IMAP',
-                    'tls_implicit' => true];
-                $listener_streams[(int) $imaps] = $imaps;
-                $announce[] = "IMAPS at $imaps_addr (implicit TLS)";
-            } else {
-                echo "Warning: failed to bind IMAPS $imaps_addr:" .
-                    " $errstr\n";
-            }
+        /* implicit-TLS sockets are optional and require ssl */
+        if ($tls_available) {
+            $bindOne('SMTPS_PORT', 'SMTP', true, 'SMTPS');
+            $bindOne('IMAPS_PORT', 'IMAP', true, 'IMAPS');
         }
         $this->immortal_stream_keys = array_keys($listener_streams);
         $this->in_streams = [
@@ -3858,13 +3737,10 @@ class MailSite
             $reads = $this->in_streams[self::CONNECTION];
             $writes = $this->out_streams[self::CONNECTION];
             /*
-                Cap the select timeout at 5 seconds so the loop
-                wakes regularly even when nothing is happening.
-                IDLE push notifications are emitted on the post-
-                select tick, so a long sleep here would delay
-                "* N EXISTS" pushes by however long the server
-                slept. Five seconds bounds notification latency
-                while keeping the idle CPU cost negligible.
+                Cap select timeout at 5s so the loop wakes
+                regularly. IDLE pushes happen post-select, so
+                a long sleep would delay "* N EXISTS"
+                notifications by that long.
              */
             $timeout = 5;
             $microtimeout = 0;
@@ -3930,13 +3806,9 @@ class MailSite
         if (!empty($listener['tls_implicit'])) {
             /*
                 Implicit TLS: negotiate the handshake before
-                queueing any banner. The crypto call is blocking,
-                which is acceptable on accept since we have no
-                application-layer state to drain first. Failure
-                tears the connection down without ever sending
-                bytes (important: we must NOT send a plaintext
-                fallback banner because the client is waiting for
-                a TLS ServerHello).
+                queueing any banner. We MUST NOT send a
+                plaintext fallback banner because the client
+                is waiting for a TLS ServerHello.
              */
             if (!$this->upgradeToTls($connection)) {
                 @fclose($connection);
@@ -4026,8 +3898,7 @@ class MailSite
         $parts = ['CAPABILITY', 'IMAP4rev1', 'IDLE',
             'NAMESPACE', 'ID', 'SPECIAL-USE',
             'CREATE-SPECIAL-USE', 'MOVE', 'UIDPLUS'];
-        $allow_plain =
-            !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
+        $allow_plain = $this->allowsPlaintextAuth();
         if (!$tls_active && $this->tls_available) {
             $parts[] = 'STARTTLS';
         }
@@ -4090,14 +3961,11 @@ class MailSite
         return false;
     }
     /**
-     * Appends bytes to the outbound write buffer for a
-     * connection. Allocates the out_streams slot lazily on
-     * the first write so connections that never produce
-     * output do not pay for an empty buffer. The actual
-     * fwrite to the socket happens later in writeClient
-     * when the select loop reports the socket writable; this
-     * keeps queueWrite cheap and lets handlers emit many
-     * lines without blocking.
+     * Appends bytes to the outbound write buffer. Allocates
+     * the out_streams slot lazily on the first write. The
+     * actual fwrite happens later in writeClient when the
+     * select loop reports the socket writable, so handlers
+     * can emit many lines without blocking.
      *
      * @param int $key connection key
      * @param string $bytes bytes to enqueue (may be empty)
@@ -4119,13 +3987,10 @@ class MailSite
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
     }
     /**
-     * Queues a tagged IMAP response of the given status (OK,
-     * NO, or BAD) and detail text. Centralizes the CRLF
-     * framing so individual command handlers do not have to
-     * repeat the "$tag STATUS detail\r\n" pattern at every
-     * exit. The detail text MUST NOT contain CR or LF; the
-     * helper does no escaping because every existing call
-     * site supplies a fixed English literal.
+     * Queues a tagged IMAP response (OK, NO, or BAD).
+     * Centralizes CRLF framing. The detail text must not
+     * contain CR or LF; we do no escaping because all call
+     * sites supply fixed English literals.
      */
     protected function imapResp($key, $tag, $status, $detail)
     {
@@ -4133,10 +3998,8 @@ class MailSite
             "$tag $status $detail\r\n");
     }
     /**
-     * Common shorthand for the very repetitive "completed"
-     * tag-OK acknowledgement that ends most successful IMAP
-     * commands. Equivalent to imapResp($key, $tag, 'OK',
-     * "$verb completed").
+     * Shorthand for the "$tag OK $verb completed" reply that
+     * ends most successful IMAP commands.
      */
     protected function imapOk($key, $tag, $verb)
     {
@@ -4144,13 +4007,22 @@ class MailSite
             "$tag OK $verb completed\r\n");
     }
     /**
-     * Reads any pending bytes from a client socket into the
-     * inbound buffer and drains the buffer by repeatedly
-     * calling processOne until no more complete commands can
-     * be parsed. Closes the connection if the socket has hit
-     * EOF. Tolerates short reads: a single fread chunk may
-     * span multiple commands or only part of one, and the
-     * remaining bytes carry over to the next select tick.
+     * Returns true if the server is configured to accept
+     * AUTH PLAIN / LOGIN over a plaintext (non-TLS) channel.
+     * Default false; deployments that explicitly opt in to
+     * loopback-only or test setups can flip this.
+     */
+    protected function allowsPlaintextAuth()
+    {
+        return !empty(
+            $this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
+    }
+    /**
+     * Reads pending bytes from a client socket into the
+     * inbound buffer and drains the buffer by calling
+     * processOne until no more complete commands parse.
+     * Closes the connection on EOF. Short reads are
+     * tolerated: leftover bytes carry over to the next tick.
      *
      * @param resource $stream client socket
      */
@@ -4195,15 +4067,11 @@ class MailSite
             return $this->consumeSmtpDataPhase($key, $buffer, $context);
         }
         /*
-            IMAP APPEND literal: when a synchronizing literal is
-            outstanding for an APPEND command, the next bytes are
-            the message body, not a command line. Drain exactly
-            'remaining' bytes from the buffer regardless of CRLFs
-            inside, then once the literal is fully collected let
-            the literal continuation handler complete the APPEND.
-            Returns true to let the outer loop process whatever
-            is left in the buffer (typically a CRLF + the next
-            command, or just a CRLF that we silently consume).
+            IMAP APPEND literal: when a synchronizing literal
+            is outstanding for an APPEND, the next bytes are
+            the message body, not a command. Drain exactly
+            'remaining' bytes regardless of CRLFs inside, then
+            let the literal continuation finish the APPEND.
          */
         if ($proto === 'IMAP' &&
             !empty($context['IMAP_LIT_PENDING']) &&
@@ -4242,12 +4110,8 @@ class MailSite
             $end_of_line = strpos($buffer, "\n");
             if ($end_of_line === false) {
                 /*
-                    Buffer cap: a line-oriented protocol must
-                    eventually see a CRLF. If the inbound buffer
-                    exceeds 64 KiB without a line terminator the
-                    client is either malformed or trying to
-                    exhaust memory; drop the connection rather
-                    than keep accumulating.
+                    Line-buffer DoS cap: drop the connection
+                    if a 64 KiB buffer never produces a CRLF.
                  */
                 if (strlen($buffer) > 65536) {
                     $this->shutdownStream($key);
@@ -4295,13 +4159,9 @@ class MailSite
             $context['STATE'] = 'READY';
             $name = $this->default_server_globals['SERVER_NAME'];
             $response = "250-$name Hello\r\n";
-            $allow_plain =
-                !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
-            if (!empty($context['TLS_ACTIVE']) && $this->tls_available) {
-                /*
-                    Already in TLS; do not re-advertise STARTTLS.
-                 */
-            } elseif ($this->tls_available) {
+            $allow_plain = $this->allowsPlaintextAuth();
+            /* Re-advertise STARTTLS only if not already in TLS */
+            if (empty($context['TLS_ACTIVE']) && $this->tls_available) {
                 $response .= "250-STARTTLS\r\n";
             }
             if (!empty($context['TLS_ACTIVE']) || $allow_plain) {
@@ -4343,9 +4203,8 @@ class MailSite
             $context['STATE'] === 'AUTH-PLAIN' ||
             $context['STATE'] === 'AUTH-LOGIN-USER' ||
             $context['STATE'] === 'AUTH-LOGIN-PASS') {
-            $allow_plain =
-                !empty($this->default_server_globals['ALLOW_PLAINTEXT_AUTH']);
-            if (empty($context['TLS_ACTIVE']) && !$allow_plain) {
+            if (empty($context['TLS_ACTIVE']) &&
+                !$this->allowsPlaintextAuth()) {
                 $this->queueWrite($key,
                     "538 5.7.11 Encryption required for AUTH\r\n");
                 return;
@@ -4481,14 +4340,12 @@ class MailSite
         $this->verifyAndSetAuth($key, $user, $pass, $context);
     }
     /**
-     * Verifies a username/password pair against the
-     * configured authenticator and updates the SMTP
-     * connection state accordingly. On success the lowercased
-     * username is stored in AUTH_USER (storage paths are
-     * case-insensitive) and a 235 reply is queued; on
-     * failure a 535 reply is queued and AUTH_USER is left
-     * unset. Either way the SMTP state returns to READY so
-     * the client can issue MAIL FROM next.
+     * Verifies a username/password pair and updates the SMTP
+     * connection state. On success: lowercased username
+     * stored in AUTH_USER (storage paths are case-insensitive)
+     * and 235 queued. On failure: 535 queued and AUTH_USER
+     * left unset. Either way state returns to READY for
+     * MAIL FROM.
      *
      * @param int $key connection key
      * @param string $user candidate username
@@ -4540,17 +4397,10 @@ class MailSite
         }
         $tail = trim($m[1]);
         /*
-            Tolerated forms:
-                <addr>
-                <>
-                addr (bareword)
-                <addr> SIZE=123 BODY=8BITMIME (parameters; we
-                drop them)
-                addr SIZE=123 (parameters with bareword)
-            We split off the first whitespace-delimited token as
-            the address candidate and discard the rest as ESMTP
-            parameters; we do not currently honor SIZE= or other
-            extensions but accepting them is harmless.
+            Tolerated forms: <addr>, <>, bareword addr, and
+            any of those followed by ESMTP parameters
+            (SIZE=123, BODY=8BITMIME, etc.) which we accept
+            but do not honor.
          */
         $space = strpos($tail, ' ');
         if ($space !== false) {
@@ -4629,11 +4479,10 @@ class MailSite
                 return;
             }
             /*
-                Authenticated submission to a non-local recipient
-                would be outbound relay. We do not implement an
-                outbound queue in this phase, so reject with a
-                clear message. A later phase can hook a smarthost
-                or queue here.
+                Authenticated submission to a non-local
+                recipient would be outbound relay; no outbound
+                queue is implemented, so reject. A smarthost
+                or queue could be added here.
              */
             $this->queueWrite($key,
                 "550 5.7.1 Outbound relay not configured\r\n");
@@ -4686,11 +4535,8 @@ class MailSite
         }
         /*
             Fire the onHeader hook before stamping our trace
-            header, so policy can examine what the client sent
-            unmodified. The header block ends at the first blank
-            line; if there is no blank line the entire message
-            is treated as headers (defensive: a malformed message
-            without a body separator should still see the hook).
+            header, so policy sees what the client sent
+            unmodified.
          */
         $headers = $this->parseRfc5322Headers($message);
         $first_to = !empty($context['RCPTTO']) ?
@@ -4803,15 +4649,12 @@ class MailSite
             'ESMTP' : 'ESMTPA';
         $now = gmdate("D, d M Y H:i:s") . " +0000";
         /*
-            Defense in depth: Received: header values originate
-            from the connection (REMOTE_ADDR), the wire RCPT TO
-            line, and the server config (SERVER_NAME,
-            SERVER_SOFTWARE). The wire path already strips
-            line-level CR and LF before the address parser
-            sees it, but a bug or a hook that mutates
-            $context['RCPTTO'] could reintroduce them. Scrub
-            CR and LF from every interpolated value so a
-            malformed entry cannot inject a fake header.
+            Defense in depth: scrub CR and LF from every
+            interpolated value so a malformed
+            REMOTE_ADDR/RCPT/SERVER_NAME cannot inject a fake
+            header. The wire path strips them already, but a
+            buggy hook mutating $context could reintroduce
+            them.
          */
         $strip = function ($value) {
             return str_replace(["\r", "\n"], ['', ''],
@@ -4831,15 +4674,14 @@ class MailSite
     /**
      * Top-level dispatcher for one IMAP command line. Splits
      * out the tag and the verb, then routes to a per-verb
-     * handler based on the connection's IMAP STATE. The state
-     * machine matches RFC 3501 sec 3:
-     *   INIT     -- unauthenticated; only LOGIN, AUTHENTICATE,
-     *               STARTTLS, CAPABILITY, NOOP, LOGOUT allowed
-     *   AUTH     -- authenticated; mailbox-level commands and
-     *               selection commands allowed
-     *   SELECTED -- authenticated AND a mailbox is selected;
-     *               adds CLOSE; in Phase 4 will add FETCH/STORE
-     *               etc.
+     * handler based on the connection's IMAP STATE. State
+     * machine per RFC 3501 sec 3:
+     *   INIT     -- unauthenticated; LOGIN, AUTHENTICATE,
+     *               STARTTLS, CAPABILITY, NOOP, LOGOUT only
+     *   AUTH     -- authenticated; mailbox-level + select
+     *               commands
+     *   SELECTED -- authenticated + selected mailbox; adds
+     *               FETCH/STORE/SEARCH/COPY/MOVE/CLOSE/etc.
      * Tags are echoed back in the tagged status response.
      */
     protected function dispatchImap($key, $line, &$context)
@@ -5075,10 +4917,8 @@ class MailSite
      */
     protected function imapCmdLogin($key, $tag, $arguments, &$context)
     {
-        $allow_plain =
-            !empty($this->default_server_globals[
-                'ALLOW_PLAINTEXT_AUTH']);
-        if (empty($context['TLS_ACTIVE']) && !$allow_plain) {
+        if (empty($context['TLS_ACTIVE']) &&
+            !$this->allowsPlaintextAuth()) {
             $this->queueWrite($key,
                 "$tag NO [PRIVACYREQUIRED] " .
                 "STARTTLS required before LOGIN\r\n");
@@ -5148,10 +4988,8 @@ class MailSite
      */
     protected function imapCmdAuthenticate($key, $tag, $arguments, &$context)
     {
-        $allow_plain =
-            !empty($this->default_server_globals[
-                'ALLOW_PLAINTEXT_AUTH']);
-        if (empty($context['TLS_ACTIVE']) && !$allow_plain) {
+        if (empty($context['TLS_ACTIVE']) &&
+            !$this->allowsPlaintextAuth()) {
             $this->queueWrite($key,
                 "$tag NO [PRIVACYREQUIRED] " .
                 "STARTTLS required before AUTHENTICATE\r\n");
@@ -5225,10 +5063,10 @@ class MailSite
         if ($continuation === 'login') {
             $context['IMAP_LIT_PENDING'] = null;
             /*
-                Phase 3 only supports LOGIN literals as a
-                fall-back; production clients send LOGIN with
-                quoted strings. We do not currently chain a
-                second literal for the password.
+                LOGIN literals are accepted as a fall-back;
+                production clients send LOGIN with quoted
+                strings. We do not currently chain a second
+                literal for the password.
              */
             $this->imapResp($key, $tag, "BAD",
                 "literal LOGIN not fully implemented");
@@ -5273,12 +5111,9 @@ class MailSite
         }
         if ($continuation === 'idle') {
             /*
-                RFC 2177: while idling, the client sends "DONE"
-                on its own line to terminate. Anything else
-                during idle is a protocol error per the RFC,
-                but we are lenient and just keep waiting if the
-                client sends an empty line; non-empty non-DONE
-                lines get a BAD response and the idle ends.
+                RFC 2177: client sends "DONE" alone on a line
+                to terminate. Empty lines are tolerated;
+                anything else gets BAD and ends the IDLE.
              */
             $upper = strtoupper(trim($line));
             if ($upper === 'DONE') {
@@ -5300,18 +5135,17 @@ class MailSite
     }
     /**
      * Tokenizes the argument tail of an IMAP command into a
-     * list of [type, value] pairs. Recognized types:
+     * list of [type, value] pairs. Types:
      *   'atom'    -- bare unquoted token
-     *   'quoted'  -- characters between matching double-quotes
-     *                with backslash-escaped " and \
-     *   'literal' -- {N} synchronizing literal; the value is
-     *                the byte count, the actual bytes arrive
-     *                on the next line and must be reassembled
-     *                by the caller via continueImapLiteral
-     * NIL is decoded as an atom with the literal value "NIL".
-     * Whitespace between tokens is consumed but not represented.
-     * Returns an empty array on a parse error mid-string; the
-     * caller should treat that as BAD syntax.
+     *   'quoted'  -- between double-quotes, backslash escapes
+     *                " and \
+     *   'literal' -- {N} synchronizing literal; value is the
+     *                byte count; bytes arrive on the next
+     *                line and are reassembled by the caller
+     *                via continueImapLiteral
+     * NIL decodes as an atom with value "NIL". Whitespace
+     * between tokens is consumed. Returns an empty array on
+     * a parse error; caller should treat that as BAD syntax.
      */
     protected function parseImapTokens($s)
     {
@@ -5355,12 +5189,11 @@ class MailSite
             }
             if ($c === '(') {
                 /*
-                    Parenthesized list: keep all contents as one
-                    'list' token. Nested lists are flattened
-                    into the outer paren count, which is fine
-                    for the IMAP commands we handle in Phase 3
-                    where lists are flat (status items, search
-                    keys etc).
+                    Parenthesized list: keep contents as one
+                    'list' token. Nested lists flatten into
+                    the outer paren count, which is fine
+                    because all our list uses (STATUS items,
+                    SEARCH keys, etc.) are flat.
                  */
                 $depth = 1;
                 $j = $i + 1;
@@ -5421,22 +5254,17 @@ class MailSite
     /**
      * Handles LIST and LSUB. Both have the same syntax:
      *      LIST <reference> <mailbox-pattern>
-     * where reference is usually "" (or sometimes "INBOX") and
-     * the pattern can include "*" (any chars) or "%" (any chars
-     * except hierarchy delimiter). Two special cases per
-     * RFC 3501 sec 6.3.8:
-     *   - empty mailbox argument: server returns the hierarchy
-     *     delimiter and root, used by clients to discover the
-     *     separator
+     * where reference is usually "" and the pattern can
+     * include "*" (any chars) or "%" (any chars except
+     * hierarchy delimiter). Two special cases per RFC 3501
+     * sec 6.3.8:
+     *   - empty mailbox argument: returns hierarchy
+     *     delimiter and root (delimiter discovery)
      *   - "%" with empty reference: returns top-level folders
-     * RFC 5258 extends LIST with selection options preceding
-     * the reference, e.g. "LIST (SPECIAL-USE) "" "*"" to ask
-     * only for special-use folders. We accept these but do not
-     * filter on them; the response includes special-use
-     * attributes either way, which is the point of the
-     * SPECIAL-USE capability.
-     * We implement the regex translation locally so we do not
-     * need to push wildcard semantics down into MailStorage.
+     * RFC 5258 selection options before the reference (e.g.
+     * "LIST (SPECIAL-USE) ...") are accepted but not filtered;
+     * special-use attributes appear in the response either
+     * way.
      */
     protected function imapCmdList($key, $tag, $arguments, &$context,
         $is_lsub)
@@ -5457,8 +5285,11 @@ class MailSite
             $i = 1;
             $n = strlen($args_trimmed);
             while ($i < $n && $depth > 0) {
-                if ($args_trimmed[$i] === '(') $depth++;
-                else if ($args_trimmed[$i] === ')') $depth--;
+                if ($args_trimmed[$i] === '(') {
+                    $depth++;
+                } else if ($args_trimmed[$i] === ')') {
+                    $depth--;
+                }
                 $i++;
             }
             $args_trimmed = ltrim(substr($args_trimmed, $i));
@@ -5494,15 +5325,10 @@ class MailSite
         }
         if ($is_lsub) {
             /*
-                LSUB filters to the subscribed set per RFC 3501
-                sec 6.3.9. INBOX is implicitly subscribed even
-                without a SUBSCRIBE command. We intersect the
-                subscribed list with the existing-folders list
-                so that LSUB does not advertise folders the
-                user has subscribed to but which no longer
-                exist (RFC 3501 actually permits returning
-                non-existent subscribed folders as well, but
-                most clients render them awkwardly).
+                LSUB filters to the subscribed set (RFC 3501
+                sec 6.3.9; INBOX is implicitly subscribed).
+                We intersect with the existing-folders list
+                so LSUB does not advertise stale folders.
              */
             $subscribed = $this->mail_storage->listSubscribed(
                 $user);
@@ -5527,16 +5353,13 @@ class MailSite
     /**
      * Returns the IMAP attribute string for a folder in a
      * LIST / LSUB response. Combines two flag families:
-     *   1. Children attributes (RFC 3348): \HasChildren or
-     *      \HasNoChildren based on whether any other folder
-     *      starts with "<this>/". Modern clients use these
-     *      to render the folder tree.
-     *   2. Special-use attributes (RFC 6154): \Drafts, \Sent,
-     *      \Trash, \Junk, \Archive, \All for folders whose
-     *      name matches the convention. INBOX is excluded
-     *      since RFC 6154 reserves the special-use flags for
-     *      non-INBOX folders.
-     * The returned string is space-separated and may be empty.
+     *   1. Children (RFC 3348): \HasChildren or
+     *      \HasNoChildren based on prefix match against
+     *      $all_folders.
+     *   2. Special-use (RFC 6154): \Drafts, \Sent, \Trash,
+     *      \Junk, \Archive, \All. INBOX is excluded; RFC 6154
+     *      reserves special-use flags for non-INBOX folders.
+     * Space-separated; may be empty.
      */
     protected function imapFolderAttrs($folder, $all_folders)
     {
@@ -5951,10 +5774,12 @@ class MailSite
     }
     /**
      * Handles CLOSE: leave SELECTED state and return to AUTH
-     * state. RFC 3501 sec 6.4.2 says CLOSE silently expunges
-     * \Deleted messages; Phase 4 will add that semantics
-     * along with the EXPUNGE command. For Phase 3 CLOSE just
-     * deselects so navigation between folders works.
+     * state. RFC 3501 sec 6.4.2 specifies that CLOSE also
+     * silently expunges \Deleted messages; this implementation
+     * does not auto-expunge on CLOSE -- callers wanting that
+     * behavior should issue EXPUNGE before CLOSE. Mainstream
+     * clients (Thunderbird, Outlook, mutt) issue an explicit
+     * EXPUNGE either way, so the deviation is rarely visible.
      */
     protected function imapCmdClose($key, $tag, &$context)
     {
@@ -5969,16 +5794,11 @@ class MailSite
     }
     /**
      * Handles UID-prefixed variants of FETCH, STORE, COPY,
-     * MOVE, and SEARCH. RFC 3501 sec 6.4.8 defines these as
-     * "operate by UID rather than by sequence number"; the
-     * argument syntax after the verb is identical, only the
-     * interpretation of the message-set numbers changes. We
-     * dispatch to the same handlers as the non-UID variants
-     * with a flag set so they treat the message-set as UIDs
-     * and emit "* N FETCH (... UID U ...)" with both the
-     * sequence number AND the UID, as required by RFC 3501
-     * sec 6.4.8: "any data items returned MUST include the
-     * UID data item".
+     * MOVE, and SEARCH. RFC 3501 sec 6.4.8: same argument
+     * syntax as non-UID, but the message-set numbers are
+     * interpreted as UIDs. We dispatch to the same handlers
+     * with a by-uid flag, and the FETCH responses always
+     * include the UID data item per the RFC.
      */
     protected function imapCmdUid($key, $tag, $arguments, &$context)
     {
@@ -6018,13 +5838,9 @@ class MailSite
      * Parses an IMAP message-set string ("1", "1:5", "1:*",
      * "*", "1,3,5", "1:3,5:7") into a closure that tests
      * membership. The closure takes (sequence_number, last_seq,
-     * uid) and returns true if the message is in the set; the
-     * $by_uid flag tells the closure whether to test the
-     * sequence or the UID against the parsed ranges. The
-     * "*" token expands to last_seq when used in by-sequence
-     * mode and to a sentinel large number in by-uid mode (the
-     * IMAP grammar treats "*" as "the largest UID currently in
-     * use" for UID FETCH purposes).
+     * uid, last_uid); $by_uid selects whether the sequence or
+     * UID is tested. "*" expands to last_seq in by-sequence
+     * mode and to last_uid in by-uid mode.
      */
     protected function imapParseMessageSet($spec, $by_uid)
     {
@@ -6264,11 +6080,16 @@ class MailSite
             $depth_p = 0;
             while ($i < $n) {
                 $character = $items_str[$i];
-                if ($character === '[') $depth_b++;
-                else if ($character === ']') $depth_b--;
-                else if ($character === '(') $depth_p++;
-                else if ($character === ')') $depth_p--;
-                else if (($character === ' ' || $character === "\t") &&
+                if ($character === '[') {
+                    $depth_b++;
+                } else if ($character === ']') {
+                    $depth_b--;
+                } else if ($character === '(') {
+                    $depth_p++;
+                } else if ($character === ')') {
+                    $depth_p--;
+                } else if (($character === ' ' ||
+                    $character === "\t") &&
                     $depth_b === 0 && $depth_p === 0) {
                     break;
                 }
@@ -6445,12 +6266,12 @@ class MailSite
     }
     /**
      * Returns the bytes for one BODY[<section>] request.
-     * Recognizes empty (whole message), HEADER (header block),
-     * TEXT (body text), HEADER.FIELDS (selected headers),
-     * HEADER.FIELDS.NOT (all but selected headers), and MIME
-     * (currently same as HEADER for non-multipart). Numeric
-     * MIME-part paths fall back to the whole body since
-     * multipart parsing is out of scope for this phase.
+     * Recognizes empty (whole message), HEADER, TEXT,
+     * HEADER.FIELDS, HEADER.FIELDS.NOT, MIME, and numeric
+     * MIME-part paths (e.g. "1", "2.1", "1.HEADER"). The
+     * multipart tree is parsed via imapParseEntity. Out-of-
+     * range or unrecognized sections fall back to the whole
+     * body so clients see data rather than an empty literal.
      */
     protected function imapBodySection($body, $section, $fields)
     {
@@ -6683,14 +6504,11 @@ class MailSite
      *      =?charset?encoding?text?=
      * where encoding is "B" (base64) or "Q" (quoted-printable
      * with "_" meaning space). Multiple consecutive encoded-
-     * words separated only by whitespace are concatenated
-     * with the whitespace stripped, per RFC 2047 sec 6.2.
-     * Bytes outside encoded-words are passed through verbatim.
-     * The result is a UTF-8 string when the input charsets
-     * are recognized; unrecognized charsets fall back to
-     * leaving the text uninterpreted but still removing the
-     * encoded-word wrapper, which is good enough for
-     * substring searches.
+     * words separated only by whitespace are concatenated with
+     * the whitespace stripped, per RFC 2047 sec 6.2. Bytes
+     * outside encoded-words pass through. Unrecognized
+     * charsets are left uninterpreted but still unwrapped,
+     * good enough for substring searches.
      */
     protected function imapDecodeMimeHeader($value)
     {
@@ -6845,17 +6663,13 @@ class MailSite
     }
     /**
      * Returns an IMAP BODYSTRUCTURE (or BODY) representation
-     * of a message. Walks the multipart MIME tree per RFC 2046
-     * and emits the nested paren-list structure RFC 3501 sec
-     * 7.4.2 specifies. For multipart entities this produces a
-     * properly nested response that lets clients identify
-     * individual parts, their content types, encodings, and
-     * sizes; clients that find an attachment part will then
-     * issue BODY[part-number] to fetch just that part.
-     *   $kind is "BODY" or "BODYSTRUCTURE": both render the
-     * same body fields; BODYSTRUCTURE additionally appends
-     * the extension fields (md5, disposition, language,
-     * location) which are required for that variant.
+     * of a message. Walks the multipart MIME tree (RFC 2046)
+     * and emits the nested paren-list per RFC 3501 sec 7.4.2.
+     * Clients use this to identify individual parts, their
+     * types, encodings, and sizes, then fetch with
+     * BODY[part-number].
+     *   $kind is "BODY" or "BODYSTRUCTURE"; the latter adds
+     * extension fields (md5, disposition, language, location).
      */
     protected function imapBodyStructure($body, $kind)
     {
@@ -7528,12 +7342,8 @@ class MailSite
             }
             $keyword = strtoupper($token[1]);
             /*
-                Flag-presence keywords map to a single
-                in_array check, optionally negated. Folding
-                them into a table cuts a 50-line repeated
-                pattern down to a single lookup so the
-                interpreter does the same work on a fraction
-                of the code.
+                Flag-presence keywords: each maps to one or
+                two flag/expected-presence pairs.
              */
             static $flag_keywords = [
                 'NEW' => ['\Recent', true, '\Seen', false],
@@ -7673,22 +7483,17 @@ class MailSite
     /**
      * Implements IDLE (RFC 2177): the client says IDLE, the
      * server replies with "+ idling" and keeps the connection
-     * open. While idling, processIdleNotifications walks the
-     * idle subscribers each main-loop tick and emits untagged
-     * responses for changes that have happened to the
-     * selected folder since IDLE began. The push set covers
-     * three event types per RFC 2177 / RFC 3501:
-     *   * N EXISTS         -- a new message was added
-     *   * N EXPUNGE        -- a message was permanently
-     *                          removed
-     *   * N FETCH (FLAGS)  -- flag changes on an existing
-     *                          message
-     * The IDLE_STATE entry holds a per-message map and the
-     * change-counter snapshot taken at IDLE entry so the
-     * tick-side code can compute the delta cheaply: when the
-     * counter has not moved, no diff is needed. The client
-     * terminates by sending "DONE", after which we ack with
-     * the tagged OK and clear all idle state.
+     * open. processIdleNotifications walks the idle
+     * subscribers each main-loop tick and emits untagged
+     * responses for changes since IDLE began. Push set per
+     * RFC 2177 / RFC 3501:
+     *   * N EXISTS         -- new message added
+     *   * N EXPUNGE        -- message permanently removed
+     *   * N FETCH (FLAGS)  -- flag change on existing message
+     * IDLE_STATE caches a per-message map and the change-
+     * counter at IDLE entry so the tick-side diff is cheap
+     * (no diff if counter unchanged). The client sends DONE
+     * to terminate; we ack with tagged OK and clear state.
      */
     protected function imapCmdIdle($key, $tag, &$context)
     {
@@ -7711,15 +7516,12 @@ class MailSite
     /**
      * Captures the per-message state of a folder for IDLE
      * diff purposes. Returns:
-     *   uids   -- ordered list of UIDs in the folder, in the
-     *             same order listMessages returns them (which
-     *             is also sequence-number order)
-     *   flags  -- map UID => flag-string (sorted, joined) so
-     *             a flag change shows up as a string change
-     *             rather than requiring deep array compare
+     *   uids   -- ordered list of UIDs (sequence order)
+     *   flags  -- map UID => sorted-and-joined flag string,
+     *             so a flag change shows up as a string
+     *             change without deep array compare
      *   count  -- number of messages, kept separate so the
-     *             EXISTS push can use the new count without
-     *             a second listMessages call
+     *             EXISTS push can use it without rewalking
      */
     protected function captureFolderState($user, $folder)
     {
@@ -7944,19 +7746,14 @@ class MailSite
      * Walks every active connection and emits IDLE push
      * notifications (EXISTS, EXPUNGE, FETCH FLAGS) for any
      * that are idling and whose subscribed folder has changed
-     * since their snapshot. The notification set captures
-     * RFC 2177 / RFC 3501 expectations: clients see the same
-     * untagged responses they would have seen if they had
-     * SELECTed the folder fresh.
+     * since their snapshot, per RFC 2177 / RFC 3501.
      *
-     * Called once per main-loop iteration. Cheap when no
-     * folder has changed: the change-counter compare is O(1)
-     * per subscriber. Folder state is read from disk at most
-     * once per (user, folder) per tick via $folder_state_cache,
-     * so N idle subscribers on the same active folder share a
-     * single listMessages walk instead of doing N independent
-     * walks. Worst case improves from O(messages * subscribers)
-     * to O(messages + subscribers) per tick.
+     * Called once per main-loop iteration. The change-counter
+     * compare is O(1) per subscriber so unchanged folders
+     * cost almost nothing. Folder state is read from disk at
+     * most once per (user, folder) per tick via
+     * $folder_state_cache, so N idle subscribers on the same
+     * folder share a single listMessages walk.
      */
     protected function processIdleNotifications()
     {
@@ -7985,15 +7782,12 @@ class MailSite
                 continue;
             }
             /*
-                The folder has changed since the last tick.
-                Reuse a tick-scoped cache of the fresh state
-                so multiple subscribers on the same folder do
-                a single listMessages walk together. Each
-                subscriber then runs the diff against its own
-                IDLE_STATE to emit personalized untagged
-                responses (different subscribers may have
-                joined idle at different points and need
-                different deltas).
+                Folder changed since the last tick. Cache the
+                fresh state per-tick so multiple subscribers
+                on the same folder share one listMessages
+                walk; each subscriber still diffs against its
+                own IDLE_STATE since they may have joined at
+                different points.
              */
             $cache_key = $user . '|' . $folder;
             if (!isset($folder_state_cache[$cache_key])) {

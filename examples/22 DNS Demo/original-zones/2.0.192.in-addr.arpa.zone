@@ -1,0 +1,31 @@
+; 2.0.192.in-addr.arpa
+;
+; Reverse DNS for the 192.0.2.0/24 block. PTR records
+; map IP addresses back to names: a query for
+; 1.2.0.192.in-addr.arpa PTR returns the name that
+; "owns" 192.0.2.1. The label order is reversed so the
+; DNS hierarchy lines up with IP-address aggregation
+; (the most specific octet is the leftmost label, so
+; subdelegation to /28 or /29 fragments works the same
+; way as forward delegation).
+;
+; Most operators publish PTR records pointing back into
+; their forward zones; the matched-pair pattern
+; (forward + reverse for the same address) is the
+; common shape.
+;
+; Try in the demo: query 1.2.0.192.in-addr.arpa for PTR,
+; then query 2.2.0.192.in-addr.arpa for PTR, and so on.
+;
+$ORIGIN 2.0.192.in-addr.arpa.
+$TTL 3600
+@               IN  SOA   ns1.example.test. admin.example.test. (
+                          2026010101 3600 1800 604800 86400 )
+@               IN  NS    ns1.example.test.
+@               IN  NS    ns2.example.test.
+1               IN  PTR   example.test.
+2               IN  PTR   www.example.test.
+3               IN  PTR   mail.example.test.
+10              IN  PTR   ns1.example.test.
+11              IN  PTR   ns2.example.test.
+99              IN  PTR   wild.example.test.

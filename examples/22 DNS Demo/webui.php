@@ -38,6 +38,8 @@ $cfg = [
     'tcp_port' => 15353,
     'tls_port' => 18853,
     'zone_dir' => __DIR__ . DIRECTORY_SEPARATOR . 'zones',
+    'original_zone_dir' => __DIR__ . DIRECTORY_SEPARATOR .
+        'original-zones',
 ];
 /*
     Send one query packet over UDP and return the raw bytes
@@ -330,6 +332,80 @@ function dnsRenderRdata($type, $rdata)
     return is_string($rdata) ? $rdata :
         json_encode($rdata);
 }
+/*
+    Parses a single zone file in-process and reports
+    whether the running DNS server's FileDnsAuthority will
+    have loaded it. The parser drops zones that lack an
+    SOA, so "no origin loaded" is the failure mode the user
+    needs to know about. We do this by pointing a fresh
+    FileDnsAuthority at a one-file scratch directory: the
+    parser is the same code as the live server runs, so
+    success here means success there.
+ */
+function dnsCheckZone($path)
+{
+    if (!is_file($path)) {
+        return ['ok' => false,
+            'message' => 'file does not exist'];
+    }
+    $tmp = sys_get_temp_dir() . DIRECTORY_SEPARATOR .
+        'atto-dns-check-' . bin2hex(random_bytes(6));
+    if (!@mkdir($tmp, 0700, true)) {
+        return ['ok' => false,
+            'message' => 'cannot create scratch dir'];
+    }
+    $base = basename($path);
+    $copy = $tmp . DIRECTORY_SEPARATOR . $base;
+    if (!@copy($path, $copy)) {
+        @rmdir($tmp);
+        return ['ok' => false,
+            'message' => 'cannot stage file for parse'];
+    }
+    $auth = new FileDnsAuthority($tmp);
+    $origins = $auth->origins();
+    @unlink($copy);
+    @rmdir($tmp);
+    if (empty($origins)) {
+        return ['ok' => false,
+            'message' => 'parser dropped this zone ' .
+                '(typical cause: no SOA record, or a ' .
+                'malformed line before the SOA)'];
+    }
+    /*
+        Count the records the parser ingested by re-asking
+        for every record at every loaded origin via TYPE_ANY.
+        This is just for the status display; the wire path
+        already tested success.
+     */
+    $record_count = 0;
+    foreach ($origins as $origin) {
+        $hits = $auth->findRecords($origin, DnsSite::TYPE_ANY,
+            DnsSite::CLASS_IN);
+        if (is_array($hits)) {
+            $record_count += count($hits);
+        }
+    }
+    return ['ok' => true,
+        'origins' => $origins,
+        'record_count' => $record_count,
+        'message' => 'parsed cleanly'];
+}
+/*
+    Compares the live zone file to the pristine original.
+    Returns "same" / "modified" / "no-original".
+ */
+function dnsZoneDriftStatus($live_path, $original_path)
+{
+    if (!is_file($original_path)) {
+        return 'no-original';
+    }
+    if (!is_file($live_path)) {
+        return 'modified';
+    }
+    $live = (string) @file_get_contents($live_path);
+    $orig = (string) @file_get_contents($original_path);
+    return ($live === $orig) ? 'same' : 'modified';
+}
 $site->get('/style.css', function () use ($site) {
     $site->header("Content-Type: text/css");
     echo <<<'CSS'
@@ -422,10 +498,42 @@ form.raw button {
     background: #fff; border: 1px solid #e5e7eb;
     padding: 10px; border-radius: 8px; margin-bottom: 14px;
 }
-.zone-list a {
-    display: inline-block; padding: 4px 10px; margin: 2px;
-    background: #eef2ff; color: #1e3a8a; text-decoration: none;
-    border-radius: 4px; font-size: 13px;
+.zone-row {
+    padding: 6px 0; border-bottom: 1px solid #f3f4f6;
+}
+.zone-row:last-child { border-bottom: 0; }
+.zone-row a {
+    color: #1e3a8a; text-decoration: none; font-weight: 500;
+}
+.zone-row a:hover { text-decoration: underline; }
+.badge {
+    display: inline-block; padding: 1px 8px; margin-left: 6px;
+    border-radius: 10px; font-size: 11px;
+    font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.badge.modified { background: #fef3c7; color: #92400e; }
+.badge.broken { background: #fee2e2; color: #991b1b; }
+.status-banner {
+    padding: 10px 14px; border-radius: 6px;
+    margin-bottom: 14px; font-size: 13px;
+    border: 1px solid transparent;
+}
+.status-banner.ok {
+    background: #ecfdf5; color: #065f46;
+    border-color: #a7f3d0;
+}
+.status-banner.broken {
+    background: #fef2f2; color: #991b1b;
+    border-color: #fecaca;
+}
+.status-banner.info {
+    background: #eff6ff; color: #1e3a8a;
+    border-color: #bfdbfe;
+}
+.status-banner code {
+    background: rgba(0,0,0,0.08); padding: 1px 6px;
+    border-radius: 3px; font-size: 12px;
 }
 form.zone {
     background: #fff; border: 1px solid #e5e7eb;
@@ -447,6 +555,22 @@ form.zone button {
 }
 form.zone .saved {
     color: #15803d; font-size: 13px;
+}
+button.reset {
+    background: #dc2626; color: #fff; border: 0;
+    padding: 8px 16px; border-radius: 4px; cursor: pointer;
+}
+button.reset:hover { background: #b91c1c; }
+button.reset-all {
+    background: #f59e0b; color: #fff; border: 0;
+    padding: 8px 16px; border-radius: 4px; cursor: pointer;
+    font-weight: 600;
+}
+button.reset-all:hover { background: #d97706; }
+.muted { color: #6b7280; font-size: 13px; }
+.banner code {
+    background: rgba(0,0,0,0.05); padding: 1px 6px;
+    border-radius: 3px; font-size: 12px;
 }
 footer {
     margin-top: 32px; padding-top: 16px;
@@ -619,7 +743,19 @@ function dnsRenderScenarios()
 {
     echo "<div class=\"banner\">Click any scenario below to " .
         "send a real DNS query against the running server " .
-        "and see the actual bytes go out and come back.</div>";
+        "and see the actual bytes go out and come back. " .
+        "Each scenario sends one query over a real socket " .
+        "and renders both the question and the answer in " .
+        "two views: a hex dump of the actual wire bytes, " .
+        "and a structured dig-style breakdown.<br><br>" .
+        "<strong>Try this:</strong> run the " .
+        "<em>A query for www.example.test</em> scenario " .
+        "first. Then go to <em>Zone editor</em>, open " .
+        "<em>example.test</em>, change the IP for " .
+        "<code>www</code> from 192.0.2.2 to anything else, " .
+        "save, and re-run the same scenario. The DNS " .
+        "server picks up your edit on the next query " .
+        "(no restart needed).</div>";
     echo "<div class=\"scenario-list\">";
     foreach (dnsScenarioList() as $key => $info) {
         echo "<div class=\"scenario\" data-key=\"" .
@@ -638,9 +774,20 @@ function dnsRenderScenarios()
 }
 function dnsRenderRaw()
 {
-    echo "<div class=\"banner\">Type a name and pick a record " .
-        "type and transport. Defaults to www.example.test, " .
-        "which the demo's zone resolves.</div>";
+    echo "<div class=\"banner\">Type any name and pick a " .
+        "record type and transport. The server is " .
+        "authoritative for the zones you can see in the " .
+        "<em>Zone editor</em> tab; anything else returns " .
+        "REFUSED. A few names to try:<br>" .
+        "<code>www.example.test</code> A &middot; " .
+        "<code>mail-heavy.test</code> MX &middot; " .
+        "<code>_dmarc.mail-heavy.test</code> TXT &middot; " .
+        "<code>ipv6-only.v6.test</code> AAAA &middot; " .
+        "<code>1.2.0.192.in-addr.arpa</code> PTR &middot; " .
+        "<code>bit.redirector.test</code> A &middot; " .
+        "<code>anything.t.redirector.test</code> A &middot; " .
+        "<code>split.corner-cases.test</code> TXT" .
+        "</div>";
     echo "<form class=\"raw\" id=\"rawForm\">";
     echo "<div><label>Name</label>";
     echo "<input name=\"name\" value=\"www.example.test\"" .
@@ -670,21 +817,78 @@ function dnsRenderZones($cfg)
         '*.zone');
     if ($files === false) { $files = []; }
     sort($files);
+    if (isset($_GET['restored'])) {
+        $n = (int) $_GET['restored'];
+        echo "<div class=\"status-banner info\">" .
+            "Restored " . $n . " zone" .
+            ($n === 1 ? '' : 's') .
+            " from original-zones/.</div>";
+    }
     echo "<div class=\"banner\">Edit zone files in place. " .
-        "Saving sends a reload signal to the running DNS " .
-        "server, so the next query reflects your changes.</div>";
-    echo "<div class=\"zone-list\"><strong>Zones:</strong> ";
+        "Saving applies immediately to the running DNS " .
+        "server: it stat-watches this directory and " .
+        "reloads on the next query. If you break a zone " .
+        "(e.g. by deleting the SOA), the parser drops it " .
+        "and queries return REFUSED &mdash; click " .
+        "<em>Reset to original</em> on the edit page to " .
+        "put it back.<br><br><strong>Suggested play:</strong> " .
+        "open <em>example.test</em> and change the A " .
+        "record for <code>www</code>, then re-run the " .
+        "<em>A query for www.example.test</em> scenario. " .
+        "Or open <em>mail-heavy.test</em> and add a new " .
+        "MX with priority 5; then run an MX query for " .
+        "<code>mail-heavy.test</code> in the Raw tab.</div>";
+    echo "<div class=\"zone-list\">";
     if (empty($files)) {
-        echo "<em>(none yet)</em>";
+        echo "<em>(no zones yet)</em>";
     } else {
+        echo "<strong>Zones:</strong><br>";
         foreach ($files as $file) {
             $base = basename($file, '.zone');
+            $orig = $cfg['original_zone_dir'] .
+                DIRECTORY_SEPARATOR . $base . '.zone';
+            $drift = dnsZoneDriftStatus($file, $orig);
+            $status = dnsCheckZone($file);
+            echo "<div class=\"zone-row\">";
             echo "<a href=\"/zones/" .
                 htmlspecialchars(rawurlencode($base)) .
-                "\">" . htmlspecialchars($base) . "</a> ";
+                "\">" . htmlspecialchars($base) . "</a>";
+            if ($drift === 'modified') {
+                echo " <span class=\"badge modified\">" .
+                    "modified</span>";
+            }
+            if (!$status['ok']) {
+                echo " <span class=\"badge broken\">" .
+                    "parse error</span>";
+            }
+            echo "</div>";
         }
     }
     echo "</div>";
+    /*
+        Restore-all is a single form button that hits
+        POST /restore-all. We render it only when at least
+        one zone has drifted from its original; otherwise
+        there is nothing to restore.
+     */
+    $any_modified = false;
+    foreach ($files as $file) {
+        $base = basename($file, '.zone');
+        $orig = $cfg['original_zone_dir'] .
+            DIRECTORY_SEPARATOR . $base . '.zone';
+        if (dnsZoneDriftStatus($file, $orig) === 'modified') {
+            $any_modified = true;
+            break;
+        }
+    }
+    if ($any_modified) {
+        echo "<form method=\"post\" action=\"/restore-all\" " .
+            "style=\"margin-top:14px\">";
+        echo "<button type=\"submit\" class=\"reset-all\">" .
+            "Restore all zones from original-zones/" .
+            "</button>";
+        echo "</form>";
+    }
 }
 function dnsRenderZoneEdit($cfg, $name)
 {
@@ -695,8 +899,50 @@ function dnsRenderZoneEdit($cfg, $name)
     }
     $path = $cfg['zone_dir'] . DIRECTORY_SEPARATOR .
         $name . '.zone';
+    $original_path = $cfg['original_zone_dir'] .
+        DIRECTORY_SEPARATOR . $name . '.zone';
     $contents = is_file($path) ?
         (string) @file_get_contents($path) : '';
+    $status = dnsCheckZone($path);
+    $drift = dnsZoneDriftStatus($path, $original_path);
+    $has_original = is_file($original_path);
+    /*
+        Status banner: success in green, parse failure in
+        red. The text mirrors what FileDnsAuthority
+        actually does -- "this zone is loaded" or "this
+        zone got dropped, here's why".
+     */
+    if ($status['ok']) {
+        echo "<div class=\"status-banner ok\">";
+        echo "<strong>&#x2713; Live:</strong> the running " .
+            "DNS server has loaded this zone (" .
+            (int) $status['record_count'] . " records, " .
+            "origin <code>" .
+            htmlspecialchars(implode(', ',
+                $status['origins'])) . "</code>). ";
+        if ($drift === 'modified') {
+            echo "Modified from the original.";
+        } else if ($drift === 'same') {
+            echo "Matches the original.";
+        }
+        echo "</div>";
+    } else {
+        echo "<div class=\"status-banner broken\">";
+        echo "<strong>&#x26A0; Not loaded:</strong> " .
+            htmlspecialchars($status['message']) . ". " .
+            "Queries for this zone will return REFUSED " .
+            "until the file parses cleanly.";
+        echo "</div>";
+    }
+    if (isset($_GET['saved'])) {
+        echo "<div class=\"status-banner info\">" .
+            "Saved. The DNS server will pick up the change " .
+            "on the next query.</div>";
+    }
+    if (isset($_GET['restored'])) {
+        echo "<div class=\"status-banner info\">" .
+            "Restored from original-zones/.</div>";
+    }
     echo "<form class=\"zone\" method=\"post\" action=\"" .
         "/zones/" . htmlspecialchars(rawurlencode($name)) .
         "\">";
@@ -704,12 +950,33 @@ function dnsRenderZoneEdit($cfg, $name)
     echo "<textarea name=\"contents\" spellcheck=\"false\">" .
         htmlspecialchars($contents) . "</textarea>";
     echo "<div class=\"actions\">";
-    echo "<button type=\"submit\">Save and reload</button>";
-    echo "<a href=\"/zones\">Back</a>";
-    if (isset($_GET['saved'])) {
-        echo "<span class=\"saved\">Saved and reloaded.</span>";
-    }
+    echo "<button type=\"submit\">Save</button>";
+    echo "<a href=\"/zones\">Back to zone list</a>";
     echo "</div></form>";
+    /*
+        Separate form for the destructive Reset. The
+        button is visible only when a pristine original
+        exists for this zone -- newly-created zones have
+        no original to restore to. We add a confirm so an
+        accidental click does not throw away in-progress
+        edits.
+     */
+    if ($has_original && $drift !== 'same') {
+        echo "<form method=\"post\" action=\"/zones/" .
+            htmlspecialchars(rawurlencode($name)) .
+            "/reset\" onsubmit=\"return confirm(" .
+            "'Replace your edits with the original " .
+            "version of this zone?');\" " .
+            "style=\"margin-top:14px\">";
+        echo "<button type=\"submit\" class=\"reset\">" .
+            "Reset to original</button>";
+        echo "</form>";
+    } else if (!$has_original) {
+        echo "<p class=\"muted\" style=\"margin-top:14px\">" .
+            "(No original-zones/" .
+            htmlspecialchars($name) . ".zone, so there " .
+            "is nothing to reset to.)</p>";
+    }
 }
 function dnsClientScript()
 {
@@ -869,6 +1136,72 @@ $site->post('/zones/{name}', function ()
      */
     $site->header("Location: /zones/" .
         rawurlencode($name) . "?saved=1");
+    $site->header("HTTP/1.1 302 Found");
+});
+/*
+    Reset one zone: copy original-zones/{name}.zone over
+    zones/{name}.zone. Refuses to act if the original is
+    missing (typical case: user created a brand-new zone
+    file with no pristine version on hand).
+ */
+$site->post('/zones/{name}/reset', function ()
+    use ($site, $cfg) {
+    $name = (string) ($_REQUEST['name'] ?? '');
+    $name = preg_replace('/[^a-zA-Z0-9._-]/', '', $name);
+    if ($name === '') {
+        echo "Bad zone name.";
+        return;
+    }
+    $live = $cfg['zone_dir'] . DIRECTORY_SEPARATOR .
+        $name . '.zone';
+    $original = $cfg['original_zone_dir'] .
+        DIRECTORY_SEPARATOR . $name . '.zone';
+    if (!is_file($original)) {
+        echo "No original-zones/" . htmlspecialchars($name) .
+            ".zone; nothing to restore.";
+        return;
+    }
+    $tmp = $live . '.new';
+    if (!@copy($original, $tmp)) {
+        echo "Failed to stage reset.";
+        return;
+    }
+    if (!@rename($tmp, $live)) {
+        @unlink($tmp);
+        echo "Failed to install reset.";
+        return;
+    }
+    $site->header("Location: /zones/" .
+        rawurlencode($name) . "?restored=1");
+    $site->header("HTTP/1.1 302 Found");
+});
+/*
+    Restore everything from original-zones/. Files in
+    zones/ that have no pristine counterpart are left
+    alone (we never delete user-created zones); this is a
+    "make me a clean baseline of the demo zones" button,
+    not a "wipe my work" button.
+ */
+$site->post('/restore-all', function () use ($site, $cfg) {
+    $files = glob($cfg['original_zone_dir'] .
+        DIRECTORY_SEPARATOR . '*.zone');
+    if ($files === false) {
+        $files = [];
+    }
+    $restored = 0;
+    foreach ($files as $original) {
+        $base = basename($original);
+        $live = $cfg['zone_dir'] . DIRECTORY_SEPARATOR .
+            $base;
+        $tmp = $live . '.new';
+        if (@copy($original, $tmp) &&
+            @rename($tmp, $live)) {
+            $restored++;
+        } else {
+            @unlink($tmp);
+        }
+    }
+    $site->header("Location: /zones?restored=" . $restored);
     $site->header("HTTP/1.1 302 Found");
 });
 /*

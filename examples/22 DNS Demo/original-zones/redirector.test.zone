@@ -1,0 +1,38 @@
+; redirector.test
+;
+; A heavy-CNAME / heavy-wildcard zone, modeled on what a
+; URL shortener or CDN-fronted SaaS publishes. Almost
+; every owner here is either a CNAME pointing somewhere
+; else or a wildcard that catches every name under a
+; subtree.
+;
+; Wildcards (RFC 4592) match every name that has no
+; exact record at or above the wildcard owner. So a
+; query for foo.t.redirector.test matches *.t but a
+; query for tracking.foo.t.redirector.test does NOT
+; match *.t -- it would need a *.foo.t to catch.
+;
+; Try in the demo: query bit.redirector.test for A
+; (CNAME chase), then anything.t.redirector.test for A
+; (wildcard expansion -- the response rewrites the
+; wildcard owner to the queried name).
+;
+$ORIGIN redirector.test.
+$TTL 600
+@               IN  SOA   ns1.redirector.test. ops.redirector.test. (
+                          2026010101 3600 1800 604800 86400 )
+@               IN  NS    ns1.redirector.test.
+ns1             IN  A     198.51.100.50
+@               IN  A     198.51.100.50
+www             IN  CNAME redirector.test.
+api             IN  CNAME api-lb.redirector.test.
+api-lb          IN  A     198.51.100.51
+api-lb          IN  A     198.51.100.52
+api-lb          IN  A     198.51.100.53
+bit             IN  CNAME api.redirector.test.
+go              IN  CNAME api.redirector.test.
+short           IN  CNAME api.redirector.test.
+*.t             IN  A     198.51.100.60
+*.t             IN  AAAA  2001:db8:11::60
+*.preview       IN  CNAME staging.redirector.test.
+staging         IN  A     198.51.100.70

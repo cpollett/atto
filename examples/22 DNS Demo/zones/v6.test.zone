@@ -1,0 +1,33 @@
+; v6.test
+;
+; An IPv6-first zone. Only the two NS hosts and the apex
+; have A records; everything else is AAAA-only. Useful
+; for showing what a happy-eyeballs client does when AAAA
+; resolves but A does not, and for seeing the wire shape
+; of an IPv6 address in RDATA (16 raw bytes vs 4 for A).
+;
+; Try in the demo: query www.v6.test for AAAA (works),
+; then for A (NODATA -- name exists but not at type A,
+; response shows zero answers and an SOA in authority).
+; Compare the bytes: AAAA RDATA is 16 bytes long, A
+; RDATA is 4.
+;
+$ORIGIN v6.test.
+$TTL 3600
+@               IN  SOA   ns1.v6.test. admin.v6.test. (
+                          2026010101 3600 1800 604800 86400 )
+@               IN  NS    ns1.v6.test.
+@               IN  NS    ns2.v6.test.
+@               IN  A     198.51.100.1
+@               IN  AAAA  2001:db8:6::1
+ns1             IN  A     198.51.100.2
+ns1             IN  AAAA  2001:db8:6::2
+ns2             IN  A     198.51.100.3
+ns2             IN  AAAA  2001:db8:6::3
+www             IN  AAAA  2001:db8:6::80
+api             IN  AAAA  2001:db8:6::a91
+api             IN  AAAA  2001:db8:6::a92
+api             IN  AAAA  2001:db8:6::a93
+cdn             IN  AAAA  2001:db8:6::cd0
+mail            IN  AAAA  2001:db8:6::ed1
+ipv6-only       IN  AAAA  2001:db8:6::fff

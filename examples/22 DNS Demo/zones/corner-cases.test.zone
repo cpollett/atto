@@ -1,0 +1,39 @@
+; corner-cases.test
+;
+; A grab-bag of master-file features that real zones use
+; but that beginner tutorials skip:
+;
+;   - $ORIGIN inside the file (changes the suffix used
+;     for relative names from this point on)
+;   - multi-string TXT (each <character-string> is
+;     length-prefixed in RDATA; a single TXT record can
+;     hold any number of them, and clients reassemble
+;     them in order)
+;   - long TXT close to the 255-byte single-string limit
+;   - deep subdomain chains (DNS labels are limited to
+;     63 octets each but a name can be up to 253 octets
+;     total across all labels)
+;   - owner-name reuse: a leading-whitespace line means
+;     "use the same owner as the previous record"
+;     (the parser supports this via an internal sentinel)
+;
+; Try in the demo: query split.corner-cases.test for TXT
+; and inspect the bytes -- you will see two length-
+; prefixed strings concatenated, not one long one.
+;
+$ORIGIN corner-cases.test.
+$TTL 3600
+@               IN  SOA   ns.corner-cases.test. admin.corner-cases.test. (
+                          2026010101 3600 1800 604800 86400 )
+@               IN  NS    ns.corner-cases.test.
+ns              IN  A     192.0.2.250
+@               IN  A     192.0.2.250
+@               IN  TXT   "single short string"
+big             IN  TXT   "this single TXT record string is intentionally close to but not over the 255 byte single-string limit imposed by RFC 1035 and is meant to show what happens when you push that boundary"
+split           IN  TXT   "first chunk of a multi-string TXT" "second chunk of the same record"
+                IN  TXT   "yet another TXT at the same owner (owner reuse via leading whitespace)"
+deep.deeper.deepest IN A 192.0.2.251
+nested.deeply.so.much.under.corner-cases.test. IN A 192.0.2.252
+$ORIGIN sub.corner-cases.test.
+www             IN  A     192.0.2.230
+api             IN  A     192.0.2.231

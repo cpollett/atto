@@ -1,0 +1,36 @@
+; mail-heavy.test
+;
+; A mail-centric zone. Demonstrates several MX with
+; different preferences (clients try lowest first, fall
+; back as needed), and the three TXT records that real
+; mail systems publish for anti-spam / anti-spoofing:
+; SPF declares which hosts are allowed to originate mail
+; for this domain, DKIM publishes the public half of the
+; signing key clients use to verify message integrity,
+; and DMARC tells receivers what to do when SPF or DKIM
+; fail.
+;
+; Try this in the demo: query mail-heavy.test for MX,
+; then for TXT, then query the dkim selector
+; (default._domainkey.mail-heavy.test) for TXT.
+;
+$ORIGIN mail-heavy.test.
+$TTL 3600
+@               IN  SOA   ns1.mail-heavy.test. postmaster.mail-heavy.test. (
+                          2026010101 3600 1800 604800 86400 )
+@               IN  NS    ns1.mail-heavy.test.
+@               IN  NS    ns2.mail-heavy.test.
+@               IN  A     203.0.113.10
+@               IN  MX    10 mx1.mail-heavy.test.
+@               IN  MX    20 mx2.mail-heavy.test.
+@               IN  MX    50 mx-fallback.mail-heavy.test.
+@               IN  TXT   "v=spf1 mx a:mail-heavy.test -all"
+_dmarc          IN  TXT   "v=DMARC1; p=quarantine; rua=mailto:postmaster@mail-heavy.test"
+default._domainkey IN TXT "v=DKIM1; k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC1234567890fakekey"
+mx1             IN  A     203.0.113.20
+mx1             IN  AAAA  2001:db8:113::20
+mx2             IN  A     203.0.113.21
+mx-fallback     IN  A     203.0.113.99
+ns1             IN  A     203.0.113.2
+ns2             IN  A     203.0.113.3
+www             IN  A     203.0.113.10

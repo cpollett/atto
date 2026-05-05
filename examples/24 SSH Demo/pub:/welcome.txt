@@ -1,0 +1,5 @@
+Welcome to the AttoSSH demo!
+
+This file lives in /pub and is readable by every user.
+Use sftp to fetch it, or "cat /pub/welcome.txt" in the
+toy shell.

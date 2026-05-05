@@ -1,3 +1,0 @@
-2026-05-04: initial AttoFTP demo published
-2026-05-03: added wildcard scenarios to AttoDNS demo
-2026-05-02: AttoDNS demo shipped

@@ -34,8 +34,9 @@
  *      UDP 15353    -- standard DNS over UDP
  *      TCP 15353    -- standard DNS over TCP (large responses,
  *                     truncation fallback)
- *      TCP 18853    -- DNS-over-TLS (DoT) when a SERVER_CONTEXT
- *                     ssl block is configured below
+ *      TCP 18853    -- DNS-over-TLS (DoT), served with the
+ *                     self-signed cert from atto's security/
+ *                     folder
  *
  * High ports are used so the demo runs without root. We pick
  * 15353 / 18853 specifically because UDP 5353 is camped by
@@ -163,20 +164,18 @@ $config = [
     'SERVER_NAME' => 'atto-dns-demo',
 ];
 /*
-    DNS-over-TLS (RFC 7858) needs a server certificate. We
-    read it from this directory if present; absence means
-    DoT is silently skipped. The cert and key files are not
-    shipped with atto -- generate a self-signed pair like:
-        openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem
-            -out cert.pem -days 365 -subj "/CN=atto-dns-demo"
-    and drop them in this directory next to index.php.
-    Windows users without openssl on PATH can use the bundled
-    one inside Git for Windows (C:\Program Files\Git\usr\bin\
-    openssl.exe), the WSL openssl, or any of the various
-    Windows OpenSSL builds (e.g. from slproweb.com).
+    DNS-over-TLS (RFC 7858) uses the self-signed server cert
+    that ships under atto's security/ folder. The same pair
+    powers examples 09 (HTTPS), 12 (Virtual Hosting), 16
+    (Server Push), 17 (HTTP/3), and 23 (FTPS), so trusting
+    it once in your client suffices for the whole repo.
  */
-$cert = __DIR__ . DIRECTORY_SEPARATOR . 'cert.pem';
-$key = __DIR__ . DIRECTORY_SEPARATOR . 'key.pem';
+$cert = __DIR__ . DIRECTORY_SEPARATOR . '..' .
+    DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR .
+    'security' . DIRECTORY_SEPARATOR . 'server.crt';
+$key = __DIR__ . DIRECTORY_SEPARATOR . '..' .
+    DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR .
+    'security' . DIRECTORY_SEPARATOR . 'server.key';
 if (is_file($cert) && is_file($key)) {
     $config['SERVER_CONTEXT'] = ['ssl' => [
         'local_cert' => $cert,

@@ -35,6 +35,9 @@ $cfg = [
     'host' => '127.0.0.1',
     'port' => 12121,
     'tls_port' => 19990,
+    'root_dir' => __DIR__ . DIRECTORY_SEPARATOR . 'root',
+    'original_root_dir' => __DIR__ . DIRECTORY_SEPARATOR .
+        'original-root',
     'demo_users' => [
         ['user' => 'anonymous', 'pass' => 'guest@example.com',
             'label' => 'Anonymous (read-only, /pub)'],
@@ -264,171 +267,155 @@ function ftpRenderTranscript($transcript)
 $site->get('/style.css', function () use ($site) {
     $site->header("Content-Type: text/css");
     echo <<<'CSS'
-* { box-sizing: border-box; }
-body {
-    margin: 0; font-family: -apple-system, BlinkMacSystemFont,
-        "Segoe UI", Roboto, sans-serif;
-    background: #f7f7f8; color: #222;
-}
-.page {
-    max-width: 1100px; margin: 0 auto; padding: 0 20px 40px;
-}
-header {
-    background: #1f2937; color: #f5f5f7; padding: 18px 24px;
-    margin: 0 -20px 20px;
-}
-header h1 { margin: 0; font-size: 20px; font-weight: 600; }
-header small { color: #9ca3af; }
-nav.tabs {
-    display: flex; gap: 4px; border-bottom: 1px solid #d1d5db;
-    margin-bottom: 18px;
-}
-nav.tabs a {
-    padding: 8px 14px; text-decoration: none; color: #444;
-    border: 1px solid transparent; border-bottom: none;
-    border-radius: 6px 6px 0 0;
-}
-nav.tabs a.active {
-    background: #fff; border-color: #d1d5db;
-    color: #111; font-weight: 600;
-}
-.banner {
-    background: #fef3c7; color: #92400e; padding: 8px 12px;
-    border-radius: 6px; font-size: 13px; margin-bottom: 14px;
-}
-.banner code, .scenario p code {
-    background: rgba(0,0,0,0.06); padding: 1px 6px;
-    border-radius: 3px; font-size: 12px;
-}
-.scenario-list {
-    display: grid; grid-template-columns: 1fr; gap: 10px;
-}
-.scenario {
-    background: #fff; border: 1px solid #e5e7eb;
-    border-radius: 8px; padding: 14px 16px;
-}
-.scenario h3 {
-    margin: 0 0 6px; font-size: 15px; font-weight: 600;
-}
-.scenario p {
-    margin: 0 0 10px; color: #4b5563; font-size: 14px;
-}
-.scenario button {
-    background: #2563eb; color: #fff; border: 0;
-    padding: 6px 14px; border-radius: 6px; cursor: pointer;
-    font-size: 13px;
-}
-.scenario button:hover { background: #1d4ed8; }
-.scenario button:disabled { background: #93c5fd; }
-.result-slot { margin-top: 12px; }
-.transcript {
-    background: #0f172a; color: #e2e8f0; padding: 10px 12px;
-    border-radius: 6px; font-family: ui-monospace,
-        "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12px; white-space: pre; overflow-x: auto;
-    line-height: 1.5;
-    max-height: 420px;
-}
-.body-pane {
-    background: #f3f4f6; border: 1px solid #e5e7eb;
-    border-radius: 6px; padding: 10px 12px; margin-top: 8px;
-    font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 12px; white-space: pre-wrap; max-height: 300px;
-    overflow-y: auto;
-}
-.note {
-    color: #6b7280; font-size: 12px; margin-top: 6px;
-}
-form.raw, form.session {
-    background: #fff; border: 1px solid #e5e7eb;
-    padding: 14px; border-radius: 8px; margin-bottom: 14px;
-}
-form.raw label, form.session label {
-    display: block; font-size: 12px; color: #4b5563;
-    margin-bottom: 3px;
-}
-form.raw textarea {
-    width: 100%; min-height: 140px;
-    font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 13px; padding: 8px; border: 1px solid #d1d5db;
-    border-radius: 4px; line-height: 1.5;
-}
-form.raw select, form.session select, form.raw input {
-    padding: 6px 8px; border: 1px solid #d1d5db;
-    border-radius: 4px; font-size: 14px;
-}
-form.raw button, form.session button {
-    background: #2563eb; color: #fff; border: 0;
-    padding: 8px 16px; border-radius: 4px; cursor: pointer;
-    font-size: 14px; margin-top: 8px;
-}
-form.raw .row {
-    display: flex; gap: 12px; margin-bottom: 10px;
-    align-items: end;
-}
-.browser {
-    background: #fff; border: 1px solid #e5e7eb;
-    border-radius: 8px; padding: 14px;
-}
-.browser .crumb {
-    font-family: ui-monospace, Menlo, Consolas, monospace;
-    font-size: 13px; padding: 6px 10px; background: #f3f4f6;
-    border-radius: 4px; margin-bottom: 10px;
-}
-.browser table {
-    width: 100%; border-collapse: collapse; font-size: 14px;
-}
-.browser th, .browser td {
-    padding: 6px 10px; text-align: left;
-    border-bottom: 1px solid #f3f4f6;
-}
+body { font-family: -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Roboto, sans-serif;
+    max-width: 920px; margin: 1.5em auto; padding: 0 1em;
+    color: #222; }
+h1 { margin-bottom: 0.1em; }
+.meta { color: #666; font-size: 0.9em; margin-bottom: 1.5em; }
+h2 { font-size: 1.05em; margin-top: 1.6em;
+    padding-bottom: 0.2em; border-bottom: 1px solid #ddd; }
+.note { color: #555; font-size: 0.88em; }
+code { background: #eee; padding: 0.1em 0.3em;
+    border-radius: 3px; font-family: ui-monospace,
+    SFMono-Regular, Menlo, monospace; }
+nav.tabs { display: flex; gap: 4px; margin: 0.5em 0 1em;
+    border-bottom: 1px solid #ddd; }
+nav.tabs a { padding: 0.5em 1em; text-decoration: none;
+    color: #444; border: 1px solid transparent;
+    border-bottom: none; border-radius: 4px 4px 0 0; }
+nav.tabs a.active { background: #f6f6f6; border-color: #ddd;
+    color: #111; font-weight: 600; }
+.reset-bar { display: flex; align-items: center; gap: 1em;
+    margin: 1em 0 1.5em; padding: 0.7em 0.9em;
+    background: #fff8e6; border: 1px solid #f0d890;
+    border-radius: 4px; }
+.reset-bar button { font: inherit; padding: 0.4em 1em;
+    background: #d97706; color: white; border: 0;
+    border-radius: 4px; cursor: pointer; flex-shrink: 0; }
+.reset-bar button:hover { background: #b85f04; }
+.reset-bar button:disabled { background: #888;
+    cursor: default; }
+.reset-bar .reset-status { color: #555; font-size: 0.9em; }
+.scenario { margin: 0.6em 0; padding: 0.7em 0.9em;
+    background: #f6f6f6; border-radius: 4px; }
+.scenario .row { display: flex; align-items: center;
+    justify-content: space-between; gap: 1em; }
+.scenario .label { font-weight: 600; }
+.scenario .desc { color: #555; font-size: 0.92em;
+    margin-top: 0.25em; }
+.scenario button { font: inherit; padding: 0.35em 0.9em;
+    background: #06c; color: white; border: 0;
+    border-radius: 4px; cursor: pointer; flex-shrink: 0;
+    min-width: 4.5em; text-align: center; }
+.scenario button:disabled { background: #888;
+    cursor: default; }
+.scenario button.close { background: #b33; }
+.scenario button.close:hover { background: #c44; }
+.scenario .transcript { display: none; margin-top: 0.7em;
+    background: #1e1e1e; color: #ddd; padding: 0.8em;
+    border-radius: 4px; white-space: pre-wrap;
+    font-size: 0.85em; font-family: ui-monospace,
+    SFMono-Regular, Menlo, monospace; max-height: 360px;
+    overflow: auto; }
+.scenario .transcript.visible { display: block; }
+.scenario .body-pane { display: none; margin-top: 0.5em;
+    background: #fff; padding: 0.8em; border-radius: 4px;
+    border: 1px solid #ddd; font-size: 0.85em;
+    font-family: ui-monospace, SFMono-Regular, Menlo,
+    monospace; white-space: pre-wrap; max-height: 200px;
+    overflow: auto; }
+.scenario .body-pane.visible { display: block; }
+.scenario .body-pane .hint { display: block;
+    font-family: -apple-system, BlinkMacSystemFont,
+    sans-serif; font-size: 0.85em; color: #666;
+    margin-bottom: 0.4em; }
+form.raw { background: #f6f6f6; padding: 0.9em;
+    border-radius: 4px; margin: 0.6em 0; }
+form.raw label { display: block; font-size: 0.85em;
+    color: #555; margin-bottom: 0.2em; }
+form.raw .row { display: flex; gap: 1em;
+    margin-bottom: 0.7em; align-items: end; flex-wrap: wrap; }
+form.raw .row > div { flex: 1; min-width: 180px; }
+form.raw select, form.raw input[type=text] { font: inherit;
+    padding: 0.35em 0.5em; border: 1px solid #bbb;
+    border-radius: 3px; width: 100%; }
+form.raw textarea { font: inherit; font-family: ui-monospace,
+    SFMono-Regular, Menlo, monospace; font-size: 0.9em;
+    padding: 0.5em; border: 1px solid #bbb;
+    border-radius: 3px; width: 100%; min-height: 7em;
+    line-height: 1.4; }
+form.raw button { font: inherit; padding: 0.4em 1em;
+    background: #06c; color: white; border: 0;
+    border-radius: 4px; cursor: pointer;
+    margin-top: 0.5em; }
+form.raw button:hover { background: #0050a0; }
+#rawResult { margin-top: 0.7em; }
+.user-pick { background: #ecf3ff; border: 1px solid #b8c8e8;
+    padding: 0.7em 0.9em; border-radius: 4px;
+    margin-bottom: 1em; }
+.user-pick label { font-size: 0.85em; color: #555;
+    margin-right: 0.4em; }
+.user-pick select { font: inherit; padding: 0.3em 0.5em;
+    border: 1px solid #b8c8e8; border-radius: 4px;
+    background: #fff; }
+.browser { background: #f6f6f6; padding: 0.9em;
+    border-radius: 4px; margin: 0.6em 0; }
+.browser .crumb { font-family: ui-monospace,
+    SFMono-Regular, Menlo, monospace; font-size: 0.9em;
+    padding: 0.4em 0.6em; background: #fff;
+    border: 1px solid #ddd; border-radius: 3px;
+    margin-bottom: 0.6em; }
+.browser table { width: 100%; border-collapse: collapse;
+    background: #fff; border: 1px solid #ddd;
+    border-radius: 3px; }
+.browser th, .browser td { text-align: left;
+    padding: 0.35em 0.6em; border-bottom: 1px solid #eee;
+    font-size: 0.92em; }
+.browser th { background: #f4f4f4; font-weight: 600;
+    font-size: 0.85em; }
 .browser tr:hover { background: #fafafa; }
-.browser a { color: #1e3a8a; text-decoration: none; }
+.browser a { color: #06c; text-decoration: none; }
 .browser a:hover { text-decoration: underline; }
-.browser .actions {
-    display: flex; gap: 4px;
-}
-.browser .actions a, .browser .actions form {
-    display: inline; margin: 0;
-}
-.browser .actions button {
-    background: transparent; border: 1px solid #d1d5db;
-    padding: 2px 8px; border-radius: 3px; cursor: pointer;
-    font-size: 12px;
-}
-.browser .actions button:hover { background: #f3f4f6; }
-.browser .actions button.danger {
-    color: #b91c1c; border-color: #fecaca;
-}
-.upload-form {
-    margin-top: 14px; padding: 12px; background: #f9fafb;
-    border: 1px dashed #d1d5db; border-radius: 6px;
-}
-.upload-form label {
-    display: block; font-size: 12px; color: #4b5563;
-    margin-bottom: 4px;
-}
-.upload-form input, .upload-form button {
-    padding: 6px 10px; border: 1px solid #d1d5db;
-    border-radius: 4px; font-size: 14px;
-}
-.upload-form button {
-    background: #2563eb; color: #fff; border: 0;
-    cursor: pointer;
-}
-.user-pick {
-    background: #eef2ff; border: 1px solid #c7d2fe;
-    padding: 8px 12px; border-radius: 6px;
-    margin-bottom: 12px; font-size: 13px;
-}
-footer {
-    margin-top: 32px; padding-top: 16px;
-    border-top: 1px solid #e5e7eb;
-    color: #6b7280; font-size: 12px; text-align: center;
-}
-@media (max-width: 700px) {
-    form.raw .row { flex-direction: column; }
-}
+.browser .actions { display: flex; gap: 0.3em;
+    flex-wrap: wrap; }
+.browser .actions form { display: inline; margin: 0; }
+.browser .actions button { font: inherit;
+    padding: 0.15em 0.6em; background: #fff;
+    color: #444; border: 1px solid #bbb; border-radius: 3px;
+    cursor: pointer; font-size: 0.85em; }
+.browser .actions button:hover { background: #eef; }
+.browser .actions button.danger { color: #b33;
+    border-color: #f0c0c0; }
+.browser .actions button.danger:hover { background: #fee; }
+.upload-form { margin-top: 0.8em; padding: 0.7em;
+    background: #fff; border: 1px dashed #ccc;
+    border-radius: 4px; }
+.upload-form label { display: block; font-size: 0.85em;
+    color: #555; margin-bottom: 0.2em; }
+.upload-form input[type=file], .upload-form input[type=text]
+    { font: inherit; padding: 0.3em 0.5em;
+    border: 1px solid #bbb; border-radius: 3px;
+    margin-right: 0.4em; }
+.upload-form button { font: inherit;
+    padding: 0.35em 0.9em; background: #06c; color: white;
+    border: 0; border-radius: 4px; cursor: pointer; }
+.upload-form button:hover { background: #0050a0; }
+.upload-form form { display: inline-block;
+    margin-right: 1em; margin-bottom: 0.4em; }
+.transcript-wrap { margin-top: 1em; }
+.transcript-wrap h3 { font-size: 0.92em; color: #555;
+    font-weight: 600; margin: 0 0 0.3em; }
+pre.transcript-static { background: #1e1e1e; color: #ddd;
+    padding: 0.8em; border-radius: 4px; white-space: pre-wrap;
+    font-size: 0.85em; font-family: ui-monospace,
+    SFMono-Regular, Menlo, monospace; max-height: 360px;
+    overflow: auto; margin: 0; }
+.banner { background: #ecf3ff; color: #234;
+    border: 1px solid #b8c8e8; padding: 0.7em 0.9em;
+    border-radius: 4px; font-size: 0.9em;
+    margin-bottom: 1em; line-height: 1.4; }
+.banner code { background: rgba(0,0,0,0.06); }
 CSS;
 });
 /*
@@ -444,24 +431,53 @@ function ftpRenderPage($which, $cfg, $body_fn)
         'raw' => ['/raw', 'Raw command box'],
         'browser' => ['/browser', 'File browser'],
     ];
-    echo "<!doctype html><html><head>";
+    $reset_msg = '';
+    if (isset($_GET['reset']) && $_GET['reset'] !== '') {
+        if ($_GET['reset'] === 'ok') {
+            $n = isset($_GET['count']) ?
+                (int) $_GET['count'] : 0;
+            $reset_msg = "Reset complete. Restored $n " .
+                "file" . ($n === 1 ? '' : 's') .
+                " from original-root/.";
+        } else if ($_GET['reset'] === 'err') {
+            $reset_msg = "Reset finished with errors -- " .
+                "see server console for details.";
+        }
+    }
+    echo "<!DOCTYPE html><html lang=\"en\"><head>";
     echo "<meta charset=\"utf-8\">";
     echo "<meta name=\"viewport\" content=\"width=" .
         "device-width, initial-scale=1\">";
-    echo "<title>AttoFTP demo</title>";
+    echo "<title>AttoFTP Demo</title>";
     echo "<link rel=\"stylesheet\" href=\"/style.css\">";
     echo "</head><body>";
-    echo "<header><div class=\"page\">";
-    echo "<h1>AttoFTP demo</h1>";
-    echo "<small>FTP server on tcp://" .
+    echo "<h1>AttoFTP Demo</h1>";
+    echo "<div class=\"meta\">FTP control on tcp://" .
         htmlspecialchars($cfg['host']) . ":" .
-        (int) $cfg['port'] . " &middot; ";
-    echo "implicit FTPS on tcp://" .
-        htmlspecialchars($cfg['host']) . ":" .
-        (int) $cfg['tls_port'];
-    echo "</small>";
-    echo "</div></header>";
-    echo "<div class=\"page\">";
+        (int) $cfg['port'] . " &middot; implicit FTPS on " .
+        "tcp://" . htmlspecialchars($cfg['host']) . ":" .
+        (int) $cfg['tls_port'] . ". Companion UI to <code>" .
+        "index.php</code>; every transcript on this page " .
+        "comes from a real control-channel exchange with " .
+        "the running server.</div>";
+    /*
+        Reset bar -- copies of original-root/ overlay any
+        local changes in root/. Same shape and palette as
+        ex20's reset-all-stored-mail bar.
+     */
+    echo "<div class=\"reset-bar\">";
+    echo "<button type=\"button\" id=\"reset-btn\">" .
+        "Reset root/ from original-root/</button>";
+    echo "<span class=\"reset-status\" id=\"reset-status\">";
+    if ($reset_msg !== '') {
+        echo htmlspecialchars($reset_msg);
+    } else {
+        echo "Wipes uploads, renames, deletions and " .
+            "directory changes under <code>root/</code> " .
+            "and overlays the pristine demo content from " .
+            "<code>original-root/</code>.";
+    }
+    echo "</span></div>";
     echo "<nav class=\"tabs\">";
     foreach ($tabs as $key => $info) {
         list($url, $label) = $info;
@@ -470,13 +486,48 @@ function ftpRenderPage($which, $cfg, $body_fn)
             htmlspecialchars($label) . "</a>";
     }
     echo "</nav>";
-    call_user_func($body_fn);
-    echo "<footer>AttoFTP &middot; built on FtpSite, " .
-        "FilesystemFtpStorage, and CompositeAuthenticator. " .
-        "All transcripts on this page come from real " .
-        "control-channel exchanges with the running server.";
-    echo "</footer>";
-    echo "</div></body></html>";
+    $body_fn();
+    echo "<script>" . ftpResetScript() . "</script>";
+    echo "</body></html>";
+}
+/*
+    Tiny client-side script for the reset bar's confirm-then-
+    POST flow. Posts to /reset and reloads the current page
+    with status query-parameters that the server-side
+    rendering surfaces in the bar.
+ */
+function ftpResetScript()
+{
+    return <<<'JS'
+(function () {
+    var btn = document.getElementById('reset-btn');
+    if (!btn) return;
+    btn.addEventListener('click', function () {
+        if (!window.confirm(
+            'Wipe root/ and restore from original-root/?\n' +
+            'This cannot be undone.')) {
+            return;
+        }
+        btn.disabled = true;
+        btn.textContent = 'Resetting...';
+        fetch('/reset', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                var qs = data.errors && data.errors.length ?
+                    '?reset=err' :
+                    '?reset=ok&count=' +
+                    encodeURIComponent(data.restored || 0);
+                window.location.search = qs;
+            })
+            .catch(function (err) {
+                btn.disabled = false;
+                btn.textContent = 'Reset root/ from ' +
+                    'original-root/';
+                alert('Reset failed: ' + err);
+            });
+    });
+})();
+JS;
 }
 /*
     Returns the static list of scenarios. Each entry has:
@@ -730,26 +781,29 @@ function ftpRenderScenarios($cfg)
         "server, run a scripted sequence of FTP commands, " .
         "and see the wire transcript. Greater-than (&gt;) " .
         "lines are sent by the client; less-than (&lt;) " .
-        "lines are server responses.<br><br>" .
-        "<strong>Try this:</strong> run " .
+        "lines are server responses. Click the <strong>" .
+        "&times;</strong> button to hide a transcript again." .
+        "<br><br><strong>Try this:</strong> run " .
         "<em>alice: upload</em>, then run " .
-        "<em>alice: rename + delete</em> to round-trip " .
-        "the upload through the rename and delete " .
-        "commands and verify the file is gone.</div>";
-    echo "<div class=\"scenario-list\">";
+        "<em>alice: rename + delete</em> to round-trip the " .
+        "upload through rename and delete and verify the " .
+        "file is gone.</div>";
     foreach (ftpScenarioList() as $key => $info) {
         echo "<div class=\"scenario\" data-key=\"" .
             htmlspecialchars($key) . "\">";
-        echo "<h3>" . htmlspecialchars($info['title']) .
-            "</h3>";
-        echo "<p>" . htmlspecialchars($info['desc']) . "</p>";
-        echo "<button type=\"button\" onclick=\"" .
-            "ftpRunScenario('" . $key . "', this)\">" .
-            "Run</button>";
-        echo "<div class=\"result-slot\"></div>";
+        echo "<div class=\"row\">";
+        echo "<div>";
+        echo "<div class=\"label\">" .
+            htmlspecialchars($info['title']) . "</div>";
+        echo "<div class=\"desc\">" .
+            htmlspecialchars($info['desc']) . "</div>";
+        echo "</div>";
+        echo "<button type=\"button\">Run</button>";
+        echo "</div>";
+        echo "<pre class=\"transcript\"></pre>";
+        echo "<div class=\"body-pane\"></div>";
         echo "</div>";
     }
-    echo "</div>";
     echo "<script>\n" . ftpClientScript() . "\n</script>\n";
 }
 /*
@@ -780,7 +834,7 @@ function ftpRenderRaw($cfg)
         "<code>HELP</code></div>";
     echo "<form class=\"raw\" id=\"rawForm\">";
     echo "<div class=\"row\">";
-    echo "<div style=\"flex:1\"><label>User</label>";
+    echo "<div><label>User</label>";
     echo "<select name=\"who\" id=\"whoPick\" " .
         "onchange=\"ftpUserPicked(this)\">";
     foreach ($cfg['demo_users'] as $i => $u) {
@@ -791,11 +845,12 @@ function ftpRenderRaw($cfg)
     echo "<option value=\"custom\">Custom...</option>";
     echo "</select></div>";
     echo "<div><label>Username</label>";
-    echo "<input name=\"user\" id=\"userField\" " .
-        "value=\"anonymous\"></div>";
+    echo "<input type=\"text\" name=\"user\" " .
+        "id=\"userField\" value=\"anonymous\"></div>";
     echo "<div><label>Password</label>";
-    echo "<input name=\"pass\" id=\"passField\" " .
-        "value=\"guest@example.com\"></div>";
+    echo "<input type=\"text\" name=\"pass\" " .
+        "id=\"passField\" value=\"guest@example.com\">" .
+        "</div>";
     echo "</div>";
     echo "<label>Commands (one per line; QUIT is sent " .
         "automatically at the end)</label>";
@@ -971,7 +1026,7 @@ function ftpRenderBrowser($cfg, $params)
         echo "<button type=\"submit\">Upload</button>";
         echo "</form>";
         echo "<form method=\"post\" action=\"" .
-            "/browser/mkdir\" style=\"margin-top:10px\">";
+            "/browser/mkdir\">";
         echo "<input type=\"hidden\" name=\"who\" " .
             "value=\"$who\">";
         echo "<input type=\"hidden\" name=\"cwd\" " .
@@ -988,15 +1043,17 @@ function ftpRenderBrowser($cfg, $params)
             "to upload, rename, delete, or mkdir.</div>";
     }
     echo "</div>";
-    /* Always show the transcript of the listing call so
-       the educational point is reinforced even on the
-       browser tab. */
-    echo "<h3 style=\"margin-top:20px;font-size:14px;" .
-        "color:#4b5563;font-weight:600\">FTP transcript " .
-        "(MLSD listing)</h3>";
-    echo "<pre class=\"transcript\">" .
+    /*
+        Always show the transcript of the listing call so
+        the educational point is reinforced even on the
+        browser tab.
+     */
+    echo "<div class=\"transcript-wrap\">";
+    echo "<h3>FTP transcript (MLSD listing)</h3>";
+    echo "<pre class=\"transcript-static\">" .
         htmlspecialchars(ftpRenderTranscript(
         $session['transcript'])) . "</pre>";
+    echo "</div>";
     echo "<script>\n" .
         "function ftpRenamePrompt(form) {\n" .
         "  var current = form.querySelector(\n" .
@@ -1090,50 +1147,76 @@ function ftpParentPath($path)
 function ftpClientScript()
 {
     return <<<'JS'
-async function ftpRunScenario(key, btn) {
-    btn.disabled = true;
-    btn.textContent = 'Running...';
-    try {
+/*
+    Each scenario card binds its button to a tri-state toggle:
+        Run        -> click sends the request, fills the
+                      transcript pane, switches button to X.
+        X          -> click hides the pane, restores Run.
+        Running... -> in-flight; button disabled.
+ */
+document.querySelectorAll('.scenario').forEach(function (el) {
+    var btn = el.querySelector('button');
+    var key = el.dataset.key;
+    var pre = el.querySelector('.transcript');
+    var body = el.querySelector('.body-pane');
+    function showRun() {
+        btn.textContent = 'Run';
+        btn.classList.remove('close');
+        btn.disabled = false;
+    }
+    function showClose() {
+        btn.textContent = '\u2715';
+        btn.classList.add('close');
+        btn.disabled = false;
+    }
+    function showBusy() {
+        btn.textContent = 'Running...';
+        btn.classList.remove('close');
+        btn.disabled = true;
+    }
+    function hideAll() {
+        pre.classList.remove('visible');
+        pre.textContent = '';
+        body.classList.remove('visible');
+        body.innerHTML = '';
+    }
+    btn.addEventListener('click', function () {
+        if (btn.classList.contains('close')) {
+            hideAll();
+            showRun();
+            return;
+        }
+        showBusy();
+        hideAll();
+        pre.classList.add('visible');
+        pre.textContent = '(running...)';
         var fd = new FormData();
         fd.append('scenario', key);
-        var r = await fetch('/scenario',
-            { method: 'POST', body: fd });
-        var data = await r.json();
-        var slot = btn.parentElement
-            .querySelector('.result-slot');
-        slot.innerHTML = ftpRenderResult(data);
-    } catch (e) {
-        var slot = btn.parentElement
-            .querySelector('.result-slot');
-        slot.innerHTML =
-            '<div class="body-pane">' +
-            ftpEscapeHtml(String(e)) + '</div>';
-    } finally {
-        btn.disabled = false;
-        btn.textContent = 'Run';
-    }
-}
-function ftpRenderResult(data) {
-    var html = '';
-    if (data.error) {
-        return '<div class="body-pane">' +
-            ftpEscapeHtml(data.error) + '</div>';
-    }
-    if (data.note) {
-        html += '<div class="note">' +
-            ftpEscapeHtml(data.note) + '</div>';
-    }
-    html += '<pre class="transcript">' +
-        ftpEscapeHtml(data.transcript) + '</pre>';
-    if (data.body && data.body.length > 0) {
-        html += '<div class="note">Data channel ' +
-            'payload (' + data.body.length +
-            ' bytes):</div>';
-        html += '<pre class="body-pane">' +
-            ftpEscapeHtml(data.body) + '</pre>';
-    }
-    return html;
-}
+        fetch('/scenario', { method: 'POST', body: fd })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.error) {
+                    pre.textContent = 'ERROR: ' + data.error;
+                } else {
+                    pre.textContent = data.transcript ||
+                        '(empty transcript)';
+                    if (data.body && data.body.length > 0) {
+                        body.innerHTML = '<span class="hint">' +
+                            'Data channel payload (' +
+                            data.body.length + ' bytes):' +
+                            '</span>' +
+                            ftpEscapeHtml(data.body);
+                        body.classList.add('visible');
+                    }
+                }
+                showClose();
+            })
+            .catch(function (err) {
+                pre.textContent = 'ERROR: ' + err;
+                showClose();
+            });
+    });
+});
 function ftpEscapeHtml(s) {
     return String(s)
         .replace(/&/g, '&amp;')
@@ -1148,34 +1231,47 @@ function ftpUserPicked(sel) {
         return;
     }
     var i = parseInt(v, 10);
-    if (typeof demoUsers !== 'undefined' &&
-        demoUsers[i]) {
+    if (typeof demoUsers !== 'undefined' && demoUsers[i]) {
         document.getElementById('userField').value =
             demoUsers[i].user;
         document.getElementById('passField').value =
             demoUsers[i].pass;
     }
 }
+/*
+    Raw command-box submit. Posts the typed commands and
+    renders the transcript inline below the form.
+ */
 var rawForm = document.getElementById('rawForm');
 if (rawForm) {
-    rawForm.addEventListener('submit',
-        async function (ev) {
+    rawForm.addEventListener('submit', function (ev) {
         ev.preventDefault();
         var slot = document.getElementById('rawResult');
-        slot.innerHTML =
-            '<div class="note">Sending...</div>';
+        slot.innerHTML = '<pre class="transcript-static">' +
+            '(sending...)</pre>';
         var fd = new FormData(rawForm);
-        try {
-            var r = await fetch('/raw',
-                { method: 'POST', body: fd });
-            var data = await r.json();
-            slot.innerHTML = ftpRenderResult(data);
-        } catch (e) {
-            slot.innerHTML =
-                '<div class="body-pane">' +
-                ftpEscapeHtml(String(e)) +
-                '</div>';
-        }
+        fetch('/raw', { method: 'POST', body: fd })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.error) {
+                    slot.innerHTML =
+                        '<pre class="transcript-static">' +
+                        'ERROR: ' +
+                        ftpEscapeHtml(data.error) +
+                        '</pre>';
+                    return;
+                }
+                slot.innerHTML =
+                    '<pre class="transcript-static">' +
+                    ftpEscapeHtml(data.transcript ||
+                        '(empty)') + '</pre>';
+            })
+            .catch(function (err) {
+                slot.innerHTML =
+                    '<pre class="transcript-static">' +
+                    'ERROR: ' + ftpEscapeHtml(String(err)) +
+                    '</pre>';
+            });
     });
 }
 JS;
@@ -1420,4 +1516,101 @@ $site->post('/browser/mkdir', function () use ($site,
     $site->header("Location: /browser?who=$who&cwd=" .
         urlencode($cwd));
 });
+/*
+    Reset endpoint: wipe everything under root/ and overlay
+    a fresh copy of original-root/. Returns JSON with the
+    file count and any errors. The reset bar's JS reloads
+    the page with a status query-parameter so the result
+    is visible without an additional state plumbing.
+ */
+$site->post('/reset', function () use ($site, $cfg) {
+    $site->header("Content-Type: application/json");
+    $live = $cfg['root_dir'];
+    $original = $cfg['original_root_dir'];
+    $errors = [];
+    if (!is_dir($original)) {
+        echo json_encode(['restored' => 0,
+            'errors' => ["original-root/ not found"]]);
+        return;
+    }
+    /*
+        Two-phase clean. First, recursively delete every
+        file and directory under root/ except root/ itself
+        (we keep the top-level dir so the running FTP
+        process's open file descriptors do not break).
+     */
+    if (is_dir($live)) {
+        ftpRecursiveClean($live, $errors);
+    } else {
+        @mkdir($live, 0755, true);
+    }
+    /*
+        Now mirror original-root/ over root/.
+     */
+    $count = 0;
+    ftpRecursiveCopy($original, $live, $count, $errors);
+    echo json_encode(['restored' => $count,
+        'errors' => $errors]);
+});
+/*
+    Recursively deletes all entries inside $dir, but leaves
+    $dir itself in place. Records error strings in $errors.
+ */
+function ftpRecursiveClean($dir, &$errors)
+{
+    $entries = @scandir($dir);
+    if ($entries === false) {
+        $errors[] = "scandir failed: $dir";
+        return;
+    }
+    foreach ($entries as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+        $path = $dir . DIRECTORY_SEPARATOR . $name;
+        if (is_dir($path) && !is_link($path)) {
+            ftpRecursiveClean($path, $errors);
+            if (!@rmdir($path)) {
+                $errors[] = "rmdir failed: $path";
+            }
+        } else {
+            if (!@unlink($path)) {
+                $errors[] = "unlink failed: $path";
+            }
+        }
+    }
+}
+/*
+    Recursively copies all entries from $src into $dst
+    (which must exist). Increments $count for each file
+    copied and records error strings in $errors.
+ */
+function ftpRecursiveCopy($src, $dst, &$count, &$errors)
+{
+    $entries = @scandir($src);
+    if ($entries === false) {
+        $errors[] = "scandir failed: $src";
+        return;
+    }
+    foreach ($entries as $name) {
+        if ($name === '.' || $name === '..') {
+            continue;
+        }
+        $sp = $src . DIRECTORY_SEPARATOR . $name;
+        $dp = $dst . DIRECTORY_SEPARATOR . $name;
+        if (is_dir($sp)) {
+            if (!is_dir($dp) && !@mkdir($dp, 0755, true)) {
+                $errors[] = "mkdir failed: $dp";
+                continue;
+            }
+            ftpRecursiveCopy($sp, $dp, $count, $errors);
+        } else if (is_file($sp)) {
+            if (@copy($sp, $dp)) {
+                $count++;
+            } else {
+                $errors[] = "copy failed: $sp -> $dp";
+            }
+        }
+    }
+}
 $site->listen(8080);

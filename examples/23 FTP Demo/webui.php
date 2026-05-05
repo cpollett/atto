@@ -199,6 +199,66 @@ function ftpPasvTransfer($sock, $cmd, $direction,
     return ['body' => $body, 'note' => null];
 }
 /*
+    EPSV variant of ftpPasvTransfer. Sends EPSV instead of
+    PASV, parses the (|||port|) reply to get the data port,
+    then dials whatever host the control connection arrived
+    on. The dial address is family-correct automatically:
+    stream_socket_get_name returns "[::1]:port" for v6 peers
+    and "127.0.0.1:port" for v4, so we just splice the new
+    data port onto the host part. This is exactly the
+    behavior real FTP clients use over EPSV -- the server's
+    omitting the address from the reply is what makes EPSV
+    dual-stack-clean.
+ */
+function ftpEpsvTransfer($sock, $cmd, $direction,
+    &$transcript, $upload_body = '')
+{
+    $reply = ftpSendCmd($sock, 'EPSV', $transcript);
+    $port = 0;
+    foreach ($reply as $line) {
+        if (preg_match('/\(\|\|\|(\d+)\|\)/', $line, $m)) {
+            $port = (int) $m[1];
+            break;
+        }
+    }
+    if ($port === 0) {
+        return ['body' => '',
+            'note' => 'EPSV reply not parseable'];
+    }
+    /*
+        Splice the EPSV-supplied port onto the control's
+        remote address. The remote name from the server's
+        side of the control socket is "host:port" (or
+        "[host]:port" for v6) -- we rebuild it with the new
+        port so the dial uses the correct family.
+     */
+    $remote = stream_socket_get_name($sock, true);
+    $colon = strrpos($remote, ':');
+    $host_part = substr($remote, 0, $colon);
+    $addr = "tcp://$host_part:$port";
+    @fwrite($sock, $cmd . "\r\n");
+    $transcript[] = ['dir' => '>', 'lines' => [$cmd]];
+    $data = @stream_socket_client($addr,
+        $errno, $errstr, 5);
+    $open = ftpReadReply($sock);
+    $transcript[] = ['dir' => '<', 'lines' => $open];
+    if (!$data) {
+        return ['body' => '',
+            'note' => "data connect failed: $errstr"];
+    }
+    stream_set_timeout($data, 5);
+    $body = '';
+    if ($direction === 'upload') {
+        @fwrite($data, $upload_body);
+    } else {
+        $body = (string) stream_get_contents($data);
+    }
+    @fclose($data);
+    $done = ftpReadReply($sock);
+    $transcript[] = ['dir' => '<', 'lines' => $done];
+    return ['body' => $body, 'note' => null];
+}
+/*
     Convenience: open a connection, log in as the given
     user, run a callback that returns a list of further
     commands (or executes its own transfers), and close.
@@ -733,6 +793,56 @@ function ftpScenarioList()
                    command after the failure to show that
                    subsequent commands return 530 too. */
                 ftpSendCmd($sock, 'PWD', $transcript);
+                return null;
+            },
+        ],
+        'epsv' => [
+            'title' => 'EPSV: dual-stack passive mode',
+            'desc' => 'EPSV (RFC 2428) is the IPv6-aware ' .
+                'replacement for PASV. Where PASV embeds a ' .
+                'four-byte IPv4 address in its reply, EPSV ' .
+                'elides the address entirely -- the reply ' .
+                'shape is just (|||port|), telling the ' .
+                'client "use whatever family you opened the ' .
+                'control connection on, this port". That ' .
+                'design means a single command works ' .
+                'unchanged over IPv4 and IPv6. The ' .
+                'demonstration here runs over the v4 control ' .
+                'channel; if you switch the launcher\'s BIND ' .
+                'to "::", the same scenario runs unchanged ' .
+                'over IPv6.',
+            'user' => 'anonymous',
+            'pass' => 'guest@example.com',
+            'run' => function ($sock, &$transcript) {
+                ftpSendCmd($sock, 'TYPE I', $transcript);
+                $r = ftpEpsvTransfer($sock, 'LIST /pub',
+                    'download', $transcript);
+                return ['body' => $r['body'],
+                    'note' => $r['note']];
+            },
+        ],
+        'epsv-all' => [
+            'title' => 'EPSV ALL: latch the session to ' .
+                'extended mode',
+            'desc' => 'A client that knows it will only use ' .
+                'EPSV can send "EPSV ALL" once after login. ' .
+                'The server records the commitment and ' .
+                'refuses PASV / PORT / EPRT for the rest of ' .
+                'the session (with 503 Bad sequence). This ' .
+                'protects against NAT boxes that try to ' .
+                'rewrite PASV/PORT addresses on the fly: if ' .
+                'the address can\'t even be in the message, ' .
+                'the NAT has nothing to break.',
+            'user' => 'anonymous',
+            'pass' => 'guest@example.com',
+            'run' => function ($sock, &$transcript) {
+                ftpSendCmd($sock, 'EPSV ALL', $transcript);
+                ftpSendCmd($sock, 'PASV', $transcript);
+                ftpSendCmd($sock, 'PORT 192,0,2,1,0,21',
+                    $transcript);
+                ftpSendCmd($sock, 'EPRT |1|192.0.2.1|21|',
+                    $transcript);
+                ftpSendCmd($sock, 'EPSV', $transcript);
                 return null;
             },
         ],

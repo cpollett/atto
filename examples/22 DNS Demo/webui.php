@@ -451,9 +451,13 @@ nav.tabs a.active {
 .scenario button {
     background: #2563eb; color: #fff; border: 0;
     padding: 6px 14px; border-radius: 6px; cursor: pointer;
-    font-size: 13px;
+    font-size: 13px; min-width: 4em; text-align: center;
 }
 .scenario button:hover { background: #1d4ed8; }
+.scenario button:disabled { background: #93c5fd;
+    cursor: default; }
+.scenario button.close { background: #b91c1c; }
+.scenario button.close:hover { background: #991b1b; }
 .result {
     margin-top: 12px; display: grid;
     grid-template-columns: 1fr 1fr; gap: 12px;
@@ -763,9 +767,7 @@ function dnsRenderScenarios()
         echo "<h3>" . htmlspecialchars($info['title']) .
             "</h3>";
         echo "<p>" . htmlspecialchars($info['desc']) . "</p>";
-        echo "<button type=\"button\" " .
-            "onclick=\"runScenario('" . $key . "', this)\">" .
-            "Run</button>";
+        echo "<button type=\"button\">Run</button>";
         echo "<div class=\"result-slot\"></div>";
         echo "</div>";
     }
@@ -981,28 +983,55 @@ function dnsRenderZoneEdit($cfg, $name)
 function dnsClientScript()
 {
     return <<<'JS'
-async function runScenario(key, btn) {
-    btn.disabled = true;
-    btn.textContent = 'Running...';
-    try {
-        const fd = new FormData();
-        fd.append('scenario', key);
-        const r = await fetch('/scenario',
-            { method: 'POST', body: fd });
-        const data = await r.json();
-        const slot = btn.parentElement
-            .querySelector('.result-slot');
-        slot.innerHTML = renderResult(data);
-    } catch (e) {
-        const slot = btn.parentElement
-            .querySelector('.result-slot');
-        slot.innerHTML = '<div class="pane error">' +
-            escapeHtml(String(e)) + '</div>';
-    } finally {
-        btn.disabled = false;
+/*
+    Each scenario card binds its button to a tri-state toggle:
+        Run        -> click sends the request, fills the
+                      result slot, switches button to X.
+        X          -> click clears the slot, restores Run.
+        Running... -> in-flight; button disabled.
+ */
+document.querySelectorAll('.scenario').forEach(function (el) {
+    var btn = el.querySelector('button');
+    var key = el.dataset.key;
+    var slot = el.querySelector('.result-slot');
+    function showRun() {
         btn.textContent = 'Run';
+        btn.classList.remove('close');
+        btn.disabled = false;
     }
-}
+    function showClose() {
+        btn.textContent = '\u2715';
+        btn.classList.add('close');
+        btn.disabled = false;
+    }
+    function showBusy() {
+        btn.textContent = 'Running...';
+        btn.classList.remove('close');
+        btn.disabled = true;
+    }
+    btn.addEventListener('click', function () {
+        if (btn.classList.contains('close')) {
+            slot.innerHTML = '';
+            showRun();
+            return;
+        }
+        showBusy();
+        slot.innerHTML = '<div class="pane">running...</div>';
+        var fd = new FormData();
+        fd.append('scenario', key);
+        fetch('/scenario', { method: 'POST', body: fd })
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                slot.innerHTML = renderResult(data);
+                showClose();
+            })
+            .catch(function (e) {
+                slot.innerHTML = '<div class="pane error">' +
+                    escapeHtml(String(e)) + '</div>';
+                showClose();
+            });
+    });
+});
 function renderResult(data) {
     if (data.error) {
         return '<div class="result"><div><h4>Error</h4>' +

@@ -663,6 +663,27 @@ class FtpConnection
      */
     public $peer = "";
     /**
+     * @var int address family of the peer: 4 for IPv4, 6
+     *      for IPv6. Set on accept by inspecting the peer
+     *      name. Drives passive-listener binding (EPSV
+     *      replies elide the address, but the listener still
+     *      has to accept on the same family the client will
+     *      dial back on) and the PASV-vs-EPSV gate (PASV is
+     *      IPv4-only; we refuse it on a v6 control with 522
+     *      per RFC 2428 sec 3 conventions).
+     */
+    public $peer_family = 4;
+    /**
+     * @var bool whether the client has issued EPSV ALL
+     *      (RFC 2428 sec 3). After EPSV ALL the server
+     *      refuses PASV/PORT/EPRT for the rest of the
+     *      session; only EPSV is honored. Lets dual-stack
+     *      clients commit to a single command set without
+     *      worrying about NAT translation tampering with
+     *      PORT/PASV addresses.
+     */
+    public $epsv_all = false;
+    /**
      * @var bool true once the client has authenticated.
      */
     public $authed = false;
@@ -806,6 +827,13 @@ class FtpSite
     const REPLY_NOT_LOGGED_IN = 530;
     const REPLY_FILE_UNAVAILABLE = 550;
     const REPLY_NEEDS_TLS = 534;
+    /*
+        522 -- network protocol not supported, used to refuse
+        PASV / PORT (which are IPv4-only) on a v6 control
+        connection. Per RFC 2428 sec 2 the reply text should
+        include the supported protocol families ("(1,2)").
+     */
+    const REPLY_BAD_NETWORK_PROTOCOL = 522;
     const REPLY_FEAT = 211;
     const REPLY_STAT = 212;
     const REPLY_HELP = 214;
@@ -1006,8 +1034,8 @@ class FtpSite
             return false;
         }
         $bind = $this->config['BIND'];
-        $ctrl_addr = "tcp://$bind:" .
-            $this->config['FTP_PORT'];
+        $ctrl_addr = $this->formatBindAddress($bind,
+            $this->config['FTP_PORT']);
         $ctrl = @stream_socket_server($ctrl_addr,
             $errno, $errstr,
             STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
@@ -1019,8 +1047,8 @@ class FtpSite
         echo "atto-ftp listening: control at $ctrl_addr\n";
         $ftps = false;
         if (!empty($this->ssl_options)) {
-            $ftps_addr = "tcp://$bind:" .
-                $this->config['FTPS_PORT'];
+            $ftps_addr = $this->formatBindAddress($bind,
+                $this->config['FTPS_PORT']);
             $ftps_context = stream_context_create(
                 ['ssl' => $this->ssl_options]);
             $ftps = @stream_socket_server($ftps_addr,
@@ -1067,6 +1095,41 @@ class FtpSite
         }
     }
     /**
+     * Returns true if the given host string looks like an
+     * IPv6 literal -- i.e. contains a colon. Hostnames cannot
+     * contain colons, IPv4 dotted-quad cannot, so a colon is
+     * a reliable v6 discriminator. We accept both raw v6
+     * literals ("::1", "2001:db8::1") and bracket-wrapped
+     * forms ("[::1]") as input.
+     *
+     * @param string $host
+     * @return bool
+     */
+    protected function looksLikeIPv6($host)
+    {
+        return strpos($host, ':') !== false;
+    }
+    /**
+     * Formats a (host, port) pair as a stream-socket-style
+     * tcp:// URL, bracket-wrapping IPv6 literals so PHP
+     * parses them correctly. PHP's stream_socket_server and
+     * stream_socket_client require IPv6 addresses to be
+     * enclosed in square brackets to disambiguate the
+     * address-port colon from address-internal colons.
+     *
+     * @param string $host
+     * @param int $port
+     * @return string
+     */
+    protected function formatBindAddress($host, $port)
+    {
+        $host = trim($host, '[]');
+        if ($this->looksLikeIPv6($host)) {
+            return "tcp://[$host]:$port";
+        }
+        return "tcp://$host:$port";
+    }
+    /**
      * Accepts one control-connection client. For implicit
      * FTPS listeners we perform the TLS handshake here;
      * for explicit-FTPS (AUTH TLS) the upgrade happens
@@ -1086,6 +1149,14 @@ class FtpSite
         $conn = new FtpConnection();
         $conn->control = $client;
         $conn->peer = (string) $peer;
+        /*
+            stream_socket_get_name reports IPv6 peers as
+            "[2001:db8::1]:port" and IPv4 peers as "1.2.3.4:
+            port". The bracket prefix is the cheapest
+            family discriminator.
+         */
+        $conn->peer_family =
+            (strlen($peer) > 0 && $peer[0] === '[') ? 6 : 4;
         $conn->tls_active = $is_implicit_tls;
         $conn->opened = time();
         $conn->last_activity = time();
@@ -1284,8 +1355,9 @@ class FtpSite
         } else if ($conn->active_addr !== false) {
             list($host, $port) = $conn->active_addr;
             $conn->active_addr = false;
+            $addr = $this->formatBindAddress($host, $port);
             $stream = @stream_socket_client(
-                "tcp://$host:$port", $errno, $errstr, 5);
+                $addr, $errno, $errstr, 5);
             if (!$stream) {
                 $this->reply($conn, self::REPLY_NO_DATA_CONN,
                     "Cannot open active data connection: " .
@@ -1324,6 +1396,24 @@ class FtpSite
     protected function bindPassiveListener($conn)
     {
         $bind = $this->config['BIND'];
+        /*
+            Bind the passive listener on the same address
+            family the control connection arrived on. If the
+            user configured a v4 BIND but the client connected
+            via v6 (or vice versa, which can happen on dual-
+            stack listeners on systems with IPV6_V6ONLY off),
+            we widen to "any" on the right family so the
+            client can dial back. This is the right behavior
+            for the EPSV reply, which advertises the same
+            family as the control connection.
+         */
+        if ($conn->peer_family === 6 &&
+            !$this->looksLikeIPv6($bind)) {
+            $bind = '::';
+        } else if ($conn->peer_family === 4 &&
+            $this->looksLikeIPv6($bind)) {
+            $bind = '0.0.0.0';
+        }
         $low = $this->pasv_port_low;
         $high = $this->pasv_port_high;
         /*
@@ -1338,7 +1428,7 @@ class FtpSite
         $max_tries = max(8, ($high - $low + 1));
         while ($tries < $max_tries) {
             $port = random_int($low, $high);
-            $addr = "tcp://$bind:$port";
+            $addr = $this->formatBindAddress($bind, $port);
             $listener = @stream_socket_server($addr,
                 $errno, $errstr,
                 STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
@@ -1355,6 +1445,10 @@ class FtpSite
      * responses. Either the configured override (for NAT'd
      * deployments) or the address the control connection
      * arrived on (the right answer for non-NAT setups).
+     * The IPv6 case is rare in practice -- EPSV replies do
+     * not carry an address, so the only consumer of this
+     * value is the IPv4-only PASV reply -- but we still keep
+     * the family-correct loopback fallback for symmetry.
      */
     protected function advertiseIp($conn)
     {
@@ -1363,12 +1457,22 @@ class FtpSite
         }
         $local = stream_socket_get_name($conn->control,
             false);
+        $fallback = ($conn->peer_family === 6) ?
+            '::1' : '127.0.0.1';
         if ($local === false) {
-            return '127.0.0.1';
+            return $fallback;
         }
+        /*
+            stream_socket_get_name reports v6 endpoints as
+            "[2001:db8::1]:port". The address ends just
+            before the closing bracket. v4 endpoints are
+            "1.2.3.4:port", so the last colon separates host
+            from port. Both cases are handled by strrpos
+            since v6 internal colons are inside the brackets.
+         */
         $colon = strrpos($local, ':');
         if ($colon === false) {
-            return '127.0.0.1';
+            return $fallback;
         }
         $ip = substr($local, 0, $colon);
         $ip = trim($ip, "[]");
@@ -1687,6 +1791,30 @@ class FtpSite
         if (!$this->requireAuth($conn)) {
             return;
         }
+        if ($conn->epsv_all) {
+            /*
+                Per RFC 2428 sec 4: once a client has issued
+                EPSV ALL, the server must refuse PASV /
+                PORT / EPRT for the remainder of the session.
+             */
+            $this->reply($conn, self::REPLY_BAD_SEQUENCE,
+                "EPSV ALL in effect; only EPSV is allowed.");
+            return;
+        }
+        if ($conn->peer_family === 6) {
+            /*
+                The PASV reply embeds an IPv4 address in
+                its (h1,h2,h3,h4,p1,p2) tuple, so it cannot
+                represent an IPv6 endpoint. RFC 2428 sec 2
+                says we should answer 522 with the supported
+                family list.
+             */
+            $this->reply($conn,
+                self::REPLY_BAD_NETWORK_PROTOCOL,
+                "Network protocol not supported on this " .
+                "control connection, use EPSV (1,2)");
+            return;
+        }
         if ($conn->pasv_listener !== false) {
             @fclose($conn->pasv_listener);
             $conn->pasv_listener = false;
@@ -1726,6 +1854,40 @@ class FtpSite
         if (!$this->requireAuth($conn)) {
             return;
         }
+        $upper = strtoupper(trim((string) $arg));
+        /*
+            RFC 2428 sec 4: "EPSV ALL" is the client's promise
+            to use only EPSV for the rest of the session. The
+            server records the flag (cmdPORT, cmdPASV,
+            cmdEPRT all gate on it) and answers 200.
+         */
+        if ($upper === 'ALL') {
+            $conn->epsv_all = true;
+            $this->reply($conn, self::REPLY_OK,
+                "EPSV ALL accepted; only EPSV will be " .
+                "honored on this session.");
+            return;
+        }
+        /*
+            Optional EPSV argument: "1" for IPv4, "2" for IPv6.
+            The client uses it on a dual-stack control to ask
+            for a specific data family. We accept the request
+            only if it matches the control connection's actual
+            family -- you cannot get a v6 data path through a
+            v4 control, regardless of how the client asks.
+         */
+        if ($upper === '1' && $conn->peer_family !== 4) {
+            $this->reply($conn,
+                self::REPLY_BAD_NETWORK_PROTOCOL,
+                "Network protocol not supported, use (2)");
+            return;
+        }
+        if ($upper === '2' && $conn->peer_family !== 6) {
+            $this->reply($conn,
+                self::REPLY_BAD_NETWORK_PROTOCOL,
+                "Network protocol not supported, use (1)");
+            return;
+        }
         if ($conn->pasv_listener !== false) {
             @fclose($conn->pasv_listener);
             $conn->pasv_listener = false;
@@ -1747,7 +1909,10 @@ class FtpSite
             connection on. The format is:
                 229 Entering Extended Passive Mode (|||port|)
             with three empty fields and the port between the
-            outer pipes.
+            outer pipes. The empty fields are what makes EPSV
+            the clean dual-stack answer: it works the same
+            way over v4 and v6 because it never names an
+            address at all.
          */
         $this->reply($conn, self::REPLY_EPSV_OK,
             "Entering Extended Passive Mode (|||$port|).");
@@ -1755,6 +1920,22 @@ class FtpSite
     protected function cmdPORT($conn, $arg)
     {
         if (!$this->requireAuth($conn)) {
+            return;
+        }
+        if ($conn->epsv_all) {
+            $this->reply($conn, self::REPLY_BAD_SEQUENCE,
+                "EPSV ALL in effect; PORT not allowed.");
+            return;
+        }
+        if ($conn->peer_family === 6) {
+            /*
+                PORT can only carry an IPv4 address. RFC 2428
+                clients on a v6 control should send EPRT
+                instead.
+             */
+            $this->reply($conn,
+                self::REPLY_BAD_NETWORK_PROTOCOL,
+                "Network protocol not supported, use EPRT");
             return;
         }
         $parts = explode(',', $arg);
@@ -1779,11 +1960,17 @@ class FtpSite
         if (!$this->requireAuth($conn)) {
             return;
         }
+        if ($conn->epsv_all) {
+            $this->reply($conn, self::REPLY_BAD_SEQUENCE,
+                "EPSV ALL in effect; EPRT not allowed.");
+            return;
+        }
         /*
             EPRT format (RFC 2428):
                 EPRT <d><net-prt><d><net-addr><d><tcp-port><d>
             Where <d> is a single delimiter character (usually
             "|") and net-prt is "1" for IPv4 or "2" for IPv6.
+            Example: "EPRT |2|2001:db8::1|21|".
          */
         if (strlen($arg) < 7) {
             $this->reply($conn, self::REPLY_PARAM_ERR,
@@ -1792,17 +1979,61 @@ class FtpSite
         }
         $delim = $arg[0];
         $parts = explode($delim, $arg);
+        /*
+            A well-formed EPRT splits into exactly five
+            pieces because of the leading and trailing
+            delimiters: ["", net-prt, net-addr, tcp-port, ""].
+            We accept any count >= 5 to be lenient with
+            stray trailing whitespace some clients add.
+         */
         if (count($parts) < 5) {
             $this->reply($conn, self::REPLY_PARAM_ERR,
                 "Bad EPRT format.");
             return;
         }
+        $family = $parts[1];
         $host = $parts[2];
         $port = (int) $parts[3];
+        /*
+            Validate the family token. "1" is IPv4, "2" is
+            IPv6. Other values are reserved and we refuse
+            them with 522 listing what we actually support.
+         */
+        if ($family !== '1' && $family !== '2') {
+            $this->reply($conn,
+                self::REPLY_BAD_NETWORK_PROTOCOL,
+                "Network protocol not supported (1,2)");
+            return;
+        }
+        /*
+            The advertised family must also match the control
+            connection's family -- you cannot return-dial a v4
+            address from a v6 control or vice versa, because
+            the data socket has to use the same family the
+            client side opens. Refuse with 522 if mismatched.
+         */
+        $advertised = ($family === '2') ? 6 : 4;
+        if ($advertised !== $conn->peer_family) {
+            $this->reply($conn,
+                self::REPLY_BAD_NETWORK_PROTOCOL,
+                "EPRT family mismatch with control " .
+                "connection family");
+            return;
+        }
+        if ($port < 1 || $port > 65535) {
+            $this->reply($conn, self::REPLY_PARAM_ERR,
+                "Bad EPRT port.");
+            return;
+        }
         if ($conn->pasv_listener !== false) {
             @fclose($conn->pasv_listener);
             $conn->pasv_listener = false;
         }
+        /*
+            We store the host as raw bytes; the bracket
+            wrapping for IPv6 happens in openDataChannel
+            when we call stream_socket_client.
+         */
         $conn->active_addr = [$host, $port];
         $this->reply($conn, self::REPLY_OK,
             "EPRT command successful.");

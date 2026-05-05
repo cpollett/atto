@@ -1,30 +1,28 @@
 <?php
 /**
- * AttoFTP demo: a click-through tour of the File Transfer
- * Protocol. Visitors land on a webui that exercises the
- * running FTP server in three modes:
+ * AttoDNS demo: a click-through tour of authoritative DNS.
+ * Visitors land on the demo UI and exercise the running DNS
+ * server through three modes:
  *
- *   1. Click-through scenarios -- pre-built sequences of
- *      FTP commands (anonymous browse, named-user upload,
- *      MLSD listings, REST resume, security-guard probes,
- *      etc.) that show the actual control-channel
- *      transcript of the conversation between client and
- *      server.
- *   2. Raw command box -- pick a username/password, type any
- *      sequence of FTP commands, see the wire transcript.
- *   3. File browser -- a server-side view of the current
- *      root with download/upload/rename/delete UI driven by
- *      real FTP commands against the running server.
+ *   1. Click-through scenarios that show the wire query, the
+ *      wire response, and a human-readable interpretation
+ *      side by side -- A, AAAA, MX with glue, TXT, CNAME
+ *      chasing, NXDOMAIN with SOA in authority, wildcard,
+ *      truncation forcing TCP, EDNS0, and DNS-over-TLS.
+ *   2. A dig-style raw query box: type a name, pick a type,
+ *      pick a transport (UDP, TCP, DoT), see the actual
+ *      bytes go out and come back.
+ *   3. A zone editor that reads the .zone master file,
+ *      lets you make changes, writes them back, and reloads
+ *      the FileDnsAuthority so the next query reflects them.
  *
  * Demonstrates:
- *
- *   - FtpSite: control-connection state machine, command
- *     dispatcher, passive and active data-channel handling
- *   - FilesystemFtpStorage: a no-escape filesystem backend
- *     with realpath()-based path-traversal guard
- *   - CompositeAuthenticator: combines a static user list
- *     with anonymous access, the common shape for an FTP
- *     server that hosts a public /pub plus per-user folders
+ *   - DnsSite: the authoritative server itself, binding
+ *     UDP, TCP, and (when a TLS context is configured) DoT
+ *   - FileDnsAuthority: zone storage backed by RFC 1035
+ *     master-format files
+ *   - DnsMessage: the wire-format codec, exposed publicly
+ *     so the demo can decode raw bytes for display
  *
  *
  * --- HOW TO RUN ---
@@ -33,183 +31,101 @@
  *
  * The demo binds:
  *
- *      TCP 12121   -- FTP control channel (and AUTH TLS for
- *                     explicit FTPS)
- *      TCP 19990   -- implicit-FTPS, served with the
+ *      UDP 15353    -- standard DNS over UDP
+ *      TCP 15353    -- standard DNS over TCP (large responses,
+ *                     truncation fallback)
+ *      TCP 18853    -- DNS-over-TLS (DoT), served with the
  *                     self-signed cert from atto's security/
  *                     folder
  *
- * The high ports follow the same "decade-shifted" pattern
- * the AttoDNS demo uses (15353 / 18853): 12121 is mnemonic
- * for "FTP-on-21-but-prefixed-with-1", 19990 for "implicit-
- * FTPS-on-990-but-prefixed-with-1". A real deployment would
- * bind 21 (privileged) and 990 (privileged).
- *
- * Passive data transfers use a small port range (50000-50050
- * by default) which the launcher passes to the server. If
- * you put a firewall in front of this server, that range
- * needs to be open.
- *
- * The launcher binds on IPv4 by default (127.0.0.1). To
- * accept IPv6 clients too, set BIND to either "::" (v6 only,
- * works everywhere) or "::1" (v6 loopback only). Modern
- * clients send EPSV / EPRT (RFC 2428) over v6; classic PASV
- * and PORT are IPv4-only and the server refuses them with
- * 522 on a v6 control channel.
+ * High ports are used so the demo runs without root. We pick
+ * 15353 / 18853 specifically because UDP 5353 is camped by
+ * mDNSResponder on macOS (used for multicast DNS / Bonjour),
+ * and binding to it can either fail outright or silently
+ * have packets stolen by the system resolver. The "1" prefix
+ * keeps the mnemonic ("port 53" -> "port 5353" -> "port
+ * 15353") while staying clear of every well-known service.
+ * A real deployment would bind UDP 53 and TCP 53 (privileged)
+ * and TCP 853 for DoT.
  *
  * The companion web UI is spawned automatically and lives at
  *
  *      http://localhost:8080/
  *
  *
- * --- CONNECTING WITH FILEZILLA ---
+ * --- TESTING WITH dig (macOS / Linux / WSL) ---
  *
- * Open Filezilla, "File" -> "Site Manager" -> "New Site":
- *
- *   Protocol:   FTP
- *   Host:       127.0.0.1
- *   Port:       12121
- *   Encryption: Use plain FTP, or "Use explicit FTPS over
- *               FTP" to upgrade after connect (the demo
- *               serves the self-signed cert from atto's
- *               security/ folder; Filezilla will warn the
- *               first time and let you trust it)
- *   Logon Type: Anonymous (or "Normal" for alice/bob)
- *   Transfer Settings -> Passive (default)
- *
- * Connect, and you should land in /pub (anonymous) or
- * /users/<name> (named user). Upload/download/rename should
- * all work; anonymous is read-only.
+ *      dig @127.0.0.1 -p 15353 www.example.test A
+ *      dig @127.0.0.1 -p 15353 mail-heavy.test MX
+ *      dig @127.0.0.1 -p 15353 ipv6-only.v6.test AAAA
+ *      dig @127.0.0.1 -p 15353 1.2.0.192.in-addr.arpa PTR
+ *      dig @127.0.0.1 -p 15353 ftp.example.test A
+ *      dig @127.0.0.1 -p 15353 +tcp example.test ANY
  *
  *
- * --- TESTING FROM A SHELL (Unix) ---
+ * --- TESTING ON WINDOWS ---
  *
- * The Debian/Ubuntu "ftp" client (or "lftp"):
+ * Windows ships nslookup by default. The non-standard port
+ * is set with -port= as the first argument, the server IP
+ * is the trailing argument:
  *
- *      ftp -p 127.0.0.1 12121
- *      Name: anonymous
- *      Password: guest@example.com
- *      ftp> ls
- *      ftp> get hello.txt
- *      ftp> bye
+ *      nslookup -port=15353 -type=A www.example.test 127.0.0.1
+ *      nslookup -port=15353 -type=MX mail-heavy.test 127.0.0.1
+ *      nslookup -port=15353 -type=AAAA ipv6-only.v6.test 127.0.0.1
+ *      nslookup -port=15353 -type=PTR 1.2.0.192.in-addr.arpa 127.0.0.1
  *
- * Or one-liner with lftp:
+ * Or the equivalent interactively (better for several
+ * lookups in a row, since it skips the per-query startup):
  *
- *      lftp -e 'cls -l /pub; bye' \
- *          ftp://anonymous:guest@127.0.0.1:12121
+ *      C:\> nslookup
+ *      > server 127.0.0.1
+ *      > set port=15353
+ *      > set type=MX
+ *      > mail-heavy.test
  *
+ * Note: Windows PowerShell's Resolve-DnsName cmdlet does
+ * NOT support a -Port parameter, so it can only hit the
+ * standard port 53. Use nslookup for non-standard ports.
  *
- * --- TESTING FROM A SHELL (Windows) ---
- *
- * Windows ships ftp.exe but it does NOT support a non-
- * standard port on the connect command line. Use the open
- * subcommand interactively:
- *
- *      C:\> ftp
- *      ftp> open 127.0.0.1 12121
- *      User: anonymous
- *      Password: guest@example.com
- *      ftp> dir
- *      ftp> get hello.txt
- *      ftp> bye
- *
- * Note that Windows ftp.exe defaults to ACTIVE mode and may
- * fail behind a NAT or with Windows Firewall. For a richer
- * client on Windows, install Filezilla or WinSCP.
+ * If you have installed BIND tools on Windows, the dig
+ * commands above work identically.
  *
  *
  * --- A REAL DEPLOYMENT WOULD ALSO ---
  *
- *   - Bind to ports 21 and 990 (privileged, needs root or
- *     setcap cap_net_bind_service)
- *   - Replace the static user list with a real user store
- *     hooked through a closure-based authenticator
- *   - Put a TLS cert from a real CA in place so AUTH TLS
- *     hands clients a verifiable certificate
+ *   - Bind to the privileged ports 53 and 853
+ *   - Add DNSSEC signing (a future framework phase)
+ *   - Run two instances on separate hosts and configure each
+ *     as a slave of the other for redundancy
  *   - Front the public listener with a rate-limiter to
- *     dampen brute-force login attempts
- *   - Pin the passive port range and open it in the firewall
+ *     dampen reflection-amplification abuse
  *
  * The demo skips all of that to keep the example readable.
  */
-require '../../src/FtpSite.php';
-use seekquarry\atto\FtpSite;
-use seekquarry\atto\AnonAuthenticator;
-use seekquarry\atto\StaticUserAuthenticator;
-use seekquarry\atto\CompositeAuthenticator;
+require '../../src/DnsSite.php';
+use seekquarry\atto\DnsSite;
+use seekquarry\atto\FileDnsAuthority;
 if (!defined("seekquarry\\atto\\RUN")) {
     define("seekquarry\\atto\\RUN", true);
 }
-$root = __DIR__ . DIRECTORY_SEPARATOR . 'root';
-if (!is_dir($root)) {
-    mkdir($root, 0755, true);
+$zone_dir = __DIR__ . DIRECTORY_SEPARATOR . 'zones';
+if (!is_dir($zone_dir)) {
+    mkdir($zone_dir, 0755, true);
 }
+$authority = new FileDnsAuthority($zone_dir);
+$dns = new DnsSite($authority);
 /*
-    Two named users plus anonymous. Static-user passwords
-    here are obviously demo-grade; a real deployment would
-    plug a closure-based authenticator into a real user
-    store. The CompositeAuthenticator tries the static list
-    first and falls back to anonymous, so a USER named
-    "alice" with the wrong password is rejected outright
-    rather than silently downgrading to anonymous.
- */
-$ftp = new FtpSite();
-$ftp->auth(new CompositeAuthenticator([
-    new StaticUserAuthenticator([
-        'alice' => [
-            'password' => 'hunter2',
-            'login_folder' => '/users/alice',
-        ],
-        'bob' => [
-            'password' => 'sekret',
-            'login_folder' => '/users/bob',
-        ],
-    ]),
-    new AnonAuthenticator('/pub'),
-]))
-    ->root($root)
-    ->banner('AttoFTP demo ready (try anonymous, ' .
-        'alice/hunter2, or bob/sekret).')
-    ->serverName('atto-ftp-demo')
-    ->passivePortRange(50000, 50050);
-$config = [
-    'BIND' => '127.0.0.1',
-    'FTP_PORT' => 12121,
-    'FTPS_PORT' => 19990,
-];
-/*
-    FTPS (RFC 4217 explicit + RFC 7151 implicit) uses the
-    self-signed server cert that ships under atto's security/
-    folder. The same pair powers examples 09 (HTTPS), 12
-    (Virtual Hosting), 16 (Server Push), 17 (HTTP/3), so
-    Filezilla treating it as trusted once is enough for the
-    whole repo.
- */
-$cert = __DIR__ . DIRECTORY_SEPARATOR . '..' .
-    DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR .
-    'security' . DIRECTORY_SEPARATOR . 'server.crt';
-$key = __DIR__ . DIRECTORY_SEPARATOR . '..' .
-    DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR .
-    'security' . DIRECTORY_SEPARATOR . 'server.key';
-if (is_file($cert) && is_file($key)) {
-    $config['SERVER_CONTEXT'] = ['ssl' => [
-        'local_cert' => $cert,
-        'local_pk' => $key,
-        'allow_self_signed' => true,
-        'verify_peer' => false,
-    ]];
-}
-/*
-    Spawn the companion web UI. Same detached-child pattern
-    as examples 20-22; on Unix we capture the child PID and
+    Spawn the companion web UI exactly like example 21.
+    Detached child so the parent process is free to run the
+    DNS event loop. On Unix we capture the child PID and
     kill it on shutdown via register_shutdown_function. On
-    Windows "start /B" does not surface the PID, so the user
-    closes the cmd window or kills php.exe via Task Manager
-    after stopping the FTP server.
+    Windows, "start /B" does not surface the PID, so the
+    user has to close the cmd window (or kill php.exe via
+    Task Manager) to stop the webui after stopping the DNS
+    server. UI URL is http://localhost:8080/.
  */
 $php = escapeshellarg(PHP_BINARY);
-$webui = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR .
-    "webui.php");
+$webui = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR . "webui.php");
 if (strstr(PHP_OS, "WIN")) {
     $job = "start /B $php $webui > NUL 2>&1";
     pclose(popen($job, "r"));
@@ -240,4 +156,32 @@ if (strstr(PHP_OS, "WIN")) {
             "you may need to kill it manually.\n";
     }
 }
-$ftp->listen($config);
+$config = [
+    'BIND' => '127.0.0.1',
+    'DNS_UDP_PORT' => 15353,
+    'DNS_TCP_PORT' => 15353,
+    'DNS_TLS_PORT' => 18853,
+    'SERVER_NAME' => 'atto-dns-demo',
+];
+/*
+    DNS-over-TLS (RFC 7858) uses the self-signed server cert
+    that ships under atto's security/ folder. The same pair
+    powers examples 09 (HTTPS), 12 (Virtual Hosting), 16
+    (Server Push), 17 (HTTP/3), and 23 (FTPS), so trusting
+    it once in your client suffices for the whole repo.
+ */
+$cert = __DIR__ . DIRECTORY_SEPARATOR . '..' .
+    DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR .
+    'security' . DIRECTORY_SEPARATOR . 'server.crt';
+$key = __DIR__ . DIRECTORY_SEPARATOR . '..' .
+    DIRECTORY_SEPARATOR . '..' . DIRECTORY_SEPARATOR .
+    'security' . DIRECTORY_SEPARATOR . 'server.key';
+if (is_file($cert) && is_file($key)) {
+    $config['SERVER_CONTEXT'] = ['ssl' => [
+        'local_cert' => $cert,
+        'local_pk' => $key,
+        'allow_self_signed' => true,
+        'verify_peer' => false,
+    ]];
+}
+$dns->listen($config);

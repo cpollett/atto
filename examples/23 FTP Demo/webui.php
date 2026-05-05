@@ -38,6 +38,21 @@ $cfg = [
     'root_dir' => __DIR__ . DIRECTORY_SEPARATOR . 'root',
     'original_root_dir' => __DIR__ . DIRECTORY_SEPARATOR .
         'original-root',
+    'bind_file' => __DIR__ . DIRECTORY_SEPARATOR .
+        'bind.txt',
+    /*
+        Allowed BIND values for the runtime dropdown. The
+        keys are written to bind.txt; index.php reads the
+        file and validates the value before binding. Anything
+        not in this map is rejected by both the launcher and
+        the /bind endpoint as a defense against tampering.
+     */
+    'bind_choices' => [
+        '127.0.0.1' => 'IPv4 loopback (127.0.0.1)',
+        '::1' => 'IPv6 loopback (::1)',
+        '0.0.0.0' => 'IPv4 all interfaces (0.0.0.0)',
+        '::' => 'IPv6 / dual-stack all interfaces (::)',
+    ],
     'demo_users' => [
         ['user' => 'anonymous', 'pass' => 'guest@example.com',
             'label' => 'Anonymous (read-only, /pub)'],
@@ -357,6 +372,17 @@ nav.tabs a.active { background: #f6f6f6; border-color: #ddd;
 .reset-bar button:disabled { background: #888;
     cursor: default; }
 .reset-bar .reset-status { color: #555; font-size: 0.9em; }
+.bind-bar { display: flex; align-items: center; gap: 1em;
+    margin: 0 0 1.5em; padding: 0.7em 0.9em;
+    background: #ecf3ff; border: 1px solid #b8c8e8;
+    border-radius: 4px; }
+.bind-bar label { font-size: 0.9em; color: #234;
+    font-weight: 600; }
+.bind-bar select { font: inherit; padding: 0.3em 0.5em;
+    border-radius: 4px; border: 1px solid #b8c8e8;
+    background: #fff; }
+.bind-bar .bind-status { color: #555; font-size: 0.9em;
+    flex: 1; }
 .scenario { margin: 0.6em 0; padding: 0.7em 0.9em;
     background: #f6f6f6; border-radius: 4px; }
 .scenario .row { display: flex; align-items: center;
@@ -538,6 +564,38 @@ function ftpRenderPage($which, $cfg, $body_fn)
             "<code>original-root/</code>.";
     }
     echo "</span></div>";
+    /*
+        Bind bar -- runtime control over the listener address
+        family. Reads the current value from bind.txt (same
+        file index.php consults) so the dropdown always
+        reflects the actual running configuration. Switching
+        the value writes bind.txt and stops both processes;
+        the user relaunches "php index.php" to pick up the
+        new bind.
+     */
+    $current_bind = is_file($cfg['bind_file']) ?
+        trim((string) file_get_contents(
+        $cfg['bind_file'])) : '127.0.0.1';
+    if (!isset($cfg['bind_choices'][$current_bind])) {
+        $current_bind = '127.0.0.1';
+    }
+    echo "<div class=\"bind-bar\">";
+    echo "<label for=\"bind-select\">Bind:</label>";
+    echo "<select id=\"bind-select\">";
+    foreach ($cfg['bind_choices'] as $key => $label) {
+        $sel = ($key === $current_bind) ? ' selected' : '';
+        echo "<option value=\"" . htmlspecialchars($key) .
+            "\"$sel>" . htmlspecialchars($label) .
+            "</option>";
+    }
+    echo "</select>";
+    echo "<span class=\"bind-status\" id=\"bind-status\">";
+    echo "Switching the bind stops the server. Relaunch " .
+        "<code>php index.php</code> in your terminal after " .
+        "the switch to see the demo on the new family. The " .
+        "v6 options exercise the EPSV / EPRT scenarios; the " .
+        "v4 options exercise PASV / PORT.";
+    echo "</span></div>";
     echo "<nav class=\"tabs\">";
     foreach ($tabs as $key => $info) {
         list($url, $label) = $info;
@@ -548,6 +606,7 @@ function ftpRenderPage($which, $cfg, $body_fn)
     echo "</nav>";
     $body_fn();
     echo "<script>" . ftpResetScript() . "</script>";
+    echo "<script>" . ftpBindScript() . "</script>";
     echo "</body></html>";
 }
 /*
@@ -584,6 +643,65 @@ function ftpResetScript()
                 btn.textContent = 'Reset root/ from ' +
                     'original-root/';
                 alert('Reset failed: ' + err);
+            });
+    });
+})();
+JS;
+}
+/*
+    Bind-bar dropdown handler. Mirrors ex20's storage-engine
+    switcher: change the dropdown -> confirm -> POST the
+    selection -> server writes bind.txt and signals both
+    processes to exit -> JS swaps the page body for a
+    "relaunch" message. The user reruns "php index.php" in
+    their terminal to bring the demo back on the new bind.
+ */
+function ftpBindScript()
+{
+    return <<<'JS'
+(function () {
+    var sel = document.getElementById('bind-select');
+    if (!sel) return;
+    var status = document.getElementById('bind-status');
+    var current = sel.value;
+    sel.addEventListener('change', function () {
+        if (sel.value === current) return;
+        if (!window.confirm(
+            'Switch the listener bind to "' + sel.value +
+            '"?\n\nThe server will stop after this ' +
+            'request. You will need to run "php index.php" ' +
+            'again in the terminal to see the example with ' +
+            'the new bind.')) {
+            sel.value = current;
+            return;
+        }
+        sel.disabled = true;
+        var fd = new FormData();
+        fd.append('bind', sel.value);
+        fetch('/bind', { method: 'POST', body: fd })
+            .then(function (r) { return r.text(); })
+            .then(function (msg) {
+                document.body.innerHTML =
+                    '<h1>Bind switched</h1>' +
+                    '<p>The server has been asked to ' +
+                    'shut down. Once it exits in your ' +
+                    'terminal, run:</p>' +
+                    '<pre style="background:#1e1e1e;' +
+                    'color:#ddd;padding:1em;' +
+                    'border-radius:4px;">php index.php' +
+                    '</pre>' +
+                    '<p>and reload this page to see the ' +
+                    'demo on <code>' +
+                    sel.value.replace(/[<>&]/g, '') +
+                    '</code>.</p>' +
+                    '<p>(Server response: <em>' +
+                    msg.replace(/[<>&]/g, '') +
+                    '</em>)</p>';
+            })
+            .catch(function (err) {
+                status.textContent = 'ERROR: ' + err;
+                sel.value = current;
+                sel.disabled = false;
             });
     });
 })();
@@ -1723,4 +1841,74 @@ function ftpRecursiveCopy($src, $dst, &$count, &$errors)
         }
     }
 }
+/*
+    Bind switcher. Mirrors ex20's /engine endpoint: validate
+    the requested bind, write bind.txt, then send SIGTERM to
+    both index.php (read from ATTOFTP_SERVER_PID env, set by
+    index.php when it spawned us) and ourselves. The detached
+    shell wrapper sleeps briefly between killing index.php
+    and killing the webui so the response has a chance to
+    reach the browser before our process dies.
+ */
+$site->post('/bind', function () use ($site, $cfg) {
+    $site->header('Content-Type: text/plain; charset=utf-8');
+    $chosen = isset($_POST['bind']) ?
+        (string) $_POST['bind'] : '';
+    if (!isset($cfg['bind_choices'][$chosen])) {
+        $site->header('HTTP/1.1 400 Bad Request');
+        echo "Unknown bind: $chosen";
+        return;
+    }
+    $written = @file_put_contents($cfg['bind_file'],
+        $chosen . "\n");
+    if ($written === false) {
+        $site->header('HTTP/1.1 500 Server Error');
+        echo "Could not write bind.txt";
+        return;
+    }
+    /*
+        Schedule the kill of index.php first, then ourselves.
+        The detached subshell sleeps so the HTTP response
+        flush completes before we go down. Without the
+        delay the browser sometimes sees a connection-reset
+        instead of the body and the JS catch-handler fires
+        with a confusing "network error" instead of seeing
+        the friendly 200 response.
+     */
+    $server_pid = isset($_SERVER['ATTOFTP_SERVER_PID']) ?
+        (int) $_SERVER['ATTOFTP_SERVER_PID'] : 0;
+    $self_pid = getmypid();
+    if (strstr(PHP_OS, "WIN")) {
+        /*
+            Windows: taskkill /F by PID. Same caveat as
+            index.php's spawn: the env var carries the PID
+            because start /B does not let the parent learn
+            the child's PID.
+         */
+        $cmds = [];
+        if ($server_pid > 1) {
+            $cmds[] = "taskkill /F /PID $server_pid";
+        }
+        if ($self_pid > 1) {
+            $cmds[] = "ping -n 2 127.0.0.1 > NUL";
+            $cmds[] = "taskkill /F /PID $self_pid";
+        }
+        if (!empty($cmds)) {
+            $job = "start /B cmd /c \"" .
+                implode(" && ", $cmds) . "\" > NUL 2>&1";
+            pclose(popen($job, "r"));
+        }
+    } else {
+        $kill_cmd = '(sleep 1';
+        if ($server_pid > 1) {
+            $kill_cmd .= "; kill $server_pid";
+        }
+        if ($self_pid > 1) {
+            $kill_cmd .= "; sleep 1; kill $self_pid";
+        }
+        $kill_cmd .= ') > /dev/null 2>&1 &';
+        @shell_exec($kill_cmd);
+    }
+    echo "bind set to $chosen; server shutting down.";
+});
 $site->listen(8080);

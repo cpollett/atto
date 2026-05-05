@@ -50,6 +50,14 @@
  * you put a firewall in front of this server, that range
  * needs to be open.
  *
+ * The launcher binds on IPv4 by default (127.0.0.1). Use the
+ * "Bind" dropdown in the demo's web UI to switch to IPv6
+ * (::1) or to a dual-stack listener (::); the choice is
+ * persisted in bind.txt and takes effect on the next
+ * launch. Modern clients send EPSV / EPRT (RFC 2428) over
+ * v6; classic PASV and PORT are IPv4-only and the server
+ * refuses them with 522 on a v6 control channel.
+ *
  * The companion web UI is spawned automatically and lives at
  *
  *      http://localhost:8080/
@@ -165,8 +173,33 @@ $ftp->auth(new CompositeAuthenticator([
         'alice/hunter2, or bob/sekret).')
     ->serverName('atto-ftp-demo')
     ->passivePortRange(50000, 50050);
+/*
+    Bind family is selectable at runtime via the dropdown in
+    the webui's reset bar. The selection is persisted in
+    bind.txt and read here on every launch. Allowed values:
+        "127.0.0.1" -- IPv4 loopback only (default; classic
+                       PASV/PORT both work)
+        "::1"       -- IPv6 loopback only (forces clients to
+                       speak EPSV/EPRT; PASV/PORT are
+                       refused with 522)
+        "0.0.0.0"   -- IPv4 on all interfaces
+        "::"        -- IPv6 on all interfaces; on most Linux
+                       and BSD systems with IPV6_V6ONLY off
+                       this also accepts IPv4 connections
+                       through v4-mapped v6 addresses
+    Anything else falls back to "127.0.0.1" so a corrupted
+    bind.txt cannot ground the demo.
+ */
+$bind_file = __DIR__ . DIRECTORY_SEPARATOR . 'bind.txt';
+$bind_value = is_file($bind_file) ?
+    trim((string) file_get_contents($bind_file)) :
+    '127.0.0.1';
+if (!in_array($bind_value,
+    ['127.0.0.1', '::1', '0.0.0.0', '::'], true)) {
+    $bind_value = '127.0.0.1';
+}
 $config = [
-    'BIND' => '127.0.0.1',
+    'BIND' => $bind_value,
     'FTP_PORT' => 12121,
     'FTPS_PORT' => 19990,
 ];
@@ -199,19 +232,30 @@ if (is_file($cert) && is_file($key)) {
     Windows "start /B" does not surface the PID, so the user
     closes the cmd window or kills php.exe via Task Manager
     after stopping the FTP server.
+
+    We export ATTOFTP_SERVER_PID into the spawned webui's
+    environment so the bind-switch endpoint in webui.php can
+    signal index.php (us) to shut down. posix_getppid() does
+    not work for that because the wrapper subshell detaches
+    webui from index.php (its parent becomes init); the env
+    var survives the detach.
  */
 $php = escapeshellarg(PHP_BINARY);
 $webui = escapeshellarg(__DIR__ . DIRECTORY_SEPARATOR .
     "webui.php");
+$self_pid = getmypid();
 if (strstr(PHP_OS, "WIN")) {
-    $job = "start /B $php $webui > NUL 2>&1";
+    $job = "set ATTOFTP_SERVER_PID=$self_pid && " .
+        "start /B $php $webui > NUL 2>&1";
     pclose(popen($job, "r"));
     echo "Spawned webui.php (Windows). Open " .
         "http://localhost:8080/\n";
-    echo "  To stop, close this cmd window or end php.exe " .
-        "in Task Manager.\n";
+    echo "  To stop, click 'Switch bind' in the UI, or " .
+        "close this cmd window, or end php.exe in Task " .
+        "Manager.\n";
 } else {
-    $job = "{ exec $php $webui ; } < /dev/null > /dev/null " .
+    $job = "{ export ATTOFTP_SERVER_PID=$self_pid; " .
+        "exec $php $webui ; } < /dev/null > /dev/null " .
         "2>&1 & echo PID=\$!";
     $h = popen($job, "r");
     $webui_pid = 0;

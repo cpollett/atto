@@ -444,14 +444,16 @@ nav.tabs a.active {
     background: #fff; border: 1px solid #e5e7eb;
     border-radius: 8px; padding: 14px 16px;
 }
-.scenario h3 {
-    margin: 0 0 6px; font-size: 15px; font-weight: 600;
-}
-.scenario p { margin: 0 0 10px; color: #4b5563; font-size: 14px; }
+.scenario .row { display: flex; align-items: center;
+    justify-content: space-between; gap: 1em; }
+.scenario .label { font-weight: 600; font-size: 15px; }
+.scenario .desc { color: #4b5563; font-size: 14px;
+    margin-top: 0.3em; }
 .scenario button {
     background: #2563eb; color: #fff; border: 0;
     padding: 6px 14px; border-radius: 6px; cursor: pointer;
     font-size: 13px; min-width: 4em; text-align: center;
+    flex-shrink: 0;
 }
 .scenario button:hover { background: #1d4ed8; }
 .scenario button:disabled { background: #93c5fd;
@@ -764,10 +766,15 @@ function dnsRenderScenarios()
     foreach (dnsScenarioList() as $key => $info) {
         echo "<div class=\"scenario\" data-key=\"" .
             htmlspecialchars($key) . "\">";
-        echo "<h3>" . htmlspecialchars($info['title']) .
-            "</h3>";
-        echo "<p>" . htmlspecialchars($info['desc']) . "</p>";
+        echo "<div class=\"row\">";
+        echo "<div>";
+        echo "<div class=\"label\">" .
+            htmlspecialchars($info['title']) . "</div>";
+        echo "<div class=\"desc\">" .
+            htmlspecialchars($info['desc']) . "</div>";
+        echo "</div>";
         echo "<button type=\"button\">Run</button>";
+        echo "</div>";
         echo "<div class=\"result-slot\"></div>";
         echo "</div>";
     }

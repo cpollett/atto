@@ -1871,6 +1871,22 @@ pre.transcript-static { background: #1e1e1e; color: #ddd;
 .crumbs a:hover { text-decoration: underline; }
 .upload-bar { margin: 0.8em 0; padding: 0.7em 0.9em;
     background: #f6f6f6; border-radius: 4px; }
+.user-switcher { margin: 0.6em 0 0; padding: 0.55em 0.8em;
+    background: #fffbe9; border: 1px solid #f0e0a8;
+    border-radius: 4px; display: flex; align-items: center;
+    gap: 0.6em; flex-wrap: wrap; font-size: 0.9em;
+    color: #4a3c00; }
+.user-switcher select { font: inherit; padding: 0.2em
+    0.4em; border-radius: 3px; border: 1px solid #d8c890;
+    background: #fff; }
+.user-switcher .reset-btn { font: inherit; padding: 0.3em
+    0.8em; background: #b33; color: white; border: 0;
+    border-radius: 4px; cursor: pointer; margin-left: auto; }
+.user-switcher .reset-btn:disabled { background: #888;
+    cursor: default; }
+.user-switcher .reset-btn:hover { background: #c44; }
+.browse-table .entry-icon { width: 1.6em; text-align:
+    center; font-size: 1.05em; padding-right: 0; }
 CSS;
 });
 /*
@@ -2494,6 +2510,36 @@ function sshRawScript()
 })();
 JS;
 }
+/**
+ * Builds a URL with a path query parameter that survives
+ * atto's WebSite request-URI parser. The upstream parser
+ * urldecodes the request URI before chopping off the
+ * query string by the (still-encoded) QUERY_STRING length,
+ * so a "%2F" inside the query string makes the chop math
+ * undercount and the route is mis-identified as 404.
+ *
+ * Workaround: emit slashes literally inside the value of
+ * the path parameter (browsers accept that fine), and
+ * still escape every other character that has special
+ * meaning in a query string. This is essentially urlencode
+ * with "/" added to the safe set.
+ */
+function sshEncPath($value)
+{
+    return str_replace('%2F', '/', urlencode($value));
+}
+/**
+ * Builds a "/browser?path=...&who=..." URL preserving the
+ * current who selection across navigation.
+ */
+function sshBrowserUrl($path, $who)
+{
+    $url = '/browser?path=' . sshEncPath($path);
+    if ($who !== '') {
+        $url .= '&who=' . urlencode($who);
+    }
+    return $url;
+}
 function sshRenderBrowser($cfg)
 {
     $path = $_GET['path'] ?? '/';
@@ -2509,14 +2555,58 @@ function sshRenderBrowser($cfg)
     if (strpos($path, '..') !== false) {
         $path = '/';
     }
-    $entries = sshBrowserListing($cfg, $path);
+    /*
+        The "who" query parameter chooses which demo user
+        the browser tab logs in as. Different users see
+        different parts of the tree (alice and bob are
+        chrooted to their home folders; guest sees the
+        whole tree but read-only). Defaults to alice.
+     */
+    $who = $_GET['who'] ?? 'alice';
+    $valid_users = array_column($cfg['demo_users'],
+        'user');
+    if (!in_array($who, $valid_users, true)) {
+        $who = 'alice';
+    }
+    $pass = '';
+    foreach ($cfg['demo_users'] as $u) {
+        if ($u['user'] === $who) {
+            $pass = $u['pass'];
+            break;
+        }
+    }
+    $entries = sshBrowserListing($cfg, $path, $who, $pass);
     echo '<div class="banner">';
     echo 'Server-side view of the storage tree, driven by ' .
         'real SFTP commands against the running server. ' .
-        'Login is as <code>alice</code> with password ' .
-        'auth. Click into directories, download files, ' .
-        'upload to the current folder, or rename / delete.';
+        'Pick a user from the switcher; alice and bob ' .
+        'land in their per-user home folder, guest sees ' .
+        'the whole tree read-only.';
     echo '</div>';
+    /* User switcher + reset button row */
+    echo '<form class="user-switcher" method="get" ' .
+        'action="/browser">';
+    echo '<input type="hidden" name="path" value="' .
+        htmlspecialchars($path) . '">';
+    echo '<label for="who-select">Logged in as:</label> ';
+    echo '<select id="who-select" name="who" ' .
+        'onchange="this.form.submit()">';
+    foreach ($cfg['demo_users'] as $u) {
+        $sel = ($u['user'] === $who) ? ' selected' : '';
+        $tag = '';
+        if (!empty($u['user']) && $u['user'] === 'guest') {
+            $tag = ' (read-only)';
+        }
+        echo '<option value="' .
+            htmlspecialchars($u['user']) . '"' . $sel .
+            '>' . htmlspecialchars($u['user']) . $tag .
+            '</option>';
+    }
+    echo '</select>';
+    echo ' <button type="button" id="resetBtn" ' .
+        'class="reset-btn">Reset root to pristine ' .
+        'state</button>';
+    echo '</form>';
     echo '<h2>Storage at ' .
         htmlspecialchars($path) . '</h2>';
     /* breadcrumbs */
@@ -2524,12 +2614,13 @@ function sshRenderBrowser($cfg)
     $parts = array_filter(explode('/', $path),
         fn($p) => $p !== '');
     $accum = '';
-    echo '<a href="/browser?path=/">/</a>';
+    echo '<a href="' . sshBrowserUrl('/', $who) .
+        '">/</a>';
     foreach ($parts as $i => $p) {
         $accum .= '/' . $p;
         if ($i < count($parts) - 1) {
-            echo ' / <a href="/browser?path=' .
-                urlencode($accum) . '">' .
+            echo ' / <a href="' .
+                sshBrowserUrl($accum, $who) . '">' .
                 htmlspecialchars($p) . '</a>';
         } else {
             echo ' / ' . htmlspecialchars($p);
@@ -2537,7 +2628,11 @@ function sshRenderBrowser($cfg)
     }
     echo '</div>';
     if ($entries === false) {
-        echo '<p class="note">Could not list this path.</p>';
+        echo '<p class="note">Could not list this path. ' .
+            '(The selected user may not have access, or ' .
+            'the path may not exist.)</p>';
+        echo '<script>' . sshBrowserScript($who) .
+            '</script>';
         return;
     }
     /* Upload form (POST multipart/form-data) */
@@ -2546,6 +2641,8 @@ function sshRenderBrowser($cfg)
         'enctype="multipart/form-data">';
     echo '<input type="hidden" name="path" value="' .
         htmlspecialchars($path) . '">';
+    echo '<input type="hidden" name="who" value="' .
+        htmlspecialchars($who) . '">';
     echo '<label for="upfile">Upload to ' .
         htmlspecialchars($path) . ': </label>';
     echo '<input type="file" name="file" id="upfile" ' .
@@ -2553,7 +2650,7 @@ function sshRenderBrowser($cfg)
     echo ' <button type="submit">Upload</button>';
     echo '</form>';
     echo '<table class="browse-table">';
-    echo '<thead><tr><th>Name</th><th>Size</th>' .
+    echo '<thead><tr><th></th><th>Name</th><th>Size</th>' .
         '<th>Modified</th><th>Actions</th></tr></thead>';
     echo '<tbody>';
     /* Show parent link if we are below root */
@@ -2562,19 +2659,22 @@ function sshRenderBrowser($cfg)
         if ($parent === '' || $parent === '.') {
             $parent = '/';
         }
-        echo '<tr><td><a href="/browser?path=' .
-            urlencode($parent) . '">..</a></td>';
+        echo '<tr><td>&#x2934;</td>';
+        echo '<td><a href="' .
+            sshBrowserUrl($parent, $who) . '">..</a></td>';
         echo '<td>--</td><td>--</td><td></td></tr>';
     }
     foreach ($entries as $e) {
         $name = $e['name'];
         $is_dir = $e['type'] === 'dir';
         $child_path = rtrim($path, '/') . '/' . $name;
+        $icon = $is_dir ? '&#x1F4C1;' : '&#x1F4C4;';
         echo '<tr>';
+        echo '<td class="entry-icon">' . $icon . '</td>';
         echo '<td>';
         if ($is_dir) {
-            echo '<a href="/browser?path=' .
-                urlencode($child_path) . '">' .
+            echo '<a href="' .
+                sshBrowserUrl($child_path, $who) . '">' .
                 htmlspecialchars($name) . '/</a>';
         } else {
             echo htmlspecialchars($name);
@@ -2588,8 +2688,8 @@ function sshRenderBrowser($cfg)
         echo '<td class="actions">';
         if (!$is_dir) {
             echo '<a href="/browser/download?path=' .
-                urlencode($child_path) .
-                '">download</a>';
+                sshEncPath($child_path) . '&who=' .
+                urlencode($who) . '">download</a>';
         }
         echo ' <a class="danger" href="#" ' .
             'data-action="delete" data-path="' .
@@ -2599,11 +2699,12 @@ function sshRenderBrowser($cfg)
         echo '</td></tr>';
     }
     echo '</tbody></table>';
-    echo '<script>' . sshBrowserScript() . '</script>';
+    echo '<script>' . sshBrowserScript($who) . '</script>';
 }
-function sshBrowserScript()
+function sshBrowserScript($who)
 {
-    return <<<'JS'
+    $who_js = json_encode($who);
+    return <<<JS
 (function () {
     document.querySelectorAll('a[data-action="delete"]')
     .forEach(function (a) {
@@ -2616,6 +2717,7 @@ function sshBrowserScript()
             fd.append('path', a.getAttribute('data-path'));
             fd.append('isdir',
                 a.getAttribute('data-isdir'));
+            fd.append('who', $who_js);
             fetch('/browser/delete', {
                 method: 'POST', body: fd,
             }).then(function () {
@@ -2623,6 +2725,30 @@ function sshBrowserScript()
             });
         });
     });
+    var resetBtn = document.getElementById('resetBtn');
+    if (resetBtn) {
+        resetBtn.addEventListener('click', function () {
+            if (!window.confirm(
+                'Reset the storage root? This deletes ' +
+                'every file currently in root/ and ' +
+                'replaces them with the contents of ' +
+                'original-root/.')) return;
+            resetBtn.disabled = true;
+            resetBtn.textContent = 'Resetting...';
+            var fd = new FormData();
+            fetch('/browser/reset', {
+                method: 'POST', body: fd,
+            }).then(function (r) {
+                return r.text();
+            }).then(function (msg) {
+                window.location.href = '/browser?path=/' +
+                    '&who=' + encodeURIComponent($who_js);
+            }).catch(function (err) {
+                resetBtn.disabled = false;
+                resetBtn.textContent = 'Reset failed';
+            });
+        });
+    }
 })();
 JS;
 }
@@ -2630,13 +2756,13 @@ JS;
  * Lists a directory via SFTP. Returns the entries array
  * or false on error. Used by the file-browser tab.
  */
-function sshBrowserListing($cfg, $path)
+function sshBrowserListing($cfg, $path, $who, $pass)
 {
     $c = sshConnect($cfg);
     if (!$c->isOpen()) {
         return false;
     }
-    if (!$c->authPassword('alice', 'hunter2')) {
+    if (!$c->authPassword($who, $pass)) {
         $c->disconnect();
         return false;
     }
@@ -2758,17 +2884,38 @@ $site->post('/raw', function () use ($site, $cfg) {
     ]);
     echo json_encode(['transcript' => $tx]);
 });
+/**
+ * Looks up the password for one of the configured demo
+ * users, or returns false if the name is unknown. Used
+ * by the file-browser routes to honor the "who" parameter.
+ */
+function sshLookupCreds($cfg, $who)
+{
+    foreach ($cfg['demo_users'] as $u) {
+        if ($u['user'] === $who) {
+            return $u['pass'];
+        }
+    }
+    return false;
+}
 $site->get('/browser/download', function () use ($site,
     $cfg) {
     $path = $_GET['path'] ?? '';
+    $who = $_GET['who'] ?? 'alice';
     if ($path === '' || strpos($path, '..') !== false) {
         $site->header('HTTP/1.1 400 Bad Request');
         echo 'bad path';
         return;
     }
+    $pass = sshLookupCreds($cfg, $who);
+    if ($pass === false) {
+        $site->header('HTTP/1.1 400 Bad Request');
+        echo 'bad user';
+        return;
+    }
     $c = sshConnect($cfg);
     if (!$c->isOpen() ||
-        !$c->authPassword('alice', 'hunter2')) {
+        !$c->authPassword($who, $pass)) {
         $site->header('HTTP/1.1 500 Internal Error');
         echo 'cannot connect';
         return;
@@ -2798,8 +2945,16 @@ $site->get('/browser/download', function () use ($site,
 $site->post('/browser/upload', function () use ($site,
     $cfg) {
     $path = $_POST['path'] ?? '/';
+    $who = $_POST['who'] ?? 'alice';
     if (strpos($path, '..') !== false) {
         $path = '/';
+    }
+    $pass = sshLookupCreds($cfg, $who);
+    $back = '/browser?path=' . sshEncPath($path) .
+        '&who=' . urlencode($who);
+    if ($pass === false) {
+        $site->header('Location: ' . $back);
+        return;
     }
     /*
         atto's cli-mode multipart parser populates $_FILES
@@ -2809,8 +2964,7 @@ $site->post('/browser/upload', function () use ($site,
         present.
      */
     if (empty($_FILES['file']['name'])) {
-        $site->header('Location: /browser?path=' .
-            urlencode($path));
+        $site->header('Location: ' . $back);
         return;
     }
     $name = basename($_FILES['file']['name']);
@@ -2822,14 +2976,13 @@ $site->post('/browser/upload', function () use ($site,
         $bytes = (string) @file_get_contents(
             $_FILES['file']['tmp_name']);
     } else {
-        $site->header('Location: /browser?path=' .
-            urlencode($path));
+        $site->header('Location: ' . $back);
         return;
     }
     $target = rtrim($path, '/') . '/' . $name;
     $c = sshConnect($cfg);
     if ($c->isOpen() &&
-        $c->authPassword('alice', 'hunter2')) {
+        $c->authPassword($who, $pass)) {
         list(, $rid) = $c->openSession();
         if ($c->subsystemRequest($rid, 'sftp') &&
             $c->sftpInit($rid)) {
@@ -2837,20 +2990,25 @@ $site->post('/browser/upload', function () use ($site,
         }
     }
     $c->disconnect();
-    $site->header('Location: /browser?path=' .
-        urlencode($path));
+    $site->header('Location: ' . $back);
 });
 $site->post('/browser/delete', function () use ($site,
     $cfg) {
     $path = $_POST['path'] ?? '';
+    $who = $_POST['who'] ?? 'alice';
     $isdir = !empty($_POST['isdir']);
     if ($path === '' || strpos($path, '..') !== false) {
         echo 'bad';
         return;
     }
+    $pass = sshLookupCreds($cfg, $who);
+    if ($pass === false) {
+        echo 'bad user';
+        return;
+    }
     $c = sshConnect($cfg);
     if ($c->isOpen() &&
-        $c->authPassword('alice', 'hunter2')) {
+        $c->authPassword($who, $pass)) {
         list(, $rid) = $c->openSession();
         if ($c->subsystemRequest($rid, 'sftp') &&
             $c->sftpInit($rid)) {
@@ -2863,6 +3021,79 @@ $site->post('/browser/delete', function () use ($site,
     $c->disconnect();
     echo 'ok';
 });
+$site->post('/browser/reset', function () use ($site,
+    $cfg) {
+    /*
+        Resets the storage tree by deleting the live root/
+        and replacing it with a fresh copy of original-
+        root/. Same self-repair logic the launcher runs at
+        startup, but on demand. Both paths come from the
+        webui's $cfg.
+     */
+    $site->header('Content-Type: text/plain');
+    $root = rtrim($cfg['root'], DIRECTORY_SEPARATOR);
+    $here = dirname($cfg['root']);
+    $pristine = $here . DIRECTORY_SEPARATOR .
+        'original-root';
+    if (!is_dir($pristine)) {
+        echo 'no pristine copy';
+        return;
+    }
+    sshRmTree($root);
+    @mkdir($root, 0777, true);
+    foreach ((array) @scandir($pristine) as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        sshCopyTree($pristine . DIRECTORY_SEPARATOR .
+            $entry, $root . DIRECTORY_SEPARATOR . $entry);
+    }
+    echo 'reset ok';
+});
+/**
+ * Recursive directory removal -- used by the reset route.
+ */
+function sshRmTree($path)
+{
+    if (!is_dir($path)) {
+        if (is_file($path)) {
+            @unlink($path);
+        }
+        return;
+    }
+    foreach ((array) @scandir($path) as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $child = $path . DIRECTORY_SEPARATOR . $entry;
+        if (is_dir($child)) {
+            sshRmTree($child);
+        } else {
+            @unlink($child);
+        }
+    }
+    @rmdir($path);
+}
+/**
+ * Recursive copy used by the reset route. Mirrors the
+ * copyTree() helper in index.php.
+ */
+function sshCopyTree($src, $dst)
+{
+    if (is_dir($src)) {
+        @mkdir($dst);
+        foreach ((array) @scandir($src) as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            sshCopyTree($src . DIRECTORY_SEPARATOR .
+                $entry,
+                $dst . DIRECTORY_SEPARATOR . $entry);
+        }
+    } else {
+        @copy($src, $dst);
+    }
+}
 $site->post('/bind', function () use ($site, $cfg) {
     $site->header('Content-Type: text/plain');
     $val = $_POST['bind'] ?? '';

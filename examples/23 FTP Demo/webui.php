@@ -63,6 +63,47 @@ $cfg = [
     ],
 ];
 /*
+    Derive the dial host from the current bind. The launcher
+    binds on the value in bind.txt; we dial back to the same
+    family (loopback). The "all interfaces" forms map to the
+    matching loopback because that is reachable on every
+    machine without surprises.
+        127.0.0.1 -> 127.0.0.1
+        0.0.0.0   -> 127.0.0.1
+        ::1       -> ::1
+        ::        -> ::1
+    The host is consumed by ftpSession/ftpScript and the few
+    places that build "tcp://host:port" dial URLs; v6 hosts
+    are bracket-wrapped by ftpDialUrl below.
+ */
+$cfg['host'] = ftpHostFromBind(
+    is_file($cfg['bind_file']) ?
+        trim((string) file_get_contents($cfg['bind_file'])) :
+        '127.0.0.1');
+/*
+    Map a bind value to the right loopback family. Anything
+    unrecognized falls back to v4 loopback.
+ */
+function ftpHostFromBind($bind)
+{
+    if ($bind === '::1' || $bind === '::') {
+        return '::1';
+    }
+    return '127.0.0.1';
+}
+/*
+    Bracket-wrap IPv6 hosts for stream_socket_client. PHP
+    requires "tcp://[::1]:port" syntax; "tcp://::1:port" is
+    parsed as host="" port=":1:port" and fails.
+ */
+function ftpDialUrl($host, $port)
+{
+    if (strpos($host, ':') !== false) {
+        return "tcp://[$host]:$port";
+    }
+    return "tcp://$host:$port";
+}
+/*
     --- FTP client primitives ---
     A small set of helpers that open a control connection,
     send commands, read replies, and run a passive-mode data
@@ -110,7 +151,7 @@ function ftpSendCmd($sock, $cmd, &$transcript)
 function ftpScript($host, $port, $commands)
 {
     $transcript = [];
-    $sock = @stream_socket_client("tcp://$host:$port",
+    $sock = @stream_socket_client(ftpDialUrl($host, $port),
         $errno, $errstr, 5);
     if (!$sock) {
         $transcript[] = ['dir' => '!',
@@ -186,7 +227,32 @@ function ftpPasvTransfer($sock, $cmd, $direction,
             break;
         }
     }
+    /*
+        IPv6 fallback. PASV embeds an IPv4 tuple, so an FTP
+        server with a v6 control connection refuses with
+        522 (RFC 2428 sec 2). When that happens here, the
+        right thing for a real client to do is retry the
+        same data transfer with EPSV. We do that inline so
+        the transcript shows both attempts: the user sees
+        the refusal, then the recovery, then the data.
+        ftpEpsvTransfer takes over; the only thing different
+        about its body is the data-channel dial.
+     */
     if ($addr === false) {
+        $first = isset($reply[0]) ? $reply[0] : '';
+        if (substr($first, 0, 4) === '522 ') {
+            $r = ftpEpsvTransfer($sock, $cmd, $direction,
+                $transcript, $upload_body);
+            $hint = 'Notice: PASV was refused with 522 ' .
+                'because the control channel is IPv6; ' .
+                'the demo retried with EPSV (RFC 2428) ' .
+                'and the transfer succeeded over the same ' .
+                'session.';
+            if (!empty($r['note'])) {
+                $hint .= ' ' . $r['note'];
+            }
+            return ['body' => $r['body'], 'note' => $hint];
+        }
         return ['body' => '',
             'note' => 'PASV reply not parseable'];
     }
@@ -283,12 +349,14 @@ function ftpEpsvTransfer($sock, $cmd, $direction,
 function ftpSession($host, $port, $user, $pass, $body_fn)
 {
     $transcript = [];
-    $sock = @stream_socket_client("tcp://$host:$port",
+    $note = null;
+    $sock = @stream_socket_client(ftpDialUrl($host, $port),
         $errno, $errstr, 5);
     if (!$sock) {
         $transcript[] = ['dir' => '!',
             'lines' => ["connect failed: $errstr"]];
-        return ['transcript' => $transcript, 'body' => ''];
+        return ['transcript' => $transcript, 'body' => '',
+            'note' => null];
     }
     stream_set_timeout($sock, 5);
     $banner = ftpReadReply($sock);
@@ -301,6 +369,10 @@ function ftpSession($host, $port, $user, $pass, $body_fn)
         $extra = $body_fn($sock, $transcript);
         if (is_array($extra) && isset($extra['body'])) {
             $body = $extra['body'];
+        }
+        if (is_array($extra) && isset($extra['note']) &&
+            $extra['note'] !== null) {
+            $note = $extra['note'];
         }
         if (is_array($extra) && !empty($extra['no_quit'])) {
             $skip_quit = true;
@@ -316,7 +388,8 @@ function ftpSession($host, $port, $user, $pass, $body_fn)
         }
     }
     @fclose($sock);
-    return ['transcript' => $transcript, 'body' => $body];
+    return ['transcript' => $transcript, 'body' => $body,
+        'note' => $note];
 }
 /*
     Renders an FTP transcript as the dig-style two-column
@@ -416,6 +489,12 @@ nav.tabs a.active { background: #f6f6f6; border-color: #ddd;
     font-family: -apple-system, BlinkMacSystemFont,
     sans-serif; font-size: 0.85em; color: #666;
     margin-bottom: 0.4em; }
+.scenario .note-hint { display: none; margin-top: 0.6em;
+    padding: 0.55em 0.8em; background: #fff8e1;
+    border-left: 3px solid #f0b400; color: #5a4400;
+    font-size: 0.88em; line-height: 1.45;
+    border-radius: 0 3px 3px 0; }
+.scenario .note-hint.visible { display: block; }
 form.raw { background: #f6f6f6; padding: 0.9em;
     border-radius: 4px; margin: 0.6em 0; }
 form.raw label { display: block; font-size: 0.85em;
@@ -538,10 +617,12 @@ function ftpRenderPage($which, $cfg, $body_fn)
     echo "<link rel=\"stylesheet\" href=\"/style.css\">";
     echo "</head><body>";
     echo "<h1>AttoFTP Demo</h1>";
+    $display_host = (strpos($cfg['host'], ':') !== false) ?
+        '[' . $cfg['host'] . ']' : $cfg['host'];
     echo "<div class=\"meta\">FTP control on tcp://" .
-        htmlspecialchars($cfg['host']) . ":" .
+        htmlspecialchars($display_host) . ":" .
         (int) $cfg['port'] . " &middot; implicit FTPS on " .
-        "tcp://" . htmlspecialchars($cfg['host']) . ":" .
+        "tcp://" . htmlspecialchars($display_host) . ":" .
         (int) $cfg['tls_port'] . ". Companion UI to <code>" .
         "index.php</code>; every transcript on this page " .
         "comes from a real control-channel exchange with " .
@@ -1028,6 +1109,7 @@ function ftpRenderScenarios($cfg)
         echo "</div>";
         echo "<button type=\"button\">Run</button>";
         echo "</div>";
+        echo "<div class=\"note-hint\"></div>";
         echo "<pre class=\"transcript\"></pre>";
         echo "<div class=\"body-pane\"></div>";
         echo "</div>";
@@ -1387,6 +1469,7 @@ document.querySelectorAll('.scenario').forEach(function (el) {
     var key = el.dataset.key;
     var pre = el.querySelector('.transcript');
     var body = el.querySelector('.body-pane');
+    var note = el.querySelector('.note-hint');
     function showRun() {
         btn.textContent = 'Run';
         btn.classList.remove('close');
@@ -1407,6 +1490,8 @@ document.querySelectorAll('.scenario').forEach(function (el) {
         pre.textContent = '';
         body.classList.remove('visible');
         body.innerHTML = '';
+        note.classList.remove('visible');
+        note.textContent = '';
     }
     btn.addEventListener('click', function () {
         if (btn.classList.contains('close')) {
@@ -1428,6 +1513,10 @@ document.querySelectorAll('.scenario').forEach(function (el) {
                 } else {
                     pre.textContent = data.transcript ||
                         '(empty transcript)';
+                    if (data.note) {
+                        note.textContent = data.note;
+                        note.classList.add('visible');
+                    }
                     if (data.body && data.body.length > 0) {
                         body.innerHTML = '<span class="hint">' +
                             'Data channel payload (' +
@@ -1542,18 +1631,21 @@ $site->post('/scenario', function () use ($site, $cfg) {
     $info = $list[$key];
     $session = ftpSession($cfg['host'], $cfg['port'],
         $info['user'], $info['pass'], $info['run']);
-    /* The body of the scenario may be the data-channel
-       payload of the last transfer; surface it. The
-       scenario callable optionally returns 'note'. */
-    $note = null;
-    /* No clean way to extract note from the callable's
-       return value -- ftpSession() only forwards 'body'.
-       Store note via a side channel: re-run the callable's
-       last return value? Simpler: peek into the transcript
-       for any "!" entry that signals an issue. */
+    /*
+        Surface the note from the inner callable (e.g. the
+        "PASV refused, retried with EPSV" hint when the
+        bind is IPv6) and any "!" entries from the
+        transcript (transport-level errors). The callable's
+        note wins; transport errors are appended as a
+        secondary line below.
+     */
+    $note = $session['note'];
     foreach ($session['transcript'] as $entry) {
-        if ($entry['dir'] === '!' && $note === null) {
-            $note = implode('; ', $entry['lines']);
+        if ($entry['dir'] === '!') {
+            $line = implode('; ', $entry['lines']);
+            $note = ($note === null) ? $line :
+                ($note . ' (' . $line . ')');
+            break;
         }
     }
     echo json_encode([

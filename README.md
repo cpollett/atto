@@ -1,50 +1,55 @@
-Atto Servers
-===============
-Atto is a collection of single file, low dependency, pure PHP servers and
-routing engines. Currently, Atto has two server classes: WebSite, a pure PHP
-web server and web routing engine and GopherSite, a pure PHP [gopher](
-https://en.wikipedia.org/wiki/Gopher_%28protocol%29) server
-and gopher routing engine.
+Atto is a collection of single-file, low-dependency, pure-PHP servers and
+routing engines. Each server is one file you drop into a project, configure
+with a few chained setters, and start with a `listen()` call. No Composer
+modules required. No build step.
 
- * Atto Servers can be used to route requests, and hence, serve as a micro
- framework for use under a traditional servers such as Apache, nginx,
- or lighttpd.
+What's in the box:
 
- * Atto can be used as a standalone server for apps
- created using its routing facility.
+ * **WebSite** -- HTTP/1.1 and HTTP/2 web server and router. Doubles as a
+   micro-framework under Apache, nginx, or lighttpd, or runs standalone.
+   Optional HTTP/3 via the sibling H3Listener (libquiche needed).
 
- * Atto is request event-driven, supporting
- asynchronous I/O for web traffic.
+ * **GopherSite** -- a [gopher protocol](
+   https://en.wikipedia.org/wiki/Gopher_%28protocol%29) server, shaped
+   just like WebSite.
 
- * Unlike similar PHP software, as a Web or Gopher Server, it instantiates
-traditional PHP superglobals like $_GET, $_POST, $_REQUEST, $_COOKIE, $_SESSION,
- $_FILES, etc and endeavors to make it easy to code apps in a rapid PHP style.
+ * **MailSite** -- SMTP and IMAP in one process. STARTTLS, authenticated
+   submission, mailbox storage, the lot.
 
-As a standalone Server:
+ * **DnsSite** -- authoritative DNS server. Reads zone files, answers UDP
+   and TCP queries, supports DoT (DNS over TLS).
 
- * Atto supports timers for background events.
- * Atto handles sessions in RAM.
- * Atto has File I/O methods fileGetContents and filePutContents which cache
-   files using the Marker algorithm.
+ * **FtpSite** -- FTP server with explicit and implicit FTPS. Speaks the
+   command set FileZilla and curl expect, including MLSD listings, passive
+   and active data connections, and a path-traversal guard.
 
-Usage
------------
+ * **SshSite** -- SSH-2 server (RFC 4250-4254) with the SFTP subsystem.
+   Curve25519 KEX, Ed25519 host keys, AES-128-CTR + HMAC-SHA-256. Password
+   and publickey auth (OpenSSH-format authorized_keys). All crypto comes
+   from PHP's bundled ext-sodium / ext-openssl / ext-hash.
+
+ * **TurnSite** -- STUN/TURN server (RFC 8489 / RFC 8656) for WebRTC and
+   SIP relays. Long-term credentials, allocations, channels.
+
+A few things every Atto server has in common: request-event-driven (one
+PHP process, async I/O); the `$site->get('/', ...)` routing API carries
+through where it makes sense; familiar superglobals like `$_GET`, `$_POST`,
+`$_SESSION`, `$_FILES` are populated for the protocols where that idiom
+fits. Sessions live in RAM, timers fire on a schedule, and file I/O goes
+through caching `fileGetContents` / `filePutContents` helpers.
+
+Hello, World
+------------
 
 ```php
 <?php
-require 'atto_server_path/src/Website.php'; //this line needs to be changed
+require 'atto_server_path/src/WebSite.php'; // adjust to your path
 
-use seekquarry\atto\Website;
+use seekquarry\atto\WebSite;
 
-$test = new WebSite();
-/*
-    A Simple Atto WebSite used to display a Hello World landing page.
-    After changing the require line above, you can run the example
-    by typing:
-       php index.php
-    and pointing a browser to http://localhost:8080/
- */
-$test->get('/', function() {
+$site = new WebSite();
+
+$site->get('/', function () {
     ?>
     <!DOCTYPE html>
     <html>
@@ -54,68 +59,89 @@ $test->get('/', function() {
     <div>My first atto server route!</div>
     </body>
     </html>
-<?php
+    <?php
 });
 
-if($test->isCli()) {
-    /*
-       This line is used if the app is run from the command line
-       with a line like:
-       php index.php
-       It causes the server to run on port 8080
-     */
-    $test->listen(8080);
+if ($site->isCli()) {
+    /* From the command line: php index.php */
+    $site->listen(8080);
 } else {
-    /* This line is for when site is run under a web server like
-       Apache, nginx, lighttpd, etc. The enclosing folder should contain an
-       .htaccess file to redirect traffic through this index.php file. So
-       redirects need to be on to use this example under a Apache, etc.
-     */
-    $test->process();
+    /* Behind Apache/nginx/lighttpd via .htaccess + this index.php */
+    $site->process();
 }
 ```
+
+Run `php index.php`, point a browser at `http://localhost:8080/`, done.
+The other servers follow the same shape: swap WebSite for FtpSite or
+SshSite or whichever, configure with chained setters, call `listen()`.
 
 Installation
 ------------
 
-Atto Server has been tested on PHP 5.5, PHP 7, and HHVM. HTTPS support does
-not currently work under HHVM.
+Atto runs on PHP 7+ (PHP 8 recommended). HTTPS works on any PHP build with
+ext-openssl; SshSite additionally needs ext-sodium.
 
-To install the software one should have PHP installed. One can then
-``git clone`` the project or download the ZIP file off of GitHub.
+Get the code:
 
-To use Atto Server in your project, add the lines:
-```php
-require 'atto_server_path/src/Website.php';  //this line needs to be changed
-
-use seekquarry\atto\Website;
 ```
-to the top of your project file. (GopherSite should be used if you want a
-[gopher](https://en.wikipedia.org/wiki/Gopher_%28protocol%29) server) If you
-don't have the ``use`` line, then to
-refer to the Website class you would need to add the whole namespace path.
-For example,
-```php
-$test = new seekquarry\atto\Website();
+git clone https://github.com/seekquarry/atto.git
 ```
 
-If you use composer, you can require Atto Servers using the command:
+Then drop one require line into your project:
+
+```php
+require 'atto_server_path/src/WebSite.php'; // or whichever Site class
+use seekquarry\atto\WebSite;
+```
+
+Composer works too:
+
 ```
 composer require seekquarry/atto
 ```
-You should then do ``composer install`` or ``composer update``.
-Requiring ``"vendor/autoload.php"`` should then suffice to allow
-Atto Servers to be autoloaded as needed by your code.
 
-More Examples
+Then `require "vendor/autoload.php"` and the Atto Site classes autoload.
+
+Examples
+--------
+
+The `examples/` folder has a numbered tour: 01-18 are WebSite features
+(routing, forms, sessions, WebSockets, streaming, HTTP/3, benchmarks),
+and 19 onward are full-protocol demos:
+
+ * **19 GopherSite Demo** -- a working gopher hole.
+ * **20 MailSite Demo** -- SMTP + IMAP, with `swaks` and `openssl s_client`
+   smoke tests.
+ * **21 Anonymous WebMail** -- a webmail front-end on top of MailSite.
+ * **22 DNS Demo** -- click-through DNS scenarios, a query box, and a
+   browser-style zone-file editor.
+ * **23 FTP Demo** -- click-through FTP scenarios, a raw command box, and
+   a live FTP-driven file browser.
+ * **24 SSH Demo** -- click-through SSH/SFTP scenarios with on-wire
+   transcripts, a raw exec command box, and a multi-user file browser.
+ * **25 TURN Demo** -- click-through STUN/TURN scenarios with full STUN
+   message decode and a raw STUN/TURN method explorer.
+
+To run any example:
+
+```
+php index.php 19   # or 20, 21, 22, 23, 24, 25, ...
+```
+
+Each demo's `index.php` carries a header docblock describing its config,
+demo credentials, and a "How to connect" pointer for real-world clients
+(curl, FileZilla, ssh, swaks, etc.). Demos 22-25 also spawn a companion
+web UI at `http://localhost:8080/` so you can poke at the server from
+your browser without leaving PHP.
+
+Going Further
 -------------
 
-The examples folder of this project has a sequence of examples illustrating
-the main features of the Atto Servers.
+The demo `webui.php` files are full worked examples of using an Atto Site
+class as a library: client classes, transcripts, error handling, all in
+one file. Copy a Site class into your own project, write your own routes,
+and you're off.
 
-You can test out a given example, by using the index.php script in the root
-project folder. For example,
-```
-php index.php 01
-```
-would run the first example.
+Atto's whole pitch is *single-file, no friction*. Skim the source of any
+Site class -- they're documented top to bottom -- and write the server
+your project actually needs.

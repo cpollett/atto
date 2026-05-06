@@ -554,15 +554,25 @@ class WebSite
             return;
         }
         $method = $_SERVER['REQUEST_METHOD'] ?? "ERROR";
-        if (empty($_SERVER['QUERY_STRING'])) {
-            $this->request_script = rtrim(
-                substr(urldecode($_SERVER['REQUEST_URI']),
-                strlen($this->base_path)), "?");
-        } else {
-            $this->request_script = substr(urldecode($_SERVER['REQUEST_URI']),
-                strlen($this->base_path),
-                -strlen($_SERVER['QUERY_STRING']) -  1);
-        }
+        /*
+            Compute the request path, separating it from
+            the query string. The chop must happen on the
+            still-encoded REQUEST_URI: a query string
+            containing percent-encoded chars (most commonly
+            "%2F" for slashes inside a value) shrinks under
+            urldecode(), so doing the chop on the decoded
+            string against the still-encoded QUERY_STRING
+            length undercounts and silently truncates the
+            path. Find the literal "?" delimiter on the
+            raw URI, then urldecode only the path portion.
+         */
+        $raw_uri = $_SERVER['REQUEST_URI'];
+        $q = strpos($raw_uri, '?');
+        $raw_path = ($q === false) ? $raw_uri :
+            substr($raw_uri, 0, $q);
+        $decoded_path = urldecode($raw_path);
+        $this->request_script = rtrim(substr($decoded_path,
+            strlen($this->base_path)), "?");
         if ($this->request_script == "") {
             $this->request_script = "/";
         }

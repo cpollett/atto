@@ -2448,6 +2448,25 @@ function sshRenderRaw($cfg)
         'creds, but you can switch to publickey auth ' .
         'with the bundled Ed25519 key.';
     echo '</div>';
+    /*
+        Reset bar matches the file-browser tab so the
+        affordance is consistent across tabs that mutate
+        the storage tree. The Raw tab can run "rm" via
+        the toy shell -- well, "cat" can be redirected
+        but actually no, rm is not in the toy shell. The
+        Raw tab can still mutate by running shell commands
+        whose side effects land in storage; reset puts
+        everything back.
+     */
+    echo '<form class="user-switcher" method="post" ' .
+        'action="/browser/reset">';
+    echo '<span>Mutated something with a custom ' .
+        'command? Snap the storage tree back to its ' .
+        'pristine state:</span>';
+    echo '<button type="button" id="resetBtn" ' .
+        'class="reset-btn">Reset root to pristine ' .
+        'state</button>';
+    echo '</form>';
     echo '<h2>Raw exec command</h2>';
     echo '<form class="raw" id="rawForm">';
     echo '<div class="row">';
@@ -2476,6 +2495,7 @@ function sshRenderRaw($cfg)
     echo '</form>';
     echo '<div id="rawResult"></div>';
     echo '<script>' . sshRawScript() . '</script>';
+    echo '<script>' . sshResetScript('') . '</script>';
 }
 function sshRawScript()
 {
@@ -2505,6 +2525,50 @@ function sshRawScript()
             result.textContent = 'ERROR: ' + err;
             btn.disabled = false;
             btn.textContent = 'Run';
+        });
+    });
+})();
+JS;
+}
+/**
+ * Reset-button wiring shared between the file-browser
+ * tab and the raw-command tab. Issues a POST to
+ * /browser/reset and reloads the page on success. The
+ * $reload_url argument lets the file browser bring the
+ * user back to / with their selected "who" preserved;
+ * an empty string just reloads the current location.
+ */
+function sshResetScript($reload_url)
+{
+    $url_js = json_encode($reload_url);
+    return <<<JS
+(function () {
+    var resetBtn = document.getElementById('resetBtn');
+    if (!resetBtn) return;
+    resetBtn.addEventListener('click', function () {
+        if (!window.confirm(
+            'Reset the storage root? This deletes every ' +
+            'file currently in root/ and replaces them ' +
+            'with the contents of original-root/.')) {
+            return;
+        }
+        resetBtn.disabled = true;
+        resetBtn.textContent = 'Resetting...';
+        var fd = new FormData();
+        fetch('/browser/reset', {
+            method: 'POST', body: fd,
+        }).then(function (r) {
+            return r.text();
+        }).then(function () {
+            var dest = $url_js;
+            if (dest && dest !== '') {
+                window.location.href = dest;
+            } else {
+                window.location.reload();
+            }
+        }).catch(function () {
+            resetBtn.disabled = false;
+            resetBtn.textContent = 'Reset failed';
         });
     });
 })();
@@ -2699,7 +2763,16 @@ function sshRenderBrowser($cfg)
         echo '</td></tr>';
     }
     echo '</tbody></table>';
+    /*
+        Two scripts: delete-link wiring (browser-tab
+        specific) and the reset button (shared with the
+        raw-command tab). Reset on the browser tab returns
+        the user to / with their selected "who" intact.
+     */
     echo '<script>' . sshBrowserScript($who) . '</script>';
+    $reset_dest = '/browser?path=/&who=' . urlencode($who);
+    echo '<script>' . sshResetScript($reset_dest) .
+        '</script>';
 }
 function sshBrowserScript($who)
 {
@@ -2725,30 +2798,6 @@ function sshBrowserScript($who)
             });
         });
     });
-    var resetBtn = document.getElementById('resetBtn');
-    if (resetBtn) {
-        resetBtn.addEventListener('click', function () {
-            if (!window.confirm(
-                'Reset the storage root? This deletes ' +
-                'every file currently in root/ and ' +
-                'replaces them with the contents of ' +
-                'original-root/.')) return;
-            resetBtn.disabled = true;
-            resetBtn.textContent = 'Resetting...';
-            var fd = new FormData();
-            fetch('/browser/reset', {
-                method: 'POST', body: fd,
-            }).then(function (r) {
-                return r.text();
-            }).then(function (msg) {
-                window.location.href = '/browser?path=/' +
-                    '&who=' + encodeURIComponent($who_js);
-            }).catch(function (err) {
-                resetBtn.disabled = false;
-                resetBtn.textContent = 'Reset failed';
-            });
-        });
-    }
 })();
 JS;
 }

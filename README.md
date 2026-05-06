@@ -78,7 +78,7 @@ SshSite or whichever, configure with chained setters, call `listen()`.
 Installation
 ------------
 
-Atto runs on PHP 7+ (PHP 8 recommended). HTTPS works on any PHP build with
+Atto runs on PHP 8+. HTTPS works on any PHP build with
 ext-openssl; SshSite additionally needs ext-sodium.
 
 Get the code:

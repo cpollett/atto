@@ -1,6 +1,7 @@
 {
     "name": "seekquarry/atto",
-    "description": "Single file, pure PHP web server and web routing engine",
+    "description": "Single-file, pure-PHP servers and routing engines:
+        HTTP/1.1+2, gopher, SMTP/IMAP, DNS, FTP, SSH/SFTP, STUN/TURN.",
     "homepage": "https://www.seekquarry.com/",
     "license": "GPL-3.0-or-later",
     "authors": [
@@ -11,11 +12,20 @@
     ],
     "minimum-stability": "stable",
     "require": {
-        "php": ">=8.4.0",
+        "php": ">=8.0.0",
+        "ext-openssl": "*",
         "ext-pcre": "*",
-        "ext-SPL":"*",
-        "ext-zip": "*",
-        "lib-pcre": "*"
+        "ext-sodium": "*"
+    },
+    "suggest": {
+        "ext-mbstring": "Charset conversion for MIME-encoded mail headers in
+            MailSite (non-UTF-8/US-ASCII parts).",
+        "ext-posix": "Privilege drop after binding privileged ports in WebSite
+            and GopherSite.",
+        "ext-ffi": "Required for the optional HTTP/3 listener (loads
+            libquiche via FFI).",
+        "ext-sockets": "Tunes UDP buffer sizes on the HTTP/3 listener;
+            optional even when FFI is present."
     },
     "autoload": {
         "psr-4": {

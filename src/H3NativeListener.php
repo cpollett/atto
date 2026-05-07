@@ -6035,8 +6035,15 @@ class H3NativeListener extends Listener
             return;
         }
         foreach ($h3->quic->emit() as $datagram) {
-            @stream_socket_sendto($this->server,
+            $sent = @stream_socket_sendto($this->server,
                 $datagram, 0, $h3->peer_address);
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(sprintf(
+                    "[H3TRACE] SEND %dB to %s sent=%s "
+                    . "src=flushOnce",
+                    strlen($datagram), $h3->peer_address,
+                    var_export($sent, true)));
+            }
         }
     }
     /**
@@ -6088,13 +6095,15 @@ class H3NativeListener extends Listener
          */
         foreach ($this->connections as $h3) {
             foreach ($h3->quic->emit() as $datagram) {
+                $sent = @stream_socket_sendto($this->server,
+                    $datagram, 0, $h3->peer_address);
                 if (getenv('ATTO_H3_TRACE')) {
                     error_log(sprintf(
-                        "[H3TRACE] SEND %dB to %s",
-                        strlen($datagram), $h3->peer_address));
+                        "[H3TRACE] SEND %dB to %s sent=%s "
+                        . "src=tickAll",
+                        strlen($datagram), $h3->peer_address,
+                        var_export($sent, true)));
                 }
-                @stream_socket_sendto($this->server,
-                    $datagram, 0, $h3->peer_address);
             }
         }
         if ($first_new !== null) {
@@ -6202,13 +6211,15 @@ class H3NativeListener extends Listener
         }
         /* Send any datagrams the QUIC layer has produced. */
         foreach ($h3->quic->emit() as $datagram) {
+            $sent = @stream_socket_sendto($this->server,
+                $datagram, 0, $peer);
             if (getenv('ATTO_H3_TRACE')) {
                 error_log(sprintf(
-                    "[H3TRACE] SEND %dB to %s",
-                    strlen($datagram), $peer));
+                    "[H3TRACE] SEND %dB to %s sent=%s "
+                    . "src=procDgram",
+                    strlen($datagram), $peer,
+                    var_export($sent, true)));
             }
-            @stream_socket_sendto($this->server, $datagram,
-                0, $peer);
         }
         return [$h3, $is_new];
     }
@@ -6274,8 +6285,16 @@ class H3NativeListener extends Listener
              */
             $h3->quic->flushStreams();
             foreach ($h3->quic->emit() as $datagram) {
-                @stream_socket_sendto($this->server,
+                $sent = @stream_socket_sendto($this->server,
                     $datagram, 0, $h3->peer_address);
+                if (getenv('ATTO_H3_TRACE')) {
+                    error_log(sprintf(
+                        "[H3TRACE] SEND %dB to %s sent=%s "
+                        . "src=tickInner",
+                        strlen($datagram),
+                        $h3->peer_address,
+                        var_export($sent, true)));
+                }
             }
         }
     }
@@ -6441,8 +6460,15 @@ class H3NativeTransport extends Transport
            1-RTT packets to the wire. */
         $conn->quic->flushStreams();
         foreach ($conn->quic->emit() as $datagram) {
-            @stream_socket_sendto($listener->server,
+            $sent = @stream_socket_sendto($listener->server,
                 $datagram, 0, $conn->peer_address);
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(sprintf(
+                    "[H3TRACE] SEND %dB to %s sent=%s "
+                    . "src=driveConn",
+                    strlen($datagram), $conn->peer_address,
+                    var_export($sent, true)));
+            }
         }
     }
     /**

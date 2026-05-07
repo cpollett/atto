@@ -10,6 +10,17 @@
         php bench.php --only=h2
         php bench.php --skip=headers,big
 
+    DEBUGGING SLOW OR EMPTY ROWS:
+        Set ATTO_BENCH_DEBUG=1 to log per-iteration curl errors
+        for any row reporting fewer successful iters than the
+        target. Useful when an H3 row appears to "hang" -- the
+        debug output shows whether each iteration is timing
+        out (errno=28 CURLE_OPERATION_TIMEDOUT), failing to
+        connect (errno=7), or some other curl-level error,
+        plus the negotiated HTTP version per success so you
+        can see if libcurl is silently falling back to H2.
+            ATTO_BENCH_DEBUG=1 php bench.php --only=h3-native
+
     PREREQ:
         Start the server first in another shell:
             php index.php
@@ -382,8 +393,23 @@ $TRANSPORTS = [
             return "https://{$host}:{$quic_port}{$path}";
         },
         'curl_opts' => [
-            CURLOPT_HTTP_VERSION => defined('CURL_HTTP_VERSION_3')
-                ? CURL_HTTP_VERSION_3 : 0,
+            /*
+                Use CURL_HTTP_VERSION_3ONLY when available
+                (libcurl >= 7.88.0). With plain CURL_HTTP_-
+                VERSION_3, libcurl attempts HTTP/3 first but
+                silently falls back to HTTP/2 over TCP if
+                QUIC fails -- which can mask H3-specific
+                bugs and dramatically inflates per-iteration
+                latency on hosts where the QUIC port has no
+                TCP listener (the fallback connect() times
+                out before erroring). _3ONLY pins the row
+                to true HTTP/3, surfacing failures fast.
+             */
+            CURLOPT_HTTP_VERSION =>
+                defined('CURL_HTTP_VERSION_3ONLY')
+                    ? CURL_HTTP_VERSION_3ONLY
+                    : (defined('CURL_HTTP_VERSION_3')
+                        ? CURL_HTTP_VERSION_3 : 0),
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_SSL_VERIFYHOST => 0,
         ],
@@ -417,8 +443,20 @@ $TRANSPORTS = [
             return "https://{$host}:{$quic_native_port}{$path}";
         },
         'curl_opts' => [
-            CURLOPT_HTTP_VERSION => defined('CURL_HTTP_VERSION_3')
-                ? CURL_HTTP_VERSION_3 : 0,
+            /*
+                See the matching comment on the 'h3' row
+                above for why we prefer _3ONLY: pinning to
+                true HTTP/3 keeps the row honest and stops
+                libcurl's silent TCP fallback from inflating
+                per-iteration latency to the connect-timeout
+                ceiling on hosts where the UDP port has no
+                paired TCP listener.
+             */
+            CURLOPT_HTTP_VERSION =>
+                defined('CURL_HTTP_VERSION_3ONLY')
+                    ? CURL_HTTP_VERSION_3ONLY
+                    : (defined('CURL_HTTP_VERSION_3')
+                        ? CURL_HTTP_VERSION_3 : 0),
             CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_SSL_VERIFYHOST => 0,
         ],
@@ -612,8 +650,12 @@ function probe($url, $http_version, $strict = false)
  */
 function singleShot($url, $opts, $iters, $desc)
 {
+    $debug = (bool) getenv('ATTO_BENCH_DEBUG');
     $times = [];
     $bytes = 0;
+    $first_err = null;
+    $err_codes = [];
+    $http_versions = [];
     for ($i = 0; $i < $iters; $i++) {
         $ch = curl_init();
         curl_setopt_array($ch, $opts + [
@@ -627,11 +669,43 @@ function singleShot($url, $opts, $iters, $desc)
         $body = curl_exec($ch);
         $time = curl_getinfo($ch, CURLINFO_TOTAL_TIME);
         $size = curl_getinfo($ch, CURLINFO_SIZE_DOWNLOAD);
+        $errno = curl_errno($ch);
+        $err = curl_error($ch);
+        $hv = curl_getinfo($ch, CURLINFO_HTTP_VERSION);
         if ($body === false) {
+            if ($debug) {
+                /*
+                    Print only the first 5 failures per row
+                    so 100-iter rows with everything failing
+                    don't drown the report.
+                 */
+                if (count($err_codes) < 5) {
+                    fwrite(STDERR, sprintf(
+                        "    [debug] iter=%d errno=%d "
+                        . "err=%s elapsed=%.3fs hv=%d\n",
+                        $i, $errno, $err, $time, $hv));
+                }
+                $err_codes[$errno] =
+                    ($err_codes[$errno] ?? 0) + 1;
+            }
+            if ($first_err === null) {
+                $first_err = "errno=$errno $err";
+            }
             continue;
+        }
+        if ($debug) {
+            $http_versions[$hv] = ($http_versions[$hv] ?? 0) + 1;
         }
         $times[] = $time;
         $bytes = $size;
+    }
+    if ($debug && !empty($err_codes)) {
+        fwrite(STDERR, "    [debug] err code counts: "
+            . json_encode($err_codes) . "\n");
+    }
+    if ($debug && !empty($http_versions)) {
+        fwrite(STDERR, "    [debug] http_version counts: "
+            . json_encode($http_versions) . "\n");
     }
     $stats = stats($times);
     $stats['desc'] = $desc;

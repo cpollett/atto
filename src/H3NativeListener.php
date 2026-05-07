@@ -384,6 +384,15 @@ class Tls13Engine
         return $this->secrets;
     }
     /**
+     * Returns the 32-byte client_random from the
+     * ClientHello, or "" if not yet seen. Useful for
+     * SSLKEYLOGFILE-style key logging during debugging.
+     */
+    public function clientRandom()
+    {
+        return $this->client_random;
+    }
+    /**
      * Returns the negotiated ALPN, or "" if none.
      */
     public function alpn()
@@ -2251,16 +2260,123 @@ class QuicPacket
         return [$packet, $body_start + $body_len];
     }
     /**
-     * Decodes a short-header (1-RTT) packet. Phase 2 stub:
-     * 1-RTT requires keys derived from TLS application
-     * traffic secrets, which we'll have in Phase 3 once
-     * the QUIC handshake completes end-to-end.
+     * Decodes a short-header (1-RTT) packet. Unlike long-
+     * headers, the DCID length isn't on the wire; the
+     * receiver knows it from the connection ID it
+     * allocated. Caller passes $dcid_len so we know where
+     * the packet number bytes start.
+     *
+     * Top 3 bits of byte 0 stay protected (form, fixed,
+     * key-phase) -- we only XOR the low 5 bits with the
+     * mask. This differs from long-header HP which only
+     * touches the low 4 bits.
      */
-    protected static function decodeShort($buf, $off, $keys,
-        $largest_pn_seen)
+    public static function decodeShort($buf, $off, $keys,
+        $dcid_len, $largest_pn_seen)
     {
-        return [false, $off,
-            "1-RTT decode not yet implemented"];
+        $packet_off = $off;
+        if (strlen($buf) < $off + 1 + $dcid_len + 4 + 16) {
+            return [false, $off, "short header truncated"];
+        }
+        $first = ord($buf[$off]);
+        $off++;
+        $dcid = substr($buf, $off, $dcid_len);
+        $off += $dcid_len;
+        $pn_offset = $off;
+        $sample_offset = $pn_offset + 4;
+        $sample = substr($buf, $sample_offset, 16);
+        $mask = $keys->headerProtectionMask($sample);
+        if ($mask === false) {
+            return [false, $off, "HP mask failed"];
+        }
+        $unprotected_first = $first ^ (ord($mask[0]) & 0x1F);
+        $pn_length = ($unprotected_first & 0x03) + 1;
+        $pn_truncated = 0;
+        for ($i = 0; $i < $pn_length; $i++) {
+            $b = ord($buf[$pn_offset + $i]) ^
+                ord($mask[$i + 1]);
+            $pn_truncated = ($pn_truncated << 8) | $b;
+        }
+        $packet_number = self::decodePacketNumber(
+            $pn_truncated, $pn_length, $largest_pn_seen);
+        $body_start = $pn_offset + $pn_length;
+        /*
+            For short-header packets there is no Length
+            field; the entire remainder of the datagram is
+            the protected payload + 16-byte AEAD tag.
+         */
+        $body_len = strlen($buf) - $body_start;
+        if ($body_len < 16) {
+            return [false, $off, "no room for AEAD tag"];
+        }
+        $hdr = chr($unprotected_first) .
+            substr($buf, $packet_off + 1,
+                $pn_offset - $packet_off - 1);
+        $pn_bytes = '';
+        for ($i = $pn_length - 1; $i >= 0; $i--) {
+            $pn_bytes .= chr(($packet_number >> ($i * 8))
+                & 0xFF);
+        }
+        $aad = $hdr . $pn_bytes;
+        $protected_body = substr($buf, $body_start,
+            $body_len);
+        $plaintext = $keys->open($packet_number, $aad,
+            $protected_body);
+        if ($plaintext === false) {
+            return [false, $body_start,
+                "AEAD authentication failed"];
+        }
+        $packet = new self();
+        $packet->form = self::FORM_SHORT;
+        $packet->destination_cid = $dcid;
+        $packet->packet_number = $packet_number;
+        $packet->packet_number_length = $pn_length;
+        $packet->payload = $plaintext;
+        $packet->header_bytes = $aad;
+        return [$packet, strlen($buf)];
+    }
+    /**
+     * Encodes a short-header (1-RTT) packet. Always uses
+     * 4-byte PN encoding for simplicity. First byte
+     * structure (RFC 9000 sec 17.3): bit 7 = 0 (form),
+     * bit 6 = 1 (fixed), bit 5 = 0 (spin), bits 4-3 = 0
+     * (reserved), bit 2 = 0 (key phase), bits 1-0 = pn
+     * length - 1.
+     */
+    public function encodeShort($keys, $packet_number,
+        $payload_unprotected)
+    {
+        $pn_length = 4;
+        $pn_low_bits = $pn_length - 1;
+        $first = 0x40 | $pn_low_bits;
+        $hdr = chr($first) . $this->destination_cid;
+        $pn_bytes = '';
+        for ($i = $pn_length - 1; $i >= 0; $i--) {
+            $pn_bytes .= chr(($packet_number >> ($i * 8))
+                & 0xFF);
+        }
+        $aad = $hdr . $pn_bytes;
+        $sealed = $keys->seal($packet_number, $aad,
+            $payload_unprotected);
+        $unprotected = $aad . $sealed;
+        $sample_offset = strlen($hdr) + 4;
+        $sample = substr($unprotected, $sample_offset, 16);
+        $mask = $keys->headerProtectionMask($sample);
+        if ($mask === false) {
+            return false;
+        }
+        $protected_first = ord($unprotected[0]) ^
+            (ord($mask[0]) & 0x1F);
+        $packet = chr($protected_first) .
+            substr($unprotected, 1, strlen($hdr) - 1);
+        for ($i = 0; $i < $pn_length; $i++) {
+            $packet .= chr(
+                ord($unprotected[strlen($hdr) + $i])
+                ^ ord($mask[$i + 1]));
+        }
+        $packet .= substr($unprotected,
+            strlen($hdr) + $pn_length);
+        return $packet;
     }
     /**
      * Decodes a truncated packet number into the full
@@ -3341,6 +3457,13 @@ class QuicConnection
      */
     public $error = "";
     /**
+     * @var bool whether we have already queued the
+     *      HANDSHAKE_DONE frame on the 1-RTT level.
+     *      Server sends this exactly once, immediately
+     *      after handshake completion (RFC 9001 sec 4.1.2).
+     */
+    public $handshake_done_sent = false;
+    /**
      * Constructs a server-side connection. $cert_pem and
      * $key_pem are the server's certificate and key for
      * the TLS 1.3 handshake; $alpn is the list of ALPN
@@ -3443,12 +3566,35 @@ class QuicConnection
                 /*
                     Short-header (1-RTT) packet, OR trailing
                     UDP-level padding bytes after a long-
-                    header packet. Either way, we can't
-                    process the rest of the datagram in
-                    Phase 3. Break (don't return) so
-                    driveHandshake still gets called below.
+                    header packet. If we have 1-RTT keys
+                    (handshake complete), try to decode;
+                    otherwise treat as padding and break.
                  */
-                break;
+                if (!isset(
+                    $this->keys[self::LEVEL_APPLICATION])) {
+                    break;
+                }
+                $level = self::LEVEL_APPLICATION;
+                $result = QuicPacket::decodeShort($buf,
+                    $start,
+                    $this->keys[$level]['rx'],
+                    strlen($this->local_cid),
+                    $this->largest_pn[$level]);
+                $pkt = $result[0];
+                $end = $result[1];
+                if ($pkt === false) {
+                    break;
+                }
+                $off = $end;
+                $this->received_pns[$level][] =
+                    $pkt->packet_number;
+                if ($pkt->packet_number >
+                    $this->largest_pn[$level]) {
+                    $this->largest_pn[$level] =
+                        $pkt->packet_number;
+                }
+                $this->processPacketFrames($level, $pkt);
+                continue;
             }
             /* Long-header packet. Determine the level
                from bits 4-5, then derive / look up the
@@ -3866,6 +4012,28 @@ class QuicConnection
         $out = [];
         $current = "";
         $pending_remaining = [];
+        /*
+            Queue HANDSHAKE_DONE the first time we hit
+            ESTABLISHED. RFC 9001 sec 4.1.2: server must
+            send HANDSHAKE_DONE to inform the client that
+            the handshake is fully complete. We also queue
+            an ACK at LEVEL_APPLICATION since by the time
+            we hit ESTABLISHED we will have received the
+            client's first 1-RTT packet (the one carrying
+            the Handshake-level Finished came in a long-
+            header Handshake packet, but a 1-RTT
+            HANDSHAKE_DONE makes sure we have *something*
+            on the application PN space to ACK against).
+         */
+        if ($this->state === self::ST_ESTABLISHED &&
+            !$this->handshake_done_sent &&
+            isset($this->keys[self::LEVEL_APPLICATION])) {
+            $payload = chr(QuicFrame::F_HANDSHAKE_DONE);
+            $ack_payload = $this->ackFrameBytes(
+                self::LEVEL_APPLICATION);
+            $this->queue1Rtt($ack_payload . $payload);
+            $this->handshake_done_sent = true;
+        }
         foreach ($this->send_queue as $entry) {
             list($level, $bytes, $status) = $entry;
             if ($status === 'pending') {
@@ -3873,9 +4041,30 @@ class QuicConnection
                     $pending_remaining[] = $entry;
                     continue;
                 }
-                /* $bytes is the unprotected payload; wrap
-                   it now. */
                 $pn = $this->next_pn[$level]++;
+                if ($level === self::LEVEL_APPLICATION) {
+                    /* Short-header packet. */
+                    $packet = new QuicPacket();
+                    $packet->destination_cid =
+                        $this->peer_cid;
+                    $bytes = $packet->encodeShort(
+                        $this->keys[$level]['tx'],
+                        $pn, $bytes);
+                    /*
+                        RFC 9000 sec 12.2: short-header
+                        packets MUST be the last packet in a
+                        UDP datagram. Flush whatever long-
+                        header packets are accumulated, then
+                        emit this 1-RTT packet on its own
+                        and reset.
+                     */
+                    if ($current !== '') {
+                        $out[] = $current;
+                        $current = "";
+                    }
+                    $out[] = $bytes;
+                    continue;
+                }
                 $packet = new QuicPacket();
                 $packet->long_type = ($level ===
                     self::LEVEL_HANDSHAKE) ?
@@ -3883,7 +4072,8 @@ class QuicConnection
                     QuicPacket::LONG_INITIAL;
                 $packet->version =
                     QuicPacket::VERSION_QUIC_V1;
-                $packet->destination_cid = $this->peer_cid;
+                $packet->destination_cid =
+                    $this->peer_cid;
                 $packet->source_cid = $this->local_cid;
                 $bytes = $packet->encodeLong(
                     $this->keys[$level]['tx'], $pn, $bytes);
@@ -3897,6 +4087,67 @@ class QuicConnection
         return $out;
     }
     /**
+     * Queues a payload (sequence of QUIC frames) for
+     * emission as a 1-RTT packet. Actual encoding + AEAD
+     * happens lazily inside emit() once the queue is
+     * flushed.
+     */
+    public function queue1Rtt($payload)
+    {
+        if ($payload === '') {
+            return;
+        }
+        $this->send_queue[] = [self::LEVEL_APPLICATION,
+            $payload, 'pending'];
+    }
+    /**
+     * Convenience: write data to a QUIC stream and
+     * optionally close the send side. Used by the H3
+     * layer for response bodies.
+     */
+    public function sendStreamData($sid, $data, $fin = false)
+    {
+        if (!isset($this->streams[$sid])) {
+            $this->streams[$sid] = new QuicStream($sid);
+        }
+        $this->streams[$sid]->write($data);
+        if ($fin) {
+            $this->streams[$sid]->finish();
+        }
+    }
+    /**
+     * Drains every writable stream into 1-RTT STREAM
+     * frames. One STREAM frame body is bounded at 1100
+     * bytes so multiple frames fit comfortably in a single
+     * ~1200-byte UDP datagram.
+     */
+    public function flushStreams()
+    {
+        if (!isset($this->keys[self::LEVEL_APPLICATION])) {
+            return;
+        }
+        foreach ($this->streams as $sid => $stream) {
+            while (true) {
+                $tup = $stream->takeForFrame(1100);
+                if ($tup === null) {
+                    break;
+                }
+                list($offset, $data, $fin) = $tup;
+                if ($data === '' && !$fin) {
+                    break;
+                }
+                $frame = QuicFrame::encode([
+                    'type' => QuicFrame::F_STREAM_BASE,
+                    'stream_id' => $sid,
+                    'offset' => $offset,
+                    'data' => $data,
+                    'fin' => $fin,
+                ]);
+                $this->queue1Rtt($frame);
+            }
+        }
+    }
+    /**
      * Returns true once the QUIC + TLS handshake has
      * completed end-to-end (server has received and
      * verified the client's Finished).
@@ -3904,5 +4155,1552 @@ class QuicConnection
     public function isEstablished()
     {
         return $this->state === self::ST_ESTABLISHED;
+    }
+    /**
+     * Returns true if the connection is in the closed
+     * state (CONNECTION_CLOSE seen, idle timeout, or
+     * local error).
+     */
+    public function isClosed()
+    {
+        return $this->state === self::ST_CLOSED;
+    }
+    /**
+     * Sends a CONNECTION_CLOSE frame and marks the
+     * connection closed. Best-effort; the frame goes out
+     * on the next emit() call (assuming we have keys at
+     * the appropriate level).
+     */
+    public function close($error_code = 0, $reason = '')
+    {
+        if ($this->state === self::ST_CLOSED) {
+            return;
+        }
+        $frame = QuicFrame::encode([
+            'type' => QuicFrame::F_CONNECTION_CLOSE,
+            'error_code' => $error_code,
+            'frame_type' => 0,
+            'reason' => $reason,
+        ]);
+        if (isset($this->keys[self::LEVEL_APPLICATION])) {
+            $this->queue1Rtt($frame);
+        }
+        $this->state = self::ST_CLOSED;
+    }
+}
+/**
+ * HTTP/3 frame codec, RFC 9114 sec 7.2. HTTP/3 frames are
+ * deliberately simpler than HTTP/2 frames: a frame is a
+ * varint type, a varint length, and length bytes of body.
+ * No flags, no stream ID inside the frame (the stream is
+ * identified by the QUIC stream the frame travels on).
+ *
+ * Type codes (RFC 9114 sec 7.2):
+ *   0x0  DATA
+ *   0x1  HEADERS
+ *   0x3  CANCEL_PUSH
+ *   0x4  SETTINGS
+ *   0x5  PUSH_PROMISE
+ *   0x7  GOAWAY
+ *   0xd  MAX_PUSH_ID
+ *
+ * Type codes 0x2, 0x6, 0x8, 0x9 are reserved and indicate
+ * a connection error if seen. Greased frame types
+ * (0x1f * N + 0x21) MUST be ignored.
+ */
+class H3FrameCodec
+{
+    const H3_DATA = 0x00;
+    const H3_HEADERS = 0x01;
+    const H3_CANCEL_PUSH = 0x03;
+    const H3_SETTINGS = 0x04;
+    const H3_PUSH_PROMISE = 0x05;
+    const H3_GOAWAY = 0x07;
+    const H3_MAX_PUSH_ID = 0x0D;
+    /**
+     * Decodes as many complete HTTP/3 frames as possible
+     * from $buf. Returns
+     *   [array_of_frames, leftover_bytes, err]
+     * leftover_bytes is the trailing portion not consumed
+     * because a frame was cut short; the caller should
+     * accumulate it and re-feed once more bytes arrive.
+     * err is "" on success.
+     */
+    public static function decodeAll($buf)
+    {
+        $frames = [];
+        $off = 0;
+        $end = strlen($buf);
+        while ($off < $end) {
+            $save = $off;
+            list($type, $off2) = QuicVarint::read($buf, $off);
+            if ($type === false) {
+                return [$frames, substr($buf, $save), ''];
+            }
+            list($len, $off3) = QuicVarint::read($buf, $off2);
+            if ($len === false ||
+                $end < $off3 + $len) {
+                return [$frames, substr($buf, $save), ''];
+            }
+            $body = substr($buf, $off3, $len);
+            $off = $off3 + $len;
+            $frames[] = ['type' => $type, 'body' => $body];
+        }
+        return [$frames, '', ''];
+    }
+    /**
+     * Encodes a single frame (type + length-prefixed
+     * body).
+     */
+    public static function encode($type, $body)
+    {
+        return QuicVarint::write($type) .
+            QuicVarint::write(strlen($body)) . $body;
+    }
+    /**
+     * Encodes a SETTINGS frame body. $settings is a flat
+     * associative array of setting_id => value, both
+     * varints. RFC 9114 sec 7.2.4 plus RFC 9204 sec 5
+     * for QPACK-related settings.
+     */
+    public static function encodeSettingsBody($settings)
+    {
+        $out = '';
+        foreach ($settings as $id => $value) {
+            $out .= QuicVarint::write($id) .
+                QuicVarint::write($value);
+        }
+        return $out;
+    }
+    /**
+     * Decodes a SETTINGS frame body into associative
+     * array.
+     */
+    public static function decodeSettingsBody($body)
+    {
+        $settings = [];
+        $off = 0;
+        while ($off < strlen($body)) {
+            list($id, $off) = QuicVarint::read($body, $off);
+            list($v, $off) = QuicVarint::read($body, $off);
+            if ($v === false) {
+                break;
+            }
+            $settings[$id] = $v;
+        }
+        return $settings;
+    }
+}
+/**
+ * QPACK header compression, RFC 9204. QPACK is HTTP/3's
+ * counterpart to HPACK (HTTP/2). Atto's QPACK is
+ * intentionally minimal:
+ *
+ *   - Encoder: never uses the dynamic table. Emits
+ *     "indexed field line" (4.5.2) when the (name, value)
+ *     pair is in the static table, "literal field line
+ *     with name reference (static)" (4.5.4) when only the
+ *     name matches, "literal field line with literal
+ *     name" (4.5.6) otherwise. No Huffman on the encoder
+ *     side (allowed by spec).
+ *
+ *   - Decoder: accepts all four representations including
+ *     post-base / dynamic-table references, but throws on
+ *     dynamic-table refs (we never grow a real dynamic
+ *     table). Required Insert Count > 0 is treated as an
+ *     error. Matches what's required when
+ *     SETTINGS_QPACK_MAX_TABLE_CAPACITY is zero.
+ *
+ *   - Huffman: clients use it; we decode it (delegating
+ *     to QpackHuffman). We don't emit it.
+ */
+class Qpack
+{
+    /**
+     * @var array static table, index => [name, value].
+     *      99 entries from RFC 9204 Appendix A.
+     */
+    protected static $static = null;
+    /**
+     * @var array name => first index in static table.
+     */
+    protected static $static_by_name = null;
+    /**
+     * @var array (name . "\0" . value) => index.
+     */
+    protected static $static_by_pair = null;
+    /**
+     * Returns the static table; built lazily.
+     */
+    public static function staticTable()
+    {
+        if (self::$static !== null) {
+            return self::$static;
+        }
+        self::$static = [
+            [':authority', ''],
+            [':path', '/'],
+            ['age', '0'],
+            ['content-disposition', ''],
+            ['content-length', '0'],
+            ['cookie', ''],
+            ['date', ''],
+            ['etag', ''],
+            ['if-modified-since', ''],
+            ['if-none-match', ''],
+            ['last-modified', ''],
+            ['link', ''],
+            ['location', ''],
+            ['referer', ''],
+            ['set-cookie', ''],
+            [':method', 'CONNECT'],
+            [':method', 'DELETE'],
+            [':method', 'GET'],
+            [':method', 'HEAD'],
+            [':method', 'OPTIONS'],
+            [':method', 'POST'],
+            [':method', 'PUT'],
+            [':scheme', 'http'],
+            [':scheme', 'https'],
+            [':status', '103'],
+            [':status', '200'],
+            [':status', '304'],
+            [':status', '404'],
+            [':status', '503'],
+            ['accept', '*/*'],
+            ['accept', 'application/dns-message'],
+            ['accept-encoding', 'gzip, deflate, br'],
+            ['accept-ranges', 'bytes'],
+            ['access-control-allow-headers', 'cache-control'],
+            ['access-control-allow-headers', 'content-type'],
+            ['access-control-allow-origin', '*'],
+            ['cache-control', 'max-age=0'],
+            ['cache-control', 'max-age=2592000'],
+            ['cache-control', 'max-age=604800'],
+            ['cache-control', 'no-cache'],
+            ['cache-control', 'no-store'],
+            ['cache-control', 'public, max-age=31536000'],
+            ['content-encoding', 'br'],
+            ['content-encoding', 'gzip'],
+            ['content-type', 'application/dns-message'],
+            ['content-type', 'application/javascript'],
+            ['content-type', 'application/json'],
+            ['content-type',
+                'application/x-www-form-urlencoded'],
+            ['content-type', 'image/gif'],
+            ['content-type', 'image/jpeg'],
+            ['content-type', 'image/png'],
+            ['content-type', 'text/css'],
+            ['content-type', 'text/html; charset=utf-8'],
+            ['content-type', 'text/plain'],
+            ['content-type', 'text/plain;charset=utf-8'],
+            ['range', 'bytes=0-'],
+            ['strict-transport-security',
+                'max-age=31536000'],
+            ['strict-transport-security',
+                'max-age=31536000; includesubdomains'],
+            ['strict-transport-security',
+                'max-age=31536000; includesubdomains; '
+                . 'preload'],
+            ['vary', 'accept-encoding'],
+            ['vary', 'origin'],
+            ['x-content-type-options', 'nosniff'],
+            ['x-xss-protection', '1; mode=block'],
+            [':status', '100'],
+            [':status', '204'],
+            [':status', '206'],
+            [':status', '302'],
+            [':status', '400'],
+            [':status', '403'],
+            [':status', '421'],
+            [':status', '425'],
+            [':status', '500'],
+            ['accept-language', ''],
+            ['access-control-allow-credentials', 'FALSE'],
+            ['access-control-allow-credentials', 'TRUE'],
+            ['access-control-allow-headers', '*'],
+            ['access-control-allow-methods', 'get'],
+            ['access-control-allow-methods',
+                'get, post, options'],
+            ['access-control-allow-methods', 'options'],
+            ['access-control-expose-headers',
+                'content-length'],
+            ['access-control-request-headers',
+                'content-type'],
+            ['access-control-request-method', 'get'],
+            ['access-control-request-method', 'post'],
+            ['alt-svc', 'clear'],
+            ['authorization', ''],
+            ['content-security-policy',
+                "script-src 'none'; object-src 'none'; "
+                . "base-uri 'none'"],
+            ['early-data', '1'],
+            ['expect-ct', ''],
+            ['forwarded', ''],
+            ['if-range', ''],
+            ['origin', ''],
+            ['purpose', 'prefetch'],
+            ['server', ''],
+            ['timing-allow-origin', '*'],
+            ['upgrade-insecure-requests', '1'],
+            ['user-agent', ''],
+            ['x-forwarded-for', ''],
+            ['x-frame-options', 'deny'],
+            ['x-frame-options', 'sameorigin'],
+        ];
+        self::$static_by_name = [];
+        self::$static_by_pair = [];
+        foreach (self::$static as $i => $entry) {
+            list($name, $value) = $entry;
+            if (!isset(self::$static_by_name[$name])) {
+                self::$static_by_name[$name] = $i;
+            }
+            self::$static_by_pair[$name . "\0" . $value] = $i;
+        }
+        return self::$static;
+    }
+    /**
+     * Encodes a list of [name, value] pairs as a QPACK
+     * encoded field section. The first two bytes are the
+     * Required Insert Count and Base; we always emit
+     * (0, 0) since we don't use the dynamic table.
+     */
+    public static function encode($headers)
+    {
+        self::staticTable();
+        /*
+            Required Insert Count = 0 (8-bit prefix)
+            Delta Base sign = 0, value = 0 (7-bit prefix)
+         */
+        $out = "\x00\x00";
+        foreach ($headers as $h) {
+            list($name, $value) = $h;
+            $name = strtolower($name);
+            $pair_key = $name . "\0" . $value;
+            if (isset(self::$static_by_pair[$pair_key])) {
+                $out .= self::encodeIndexedFieldLine(
+                    self::$static_by_pair[$pair_key],
+                    true);
+                continue;
+            }
+            if (isset(self::$static_by_name[$name])) {
+                $out .= self::encodeLiteralWithNameRef(
+                    self::$static_by_name[$name], true,
+                    $value);
+                continue;
+            }
+            $out .= self::encodeLiteralWithLiteralName(
+                $name, $value);
+        }
+        return $out;
+    }
+    /**
+     * Indexed Field Line, sec 4.5.2.
+     *   1 T x x x x x x  index (6-bit prefix integer)
+     * T = 1 means static table.
+     */
+    protected static function encodeIndexedFieldLine($index,
+        $is_static)
+    {
+        $first = 0x80 | ($is_static ? 0x40 : 0x00);
+        return self::encodePrefixedInt($index, 6, $first);
+    }
+    /**
+     * Literal Field Line With Name Reference, sec 4.5.4.
+     *   0 1 N T x x x x  index (4-bit prefix)
+     *   value as string-with-huffman (we omit huffman).
+     * N = Never-Indexed flag (0 here), T = static.
+     */
+    protected static function encodeLiteralWithNameRef(
+        $index, $is_static, $value)
+    {
+        $first = 0x40 | ($is_static ? 0x10 : 0x00);
+        return self::encodePrefixedInt($index, 4, $first) .
+            self::encodeString($value, 7);
+    }
+    /**
+     * Literal Field Line With Literal Name, sec 4.5.6.
+     *   0 0 1 N H x x x  name-length (3-bit prefix)
+     *   name bytes
+     *   value (string-with-huffman)
+     * H = use Huffman (we set 0).
+     */
+    protected static function encodeLiteralWithLiteralName(
+        $name, $value)
+    {
+        $first = 0x20;
+        return self::encodePrefixedInt(strlen($name), 3,
+            $first) . $name .
+            self::encodeString($value, 7);
+    }
+    /**
+     * Encodes a value preceded by a length, with a
+     * variable-bit prefix. The Huffman bit is bit
+     * (prefix_bits) of the first byte; we always set 0
+     * (no Huffman on encode).
+     */
+    protected static function encodeString($s, $prefix_bits)
+    {
+        return self::encodePrefixedInt(strlen($s),
+            $prefix_bits, 0) . $s;
+    }
+    /**
+     * QPACK prefixed-integer encoding, RFC 7541 sec 5.1
+     * (HPACK; QPACK reuses the same primitive). N is the
+     * number of bits in the first byte allocated to the
+     * integer; the remaining (8-N) bits are flag bits the
+     * caller pre-OR-ed into $high_bits.
+     */
+    protected static function encodePrefixedInt($value,
+        $n_bits, $high_bits)
+    {
+        $cap = (1 << $n_bits) - 1;
+        if ($value < $cap) {
+            return chr($high_bits | $value);
+        }
+        $out = chr($high_bits | $cap);
+        $value -= $cap;
+        while ($value >= 128) {
+            $out .= chr(($value & 0x7F) | 0x80);
+            $value >>= 7;
+        }
+        $out .= chr($value);
+        return $out;
+    }
+    /**
+     * Decoder: reads $bytes (a complete QPACK-encoded
+     * field section) and returns a list of [name, value]
+     * pairs. Throws on malformed input or dynamic-table
+     * references.
+     */
+    public static function decode($bytes)
+    {
+        self::staticTable();
+        $off = 0;
+        list($insert_count, $off) =
+            self::readPrefixedInt($bytes, $off, 8);
+        if ($insert_count !== 0) {
+            throw new \RuntimeException(
+                "Required Insert Count nonzero; dynamic " .
+                "table not supported");
+        }
+        list($base_first, $off) = self::readU8($bytes, $off);
+        list($delta_base, $off) =
+            self::readPrefixedIntFrom($bytes, $off, 7,
+                $base_first & 0x7F);
+        $headers = [];
+        while ($off < strlen($bytes)) {
+            list($byte, ) = self::readU8($bytes, $off);
+            if (($byte & 0x80) !== 0) {
+                /* Indexed Field Line, 4.5.2 */
+                $is_static = (bool)($byte & 0x40);
+                list($index, $off) =
+                    self::readPrefixedInt($bytes, $off, 6);
+                $headers[] = self::lookupStatic($index,
+                    $is_static, true);
+            } else if (($byte & 0x40) !== 0) {
+                /* Literal Field Line With Name Reference,
+                   4.5.4 */
+                $is_static = (bool)($byte & 0x10);
+                list($index, $off) =
+                    self::readPrefixedInt($bytes, $off, 4);
+                $entry = self::lookupStatic($index,
+                    $is_static, false);
+                list($value, $off) =
+                    self::readStringWithHuffman($bytes,
+                        $off, 7);
+                $headers[] = [$entry[0], $value];
+            } else if (($byte & 0x20) !== 0) {
+                /* Literal Field Line With Literal Name,
+                   4.5.6 */
+                list($name, $off) =
+                    self::readStringWithHuffman($bytes,
+                        $off, 3);
+                list($value, $off) =
+                    self::readStringWithHuffman($bytes,
+                        $off, 7);
+                $headers[] = [strtolower($name), $value];
+            } else if (($byte & 0x10) !== 0) {
+                throw new \RuntimeException(
+                    "post-base index not supported");
+            } else {
+                throw new \RuntimeException(
+                    "post-base name ref not supported");
+            }
+        }
+        return $headers;
+    }
+    protected static function readU8($buf, $off)
+    {
+        if (strlen($buf) <= $off) {
+            throw new \RuntimeException("QPACK truncated");
+        }
+        return [ord($buf[$off]), $off + 1];
+    }
+    protected static function readPrefixedInt($buf, $off,
+        $n_bits)
+    {
+        list($byte, $off) = self::readU8($buf, $off);
+        $cap = (1 << $n_bits) - 1;
+        $value = $byte & $cap;
+        return self::readPrefixedIntFrom($buf, $off,
+            $n_bits, $value);
+    }
+    protected static function readPrefixedIntFrom($buf, $off,
+        $n_bits, $value)
+    {
+        $cap = (1 << $n_bits) - 1;
+        if ($value < $cap) {
+            return [$value, $off];
+        }
+        $shift = 0;
+        while (true) {
+            list($b, $off) = self::readU8($buf, $off);
+            $value += ($b & 0x7F) << $shift;
+            if (($b & 0x80) === 0) {
+                break;
+            }
+            $shift += 7;
+            if ($shift > 56) {
+                throw new \RuntimeException(
+                    "prefixed int overflow");
+            }
+        }
+        return [$value, $off];
+    }
+    protected static function readStringWithHuffman($buf,
+        $off, $prefix_bits)
+    {
+        list($byte, ) = self::readU8($buf, $off);
+        $huffman_bit = 1 << $prefix_bits;
+        $is_huffman = (bool)($byte & $huffman_bit);
+        list($len, $off) =
+            self::readPrefixedInt($buf, $off, $prefix_bits);
+        if (strlen($buf) < $off + $len) {
+            throw new \RuntimeException(
+                "QPACK string truncated");
+        }
+        $bytes = substr($buf, $off, $len);
+        $off += $len;
+        if ($is_huffman) {
+            $bytes = QpackHuffman::decode($bytes);
+        }
+        return [$bytes, $off];
+    }
+    protected static function lookupStatic($index,
+        $is_static, $want_value)
+    {
+        if (!$is_static) {
+            throw new \RuntimeException(
+                "dynamic table not supported");
+        }
+        if (!isset(self::$static[$index])) {
+            throw new \RuntimeException(
+                "static table index out of range: $index");
+        }
+        list($name, $value) = self::$static[$index];
+        if ($want_value) {
+            return [$name, $value];
+        }
+        return [$name, ''];
+    }
+}
+/**
+ * QPACK Huffman codec, using the table from RFC 7541
+ * Appendix B (which QPACK adopts unchanged). Phase 4 only
+ * implements decode -- our encoder doesn't Huffman-encode
+ * strings (the spec allows this).
+ *
+ * The table maps each of 257 symbols (0-255 plus EOS=256)
+ * to a code of 5-30 bits. We build a binary lookup tree
+ * lazily on first decode.
+ */
+class QpackHuffman
+{
+    /**
+     * @var array binary tree: each node is a 2-element
+     *      array [left, right] where each branch is
+     *      either an int (leaf, the symbol) or a 2-element
+     *      array (internal node).
+     */
+    protected static $tree = null;
+    /**
+     * @var array list of [code, bit_length] from
+     *      RFC 7541 Appendix B.
+     */
+    protected static $codes = null;
+    /**
+     * Builds the codes table on first use. Embedded as a
+     * compact comma-separated string ("hex:bits" pairs) so
+     * the file stays under 80 columns and the data bulk is
+     * small.
+     */
+    protected static function loadCodes()
+    {
+        if (self::$codes !== null) {
+            return;
+        }
+        $raw = "1ff8:13,7fffd8:23,fffffe2:28,fffffe3:28,"
+            . "fffffe4:28,fffffe5:28,fffffe6:28,fffffe7:28,"
+            . "fffffe8:28,ffffea:24,3ffffffc:30,fffffe9:28,"
+            . "fffffea:28,3ffffffd:30,fffffeb:28,fffffec:28,"
+            . "fffffed:28,fffffee:28,fffffef:28,ffffff0:28,"
+            . "ffffff1:28,ffffff2:28,3ffffffe:30,ffffff3:28,"
+            . "ffffff4:28,ffffff5:28,ffffff6:28,ffffff7:28,"
+            . "ffffff8:28,ffffff9:28,ffffffa:28,ffffffb:28,"
+            . "14:6,3f8:10,3f9:10,ffa:12,1ff9:13,15:6,"
+            . "f8:8,7fa:11,3fa:10,3fb:10,f9:8,7fb:11,"
+            . "fa:8,16:6,17:6,18:6,0:5,1:5,2:5,19:6,"
+            . "1a:6,1b:6,1c:6,1d:6,1e:6,1f:6,5c:7,fb:8,"
+            . "7ffc:15,20:6,ffb:12,3fc:10,1ffa:13,21:6,"
+            . "5d:7,5e:7,5f:7,60:7,61:7,62:7,63:7,64:7,"
+            . "65:7,66:7,67:7,68:7,69:7,6a:7,6b:7,6c:7,"
+            . "6d:7,6e:7,6f:7,70:7,71:7,72:7,fc:8,73:7,"
+            . "fd:8,1ffb:13,7fff0:19,1ffc:13,3ffc:14,"
+            . "22:6,7ffd:15,3:5,23:6,4:5,24:6,5:5,25:6,"
+            . "26:6,27:6,6:5,74:7,75:7,28:6,29:6,2a:6,"
+            . "7:5,2b:6,76:7,2c:6,8:5,9:5,2d:6,77:7,"
+            . "78:7,79:7,7a:7,7b:7,7ffe:15,7fc:11,3ffd:14,"
+            . "1ffd:13,ffffffc:28,fffe6:20,3fffd2:22,"
+            . "fffe7:20,fffe8:20,3fffd3:22,3fffd4:22,"
+            . "3fffd5:22,7fffd9:23,3fffd6:22,7fffda:23,"
+            . "7fffdb:23,7fffdc:23,7fffdd:23,7fffde:23,"
+            . "ffffeb:24,7fffdf:23,ffffec:24,ffffed:24,"
+            . "3fffd7:22,7fffe0:23,ffffee:24,7fffe1:23,"
+            . "7fffe2:23,7fffe3:23,7fffe4:23,1fffdc:21,"
+            . "3fffd8:22,7fffe5:23,3fffd9:22,7fffe6:23,"
+            . "7fffe7:23,ffffef:24,3fffda:22,1fffdd:21,"
+            . "fffe9:20,3fffdb:22,3fffdc:22,7fffe8:23,"
+            . "7fffe9:23,1fffde:21,7fffea:23,3fffdd:22,"
+            . "3fffde:22,fffff0:24,1fffdf:21,3fffdf:22,"
+            . "7fffeb:23,7fffec:23,1fffe0:21,1fffe1:21,"
+            . "3fffe0:22,1fffe2:21,7fffed:23,3fffe1:22,"
+            . "7fffee:23,7fffef:23,fffea:20,3fffe2:22,"
+            . "3fffe3:22,3fffe4:22,7ffff0:23,3fffe5:22,"
+            . "3fffe6:22,7ffff1:23,3ffffe0:26,3ffffe1:26,"
+            . "fffeb:20,7fff1:19,3fffe7:22,7ffff2:23,"
+            . "3fffe8:22,1ffffec:25,3ffffe2:26,3ffffe3:26,"
+            . "3ffffe4:26,7ffffde:27,7ffffdf:27,3ffffe5:26,"
+            . "fffff1:24,1ffffed:25,7fff2:19,1fffe3:21,"
+            . "3ffffe6:26,7ffffe0:27,7ffffe1:27,3ffffe7:26,"
+            . "7ffffe2:27,fffff2:24,1fffe4:21,1fffe5:21,"
+            . "3ffffe8:26,3ffffe9:26,ffffffd:28,7ffffe3:27,"
+            . "7ffffe4:27,7ffffe5:27,fffec:20,fffff3:24,"
+            . "fffed:20,1fffe6:21,3fffe9:22,1fffe7:21,"
+            . "1fffe8:21,7ffff3:23,3fffea:22,3fffeb:22,"
+            . "1ffffee:25,1ffffef:25,fffff4:24,fffff5:24,"
+            . "3ffffea:26,7ffff4:23,3ffffeb:26,7ffffe6:27,"
+            . "3ffffec:26,3ffffed:26,7ffffe7:27,7ffffe8:27,"
+            . "7ffffe9:27,7ffffea:27,7ffffeb:27,ffffffe:28,"
+            . "7ffffec:27,7ffffed:27,7ffffee:27,7ffffef:27,"
+            . "7fffff0:27,3ffffee:26,3fffffff:30";
+        self::$codes = [];
+        foreach (explode(',', $raw) as $tok) {
+            list($hex, $bits) = explode(':', $tok);
+            self::$codes[] = [hexdec($hex), (int) $bits];
+        }
+        /*
+            Either 256 (no EOS) or 257 (with EOS) is fine;
+            257 is the canonical RFC 7541 form. If the
+            count is anything else the table is corrupted
+            and decode would silently produce wrong output;
+            bail loudly instead.
+         */
+        $n = count(self::$codes);
+        if ($n !== 256 && $n !== 257) {
+            throw new \RuntimeException(
+                "QpackHuffman table wrong size: $n");
+        }
+    }
+    /**
+     * Builds the binary lookup tree from the codes table.
+     */
+    protected static function buildTree()
+    {
+        if (self::$tree !== null) {
+            return;
+        }
+        self::loadCodes();
+        $root = [null, null];
+        foreach (self::$codes as $sym => $entry) {
+            list($code, $bits) = $entry;
+            $node = &$root;
+            for ($i = $bits - 1; $i >= 0; $i--) {
+                $bit = ($code >> $i) & 1;
+                if ($i === 0) {
+                    $node[$bit] = $sym;
+                } else {
+                    if (!is_array($node[$bit])) {
+                        $node[$bit] = [null, null];
+                    }
+                    $node = &$node[$bit];
+                }
+            }
+            unset($node);
+        }
+        self::$tree = $root;
+    }
+    /**
+     * Decodes a Huffman-encoded byte string. The encoded
+     * stream is padded with the most significant bits of
+     * the EOS symbol (all 1s); we ignore trailing bits
+     * once we have walked through every full byte.
+     */
+    public static function decode($bytes)
+    {
+        self::buildTree();
+        $out = '';
+        $node = self::$tree;
+        $bitlen = strlen($bytes) * 8;
+        for ($i = 0; $i < $bitlen; $i++) {
+            $byte_idx = $i >> 3;
+            $bit = (ord($bytes[$byte_idx])
+                >> (7 - ($i & 7))) & 1;
+            $next = $node[$bit];
+            if (is_int($next)) {
+                $out .= chr($next);
+                $node = self::$tree;
+            } else if (is_array($next)) {
+                $node = $next;
+            } else {
+                /*
+                    Hit a missing branch -- this is the
+                    EOS-style padding; we should have
+                    consumed all real symbols by now. Just
+                    stop.
+                 */
+                break;
+            }
+        }
+        return $out;
+    }
+}
+/**
+ * Public H3 Connection. Extends atto's Connection so it
+ * fits seamlessly into the existing $_SERVER routing.
+ * Wraps a QuicConnection plus the H3-layer state for one
+ * peer.
+ */
+class H3Connection extends Connection
+{
+    /**
+     * @var QuicConnection underlying QUIC connection
+     */
+    public $quic;
+    /**
+     * @var string hex-string view of the local CID, for
+     *      logging.
+     */
+    public $scid_hex = '';
+    /**
+     * @var string peer address in "ip:port" form, for
+     *      REMOTE_ADDR / REMOTE_PORT building.
+     */
+    public $peer_address = '';
+    /**
+     * @var int|null QUIC stream ID of the server's
+     *      uni control stream (allocated lazily on first
+     *      flush).
+     */
+    public $control_stream_id = null;
+    /**
+     * @var bool whether we have written the SETTINGS
+     *      frame on the control stream.
+     */
+    public $settings_sent = false;
+    /**
+     * @var array per-bidi-stream H3 state. Key is the QUIC
+     *      stream id; value is an associative array
+     *      ['headers' => [...], ':method' => 'GET', etc.,
+     *       'body_chunks' => [...], 'fin_seen' => bool,
+     *       'dispatched' => bool, 'h3_buf' => '' (partial
+     *       frames waiting for more data)].
+     */
+    public $h3_streams = [];
+    /**
+     * @var array per-uni-stream state. Key is QUIC stream
+     *      id; value is ['type' => varint or null,
+     *       'header_buf' => '' (waiting for the type byte
+     *       prefix)].
+     */
+    public $uni_streams = [];
+    /**
+     * @var int next bidi stream id to use for server-
+     *      initiated streams. Server-initiated bidi
+     *      streams in QUIC are 0b01 (id mod 4 == 1); we
+     *      currently don't open any (servers respond on
+     *      client-initiated streams), so this is unused
+     *      but reserved.
+     */
+    public $next_server_bidi = 1;
+    /**
+     * @var int next uni stream id for our control stream
+     *      and any server-initiated uni streams. Server-
+     *      initiated uni streams in QUIC have id mod 4
+     *      == 3 (binary 0b11). The lowest valid value is
+     *      3.
+     */
+    public $next_server_uni = 3;
+    /**
+     * Constructor: wraps a QuicConnection.
+     */
+    public function __construct($quic, $scid_hex,
+        $peer_address)
+    {
+        $this->quic = $quic;
+        $this->scid_hex = $scid_hex;
+        $this->peer_address = $peer_address;
+        $this->protocol = 'h3';
+        $this->client_http = 'HTTP/3';
+        $this->is_secure = true;
+        $this->https = 'on';
+    }
+    /**
+     * True once the QUIC handshake has finished and the
+     * connection can carry application data.
+     */
+    public function isEstablished()
+    {
+        return $this->quic->isEstablished();
+    }
+    /**
+     * True if the connection has gone into closed state
+     * (CONNECTION_CLOSE seen, idle timeout, fatal error).
+     */
+    public function isClosed()
+    {
+        return $this->quic->isClosed();
+    }
+    /**
+     * Tears down the connection, sending CONNECTION_CLOSE
+     * if possible.
+     */
+    public function close($error_code = 0, $reason = '')
+    {
+        $this->quic->close($error_code, $reason);
+    }
+}
+/**
+ * H3Listener: the public listener class. Owns the UDP
+ * socket, the connection table, and the lazy-init of
+ * H3Transport. Mirrors the FFI-version's surface so
+ * WebSite::listen() routes the same way regardless of
+ * which backend is active.
+ */
+class H3Listener extends Listener
+{
+    /**
+     * @var string PEM bytes of the server certificate,
+     *      cached so each new H3Connection's underlying
+     *      Tls13Engine can be constructed without re-
+     *      reading the file.
+     */
+    public $cert_pem = '';
+    /**
+     * @var string PEM bytes of the server private key.
+     */
+    public $key_pem = '';
+    /**
+     * @var array list of ALPN byte-strings the listener
+     *      offers, in preference order.
+     */
+    public $alpn_offered = ['h3'];
+    /**
+     * @var array dcid-hex => H3Connection. Active
+     *      connections.
+     */
+    public $connections = [];
+    /**
+     * @var array dcid-hex => float (Unix time of last
+     *      activity). Used to reap idle connections.
+     */
+    public $last_activity = [];
+    /**
+     * Standard listener constructor; cert/key/alpn are
+     * filled in by tryOpen.
+     */
+    public function __construct($server, $address, $globals,
+        $cert_pem, $key_pem, $alpn = ['h3'])
+    {
+        parent::__construct($server, $address, true,
+            $globals);
+        $this->cert_pem = $cert_pem;
+        $this->key_pem = $key_pem;
+        $this->alpn_offered = $alpn;
+    }
+    /**
+     * Opens an H3Listener on $bind_address. $context is the
+     * PHP stream context array typically built from the
+     * 'ssl' settings in the listen() spec; we pull
+     * 'local_cert' and 'local_pk' out of it. Returns null
+     * if the listener cannot be opened (missing cert/key,
+     * UDP bind failure).
+     */
+    public static function tryOpen($bind_address, $context,
+        $globals)
+    {
+        $ssl = $context['ssl'] ?? [];
+        $cert_path = $ssl['local_cert'] ?? '';
+        $key_path = $ssl['local_pk'] ?? '';
+        if (empty($cert_path) || empty($key_path)) {
+            echo "H3Listener for $bind_address: missing "
+                . "ssl.local_cert / ssl.local_pk\n";
+            return null;
+        }
+        if (!is_file($cert_path) || !is_file($key_path)) {
+            echo "H3Listener for $bind_address: cert or "
+                . "key file does not exist\n";
+            return null;
+        }
+        $cert_pem = file_get_contents($cert_path);
+        $key_pem = file_get_contents($key_path);
+        if (!$cert_pem || !$key_pem) {
+            echo "H3Listener for $bind_address: cert or "
+                . "key file unreadable\n";
+            return null;
+        }
+        $udp_address = preg_replace('/^tcp:\/\//', 'udp://',
+            $bind_address);
+        if ($udp_address === $bind_address &&
+            strpos($bind_address, '://') === false) {
+            $udp_address = 'udp://' . $bind_address;
+        }
+        $server = stream_socket_server($udp_address, $errno,
+            $errstr, STREAM_SERVER_BIND);
+        if (!$server) {
+            echo "H3Listener bind $udp_address: $errstr\n";
+            return null;
+        }
+        stream_set_blocking($server, false);
+        return new self($server, $bind_address, $globals,
+            $cert_pem, $key_pem, ['h3']);
+    }
+    /**
+     * Closes the UDP socket and tears down all tracked
+     * connections.
+     */
+    public function close()
+    {
+        foreach ($this->connections as $c) {
+            $c->close();
+        }
+        $this->connections = [];
+        parent::close();
+    }
+    /**
+     * Drains pending UDP datagrams, demuxes them to the
+     * right H3Connection, and returns the first newly-
+     * established connection (matching the H1/H2 pattern
+     * where accept returns at most one new Connection per
+     * call). Stale handshakes are reaped here on every
+     * UDP wake-up.
+     *
+     * @param ConnectionAcceptor $acceptor unused for H3
+     *     (kept for parent-class compat)
+     * @param float $timeout unused
+     * @return array [Connection|null, array|null]
+     */
+    public function accept($acceptor, $timeout)
+    {
+        $this->reapStaleConnections();
+        $first_new = null;
+        $first_context = null;
+        $max = 4096;
+        while ($max-- > 0) {
+            $peer = '';
+            $buf = @stream_socket_recvfrom($this->server,
+                65535, 0, $peer);
+            if ($buf === false || $buf === '') {
+                break;
+            }
+            list($conn, $is_new) = $this->processDatagram(
+                $buf, $peer);
+            if ($conn === null) {
+                continue;
+            }
+            $this->last_activity[$conn->scid_hex] =
+                microtime(true);
+            if ($is_new && $first_new === null) {
+                $first_new = $conn;
+                $first_context = [
+                    'protocol' => 'h3',
+                    'is_secure' => true,
+                ];
+            }
+        }
+        /*
+            Even if no inbound packets arrived this turn,
+            something may have queued up output (typically
+            the response from a prior dispatchRequest). Flush
+            every connection unconditionally.
+         */
+        foreach ($this->connections as $h3) {
+            foreach ($h3->quic->emit() as $datagram) {
+                @stream_socket_sendto($this->server,
+                    $datagram, 0, $h3->peer_address);
+            }
+        }
+        if ($first_new !== null) {
+            return [$first_new, $first_context];
+        }
+        return [null, null];
+    }
+    /**
+     * Demuxes one inbound datagram. Returns
+     *   [H3Connection|null, $is_new]
+     * where $is_new is true if this datagram opened a new
+     * connection.
+     */
+    public function processDatagram($buf, $peer)
+    {
+        $dcid = self::peekDcid($buf,
+            $this->commonCidLength());
+        if ($dcid === '' || $dcid === false) {
+            return [null, false];
+        }
+        $key_h = bin2hex($dcid);
+        $is_new = false;
+        if (!isset($this->connections[$key_h])) {
+            /*
+                Could be a brand-new client Initial whose
+                DCID was the value the client picked, OR a
+                follow-up packet whose DCID is our local_cid
+                from an earlier reply. Look up by local_cid
+                first.
+             */
+            $existing_h = null;
+            foreach ($this->connections as $kh => $cc) {
+                if ($cc->quic->local_cid === $dcid) {
+                    $existing_h = $kh;
+                    break;
+                }
+            }
+            if ($existing_h !== null) {
+                $key_h = $existing_h;
+            } else {
+                /* New connection -- only accept if this is
+                   a long-header Initial. */
+                if (strlen($buf) < 1 ||
+                    (ord($buf[0]) & 0x80) === 0) {
+                    return [null, false];
+                }
+                $quic = new QuicConnection(
+                    $this->cert_pem, $this->key_pem,
+                    $this->alpn_offered);
+                $h3 = new H3Connection($quic,
+                    bin2hex($quic->local_cid), $peer);
+                $h3->listener_name =
+                    $this->globals['SERVER_NAME'] ?? '';
+                $h3->listener_port =
+                    $this->globals['SERVER_PORT'] ?? '';
+                $this->connections[$key_h] = $h3;
+                $is_new = true;
+            }
+        }
+        $h3 = $this->connections[$key_h];
+        $ok = $h3->quic->processDatagram($buf, $peer);
+        if (!$ok || $h3->isClosed()) {
+            unset($this->connections[$key_h]);
+            unset($this->last_activity[$key_h]);
+            return [$h3, false];
+        }
+        /* Send any datagrams the QUIC layer has produced. */
+        foreach ($h3->quic->emit() as $datagram) {
+            @stream_socket_sendto($this->server, $datagram,
+                0, $peer);
+        }
+        return [$h3, $is_new];
+    }
+    /**
+     * Peeks the DCID out of a datagram. For long-header
+     * packets the DCID length is on the wire. For short-
+     * header packets we have to assume the locally chosen
+     * length, which we standardize at 8 bytes for all
+     * connections opened by this listener.
+     */
+    protected static function peekDcid($buf, $short_dcid_len)
+    {
+        if (strlen($buf) < 1) {
+            return false;
+        }
+        if (ord($buf[0]) & 0x80) {
+            if (strlen($buf) < 6) {
+                return false;
+            }
+            $dcid_len = ord($buf[5]);
+            if (strlen($buf) < 6 + $dcid_len) {
+                return false;
+            }
+            return substr($buf, 6, $dcid_len);
+        }
+        if (strlen($buf) < 1 + $short_dcid_len) {
+            return false;
+        }
+        return substr($buf, 1, $short_dcid_len);
+    }
+    /**
+     * Returns the byte length of CIDs we use for new
+     * connections. Currently a fixed 8 bytes; could be
+     * made per-connection if we ever rotate CIDs (Phase 5).
+     */
+    protected function commonCidLength()
+    {
+        return 8;
+    }
+    /**
+     * Tick all live connections: send any queued packets
+     * (e.g. ACKs whose timer just expired), drop any whose
+     * idle timer has elapsed.
+     */
+    public function tickAllConnections()
+    {
+        foreach ($this->connections as $kh => $h3) {
+            if ($h3->isClosed()) {
+                unset($this->connections[$kh]);
+                unset($this->last_activity[$kh]);
+                continue;
+            }
+            foreach ($h3->quic->emit() as $datagram) {
+                @stream_socket_sendto($this->server,
+                    $datagram, 0, $h3->peer_address);
+            }
+        }
+    }
+    /**
+     * Expires connections that have not received any
+     * packet in IDLE_TIMEOUT_SECS. Keeps the connection
+     * map small under load and matches the QUIC idle-
+     * timeout transport parameter we advertise (30s).
+     */
+    public function reapStaleConnections()
+    {
+        $now = microtime(true);
+        $threshold = 30.0;
+        foreach ($this->last_activity as $kh => $when) {
+            if ($now - $when > $threshold) {
+                if (isset($this->connections[$kh])) {
+                    $this->connections[$kh]->close();
+                    unset($this->connections[$kh]);
+                }
+                unset($this->last_activity[$kh]);
+            }
+        }
+    }
+    /**
+     * Returns the number of milliseconds until the next
+     * connection-level timer fires. Used by the event loop
+     * to bound select() waits. Phase 4: a fixed 100ms
+     * poll; Phase 5 will compute the actual minimum
+     * across PTO timers.
+     */
+    public function nextTimeoutMillis()
+    {
+        return 100;
+    }
+    /**
+     * Snapshot stats placeholder. Returns an empty array
+     * for now; Phase 5 will fill in per-connection RTT,
+     * loss, congestion-window stats.
+     */
+    public function snapshotAllStats()
+    {
+        return [];
+    }
+}
+/**
+ * H3Transport: the per-protocol parser. WebSite holds one
+ * Transport instance per supported protocol and routes
+ * each readable event to the Transport matching the
+ * Connection's negotiated protocol. For H3 the readable
+ * events are produced by H3Listener::accept rather than
+ * by the dispatcher's per-connection select set, so
+ * onReadable is a no-op. driveConnection is the real
+ * entry point: it polls the QUIC layer for new STREAM
+ * frame data, reassembles HTTP/3 frames, and dispatches
+ * full requests through WebSite::setGlobals +
+ * WebSite::getResponseData.
+ */
+class H3Transport extends Transport
+{
+    /**
+     * No-op for H3: per-connection readable events are
+     * driven by H3Listener::accept reading the shared UDP
+     * socket and dispatching datagrams. WebSite never
+     * adds an H3Connection to its select set.
+     */
+    public function onReadable($key, $conn, $in_stream,
+        $too_long)
+    {
+        /* nothing -- see class docblock */
+    }
+    /**
+     * Drives the HTTP/3 protocol layer on a freshly fed
+     * QUIC connection. Polls each QuicStream for
+     * application data, parses HTTP/3 frames, captures
+     * HEADERS via Qpack::decode, dispatches the request
+     * once FIN is seen, and ships back a response.
+     */
+    public function driveConnection($listener, $conn)
+    {
+        if (!$conn->isEstablished()) {
+            return;
+        }
+        $this->ensureControlStream($listener, $conn);
+        foreach ($conn->quic->streams as $sid => $stream) {
+            $is_uni = self::isUni($sid);
+            $is_client_init = self::isClientInitiated($sid);
+            if (!$is_client_init) {
+                /* Server-initiated stream (our control
+                   stream, push streams, etc.) -- nothing
+                   to consume here. flushStreams handles
+                   their outbound side. */
+                continue;
+            }
+            $bytes = $stream->consume();
+            if ($is_uni) {
+                $this->handleUniStream($conn, $sid, $stream,
+                    $bytes);
+                continue;
+            }
+            $this->handleBidiStream($listener, $conn, $sid,
+                $stream, $bytes);
+        }
+        /* Drain anything our handlers wrote into the
+           stream-send buffers, then flush the resulting
+           1-RTT packets to the wire. */
+        $conn->quic->flushStreams();
+        foreach ($conn->quic->emit() as $datagram) {
+            @stream_socket_sendto($listener->server,
+                $datagram, 0, $conn->peer_address);
+        }
+    }
+    /**
+     * If we have not yet opened our server-initiated uni
+     * control stream, do so and write a SETTINGS frame
+     * (RFC 9114 sec 6.2.1). Server-initiated uni streams
+     * in QUIC have stream IDs of the form 4n + 3.
+     */
+    protected function ensureControlStream($listener, $conn)
+    {
+        if ($conn->settings_sent) {
+            return;
+        }
+        $sid = $conn->next_server_uni;
+        $conn->next_server_uni += 4;
+        $conn->control_stream_id = $sid;
+        /*
+            First byte on a uni stream is the unidirectional
+            stream type (varint). 0x00 = control stream
+            (RFC 9114 sec 6.2.1).
+         */
+        $type = QuicVarint::write(0x00);
+        $settings_body =
+            H3FrameCodec::encodeSettingsBody([
+                /* QPACK_MAX_TABLE_CAPACITY = 0: we don't
+                   maintain a dynamic table. */
+                0x01 => 0,
+                /* QPACK_BLOCKED_STREAMS = 0 */
+                0x07 => 0,
+                /* MAX_FIELD_SECTION_SIZE = 65536 */
+                0x06 => 65536,
+            ]);
+        $settings_frame = H3FrameCodec::encode(
+            H3FrameCodec::H3_SETTINGS, $settings_body);
+        $conn->quic->sendStreamData($sid,
+            $type . $settings_frame, false);
+        $conn->settings_sent = true;
+    }
+    /**
+     * RFC 9000 sec 2.1: stream IDs whose lowest bit is 1
+     * are uni-directional.
+     */
+    protected static function isUni($sid)
+    {
+        return ($sid & 0x02) !== 0;
+    }
+    /**
+     * Stream IDs whose second-lowest bit is 0 are client-
+     * initiated.
+     */
+    protected static function isClientInitiated($sid)
+    {
+        return ($sid & 0x01) === 0;
+    }
+    /**
+     * Handles bytes received on a peer-initiated
+     * unidirectional stream. The first varint on every
+     * uni stream is the type; the rest is type-specific.
+     * We accept type 0x00 (control stream) so we can read
+     * the client's SETTINGS frame, and silently discard
+     * other types (push, encoder, decoder streams) since
+     * we don't use them.
+     */
+    protected function handleUniStream($conn, $sid, $stream,
+        $bytes)
+    {
+        if (!isset($conn->uni_streams[$sid])) {
+            $conn->uni_streams[$sid] = [
+                'type' => null,
+                'header_buf' => '',
+            ];
+        }
+        $st = &$conn->uni_streams[$sid];
+        $st['header_buf'] .= $bytes;
+        if ($st['type'] === null) {
+            list($t, $off) = QuicVarint::read(
+                $st['header_buf'], 0);
+            if ($t === false) {
+                return;
+            }
+            $st['type'] = $t;
+            $st['header_buf'] = substr($st['header_buf'],
+                $off);
+        }
+        if ($st['type'] === 0x00) {
+            /* Control stream: parse and discard SETTINGS,
+               ignore the rest. */
+            list($frames, $left, $err) =
+                H3FrameCodec::decodeAll($st['header_buf']);
+            $st['header_buf'] = $left;
+            /* No action needed; settings come across but
+               don't change our behavior in Phase 4. */
+        } else {
+            /* Push streams (0x01), QPACK encoder (0x02),
+               decoder (0x03), and grease types -- discard
+               buffered bytes since we don't act on them. */
+            $st['header_buf'] = '';
+        }
+        unset($st);
+    }
+    /**
+     * Handles bytes received on a client-initiated bidi
+     * stream. These carry HTTP/3 request frames: HEADERS
+     * always first, optional DATA frames, eventually a
+     * stream FIN.
+     */
+    protected function handleBidiStream($listener, $conn,
+        $sid, $stream, $bytes)
+    {
+        if (!isset($conn->h3_streams[$sid])) {
+            $conn->h3_streams[$sid] = [
+                'h3_buf' => '',
+                'headers' => [],
+                'method' => '',
+                'path' => '',
+                'authority' => '',
+                'scheme' => '',
+                'body_chunks' => [],
+                'fin_seen' => false,
+                'dispatched' => false,
+            ];
+        }
+        $st = &$conn->h3_streams[$sid];
+        $st['h3_buf'] .= $bytes;
+        list($frames, $left, $err) =
+            H3FrameCodec::decodeAll($st['h3_buf']);
+        $st['h3_buf'] = $left;
+        foreach ($frames as $f) {
+            if ($f['type'] === H3FrameCodec::H3_HEADERS) {
+                try {
+                    $headers = Qpack::decode($f['body']);
+                } catch (\Throwable $e) {
+                    $conn->close(0x010C,
+                        "QPACK_DECOMPRESSION_FAILED");
+                    return;
+                }
+                foreach ($headers as $h) {
+                    list($n, $v) = $h;
+                    if ($n === ':method') {
+                        $st['method'] = $v;
+                    } else if ($n === ':path') {
+                        $st['path'] = $v;
+                    } else if ($n === ':authority') {
+                        $st['authority'] = $v;
+                    } else if ($n === ':scheme') {
+                        $st['scheme'] = $v;
+                    } else if (substr($n, 0, 1) !== ':') {
+                        $st['headers'][$n] = $v;
+                    }
+                }
+            } else if ($f['type'] === H3FrameCodec::H3_DATA) {
+                $st['body_chunks'][] = $f['body'];
+            }
+            /* Other frame types: silently ignore */
+        }
+        if ($stream->isReceiveDone() && !$st['fin_seen']) {
+            $st['fin_seen'] = true;
+        }
+        unset($st);
+        if ($conn->h3_streams[$sid]['fin_seen'] &&
+            !$conn->h3_streams[$sid]['dispatched']) {
+            $this->dispatchRequest($listener, $conn, $sid);
+        }
+    }
+    /**
+     * Dispatches one fully-received request through atto's
+     * setGlobals + getResponseData pipeline, then writes
+     * the response back as an HTTP/3 HEADERS + DATA frame
+     * pair.
+     */
+    protected function dispatchRequest($listener, $conn, $sid)
+    {
+        $st = &$conn->h3_streams[$sid];
+        $st['dispatched'] = true;
+        $context = $this->buildContext($listener, $conn,
+            $st);
+        $this->site->setGlobals($context, $conn);
+        try {
+            $body = $this->site->getResponseData(false);
+        } catch (\Throwable $e) {
+            $this->sendErrorResponse($conn, $sid, 500);
+            return;
+        }
+        $status = 200;
+        if (preg_match('/HTTP\/[\d.]+ (\d+)/',
+            $this->site->header_data, $m)) {
+            $status = (int) $m[1];
+        }
+        $headers = [];
+        $lines = explode("\r\n", $this->site->header_data);
+        array_shift($lines);
+        foreach ($lines as $line) {
+            if ($line === '') {
+                continue;
+            }
+            $headers[] = $line;
+        }
+        $this->sendResponse($conn, $sid, $status, $headers,
+            $body);
+        /*
+            Keep the per-stream record around with
+            dispatched=true so handleBidiStream's idempotence
+            check stops re-dispatching. The H3 stream entry
+            is small; reaping happens when the QUIC layer
+            shuts the stream down or when the connection
+            closes.
+         */
+    }
+    /**
+     * Builds an H1/H2-style $context array from captured
+     * H3 request state. Mirrors what the FFI version
+     * produces so apps don't see a difference.
+     */
+    protected function buildContext($listener, $conn, $st)
+    {
+        $path_only = $st['path'];
+        $query = '';
+        $qpos = strpos($st['path'], '?');
+        if ($qpos !== false) {
+            $path_only = substr($st['path'], 0, $qpos);
+            $query = substr($st['path'], $qpos + 1);
+        }
+        $remote_addr = '';
+        $remote_port = '';
+        if ($conn->peer_address !== '') {
+            $colon = strrpos($conn->peer_address, ':');
+            if ($colon !== false) {
+                $remote_addr = trim(substr(
+                    $conn->peer_address, 0, $colon), '[]');
+                $remote_port = substr(
+                    $conn->peer_address, $colon + 1);
+            }
+        }
+        $authority = 'localhost';
+        $candidate = trim($st['authority'] ?? '');
+        if ($candidate === '' &&
+            isset($st['headers']['host'])) {
+            $candidate = trim($st['headers']['host']);
+        }
+        if ($candidate !== '' && filter_var(
+                "http://$candidate", FILTER_VALIDATE_URL)) {
+            $authority = $candidate;
+        }
+        $body = empty($st['body_chunks']) ? ''
+            : implode('', $st['body_chunks']);
+        $context = [
+            'REQUEST_METHOD' => $st['method'],
+            'REQUEST_URI' => $st['path'],
+            'QUERY_STRING' => $query,
+            'PATH_INFO' => $path_only,
+            'SCRIPT_NAME' => '',
+            'HTTP_HOST' => $authority,
+            'SERVER_PROTOCOL' => 'HTTP/3',
+            'SERVER_NAME' =>
+                $listener->globals['SERVER_NAME'] ?? '',
+            'SERVER_PORT' =>
+                $listener->globals['SERVER_PORT'] ?? '',
+            'REMOTE_ADDR' => $remote_addr,
+            'REMOTE_PORT' => $remote_port,
+            'HTTPS' => 'on',
+            'CONTENT' => $body,
+        ];
+        foreach ($st['headers'] as $name => $value) {
+            if ($name === 'host') {
+                continue;
+            }
+            $h = 'HTTP_' . strtoupper(
+                str_replace('-', '_', $name));
+            $context[$h] = $value;
+        }
+        return $context;
+    }
+    /**
+     * Builds and queues a complete H3 response on $sid:
+     * one HEADERS frame followed by one DATA frame, then
+     * FIN.
+     */
+    protected function sendResponse($conn, $sid, $status,
+        $header_lines, $body)
+    {
+        $h3_headers = [
+            [':status', (string) $status],
+        ];
+        foreach ($header_lines as $line) {
+            $cpos = strpos($line, ':');
+            if ($cpos === false) {
+                continue;
+            }
+            $name = strtolower(trim(
+                substr($line, 0, $cpos)));
+            $value = trim(substr($line, $cpos + 1));
+            /*
+                HTTP/3 (RFC 9114 sec 4.2) forbids the
+                connection-specific headers Connection,
+                Keep-Alive, Proxy-Connection, Transfer-
+                Encoding, Upgrade. Skip them silently.
+             */
+            if ($name === 'connection' ||
+                $name === 'keep-alive' ||
+                $name === 'proxy-connection' ||
+                $name === 'transfer-encoding' ||
+                $name === 'upgrade') {
+                continue;
+            }
+            $h3_headers[] = [$name, $value];
+        }
+        $headers_body = Qpack::encode($h3_headers);
+        $headers_frame = H3FrameCodec::encode(
+            H3FrameCodec::H3_HEADERS, $headers_body);
+        $conn->quic->sendStreamData($sid, $headers_frame,
+            false);
+        if ($body !== '') {
+            $data_frame = H3FrameCodec::encode(
+                H3FrameCodec::H3_DATA, $body);
+            $conn->quic->sendStreamData($sid, $data_frame,
+                true);
+        } else {
+            $conn->quic->sendStreamData($sid, '', true);
+        }
+    }
+    /**
+     * Best-effort error response when the app handler
+     * throws.
+     */
+    protected function sendErrorResponse($conn, $sid,
+        $status)
+    {
+        $body = "HTTP $status\r\n";
+        $this->sendResponse($conn, $sid, $status,
+            ['content-type: text/plain'], $body);
     }
 }

@@ -140,6 +140,7 @@ class Tls13Engine
         --- Named groups for key share (RFC 8446 sec 4.2.7) ---
      */
     const GROUP_X25519 = 0x001D;
+    const GROUP_SECP256R1 = 0x0017;
     /*
         --- Signature schemes (RFC 8446 sec 4.2.3) ---
         Atto offers two: ecdsa_secp256r1_sha256 always,
@@ -166,6 +167,16 @@ class Tls13Engine
     const ST_SENT_SERVER_FLIGHT = 1;
     const ST_AWAIT_CLIENT_FINISHED = 2;
     const ST_HANDSHAKE_COMPLETE = 3;
+    /*
+        Inserted in Phase 6.x: ClientHello has been fully
+        parsed and validated, server flight has not yet been
+        built. The QuicConnection driver checks this before
+        calling buildServerFlight() so it doesn't try to
+        build a flight when the CH straddles two QUIC
+        Initial packets and only the first half has arrived.
+        Picks ID 4 to leave the existing IDs alone.
+     */
+    const ST_GOT_CLIENT_HELLO = 4;
     const ST_FAILED = 99;
     /**
      * @var int current state machine position
@@ -244,9 +255,34 @@ class Tls13Engine
     protected $x25519_public = "";
     /**
      * @var string client's 32-byte X25519 public from the
-     *      key_share extension.
+     *      key_share extension. Empty if client did not
+     *      offer X25519.
      */
     protected $client_x25519_public = "";
+    /**
+     * @var \OpenSSLAsymmetricKey|resource|null our P-256
+     *      ephemeral keypair (when negotiated). Cleared
+     *      after shared-secret derivation.
+     */
+    protected $p256_keypair = null;
+    /**
+     * @var string our P-256 public point on the wire, 65
+     *      bytes (uncompressed: 0x04 || X || Y).
+     */
+    protected $p256_public_wire = "";
+    /**
+     * @var string client's 65-byte P-256 public from the
+     *      key_share extension. Empty if client did not
+     *      offer P-256.
+     */
+    protected $client_p256_public = "";
+    /**
+     * @var int the named group we picked for ECDHE. Either
+     *      GROUP_X25519 or GROUP_SECP256R1; 0 until a
+     *      ClientHello with a usable share has been
+     *      parsed.
+     */
+    protected $selected_group = 0;
     /**
      * @var string ClientHello.random (32 bytes), captured.
      */
@@ -380,6 +416,23 @@ class Tls13Engine
     public function isComplete()
     {
         return $this->state === self::ST_HANDSHAKE_COMPLETE;
+    }
+    /**
+     * Returns true once a complete ClientHello has been
+     * delivered via feedClientHello(). The QuicConnection
+     * driver checks this before attempting buildServerFlight
+     * -- when a client whose ClientHello straddles two QUIC
+     * Initial packets connects (curl-with-quictls is one
+     * example), the first Initial only carries a partial
+     * CH and we should wait for the second before building
+     * our reply.
+     */
+    public function hasClientHello()
+    {
+        return $this->state === self::ST_GOT_CLIENT_HELLO
+            || $this->state ===
+                self::ST_AWAIT_CLIENT_FINISHED
+            || $this->state === self::ST_HANDSHAKE_COMPLETE;
     }
     /**
      * Returns the four 1-RTT traffic secrets after handshake
@@ -623,8 +676,8 @@ class Tls13Engine
             4 + $body_len);
         $body = substr($bytes, 4, $body_len);
         if (!$this->parseClientHelloBody($body)) {
-            if (true ||getenv('ATTO_TLS_DEBUG_CH')) {
-                $path = '/Users/cpollett/atto_clienthello.bin';
+            if (getenv('ATTO_TLS_DEBUG_CH')) {
+                $path = '/tmp/atto_clienthello.bin';
                 file_put_contents($path, $bytes);
                 error_log("Tls13Engine: ClientHello parse "
                     . "failed (" . $this->error . "); "
@@ -633,6 +686,7 @@ class Tls13Engine
             }
             return false;
         }
+        $this->state = self::ST_GOT_CLIENT_HELLO;
         return true;
     }
     /**
@@ -709,8 +763,20 @@ class Tls13Engine
         if (!$this->parseClientHelloExtensions($ext_blob)) {
             return false;
         }
-        if ($this->client_x25519_public === '') {
-            $this->fail("client did not offer x25519 key share");
+        /*
+            Pick the named group for ECDHE. We prefer X25519
+            when both shares are offered (smaller wire bytes
+            and faster), but accept P-256 when X25519 isn't
+            on the table -- BoringSSL/quictls clients sometimes
+            offer only secp256r1 by default.
+         */
+        if ($this->client_x25519_public !== '') {
+            $this->selected_group = self::GROUP_X25519;
+        } else if ($this->client_p256_public !== '') {
+            $this->selected_group = self::GROUP_SECP256R1;
+        } else {
+            $this->fail("client did not offer X25519 or "
+                . "P-256 key share");
             return false;
         }
         return true;
@@ -825,8 +891,10 @@ class Tls13Engine
     /**
      * Parses the client's key_share extension. Walks the
      * list of (group, key_exchange) pairs and captures the
-     * x25519 public if present. Other groups are ignored
-     * since x25519 is the only one we offer.
+     * X25519 public if present, P-256 public if present.
+     * Other groups are ignored. The selection between the
+     * two happens later (we prefer X25519 when both are
+     * offered).
      */
     protected function parseClientKeyShare($payload)
     {
@@ -850,6 +918,17 @@ class Tls13Engine
             if ($group === self::GROUP_X25519 &&
                 strlen($pub) === 32) {
                 $this->client_x25519_public = $pub;
+            } else if ($group === self::GROUP_SECP256R1 &&
+                strlen($pub) === 65 &&
+                $pub[0] === "\x04") {
+                /*
+                    P-256 wire form: 0x04 || X(32) || Y(32),
+                    65 bytes total. Compressed forms are
+                    legal (RFC 8446 sec 4.2.8.2) but every
+                    common TLS stack sends uncompressed; we
+                    don't bother handling 0x02/0x03 here.
+                 */
+                $this->client_p256_public = $pub;
             }
         }
         return true;
@@ -983,38 +1062,27 @@ class Tls13Engine
      */
     protected function deriveHandshakeSecrets()
     {
-        if (strlen($this->client_x25519_public) !== 32 ||
-            strlen($this->x25519_secret) !== 32) {
-            /*
-                Defensive: deriveHandshakeSecrets is only legal
-                after a successful ClientHello parse that
-                populated both keys to 32 bytes. If we get here
-                with shorter buffers some upstream check failed
-                to short-circuit. Bail cleanly with a logged
-                error rather than letting sodium throw.
-             */
-            $this->fail("X25519 key share missing or wrong "
-                . "length (peer public="
-                . strlen($this->client_x25519_public)
-                . "B, local secret="
-                . strlen($this->x25519_secret) . "B)");
+        $shared = $this->computeEcdheShared();
+        if ($shared === false) {
             return;
         }
         $zeros = str_repeat("\x00", $this->hash_len);
         $early_secret = $this->hkdfExtract('', $zeros);
         $derived_1 = $this->deriveSecret($early_secret,
             'derived', '');
-        $shared = sodium_crypto_scalarmult($this->x25519_secret,
-            $this->client_x25519_public);
         $this->handshake_secret = $this->hkdfExtract(
             $derived_1, $shared);
         /*
-            Wipe the X25519 ephemeral key as soon as we have
-            the shared secret. RFC 8446 sec 4.2.8.1 doesn't
-            mandate this but it bounds the window for forward-
-            secrecy compromise if the process is dumped.
+            Wipe the ephemeral private material as soon as we
+            have the shared secret. RFC 8446 sec 4.2.8.1
+            doesn't mandate this but it bounds the window for
+            forward-secrecy compromise if the process is
+            dumped.
          */
-        $this->x25519_secret = str_repeat("\x00", 32);
+        if ($this->x25519_secret !== '') {
+            $this->x25519_secret = str_repeat("\x00", 32);
+        }
+        $this->p256_keypair = null;
         $th = $this->transcriptHash();
         $this->secrets['c_hs'] = $this->hkdfExpandLabel(
             $this->handshake_secret, 'c hs traffic', $th,
@@ -1022,6 +1090,93 @@ class Tls13Engine
         $this->secrets['s_hs'] = $this->hkdfExpandLabel(
             $this->handshake_secret, 's hs traffic', $th,
             $this->hash_len);
+    }
+    /**
+     * Computes the ECDHE shared secret for the negotiated
+     * named group. Returns the 32-byte secret on success
+     * or false (with $this->fail invoked) on error.
+     */
+    protected function computeEcdheShared()
+    {
+        if ($this->selected_group === self::GROUP_X25519) {
+            if (strlen($this->client_x25519_public) !== 32
+                || strlen($this->x25519_secret) !== 32) {
+                $this->fail("X25519 key share missing or "
+                    . "wrong length (peer public="
+                    . strlen($this->client_x25519_public)
+                    . "B, local secret="
+                    . strlen($this->x25519_secret) . "B)");
+                return false;
+            }
+            return sodium_crypto_scalarmult(
+                $this->x25519_secret,
+                $this->client_x25519_public);
+        }
+        if ($this->selected_group ===
+                self::GROUP_SECP256R1) {
+            if (strlen($this->client_p256_public) !== 65
+                || $this->p256_keypair === null) {
+                $this->fail("P-256 key share missing or "
+                    . "wrong length (peer public="
+                    . strlen($this->client_p256_public)
+                    . "B, local kp="
+                    . ($this->p256_keypair === null
+                        ? 'null' : 'set') . ")");
+                return false;
+            }
+            $peer_pem = self::p256RawPointToPubPem(
+                $this->client_p256_public);
+            $peer_key = openssl_pkey_get_public($peer_pem);
+            if ($peer_key === false) {
+                $this->fail("openssl rejected peer P-256 "
+                    . "public");
+                return false;
+            }
+            $shared = openssl_pkey_derive($peer_key,
+                $this->p256_keypair, 32);
+            if ($shared === false || strlen($shared) !== 32) {
+                $this->fail("P-256 ECDH derive failed");
+                return false;
+            }
+            return $shared;
+        }
+        $this->fail("no ECDHE group selected");
+        return false;
+    }
+    /**
+     * Wraps a raw uncompressed P-256 point (65 bytes:
+     * 0x04 || X || Y) in a SubjectPublicKeyInfo PEM so
+     * openssl_pkey_get_public can parse it. The DER
+     * structure is fixed: the inner AlgorithmIdentifier
+     * for P-256 is the same constant 21-byte sequence
+     * for any P-256 key (id-ecPublicKey + prime256v1
+     * named curve), so we can prepend it verbatim.
+     */
+    protected static function p256RawPointToPubPem($point65)
+    {
+        /*
+            ASN.1 SubjectPublicKeyInfo:
+              SEQUENCE {
+                SEQUENCE {
+                  OID id-ecPublicKey 1.2.840.10045.2.1,
+                  OID prime256v1     1.2.840.10045.3.1.7
+                }
+                BIT STRING (point bytes, prepended 0x00
+                            for "no unused bits")
+              }
+            Total: 0x30 LEN 0x30 0x13 ... 0x03 0x42 0x00 ||
+            point.
+         */
+        $algo_seq = hex2bin("301306072a8648ce3d020106082a"
+            . "8648ce3d030107");
+        $bit_string = "\x00" . $point65;
+        $bit_string_wrapped = "\x03"
+            . chr(strlen($bit_string)) . $bit_string;
+        $inner = $algo_seq . $bit_string_wrapped;
+        $der = "\x30" . chr(strlen($inner)) . $inner;
+        return "-----BEGIN PUBLIC KEY-----\n"
+            . chunk_split(base64_encode($der), 64, "\n")
+            . "-----END PUBLIC KEY-----\n";
     }
     /**
      * Derives master_secret and the application traffic
@@ -1178,22 +1333,62 @@ class Tls13Engine
         if ($this->state === self::ST_FAILED) {
             return false;
         }
-        if ($this->state !== self::ST_AWAIT_CLIENT_HELLO) {
+        if ($this->state !== self::ST_GOT_CLIENT_HELLO) {
+            /*
+                Legal entry state was originally ST_AWAIT_-
+                CLIENT_HELLO, but that was wrong: it allowed
+                buildServerFlight to fire before any CH had
+                actually been parsed (which is what curl-with-
+                quictls hits, since its ClientHello straddles
+                two QUIC Initial packets). Now we require
+                feedClientHello to have completed first.
+             */
             $this->fail("buildServerFlight in state "
                 . $this->state);
             return false;
         }
         /*
-            Generate our X25519 keypair if we haven't already.
-            sodium_crypto_kx_keypair returns 64 bytes:
-            32 secret + 32 public, in that order.
+            Generate our ECDHE keypair for whichever group we
+            picked during ClientHello validation. X25519 uses
+            sodium_crypto_kx (libsodium-backed Curve25519);
+            P-256 uses openssl_pkey_new with prime256v1. Both
+            yield a 32-byte shared secret on the other side.
          */
-        if ($this->x25519_secret === '') {
-            $kp = sodium_crypto_kx_keypair();
-            $this->x25519_secret =
-                sodium_crypto_kx_secretkey($kp);
-            $this->x25519_public =
-                sodium_crypto_kx_publickey($kp);
+        if ($this->selected_group === self::GROUP_X25519) {
+            if ($this->x25519_secret === '') {
+                $kp = sodium_crypto_kx_keypair();
+                $this->x25519_secret =
+                    sodium_crypto_kx_secretkey($kp);
+                $this->x25519_public =
+                    sodium_crypto_kx_publickey($kp);
+            }
+        } else if ($this->selected_group ===
+                self::GROUP_SECP256R1) {
+            if ($this->p256_keypair === null) {
+                $this->p256_keypair = openssl_pkey_new([
+                    'curve_name' => 'prime256v1',
+                    'private_key_type' => OPENSSL_KEYTYPE_EC,
+                ]);
+                if ($this->p256_keypair === false) {
+                    $this->p256_keypair = null;
+                    $this->fail("openssl P-256 keypair "
+                        . "generation failed");
+                    return false;
+                }
+                $details = openssl_pkey_get_details(
+                    $this->p256_keypair);
+                /*
+                    TLS 1.3 wire form for P-256: 0x04 (uncomp)
+                    || X (32) || Y (32). RFC 8446 sec 4.2.8.2
+                    citing SEC 1.
+                 */
+                $this->p256_public_wire = "\x04"
+                    . $details['ec']['x']
+                    . $details['ec']['y'];
+            }
+        } else {
+            $this->fail("no usable named group selected");
+            return false;
         }
         $this->server_random = random_bytes(32);
         /*
@@ -1278,8 +1473,13 @@ class Tls13Engine
             self::EXT_SUPPORTED_VERSIONS) .
             $this->packVec16(
             $this->packU16(self::TLS_VERSION_1_3));
-        $ks_payload = $this->packU16(self::GROUP_X25519) .
-            $this->packVec16($this->x25519_public);
+        if ($this->selected_group === self::GROUP_X25519) {
+            $ks_pub = $this->x25519_public;
+        } else {
+            $ks_pub = $this->p256_public_wire;
+        }
+        $ks_payload = $this->packU16($this->selected_group)
+            . $this->packVec16($ks_pub);
         $ks = $this->packU16(self::EXT_KEY_SHARE) .
             $this->packVec16($ks_payload);
         $extensions = $this->packVec16($sv . $ks);
@@ -3998,8 +4198,13 @@ class QuicConnection
             return;
         }
         /* If we just received the ClientHello and haven't
-           sent our flight yet, build it now. */
+           sent our flight yet, build it now. The
+           hasClientHello() gate prevents us from trying to
+           build a flight before any CH bytes have been
+           parsed -- the case curl-with-quictls hits, since
+           its CH straddles two QUIC Initials. */
         if ($this->state === self::ST_NEW &&
+            $this->tls->hasClientHello() &&
             $this->tls->isComplete() === false) {
             $secrets = $this->tls->trafficSecrets();
             if (empty($secrets)) {

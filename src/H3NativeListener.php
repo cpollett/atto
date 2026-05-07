@@ -3743,6 +3743,14 @@ class QuicConnection
             $pkt = $result[0];
             $end = $result[1];
             $err = $result[2] ?? '';
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(sprintf(
+                    "[H3TRACE]   decode level=%d "
+                    . "result=%s err=%s end=%d",
+                    $level,
+                    $pkt === false ? 'fail' : 'ok',
+                    $err, $end));
+            }
             if ($pkt === false) {
                 /* Could not decode this packet (HP/AEAD
                    failure or truncation). Per RFC 9000
@@ -3924,8 +3932,25 @@ class QuicConnection
      */
     protected function feedTlsCrypto($level, $bytes)
     {
+        if (getenv('ATTO_H3_TRACE')) {
+            error_log(sprintf(
+                "[H3TRACE]   feedTlsCrypto level=%d "
+                . "bytes=%dB tls_err=%s",
+                $level, strlen($bytes),
+                $this->tls->getError() === ''
+                    ? '(none)' : $this->tls->getError()));
+        }
         if ($level === self::LEVEL_INITIAL) {
-            $this->tls->feedClientHello($bytes);
+            $ok = $this->tls->feedClientHello($bytes);
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(sprintf(
+                    "[H3TRACE]   feedClientHello "
+                    . "returned=%s err=%s",
+                    $ok ? 'true' : 'false',
+                    $this->tls->getError() === ''
+                        ? '(none)' : $this->tls->getError()
+                ));
+            }
             return;
         }
         if ($level === self::LEVEL_HANDSHAKE) {
@@ -3958,6 +3983,15 @@ class QuicConnection
      */
     protected function driveHandshake()
     {
+        if (getenv('ATTO_H3_TRACE')) {
+            error_log(sprintf(
+                "[H3TRACE]   driveHandshake state=%d "
+                . "tls_complete=%s tls_err=%s",
+                $this->state,
+                $this->tls->isComplete() ? 'yes' : 'no',
+                $this->tls->getError() === ''
+                    ? '(none)' : $this->tls->getError()));
+        }
         if ($this->tls->getError() !== '') {
             $this->error = $this->tls->getError();
             $this->state = self::ST_CLOSED;
@@ -3986,6 +4020,18 @@ class QuicConnection
                     $tp);
                 $flight = $this->tls->buildServerFlight(
                     'quic');
+                if (getenv('ATTO_H3_TRACE')) {
+                    error_log(sprintf(
+                        "[H3TRACE]   buildServerFlight "
+                        . "result=%s flight_len=%d "
+                        . "tls_err=%s",
+                        $flight === false ? 'fail' : 'ok',
+                        $flight === false ? 0
+                            : strlen($flight),
+                        $this->tls->getError() === ''
+                            ? '(none)'
+                            : $this->tls->getError()));
+                }
                 if ($flight === false) {
                     $this->error = $this->tls->getError();
                     $this->state = self::ST_CLOSED;
@@ -5387,6 +5433,11 @@ class H3NativeListener extends Listener
          */
         foreach ($this->connections as $h3) {
             foreach ($h3->quic->emit() as $datagram) {
+                if (getenv('ATTO_H3_TRACE')) {
+                    error_log(sprintf(
+                        "[H3TRACE] SEND %dB to %s",
+                        strlen($datagram), $h3->peer_address));
+                }
                 @stream_socket_sendto($this->server,
                     $datagram, 0, $h3->peer_address);
             }
@@ -5404,9 +5455,24 @@ class H3NativeListener extends Listener
      */
     public function processDatagram($buf, $peer)
     {
+        if (getenv('ATTO_H3_TRACE')) {
+            $first = strlen($buf) > 0 ? ord($buf[0]) : 0;
+            $is_long = ($first & 0x80) ? 'long' : 'short';
+            $type = ($first & 0x80) ? (($first >> 4) & 3)
+                : -1;
+            error_log(sprintf(
+                "[H3TRACE] RECV %dB from %s first=0x%02x "
+                . "form=%s long_type=%d",
+                strlen($buf), $peer, $first, $is_long,
+                $type));
+        }
         $dcid = self::peekDcid($buf,
             $this->commonCidLength());
         if ($dcid === '' || $dcid === false) {
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(
+                    "[H3TRACE]   peekDcid failed; dropping");
+            }
             return [null, false];
         }
         $key_h = bin2hex($dcid);
@@ -5481,6 +5547,11 @@ class H3NativeListener extends Listener
         }
         /* Send any datagrams the QUIC layer has produced. */
         foreach ($h3->quic->emit() as $datagram) {
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(sprintf(
+                    "[H3TRACE] SEND %dB to %s",
+                    strlen($datagram), $peer));
+            }
             @stream_socket_sendto($this->server, $datagram,
                 0, $peer);
         }

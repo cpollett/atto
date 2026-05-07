@@ -558,17 +558,29 @@ $test->get('/h3stats', function () use ($test) {
     $force_snapshot = !empty($_GET['snapshot']);
     $include_reaped = !empty($_GET['keep']) || $force_snapshot;
     foreach ($test->listeners() as $listener) {
-        if ($listener instanceof seekquarry\atto\H3Listener) {
-            if ($force_snapshot) {
-                $listener->forceSnapshotAll();
-            }
-            foreach ($listener->snapshotAllStats() as $row) {
-                $stats[] = $row;
-            }
-            if ($include_reaped) {
-                foreach ($listener->snapshotReapedStats() as $row) {
-                    $reaped[] = $row;
-                }
+        /*
+            Both H3Listener (FFI) and H3NativeListener
+            (pure-PHP) expose the same snapshot/forceSnapshot
+            API surface, so duck-type by method existence.
+            Plain Listener / TcpListener instances don't
+            define snapshotAllStats and are skipped.
+         */
+        if (!method_exists($listener, 'snapshotAllStats')) {
+            continue;
+        }
+        if ($force_snapshot
+            && method_exists($listener, 'forceSnapshotAll')) {
+            $listener->forceSnapshotAll();
+        }
+        foreach ($listener->snapshotAllStats() as $row) {
+            $stats[] = $row;
+        }
+        if ($include_reaped
+            && method_exists($listener,
+                'snapshotReapedStats')) {
+            foreach ($listener->snapshotReapedStats()
+                    as $row) {
+                $reaped[] = $row;
             }
         }
     }
@@ -664,6 +676,22 @@ if ($test->isCli()) {
             'alpn_protocols' => 'h2,http/1.1',
         ]]],
         ['address' => 8443, 'protocol' => 'h3',
+            'context' => ['ssl' => [
+                'local_cert' => $cert,
+                'local_pk' => $key,
+            ]]],
+        /*
+            Pure-PHP HTTP/3 listener on a separate UDP port
+            (8444) so it doesn't compete with the FFI 'h3'
+            listener if both are present. h3-native needs
+            no FFI / libquiche; ext-openssl + ext-sodium
+            (and ext-gmp for RSA certs) is the full
+            requirement set. Comment this entry out if you
+            don't want a second H3 backend on a different
+            port; everything else in the bench works
+            without it.
+         */
+        ['address' => 8444, 'protocol' => 'h3-native',
             'context' => ['ssl' => [
                 'local_cert' => $cert,
                 'local_pk' => $key,

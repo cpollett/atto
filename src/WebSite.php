@@ -1790,6 +1790,12 @@ class WebSite
         if (class_exists('\seekquarry\atto\H3Transport', false)) {
             $this->transports['h3'] = new H3Transport($this);
         }
+        if (class_exists(
+                '\seekquarry\atto\H3NativeTransport',
+                false)) {
+            $this->transports['h3-native'] =
+                new H3NativeTransport($this);
+        }
         foreach ($opened as $entry) {
             $server = $entry->server;
             if ($server === null) {
@@ -2499,14 +2505,16 @@ class WebSite
         if ($connection === null) {
             return;
         }
-        if ($connection->protocol === 'h3') {
+        if ($connection->protocol === 'h3' ||
+            $connection->protocol === 'h3-native') {
             /*
                 H3 connections have no PHP stream resource; the
                 listener's UDP socket carries traffic for all of
-                them. The H3Listener already registered this
-                connection in its own CID-keyed map and drove the
-                first packet through quiche_conn_recv. Nothing
-                more to do at the WebSite event-loop level.
+                them. The H3 listener (FFI or pure-PHP) already
+                registered this connection in its own CID-keyed
+                map and drove the first packet through the
+                receive path. Nothing more to do at the WebSite
+                event-loop level.
              */
             return;
         }

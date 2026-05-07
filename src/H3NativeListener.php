@@ -3108,10 +3108,15 @@ class QuicStream
                                   may still arrive */
     const RECV_DONE = 2; /* FIN seen and all bytes
                             delivered to app */
+    const RECV_RESET = 3; /* peer sent RESET_STREAM; no
+                             more bytes expected */
     const SEND_READY = 0;
     const SEND_DATA = 1;
     const SEND_DATA_SENT = 2;
     const SEND_DONE = 3;
+    const SEND_RESET = 4; /* peer sent STOP_SENDING; we
+                             stop transmitting on this
+                             stream */
     /**
      * @var int 62-bit stream ID
      */
@@ -3260,7 +3265,8 @@ class QuicStream
      */
     public function isReceiveDone()
     {
-        return $this->recv_state === self::RECV_DONE;
+        return $this->recv_state === self::RECV_DONE ||
+            $this->recv_state === self::RECV_RESET;
     }
     /**
      * Appends bytes to the send buffer. The
@@ -3296,6 +3302,9 @@ class QuicStream
      */
     public function takeForFrame($max_bytes)
     {
+        if ($this->send_state === self::SEND_RESET) {
+            return null;
+        }
         if ($this->send_buf === '' && !$this->send_fin) {
             return null;
         }
@@ -3780,6 +3789,45 @@ class QuicConnection
                 case QuicFrame::F_HANDSHAKE_DONE:
                 case QuicFrame::F_NEW_CONNECTION_ID:
                 case QuicFrame::F_NEW_TOKEN:
+                    break;
+                case QuicFrame::F_RESET_STREAM:
+                    /*
+                        Peer abandoned the send side of a
+                        stream. Mark the receive half done
+                        and surface anything we have. RFC
+                        9000 sec 3.5: receiver may discard
+                        any buffered data; we keep what we
+                        have so the app can read partial
+                        results, but no more bytes will
+                        arrive.
+                     */
+                    if (isset(
+                        $this->streams[$f['stream_id']])) {
+                        $stream = $this->streams[
+                            $f['stream_id']];
+                        $stream->recv_state =
+                            QuicStream::RECV_RESET;
+                    }
+                    break;
+                case QuicFrame::F_STOP_SENDING:
+                    /*
+                        Peer asked us to stop sending on a
+                        stream. Mark the send half reset so
+                        flushStreams skips it. RFC 9000 sec
+                        3.5 also requires us to send
+                        RESET_STREAM in response, but for
+                        now we just stop pushing data; the
+                        peer will see no more frames and
+                        the connection's idle timer will
+                        eventually clean up.
+                     */
+                    if (isset(
+                        $this->streams[$f['stream_id']])) {
+                        $stream = $this->streams[
+                            $f['stream_id']];
+                        $stream->send_state =
+                            QuicStream::SEND_RESET;
+                    }
                     break;
                 case QuicFrame::F_CONNECTION_CLOSE:
                 case QuicFrame::F_CONNECTION_CLOSE_APP:
@@ -5103,7 +5151,14 @@ class H3NativeConnection extends Connection
         $this->quic = $quic;
         $this->scid_hex = $scid_hex;
         $this->peer_address = $peer_address;
-        $this->protocol = 'h3';
+        /*
+            'h3-native' is a separate protocol code from 'h3'
+            (which is reserved for H3Connection from the FFI
+            backend). The two share the same wire protocol
+            but route through different per-protocol Transport
+            instances inside WebSite.
+         */
+        $this->protocol = 'h3-native';
         $this->client_http = 'HTTP/3';
         $this->is_secure = true;
         $this->https = 'on';
@@ -5169,6 +5224,15 @@ class H3NativeListener extends Listener
      */
     public $last_activity = [];
     /**
+     * @var WebSite|null back-reference to the WebSite that
+     *      opened this listener. Set by WebSite::listen()
+     *      right after tryOpen() returns. Used by
+     *      processDatagram to reach
+     *      $site->transports['h3-native'] for application-
+     *      level dispatch.
+     */
+    public $site = null;
+    /**
      * Standard listener constructor; cert/key/alpn are
      * filled in by tryOpen.
      */
@@ -5225,7 +5289,13 @@ class H3NativeListener extends Listener
             return null;
         }
         stream_set_blocking($server, false);
-        return new self($server, $bind_address, $globals,
+        /*
+            Pass the udp:// form to the parent so dashboard
+            output ("SERVER listening at ...") shows the real
+            transport instead of the tcp:// alias the user
+            wrote in their listen spec.
+         */
+        return new self($server, $udp_address, $globals,
             $cert_pem, $key_pem, ['h3']);
     }
     /**
@@ -5357,6 +5427,30 @@ class H3NativeListener extends Listener
             unset($this->last_activity[$key_h]);
             return [$h3, false];
         }
+        /*
+            Drive the H3 layer for this connection so any
+            request frames just received get parsed,
+            dispatched through the WebSite app handler, and
+            their responses queued into the QUIC send queue.
+            The transport reference is reached via the
+            WebSite back-pointer that listen() sets after
+            tryOpen returns. Without this call the request
+            never reaches the app and the client sits at
+            "GET sent" forever (this is the integration
+            point that the Phase 4 standalone test rig
+            exercised manually after each accept).
+
+            Skip if no site is wired (e.g. unit tests that
+            instantiate the listener directly). Also skip
+            until the connection is ESTABLISHED so we don't
+            poke the H3 layer mid-handshake.
+         */
+        if ($this->site !== null &&
+            isset($this->site->transports['h3-native']) &&
+            $h3->isEstablished()) {
+            $this->site->transports['h3-native']
+                ->driveConnection($this, $h3);
+        }
         /* Send any datagrams the QUIC layer has produced. */
         foreach ($h3->quic->emit() as $datagram) {
             @stream_socket_sendto($this->server, $datagram,
@@ -5469,6 +5563,32 @@ class H3NativeListener extends Listener
             $out[$kh] = $h3->quic->stats();
         }
         return $out;
+    }
+    /**
+     * No-op compatibility method for the FFI listener's
+     * forceSnapshotAll(). The FFI version uses this to
+     * flush a quiche-internal stats ring buffer that
+     * batches updates; the pure-PHP listener computes
+     * stats live from connection state inside
+     * snapshotAllStats() so there is nothing to flush.
+     * Defined here so callers (e.g. /h3stats endpoints)
+     * can call it without an instanceof check.
+     */
+    public function forceSnapshotAll()
+    {
+        /* no-op; see method docblock */
+    }
+    /**
+     * Returns stats for connections that have been reaped
+     * since the last snapshot. The pure-PHP listener does
+     * not currently retain a reaped-connection history
+     * (it simply unsets entries on close); returns an
+     * empty array for now. A future revision could keep
+     * a small ring of recent closures.
+     */
+    public function snapshotReapedStats()
+    {
+        return [];
     }
 }
 /**

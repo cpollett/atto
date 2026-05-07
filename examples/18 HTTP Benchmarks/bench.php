@@ -101,6 +101,11 @@ Options:
     --quic-port=PORT      default same as --tls-port (HTTP/3 over
                           QUIC binds the same port number as H2,
                           but on UDP rather than TCP)
+    --quic-native-port=PORT
+                          default 8444 (pure-PHP HTTP/3 listener,
+                          h3-native://, binds its own UDP port so
+                          it can run side-by-side with the FFI
+                          libquiche-backed h3 listener)
     --iterations=N        per single-shot case (default 100)
     --concurrency=N       parallel requests for asset case
                           (default 50)
@@ -112,7 +117,9 @@ Options:
                           H1+TLS at parallel work over a real
                           network, and how H3's 0-RTT
                           handshake wins back time at high RTT.
-    --only=h1,h2,h3       run only the listed protocols
+    --only=h1,h2,h3,h3-native
+                          run only the listed protocols
+                          (h1, h1s, h2, h3, h3-native)
     --skip=case,case      skip the listed cases
                           (small,big,asset,headers,keepalive,post)
     --help                this message
@@ -124,6 +131,14 @@ $host = $opts['host'] ?? '127.0.0.1';
 $plain_port = (int) ($opts['plain-port'] ?? 8080);
 $tls_port = (int) ($opts['tls-port'] ?? 8443);
 $quic_port = (int) ($opts['quic-port'] ?? $tls_port);
+/*
+    The pure-PHP HTTP/3 listener (h3-native://) binds a
+    separate UDP port from the FFI 'h3' listener so both can
+    coexist on the same atto instance for side-by-side
+    comparison. index.php in this directory uses 8444 by
+    default; override here if you've moved it.
+ */
+$quic_native_port = (int) ($opts['quic-native-port'] ?? 8444);
 $iterations = (int) ($opts['iterations'] ?? 100);
 $concurrency = (int) ($opts['concurrency'] ?? 50);
 $latency_ms = (float) ($opts['latency-ms'] ?? 0);
@@ -165,12 +180,22 @@ if ($latency_ms > 0) {
         unambiguous.
      */
     $proxy_quic_port = $quic_port + 20000;
+    /*
+        Pure-PHP h3-native listener gets its own proxy port,
+        offset the same +20000 way (UDP, like the FFI h3
+        proxy) but applied to its native UDP port (default
+        8444) so the two can run in parallel without
+        clashing.
+     */
+    $proxy_quic_native_port = $quic_native_port + 20000;
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__DIR__ . "/proxy.php");
     foreach ([
         [$proxy_plain_port, $host, $plain_port, 'tcp'],
         [$proxy_tls_port, $host, $tls_port, 'tcp'],
         [$proxy_quic_port, $host, $quic_port, 'udp'],
+        [$proxy_quic_native_port, $host, $quic_native_port,
+            'udp'],
     ] as $proxy_spec) {
         list($listen, $thost, $tport, $proto) = $proxy_spec;
         $cmd = "$php $script $listen " . escapeshellarg($thost) .
@@ -265,6 +290,7 @@ if ($latency_ms > 0) {
     $plain_port = $proxy_plain_port;
     $tls_port = $proxy_tls_port;
     $quic_port = $proxy_quic_port;
+    $quic_native_port = $proxy_quic_native_port;
     fwrite(STDERR, "  latency: " . $latency_ms .
         "ms each way (RTT " . (2 * $latency_ms) . "ms)\n");
 }
@@ -362,6 +388,41 @@ $TRANSPORTS = [
             CURLOPT_SSL_VERIFYHOST => 0,
         ],
     ],
+    'h3-native' => [
+        /*
+            Pure-PHP HTTP/3 listener. No libquiche, no FFI --
+            ext-openssl + ext-sodium are the full requirement
+            set, both of which ship with stock PHP on every
+            platform we care about. Because there are no
+            external dependencies to gate on, this row runs
+            by default whenever atto's index.php has bound an
+            h3-native:// listener (default UDP port 8444). If
+            curl supports HTTP/3 the row probes successfully
+            and shows up alongside the FFI 'h3' row for
+            side-by-side comparison; if not, both H3 rows are
+            skipped together for the same reason.
+         */
+        'name' => 'HTTP/3-native',
+        'available' => function () use (
+            $host, $quic_native_port, $latency_ms) {
+            if (!defined('CURL_HTTP_VERSION_3')) {
+                return false;
+            }
+            return probe(
+                "https://{$host}:{$quic_native_port}/small",
+                CURL_HTTP_VERSION_3, true);
+        },
+        'endpoint' => function ($path)
+            use ($host, $quic_native_port) {
+            return "https://{$host}:{$quic_native_port}{$path}";
+        },
+        'curl_opts' => [
+            CURLOPT_HTTP_VERSION => defined('CURL_HTTP_VERSION_3')
+                ? CURL_HTTP_VERSION_3 : 0,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+        ],
+    ],
 ];
 if (!empty($only)) {
     $TRANSPORTS = array_intersect_key(
@@ -371,9 +432,9 @@ $active = [];
 foreach ($TRANSPORTS as $key => $t) {
     if (($t['available'])()) {
         $active[$key] = $t;
-        echo sprintf("  %-12s available\n", $t['name']);
+        echo sprintf("  %-13s available\n", $t['name']);
     } else {
-        echo sprintf("  %-12s unavailable (skipping)\n",
+        echo sprintf("  %-13s unavailable (skipping)\n",
             $t['name']);
     }
 }
@@ -453,14 +514,14 @@ foreach ($cases as $case_name => $case_fn) {
         $result = $case_fn($t);
         if ($first) {
             echo "  " . $result['desc'] . "\n";
-            printf("  %-12s  %6s  %8s  %8s  %8s  %8s  %10s\n",
+            printf("  %-13s  %6s  %8s  %8s  %8s  %8s  %10s\n",
                 'protocol', 'iters', 'min(ms)', 'median',
                 'p95', 'req/s', 'kB/s');
             $first = false;
         }
         $rps = ($result['median'] > 0)
             ? 1.0 / $result['median'] : 0.0;
-        printf("  %-12s  %6d  %8.2f  %8.2f  %8.2f  %8.0f  %10s\n",
+        printf("  %-13s  %6d  %8.2f  %8.2f  %8.2f  %8.0f  %10s\n",
             $t['name'],
             $result['iters'],
             $result['min'] * 1000,

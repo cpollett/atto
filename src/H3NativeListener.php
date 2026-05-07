@@ -623,6 +623,14 @@ class Tls13Engine
             4 + $body_len);
         $body = substr($bytes, 4, $body_len);
         if (!$this->parseClientHelloBody($body)) {
+            if (getenv('ATTO_TLS_DEBUG_CH')) {
+                $path = '/Users/cpollett/atto_clienthello.bin';
+                file_put_contents($path, $bytes);
+                error_log("Tls13Engine: ClientHello parse "
+                    . "failed (" . $this->error . "); "
+                    . "wrote " . strlen($bytes)
+                    . " bytes of CH to " . $path);
+            }
             return false;
         }
         return true;
@@ -975,6 +983,23 @@ class Tls13Engine
      */
     protected function deriveHandshakeSecrets()
     {
+        if (strlen($this->client_x25519_public) !== 32 ||
+            strlen($this->x25519_secret) !== 32) {
+            /*
+                Defensive: deriveHandshakeSecrets is only legal
+                after a successful ClientHello parse that
+                populated both keys to 32 bytes. If we get here
+                with shorter buffers some upstream check failed
+                to short-circuit. Bail cleanly with a logged
+                error rather than letting sodium throw.
+             */
+            $this->fail("X25519 key share missing or wrong "
+                . "length (peer public="
+                . strlen($this->client_x25519_public)
+                . "B, local secret="
+                . strlen($this->x25519_secret) . "B)");
+            return;
+        }
         $zeros = str_repeat("\x00", $this->hash_len);
         $early_secret = $this->hkdfExtract('', $zeros);
         $derived_1 = $this->deriveSecret($early_secret,
@@ -1184,6 +1209,9 @@ class Tls13Engine
             transcript through ServerHello is fixed.
          */
         $this->deriveHandshakeSecrets();
+        if ($this->state === self::ST_FAILED) {
+            return false;
+        }
         /*
             Step 3: build the inner messages -- everything
             after ServerHello goes into the encrypted

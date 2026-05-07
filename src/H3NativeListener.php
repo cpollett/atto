@@ -623,7 +623,7 @@ class Tls13Engine
             4 + $body_len);
         $body = substr($bytes, 4, $body_len);
         if (!$this->parseClientHelloBody($body)) {
-            if (getenv('ATTO_TLS_DEBUG_CH')) {
+            if (true ||getenv('ATTO_TLS_DEBUG_CH')) {
                 $path = '/Users/cpollett/atto_clienthello.bin';
                 file_put_contents($path, $bytes);
                 error_log("Tls13Engine: ClientHello parse "

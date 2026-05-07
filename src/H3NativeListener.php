@@ -4890,6 +4890,18 @@ class QuicConnection
         $this->state = self::ST_CLOSED;
     }
     /**
+     * Marks the connection closed without queuing a
+     * CONNECTION_CLOSE frame. Used by the listener on idle-
+     * timeout reaps, which RFC 9000 sec 10.1 requires to be
+     * silent: both peers run their own idle timers and tear
+     * down independently when the timeout elapses, so any
+     * frame on the wire would just confuse the peer.
+     */
+    public function markClosedSilently()
+    {
+        $this->state = self::ST_CLOSED;
+    }
+    /**
      * Returns a flat associative array of stats for this
      * connection, suitable for JSON encoding. Read-only;
      * does not mutate state.
@@ -5824,15 +5836,49 @@ class H3NativeListener extends Listener
     }
     /**
      * Closes the UDP socket and tears down all tracked
-     * connections.
+     * connections. For each live connection, queues a
+     * CONNECTION_CLOSE frame (RFC 9000 sec 10.2) and flushes
+     * once to the wire so the peer sees a deliberate close
+     * rather than waiting for its idle timer to expire.
+     *
+     * This is best-effort: the close frame goes out on a
+     * single emit() pass, with no retransmission. A peer
+     * that loses the close datagram falls back to the
+     * normal idle-timeout path, so callers don't need to
+     * handle retransmission here. Real RFC 9000 sec 10.2.2
+     * "closing state" (continued retransmission of CONNECTION
+     * _CLOSE for at least 3 PTO) is a Phase 11 concern.
      */
     public function close()
     {
-        foreach ($this->connections as $c) {
-            $c->close();
+        foreach ($this->connections as $h3) {
+            if ($h3->isClosed()) {
+                continue;
+            }
+            $h3->close();
+            $this->flushConnectionOnce($h3);
         }
         $this->connections = [];
         parent::close();
+    }
+    /**
+     * Drains pending datagrams from one H3Connection's QUIC
+     * emit() queue and writes them to the wire. Used by
+     * close() so a queued CONNECTION_CLOSE frame actually
+     * reaches the peer before the connection is dropped
+     * from the listener's map. Safe to call on a closed or
+     * partially-closed connection; emit() returns an empty
+     * list when there's nothing to send.
+     */
+    protected function flushConnectionOnce($h3)
+    {
+        if (!is_resource($this->server)) {
+            return;
+        }
+        foreach ($h3->quic->emit() as $datagram) {
+            @stream_socket_sendto($this->server,
+                $datagram, 0, $h3->peer_address);
+        }
     }
     /**
      * Drains pending UDP datagrams, demuxes them to the
@@ -6087,9 +6133,30 @@ class H3NativeListener extends Listener
     {
         $now = microtime(true);
         foreach ($this->connections as $kh => $h3) {
-            if ($h3->isClosed()
-                || $h3->quic->isIdleExpired($now)) {
-                $h3->close();
+            if ($h3->quic->isIdleExpired($now)) {
+                /*
+                    RFC 9000 sec 10.1: idle-timeout MUST be a
+                    silent close. Mark the connection closed
+                    locally and drop it without queuing a
+                    CONNECTION_CLOSE frame. The peer is
+                    expected to do the same on its own idle
+                    timer.
+                 */
+                $h3->quic->markClosedSilently();
+                unset($this->connections[$kh]);
+                unset($this->last_activity[$kh]);
+                continue;
+            }
+            if ($h3->isClosed()) {
+                /*
+                    Connection was closed earlier (peer sent
+                    CONNECTION_CLOSE, or we did during a
+                    handshake failure). Flush once so any
+                    queued CONNECTION_CLOSE frame actually
+                    reaches the peer before we drop the
+                    connection from the table.
+                 */
+                $this->flushConnectionOnce($h3);
                 unset($this->connections[$kh]);
                 unset($this->last_activity[$kh]);
             }

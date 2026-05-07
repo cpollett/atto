@@ -34,8 +34,34 @@
  *         signature_algorithms, application_layer_protocol_negotiation,
  *         supported_groups, quic_transport_parameters.
  *
- * RFC 9000 (QUIC), RFC 9001 (QUIC + TLS), RFC 9002 (loss det),
- * RFC 9114 (HTTP/3), RFC 9204 (QPACK) -- pending phases 2-4.
+ * RFC 9000 (QUIC v1) -- Initial / Handshake / 1-RTT packet
+ *     spaces, AEAD packet protection (AES-128-GCM and ChaCha20-
+ *     Poly1305), header protection, varint encoding, full frame
+ *     set (CRYPTO, STREAM, ACK, PING, PADDING, MAX_DATA,
+ *     MAX_STREAM_DATA, MAX_STREAMS_*, RESET_STREAM, STOP_SENDING,
+ *     NEW_CONNECTION_ID, RETIRE_CONNECTION_ID, PATH_CHALLENGE,
+ *     PATH_RESPONSE, CONNECTION_CLOSE, HANDSHAKE_DONE), idle
+ *     timeout, graceful CONNECTION_CLOSE, ACK obligation tracking
+ *     per RFC 9000 sec 13.2.1 (ack-eliciting packets receive an
+ *     ACK on the next emit() turn, piggybacked onto outbound
+ *     1-RTT data when available). Loss detection / retransmission
+ *     and real congestion control (RFC 9002) are deferred to a
+ *     future phase; this listener relies on stop-and-wait flow
+ *     control plus the peer's retransmits for now.
+ *
+ * RFC 9001 (QUIC+TLS) -- Initial-key derivation from the original
+ *     destination CID, traffic-secret derivation, RFC 8446 TLS 1.3
+ *     mapped onto QUIC packet protection. Header protection uses
+ *     OpenSSL's chacha20 cipher when available and falls back to
+ *     a pure-PHP RFC 8439 implementation when the platform
+ *     openssl build (LibreSSL on stock macOS, for instance) does
+ *     not expose it.
+ *
+ * RFC 9114 (HTTP/3) and RFC 9204 (QPACK) -- bidi request streams,
+ *     server-initiated unidirectional control stream with
+ *     SETTINGS, static-table-only QPACK encoder/decoder, HEADERS
+ *     and DATA frame round-trips. No server push, no extensible
+ *     priorities, no dynamic QPACK table.
  *
  * --- LIMITATIONS ---
  *
@@ -3832,17 +3858,24 @@ class QuicConnection
      */
     public $largest_pn = [];
     /**
-     * @var array level => bool. True when the application
-     *      level has received at least one ACK-eliciting
-     *      frame since the last time we emitted an ACK for
-     *      that level. RFC 9000 sec 13.2 requires a server
-     *      to acknowledge ACK-eliciting packets within
-     *      max_ack_delay (default 25 ms), and in practice
-     *      ngtcp2 retransmits the request stream
-     *      indefinitely if its STREAM frame goes unACKed
-     *      because it never observes the response either.
-     *      An ACK-only packet emitted alongside (or before)
-     *      our response breaks that retransmit loop.
+     * @var array level => bool. Set to true the moment
+     *      processPacketFrames sees an ACK-eliciting frame
+     *      at that level, cleared by emit() once a
+     *      corresponding ACK has been sent. RFC 9000 sec
+     *      13.2.1: a receiver MUST acknowledge every ACK-
+     *      eliciting packet within max_ack_delay. We do not
+     *      currently delay the ACK; emit() drains the flag
+     *      on the next call after the eliciting packet was
+     *      processed, which in practice is the same event-
+     *      loop turn. Without this tracking, a 1-RTT STREAM
+     *      frame whose carrying packet arrives after the
+     *      ESTABLISHED transition (and therefore after the
+     *      lone ACK we bundle with HANDSHAKE_DONE) is never
+     *      acknowledged, and ngtcp2-based clients
+     *      retransmit it indefinitely, blocking the
+     *      response from being delivered to the application
+     *      layer of the peer even though the server emitted
+     *      it on the wire.
      */
     public $ack_pending = [
         self::LEVEL_INITIAL => false,
@@ -4274,56 +4307,8 @@ class QuicConnection
         if ($err !== '' && $err !== 'unknown frame type') {
             /* Partial decode -- still process what we got. */
         }
-        if (getenv('ATTO_H3_TRACE')) {
-            $types = [];
-            foreach ($frames as $f) {
-                $tname = sprintf("0x%02x", $f['type']);
-                if ($f['type'] >= QuicFrame::F_STREAM_BASE
-                    && $f['type'] <= 0x0f) {
-                    $tname .= sprintf("(sid=%d,len=%d,fin=%s)",
-                        $f['stream_id'] ?? -1,
-                        isset($f['data'])
-                            ? strlen($f['data']) : 0,
-                        ($f['fin'] ?? false) ? 'y' : 'n');
-                } else if (isset($f['stream_id'])) {
-                    $tname .= sprintf("(sid=%d,val=%s)",
-                        $f['stream_id'],
-                        $f['value'] ?? '?');
-                } else if (isset($f['value'])) {
-                    $tname .= sprintf("(val=%s)",
-                        $f['value']);
-                }
-                $types[] = $tname;
-            }
-            error_log(sprintf(
-                "[H3TRACE]   frames level=%d count=%d "
-                . "err=%s types=[%s]",
-                $level, count($frames), $err,
-                implode(",", $types)));
-        }
         foreach ($frames as $f) {
-            /*
-                RFC 9000 sec 1.2 / sec 13.2.1: every frame
-                except ACK, PADDING, and CONNECTION_CLOSE is
-                "ACK-eliciting". Receiving one obligates us
-                to acknowledge the carrying packet within
-                max_ack_delay (and immediately for stream
-                data). We track that obligation per packet-
-                number space; emit() consumes the flag and
-                emits an ACK-only packet when no other
-                outbound 1-RTT bytes happen to be queued
-                for the same tick. Without this loop ngtcp2
-                retransmits unACKed STREAM frames forever
-                even when our response is going out, because
-                from its loss-detection POV the request was
-                lost.
-             */
-            $type = $f['type'];
-            if ($type !== QuicFrame::F_ACK
-                && $type !== QuicFrame::F_ACK_ECN
-                && $type !== QuicFrame::F_PADDING
-                && $type !== QuicFrame::F_CONNECTION_CLOSE
-                && $type !== QuicFrame::F_CONNECTION_CLOSE_APP) {
+            if (self::isAckEliciting($f['type'])) {
                 $this->ack_pending[$level] = true;
             }
             switch ($f['type']) {
@@ -4784,6 +4769,26 @@ class QuicConnection
         }
     }
     /**
+     * Returns true if a frame of the given type obligates
+     * the receiver to send an ACK. Per RFC 9000 sec 1.2
+     * the ack-eliciting set is every frame type EXCEPT
+     * ACK, ACK_ECN, PADDING, and the two CONNECTION_CLOSE
+     * variants. The H3-native server tracks ack obligation
+     * per packet-number space in $ack_pending and drains
+     * it from emit().
+     */
+    protected static function isAckEliciting($type)
+    {
+        if ($type === QuicFrame::F_ACK ||
+            $type === QuicFrame::F_ACK_ECN ||
+            $type === QuicFrame::F_PADDING ||
+            $type === QuicFrame::F_CONNECTION_CLOSE ||
+            $type === QuicFrame::F_CONNECTION_CLOSE_APP) {
+            return false;
+        }
+        return true;
+    }
+    /**
      * Builds an ACK frame's wire bytes covering all
      * received packet numbers in the given PN space.
      * Returns "" if nothing to ACK.
@@ -4864,17 +4869,14 @@ class QuicConnection
                 false;
         }
         /*
-            Flush any pending ACK obligation in the
-            application packet-number space. RFC 9000 sec
-            13.2.1: receivers SHOULD acknowledge ACK-
-            eliciting packets within max_ack_delay. The
-            simplest correct policy here is to bundle the
-            ACK with the next 1-RTT payload we already
-            intend to send if there is one, otherwise emit
-            an ACK-only packet. We unconditionally prepend
-            the ACK to the FIRST queued 1-RTT entry and
-            otherwise queue an ACK-only payload; either
-            way the ACK leaves on this emit() call.
+            Discharge any pending ACK obligation in the
+            application packet-number space (RFC 9000 sec
+            13.2.1). Piggyback the ACK onto the first
+            already-queued 1-RTT payload if there is one,
+            otherwise queue an ACK-only payload. Either way
+            the ACK leaves on this emit() call. See the
+            $ack_pending property docblock for context on
+            why this is required.
          */
         if ($this->ack_pending[self::LEVEL_APPLICATION] &&
             isset($this->keys[self::LEVEL_APPLICATION])) {

@@ -2,14 +2,20 @@
 /**
  * SeekQuarry/Atto Web Site Project
  *
- * Pure-PHP HTTP/3 (QUIC) listener. Drop-in replacement for the
- * libquiche-FFI-backed H3Listener.php that shipped through atto
- * 2.0.x. The public API surface is unchanged: H3Listener,
- * H3Connection, H3Transport in this same namespace, with the same
- * tryOpen() / accept() / driveConnection() / dispatchRequest()
- * shape WebSite already calls. WebSite.php loads this file
- * lazily on first listen() spec that requests 'protocol' => 'h3',
- * exactly the same way the FFI version was loaded.
+ * Pure-PHP HTTP/3 (QUIC) listener. Sibling to the libquiche-FFI-
+ * backed H3Listener.php that shipped through atto 2.0.x. Whereas
+ * H3Listener.php delegates wire-format work to libquiche through
+ * PHP FFI bindings, this file implements TLS 1.3, QUIC v1, and
+ * HTTP/3 entirely in PHP using the standard openssl + sodium
+ * extensions (plus gmp when an RSA cert is supplied). No FFI, no
+ * native dependencies, no Composer.
+ *
+ * The public surface is the H3NativeListener / H3NativeConnection
+ * / H3NativeTransport trio, kept distinct from the FFI version's
+ * H3Listener / H3Connection / H3Transport so both can coexist.
+ * WebSite.php loads this file lazily on a listen() spec that
+ * requests 'protocol' => 'h3-native', and falls through to the
+ * FFI version on 'protocol' => 'h3'.
  *
  * --- WHAT'S IMPLEMENTED ---
  *
@@ -3464,6 +3470,44 @@ class QuicConnection
      */
     public $handshake_done_sent = false;
     /**
+     * @var float Unix time the connection was created.
+     *      Used by the listener to expire stuck handshakes.
+     */
+    public $created_at = 0.0;
+    /**
+     * @var float Unix time of the most recent inbound or
+     *      outbound packet. Drives the idle-timeout
+     *      check.
+     */
+    public $last_packet_at = 0.0;
+    /**
+     * @var int total UDP bytes received on this
+     *      connection (raw datagram bytes, including
+     *      packets we couldn't decrypt).
+     */
+    public $stats_bytes_received = 0;
+    /**
+     * @var int total UDP bytes sent on this connection.
+     */
+    public $stats_bytes_sent = 0;
+    /**
+     * @var int total packets received successfully (at
+     *      any encryption level).
+     */
+    public $stats_packets_received = 0;
+    /**
+     * @var int total packets sent.
+     */
+    public $stats_packets_sent = 0;
+    /**
+     * @var int peer's max_idle_timeout transport
+     *      parameter, in milliseconds. Defaults to 30s
+     *      until parsed from peer's TPs in Phase 5+;
+     *      Phase 4 didn't surface this from
+     *      Tls13Engine::clientQuicTransportParameters.
+     */
+    public $peer_max_idle_ms = 30000;
+    /**
      * Constructs a server-side connection. $cert_pem and
      * $key_pem are the server's certificate and key for
      * the TLS 1.3 handshake; $alpn is the list of ALPN
@@ -3471,6 +3515,8 @@ class QuicConnection
      */
     public function __construct($cert_pem, $key_pem, $alpn)
     {
+        $this->created_at = microtime(true);
+        $this->last_packet_at = $this->created_at;
         /*
             Generate our own connection ID. This is what the
             peer will use as DCID on packets after the first
@@ -3558,6 +3604,8 @@ class QuicConnection
      */
     public function processDatagram($buf, $peer)
     {
+        $this->last_packet_at = microtime(true);
+        $this->stats_bytes_received += strlen($buf);
         $off = 0;
         while ($off < strlen($buf)) {
             $start = $off;
@@ -3586,6 +3634,7 @@ class QuicConnection
                     break;
                 }
                 $off = $end;
+                $this->stats_packets_received++;
                 $this->received_pns[$level][] =
                     $pkt->packet_number;
                 if ($pkt->packet_number >
@@ -3670,6 +3719,7 @@ class QuicConnection
                 continue;
             }
             $off = $end;
+            $this->stats_packets_received++;
             $this->received_pns[$level][] =
                 $pkt->packet_number;
             if ($pkt->packet_number >
@@ -3895,6 +3945,47 @@ class QuicConnection
         }
         $this->peer_transport_params =
             $this->tls->clientQuicTransportParameters();
+        if ($this->peer_transport_params !== '') {
+            $this->parsePeerTransportParams();
+        }
+    }
+    /**
+     * Walks the peer's QUIC transport parameters block
+     * (RFC 9000 sec 18) and surfaces the few values atto
+     * cares about. Each parameter is encoded as
+     *   (varint id, varint length, value bytes).
+     * Phase 5 only extracts max_idle_timeout (id 0x01).
+     * Other parameters (max_udp_payload_size,
+     * initial_max_data, etc.) are accepted by the wire
+     * but currently used only at their defaults.
+     */
+    protected function parsePeerTransportParams()
+    {
+        $tp = $this->peer_transport_params;
+        $off = 0;
+        while ($off < strlen($tp)) {
+            list($id, $off) = QuicVarint::read($tp, $off);
+            list($len, $off) = QuicVarint::read($tp, $off);
+            if ($len === false ||
+                strlen($tp) < $off + $len) {
+                break;
+            }
+            $value = substr($tp, $off, $len);
+            $off += $len;
+            if ($id === 0x01) {
+                /*
+                    max_idle_timeout, in milliseconds. The
+                    value is itself a varint inside the
+                    length-delimited bytes. A value of 0 means
+                    "no timeout"; we cap at our local 30s in
+                    that case so we still reap stuck peers.
+                 */
+                list($v, ) = QuicVarint::read($value, 0);
+                if ($v !== false && $v > 0) {
+                    $this->peer_max_idle_ms = (int) $v;
+                }
+            }
+        }
     }
     /**
      * Splits the bytes returned by Tls13Engine::build-
@@ -4084,6 +4175,23 @@ class QuicConnection
             $out[] = $current;
         }
         $this->send_queue = $pending_remaining;
+        if (!empty($out)) {
+            $this->last_packet_at = microtime(true);
+            foreach ($out as $datagram) {
+                $this->stats_bytes_sent += strlen($datagram);
+                /*
+                    Counting datagrams here. A datagram may
+                    contain multiple coalesced QUIC packets
+                    (Initial+Handshake during the handshake)
+                    but tracking per-packet count would
+                    require splitting bookkeeping below in
+                    encodeLong/encodeShort. Datagram count
+                    is the more useful number for ops
+                    debugging anyway.
+                 */
+                $this->stats_packets_sent++;
+            }
+        }
         return $out;
     }
     /**
@@ -4166,6 +4274,28 @@ class QuicConnection
         return $this->state === self::ST_CLOSED;
     }
     /**
+     * Returns true if no inbound or outbound packet has
+     * crossed this connection in $timeout_seconds. The
+     * caller (typically H3NativeListener::reapStale-
+     * Connections) closes the connection silently when
+     * this is true. Idle timeout is symmetrical: either
+     * peer can declare the connection dead per RFC 9000
+     * sec 10.1 once min(local_max_idle_timeout,
+     * peer_max_idle_timeout) elapses.
+     */
+    public function isIdleExpired($now)
+    {
+        if ($this->state === self::ST_CLOSED) {
+            return false;
+        }
+        if ($this->last_packet_at <= 0.0) {
+            return false;
+        }
+        $idle_ms = min(30000, $this->peer_max_idle_ms);
+        $threshold = $idle_ms / 1000.0;
+        return ($now - $this->last_packet_at) > $threshold;
+    }
+    /**
      * Sends a CONNECTION_CLOSE frame and marks the
      * connection closed. Best-effort; the frame goes out
      * on the next emit() call (assuming we have keys at
@@ -4186,6 +4316,29 @@ class QuicConnection
             $this->queue1Rtt($frame);
         }
         $this->state = self::ST_CLOSED;
+    }
+    /**
+     * Returns a flat associative array of stats for this
+     * connection, suitable for JSON encoding. Read-only;
+     * does not mutate state.
+     */
+    public function stats()
+    {
+        return [
+            'state' => $this->state,
+            'established' => $this->isEstablished(),
+            'closed' => $this->isClosed(),
+            'cid' => bin2hex($this->local_cid),
+            'peer_cid' => bin2hex($this->peer_cid),
+            'created_at' => $this->created_at,
+            'last_packet_at' => $this->last_packet_at,
+            'bytes_received' => $this->stats_bytes_received,
+            'bytes_sent' => $this->stats_bytes_sent,
+            'packets_received' =>
+                $this->stats_packets_received,
+            'packets_sent' => $this->stats_packets_sent,
+            'streams_open' => count($this->streams),
+        ];
     }
 }
 /**
@@ -4881,7 +5034,7 @@ class QpackHuffman
  * Wraps a QuicConnection plus the H3-layer state for one
  * peer.
  */
-class H3Connection extends Connection
+class H3NativeConnection extends Connection
 {
     /**
      * @var QuicConnection underlying QUIC connection
@@ -4987,7 +5140,7 @@ class H3Connection extends Connection
  * WebSite::listen() routes the same way regardless of
  * which backend is active.
  */
-class H3Listener extends Listener
+class H3NativeListener extends Listener
 {
     /**
      * @var string PEM bytes of the server certificate,
@@ -5187,7 +5340,7 @@ class H3Listener extends Listener
                 $quic = new QuicConnection(
                     $this->cert_pem, $this->key_pem,
                     $this->alpn_offered);
-                $h3 = new H3Connection($quic,
+                $h3 = new H3NativeConnection($quic,
                     bin2hex($quic->local_cid), $peer);
                 $h3->listener_name =
                     $this->globals['SERVER_NAME'] ?? '';
@@ -5267,21 +5420,22 @@ class H3Listener extends Listener
         }
     }
     /**
-     * Expires connections that have not received any
-     * packet in IDLE_TIMEOUT_SECS. Keeps the connection
-     * map small under load and matches the QUIC idle-
-     * timeout transport parameter we advertise (30s).
+     * Expires connections whose QuicConnection has gone
+     * idle past the negotiated max_idle_timeout. Keeps the
+     * connection map small under load. RFC 9000 sec 10.1:
+     * idle timeout is the minimum of the two peers' values
+     * (which we don't currently parse from peer transport
+     * params; in Phase 5 the QuicConnection defaults to
+     * 30 seconds).
      */
     public function reapStaleConnections()
     {
         $now = microtime(true);
-        $threshold = 30.0;
-        foreach ($this->last_activity as $kh => $when) {
-            if ($now - $when > $threshold) {
-                if (isset($this->connections[$kh])) {
-                    $this->connections[$kh]->close();
-                    unset($this->connections[$kh]);
-                }
+        foreach ($this->connections as $kh => $h3) {
+            if ($h3->isClosed()
+                || $h3->quic->isIdleExpired($now)) {
+                $h3->close();
+                unset($this->connections[$kh]);
                 unset($this->last_activity[$kh]);
             }
         }
@@ -5289,22 +5443,32 @@ class H3Listener extends Listener
     /**
      * Returns the number of milliseconds until the next
      * connection-level timer fires. Used by the event loop
-     * to bound select() waits. Phase 4: a fixed 100ms
-     * poll; Phase 5 will compute the actual minimum
-     * across PTO timers.
+     * to bound select() waits. Phase 4 uses a fixed 100 ms
+     * poll, which is small enough that idle-timeout reaps
+     * fire promptly without tying the event loop to a
+     * full RTT-aware PTO calculation. A future phase can
+     * compute the actual minimum across per-connection
+     * PTO + idle timers if 100 ms wakeups become a CPU
+     * concern.
      */
     public function nextTimeoutMillis()
     {
         return 100;
     }
     /**
-     * Snapshot stats placeholder. Returns an empty array
-     * for now; Phase 5 will fill in per-connection RTT,
-     * loss, congestion-window stats.
+     * Returns a snapshot of every active connection's
+     * stats. Useful for ops dashboards and the same
+     * shape the FFI listener returns for sibling stats
+     * tools. Each entry is the dict produced by
+     * QuicConnection::stats().
      */
     public function snapshotAllStats()
     {
-        return [];
+        $out = [];
+        foreach ($this->connections as $kh => $h3) {
+            $out[$kh] = $h3->quic->stats();
+        }
+        return $out;
     }
 }
 /**
@@ -5312,7 +5476,7 @@ class H3Listener extends Listener
  * Transport instance per supported protocol and routes
  * each readable event to the Transport matching the
  * Connection's negotiated protocol. For H3 the readable
- * events are produced by H3Listener::accept rather than
+ * events are produced by H3NativeListener::accept rather than
  * by the dispatcher's per-connection select set, so
  * onReadable is a no-op. driveConnection is the real
  * entry point: it polls the QUIC layer for new STREAM
@@ -5320,11 +5484,11 @@ class H3Listener extends Listener
  * full requests through WebSite::setGlobals +
  * WebSite::getResponseData.
  */
-class H3Transport extends Transport
+class H3NativeTransport extends Transport
 {
     /**
      * No-op for H3: per-connection readable events are
-     * driven by H3Listener::accept reading the shared UDP
+     * driven by H3NativeListener::accept reading the shared UDP
      * socket and dispatching datagrams. WebSite never
      * adds an H3Connection to its select set.
      */

@@ -1684,39 +1684,52 @@ class WebSite
             }
             $merged_context = array_replace_recursive($shared_context,
                 $spec_context);
-            if ($spec_protocol === 'h3') {
+            if ($spec_protocol === 'h3-native'
+                || $spec_protocol === 'h3') {
                 /*
-                    H3 listener: load the optional H3Listener module
-                    on first request and let it open a UDP socket
-                    via libquiche. If the module is unavailable
-                    (FFI extension not loaded, libquiche not
-                    installed, or cert/key missing), tryOpen
-                    returns null and we silently skip the H3
-                    listener while keeping any sibling H1/H2
-                    listeners. The server stays usable as
-                    H1/H2-only with no extra ceremony — opt-in
-                    H3 with graceful degradation.
+                    H3 listener. Two implementations are
+                    available: 'h3' loads the libquiche-FFI
+                    H3Listener, 'h3-native' loads the pure-PHP
+                    H3NativeListener. The two listeners coexist
+                    -- both define tryOpen() / accept() /
+                    nextTimeoutMillis() / tickAllConnections()
+                    so the event loop drives them
+                    interchangeably below via duck-typing on
+                    those method names.
+
+                    Either implementation may be unavailable:
+                    'h3' needs FFI + libquiche, 'h3-native'
+                    only needs ext-openssl + ext-sodium and
+                    optionally ext-gmp for RSA certs. Both
+                    fall through quietly when the optional
+                    pieces are missing.
                  */
-                if (!class_exists(
-                        '\seekquarry\atto\H3Listener', false)) {
-                    $h3_path = __DIR__ . '/H3Listener.php';
+                $is_native = ($spec_protocol === 'h3-native');
+                $cls = $is_native
+                    ? '\seekquarry\atto\H3NativeListener'
+                    : '\seekquarry\atto\H3Listener';
+                $file = $is_native
+                    ? 'H3NativeListener.php'
+                    : 'H3Listener.php';
+                if (!class_exists($cls, false)) {
+                    $h3_path = __DIR__ . '/' . $file;
                     if (is_file($h3_path)) {
                         require_once $h3_path;
                     }
                 }
-                if (!class_exists(
-                        '\seekquarry\atto\H3Listener', false)) {
-                    echo "H3 listener requested for $spec_address "
-                        . "but src/H3Listener.php is missing; "
-                        . "skipping\n";
+                if (!class_exists($cls, false)) {
+                    echo "$spec_protocol listener requested "
+                        . "for $spec_address but src/$file "
+                        . "is missing; skipping\n";
                     continue;
                 }
-                $parsed = $this->parseListenAddress($spec_address);
+                $parsed = $this->parseListenAddress(
+                    $spec_address);
                 $h3_globals = [
                     'SERVER_NAME' => $parsed['host'],
                     'SERVER_PORT' => $parsed['port'],
                 ];
-                $h3 = H3Listener::tryOpen($parsed['bind_address'],
+                $h3 = $cls::tryOpen($parsed['bind_address'],
                     $merged_context, $h3_globals);
                 if ($h3 !== null) {
                     $h3->site = $this;
@@ -1831,7 +1844,14 @@ class WebSite
              */
             $h3_min_ms = null;
             foreach ($this->listeners as $listener_entry) {
-                if ($listener_entry instanceof H3Listener) {
+                /*
+                    Duck-type any UDP-driven listener that
+                    exposes nextTimeoutMillis(). Both
+                    H3Listener (FFI) and H3NativeListener
+                    (pure-PHP) define the method.
+                 */
+                if (method_exists($listener_entry,
+                        'nextTimeoutMillis')) {
                     $candidate = $listener_entry->nextTimeoutMillis();
                     if ($candidate !== null
                         && ($h3_min_ms === null
@@ -1866,7 +1886,8 @@ class WebSite
                 timeout_as_millis check.
              */
             foreach ($this->listeners as $listener_entry) {
-                if ($listener_entry instanceof H3Listener) {
+                if (method_exists($listener_entry,
+                        'tickAllConnections')) {
                     $listener_entry->tickAllConnections();
                 }
             }

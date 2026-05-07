@@ -51,7 +51,7 @@ $test = new WebSite();
         /small        2-byte response — per-request overhead
         /big          1 MiB response — sustained throughput
         /asset/{n}    indexed small response — parallel-fetch
-        /headers      100 custom headers — HPack vs plaintext
+        /headers      100 custom headers — HPACK / QPACK vs plain
         /echo-post    echoes POST body — request-body round-trip
 
     The server listens on both plain HTTP (8080) and TLS (8443)
@@ -206,7 +206,7 @@ var KNOWN_CASES = [
     {key: 'SMALL',     label: '/small (per-request overhead)'},
     {key: 'BIG',       label: '/big (1 MiB throughput)'},
     {key: 'ASSET',     label: '/asset (parallel multiplex)'},
-    {key: 'HEADERS',   label: '/headers (HPack vs plain)'},
+    {key: 'HEADERS',   label: '/headers (HPACK/QPACK vs plain)'},
     {key: 'KEEPALIVE', label: '/small over one connection'},
     {key: 'POST',      label: '/echo-post (round-trip body)'},
 ];
@@ -498,9 +498,13 @@ $test->get('/headers', function () use ($test) {
     /*
         Response with 100 custom headers. On H1 the runner
         sees 100 repeated header lines per response in
-        plaintext; on H2 HPack indexes repeated names so the
-        wire bytes are dramatically smaller after the first
-        request on a connection.
+        plaintext; on H2 HPACK and on H3 QPACK index
+        repeated names so the wire bytes are dramatically
+        smaller after the first request on a connection.
+        H3's static and dynamic QPACK tables are similar in
+        spirit to H2's HPACK but reorder field handling so
+        the per-stream decoder doesn't block the connection
+        on out-of-order delivery.
      */
     for ($i = 0; $i < 100; $i++) {
         $test->header("X-Bench-Header-{$i}: value-{$i}");

@@ -2140,23 +2140,171 @@ class QuicPacketKeys
             uses sample[0..3] as a 32-bit LE counter and
             sample[4..15] as the 12-byte nonce, then takes
             the first 5 bytes of the keystream as the mask.
-            PHP's libsodium binding doesn't expose raw
-            ChaCha20 (only AEAD wrappers and XChaCha20), so
-            we go through openssl. OpenSSL 3.x's chacha20
-            EVP cipher takes a 16-byte IV laid out as
-            counter(4 LE) || nonce(12), which matches the
-            RFC layout exactly -- verified against RFC 8439
-            section 2.4.2 test vector.
+
+            We try OpenSSL's 'chacha20' EVP cipher first
+            because it's an order of magnitude faster than
+            pure PHP, but fall back to pure PHP if the
+            cipher is unavailable (LibreSSL on stock macOS
+            does not expose raw chacha20 -- only the AEAD
+            ChaCha20-Poly1305) or if its IV layout differs
+            from RFC 8439's. self::chachaUseOpenssl() runs
+            a one-shot RFC 8439 self-test the first time
+            it's called and caches the result.
          */
-        $iv = substr($sample, 0, 16);
-        $ks = openssl_encrypt(
-            "\x00\x00\x00\x00\x00", 'chacha20',
-            $this->hp_key,
-            OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $iv);
-        if ($ks === false) {
+        $counter = ord($sample[0])
+            | (ord($sample[1]) << 8)
+            | (ord($sample[2]) << 16)
+            | (ord($sample[3]) << 24);
+        $nonce = substr($sample, 4, 12);
+        if (self::chachaUseOpenssl()) {
+            $iv = substr($sample, 0, 16);
+            $ks = openssl_encrypt(
+                "\x00\x00\x00\x00\x00", 'chacha20',
+                $this->hp_key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $iv);
+            if ($ks === false) {
+                return false;
+            }
+            return substr($ks, 0, 5);
+        }
+        $block = self::chacha20Block($this->hp_key, $counter,
+            $nonce);
+        if ($block === false) {
             return false;
         }
-        return substr($ks, 0, 5);
+        return substr($block, 0, 5);
+    }
+    /**
+     * Returns true iff this PHP build's openssl_encrypt
+     * supports the 'chacha20' raw-stream cipher and
+     * implements its IV layout as RFC 8439 expects --
+     * i.e. counter(4 LE) || nonce(12). Cached after the
+     * first call. On macOS systems that link against
+     * LibreSSL the cipher may be missing or laid out
+     * differently, in which case this method returns false
+     * and headerProtectionMask falls back to pure PHP.
+     *
+     * The self-test uses the well-known RFC 8439 sec 2.3.2
+     * test vector. A mismatch is treated the same as the
+     * cipher being absent: openssl is unsafe to use for
+     * ChaCha20 HP.
+     */
+    public static function chachaUseOpenssl()
+    {
+        static $cached = null;
+        if ($cached !== null) {
+            return $cached;
+        }
+        $key = '';
+        for ($i = 0; $i < 32; $i++) {
+            $key .= chr($i);
+        }
+        $iv = "\x01\x00\x00\x00"
+            . "\x00\x00\x00\x09\x00\x00\x00\x4a\x00\x00\x00\x00";
+        $expected = "\x10\xf1\xe7\xe4\xd1\x3b\x59\x15"
+            . "\x50\x0f\xdd\x1f\xa3\x20\x71\xc4";
+        $got = @openssl_encrypt(
+            str_repeat("\x00", 16), 'chacha20', $key,
+            OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $iv);
+        $cached = ($got !== false && $got === $expected);
+        return $cached;
+    }
+    /**
+     * Pure-PHP ChaCha20 block function per RFC 8439 sec
+     * 2.3. Produces 64 bytes of keystream from $key (32
+     * bytes), $counter (32-bit unsigned int), and $nonce
+     * (12 bytes). Used as a fallback for the HP mask when
+     * OpenSSL's 'chacha20' cipher isn't available; only the
+     * first 5 bytes of output are needed there. Slower than
+     * OpenSSL by ~10x but inconsequential for QUIC HP at
+     * realistic packet rates (5 bytes per packet).
+     */
+    public static function chacha20Block($key, $counter,
+        $nonce)
+    {
+        if (strlen($key) !== 32 || strlen($nonce) !== 12) {
+            return false;
+        }
+        /*
+            Initialize 16-word state per RFC 8439 sec 2.3:
+                row 0: four "expand 32-byte k" constants
+                row 1: words 4..7 = key[0..15]
+                row 2: words 8..11 = key[16..31]
+                row 3: word 12 = counter, 13..15 = nonce
+            All as 32-bit little-endian words.
+         */
+        $s = [];
+        $s[0] = 0x61707865;
+        $s[1] = 0x3320646e;
+        $s[2] = 0x79622d32;
+        $s[3] = 0x6b206574;
+        for ($i = 0; $i < 8; $i++) {
+            $b = $i * 4;
+            $s[4 + $i] = ord($key[$b])
+                | (ord($key[$b + 1]) << 8)
+                | (ord($key[$b + 2]) << 16)
+                | (ord($key[$b + 3]) << 24);
+        }
+        $s[12] = $counter & 0xffffffff;
+        for ($i = 0; $i < 3; $i++) {
+            $b = $i * 4;
+            $s[13 + $i] = ord($nonce[$b])
+                | (ord($nonce[$b + 1]) << 8)
+                | (ord($nonce[$b + 2]) << 16)
+                | (ord($nonce[$b + 3]) << 24);
+        }
+        $w = $s;
+        /* 20 rounds = 10 double rounds. */
+        for ($r = 0; $r < 10; $r++) {
+            self::chacha20Qr($w, 0, 4, 8, 12);
+            self::chacha20Qr($w, 1, 5, 9, 13);
+            self::chacha20Qr($w, 2, 6, 10, 14);
+            self::chacha20Qr($w, 3, 7, 11, 15);
+            self::chacha20Qr($w, 0, 5, 10, 15);
+            self::chacha20Qr($w, 1, 6, 11, 12);
+            self::chacha20Qr($w, 2, 7, 8, 13);
+            self::chacha20Qr($w, 3, 4, 9, 14);
+        }
+        /* Add original state, then serialize little-
+           endian. */
+        $out = '';
+        for ($i = 0; $i < 16; $i++) {
+            $v = ($w[$i] + $s[$i]) & 0xffffffff;
+            $out .= chr($v & 0xff)
+                . chr(($v >> 8) & 0xff)
+                . chr(($v >> 16) & 0xff)
+                . chr(($v >> 24) & 0xff);
+        }
+        return $out;
+    }
+    /**
+     * One ChaCha20 quarter-round on words a, b, c, d of
+     * the working state. RFC 8439 sec 2.1. PHP integers
+     * are 64-bit on every platform we run on, so we mask
+     * with 0xffffffff to keep additions in 32-bit space.
+     */
+    protected static function chacha20Qr(&$w, $a, $b, $c, $d)
+    {
+        $w[$a] = ($w[$a] + $w[$b]) & 0xffffffff;
+        $w[$d] = $w[$d] ^ $w[$a];
+        $w[$d] = ((($w[$d] << 16) & 0xffffffff)
+            | (($w[$d] >> 16) & 0xffff))
+            & 0xffffffff;
+        $w[$c] = ($w[$c] + $w[$d]) & 0xffffffff;
+        $w[$b] = $w[$b] ^ $w[$c];
+        $w[$b] = ((($w[$b] << 12) & 0xffffffff)
+            | (($w[$b] >> 20) & 0xfff))
+            & 0xffffffff;
+        $w[$a] = ($w[$a] + $w[$b]) & 0xffffffff;
+        $w[$d] = $w[$d] ^ $w[$a];
+        $w[$d] = ((($w[$d] << 8) & 0xffffffff)
+            | (($w[$d] >> 24) & 0xff))
+            & 0xffffffff;
+        $w[$c] = ($w[$c] + $w[$d]) & 0xffffffff;
+        $w[$b] = $w[$b] ^ $w[$c];
+        $w[$b] = ((($w[$b] << 7) & 0xffffffff)
+            | (($w[$b] >> 25) & 0x7f))
+            & 0xffffffff;
     }
     /**
      * Constructs the AEAD nonce by left-padding the 64-bit
@@ -3958,6 +4106,17 @@ class QuicConnection
                     $this->largest_pn[$level]);
                 $pkt = $result[0];
                 $end = $result[1];
+                if (getenv('ATTO_H3_TRACE')) {
+                    $err = $result[2] ?? '';
+                    error_log(sprintf(
+                        "[H3TRACE]   decode level=2 "
+                        . "result=%s err=%s end=%d "
+                        . "pn=%s",
+                        $pkt === false ? 'fail' : 'ok',
+                        $err, $end,
+                        $pkt === false ? '?'
+                            : (string) $pkt->packet_number));
+                }
                 if ($pkt === false) {
                     break;
                 }

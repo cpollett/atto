@@ -3832,6 +3832,24 @@ class QuicConnection
      */
     public $largest_pn = [];
     /**
+     * @var array level => bool. True when the application
+     *      level has received at least one ACK-eliciting
+     *      frame since the last time we emitted an ACK for
+     *      that level. RFC 9000 sec 13.2 requires a server
+     *      to acknowledge ACK-eliciting packets within
+     *      max_ack_delay (default 25 ms), and in practice
+     *      ngtcp2 retransmits the request stream
+     *      indefinitely if its STREAM frame goes unACKed
+     *      because it never observes the response either.
+     *      An ACK-only packet emitted alongside (or before)
+     *      our response breaks that retransmit loop.
+     */
+    public $ack_pending = [
+        self::LEVEL_INITIAL => false,
+        self::LEVEL_HANDSHAKE => false,
+        self::LEVEL_APPLICATION => false,
+    ];
+    /**
      * @var array level => crypto data byte buffer
      *      (offset => bytes) and next-expected-offset for
      *      in-order delivery to Tls13Engine.
@@ -4284,6 +4302,30 @@ class QuicConnection
                 implode(",", $types)));
         }
         foreach ($frames as $f) {
+            /*
+                RFC 9000 sec 1.2 / sec 13.2.1: every frame
+                except ACK, PADDING, and CONNECTION_CLOSE is
+                "ACK-eliciting". Receiving one obligates us
+                to acknowledge the carrying packet within
+                max_ack_delay (and immediately for stream
+                data). We track that obligation per packet-
+                number space; emit() consumes the flag and
+                emits an ACK-only packet when no other
+                outbound 1-RTT bytes happen to be queued
+                for the same tick. Without this loop ngtcp2
+                retransmits unACKed STREAM frames forever
+                even when our response is going out, because
+                from its loss-detection POV the request was
+                lost.
+             */
+            $type = $f['type'];
+            if ($type !== QuicFrame::F_ACK
+                && $type !== QuicFrame::F_ACK_ECN
+                && $type !== QuicFrame::F_PADDING
+                && $type !== QuicFrame::F_CONNECTION_CLOSE
+                && $type !== QuicFrame::F_CONNECTION_CLOSE_APP) {
+                $this->ack_pending[$level] = true;
+            }
             switch ($f['type']) {
                 case QuicFrame::F_CRYPTO:
                     $this->onCrypto($level, $f);
@@ -4818,6 +4860,46 @@ class QuicConnection
                 self::LEVEL_APPLICATION);
             $this->queue1Rtt($ack_payload . $payload);
             $this->handshake_done_sent = true;
+            $this->ack_pending[self::LEVEL_APPLICATION] =
+                false;
+        }
+        /*
+            Flush any pending ACK obligation in the
+            application packet-number space. RFC 9000 sec
+            13.2.1: receivers SHOULD acknowledge ACK-
+            eliciting packets within max_ack_delay. The
+            simplest correct policy here is to bundle the
+            ACK with the next 1-RTT payload we already
+            intend to send if there is one, otherwise emit
+            an ACK-only packet. We unconditionally prepend
+            the ACK to the FIRST queued 1-RTT entry and
+            otherwise queue an ACK-only payload; either
+            way the ACK leaves on this emit() call.
+         */
+        if ($this->ack_pending[self::LEVEL_APPLICATION] &&
+            isset($this->keys[self::LEVEL_APPLICATION])) {
+            $ack_payload = $this->ackFrameBytes(
+                self::LEVEL_APPLICATION);
+            if ($ack_payload !== '') {
+                $piggybacked = false;
+                foreach ($this->send_queue as $idx => $sq) {
+                    list($lv, $b, $st) = $sq;
+                    if ($lv === self::LEVEL_APPLICATION
+                        && $st === 'pending') {
+                        $this->send_queue[$idx][1] =
+                            $ack_payload . $b;
+                        $piggybacked = true;
+                        break;
+                    }
+                }
+                if (!$piggybacked) {
+                    $this->send_queue[] = [
+                        self::LEVEL_APPLICATION,
+                        $ack_payload, 'pending'];
+                }
+            }
+            $this->ack_pending[self::LEVEL_APPLICATION] =
+                false;
         }
         foreach ($this->send_queue as $entry) {
             list($level, $bytes, $status) = $entry;

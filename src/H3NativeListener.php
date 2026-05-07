@@ -1700,3 +1700,644 @@ class Tls13Engine
         return false;
     }
 }
+/**
+ * QUIC packet keys for one encryption level (Initial,
+ * Handshake, 1-RTT, or 0-RTT-not-implemented). Bundles the
+ * AEAD key, AEAD IV, header-protection key, and the cipher
+ * suite code so the rest of the stack can call sealPacket()
+ * / openPacket() without re-deriving keys per packet.
+ *
+ * Two construction paths:
+ *   - fromInitialDcid($dcid, $is_server) -- the
+ *     deterministic Initial keys, derived per RFC 9001
+ *     sec 5.2 from the client's Destination Connection ID
+ *     and the Initial salt.
+ *   - fromTrafficSecret($secret, $cipher) -- Handshake or
+ *     1-RTT keys, derived from a TLS 1.3 traffic secret
+ *     plus the negotiated cipher suite, per RFC 9001
+ *     sec 5.1.
+ */
+class QuicPacketKeys
+{
+    /*
+        Initial salt, RFC 9001 sec 5.2 (constant for QUIC v1).
+     */
+    const INITIAL_SALT_HEX =
+        "38762cf7f55934b34d179ae6a4c80cadccbb7f0a";
+    /**
+     * @var int cipher suite code, mirroring
+     *      Tls13Engine::CIPHER_*. Determines AEAD/HP
+     *      primitive, key/IV lengths.
+     */
+    public $cipher = 0;
+    /**
+     * @var string AEAD key. 16 bytes for AES-128-GCM
+     *      (Initial always uses this), 32 bytes for
+     *      ChaCha20-Poly1305.
+     */
+    public $key = "";
+    /**
+     * @var string AEAD IV. Always 12 bytes.
+     */
+    public $iv = "";
+    /**
+     * @var string Header-protection key, same length as
+     *      the AEAD key.
+     */
+    public $hp_key = "";
+    /**
+     * Builds Initial keys for both client-to-server and
+     * server-to-client directions from the client's
+     * Destination Connection ID. Returns
+     * ['client' => QuicPacketKeys, 'server' => QuicPacketKeys].
+     */
+    public static function fromInitialDcid($dcid)
+    {
+        $salt = hex2bin(self::INITIAL_SALT_HEX);
+        $initial_secret = self::hkdfExtract($salt, $dcid);
+        $client_secret = self::hkdfExpandLabel(
+            $initial_secret, 'client in', '', 32);
+        $server_secret = self::hkdfExpandLabel(
+            $initial_secret, 'server in', '', 32);
+        return [
+            'client' => self::fromTrafficSecret(
+                $client_secret,
+                Tls13Engine::CIPHER_AES_128_GCM_SHA256),
+            'server' => self::fromTrafficSecret(
+                $server_secret,
+                Tls13Engine::CIPHER_AES_128_GCM_SHA256),
+        ];
+    }
+    /**
+     * Builds keys for one direction from a traffic secret
+     * (TLS handshake_traffic_secret_c/_s for Handshake-
+     * level keys, or application_traffic_secret_c/_s for
+     * 1-RTT keys). $cipher selects the primitive.
+     */
+    public static function fromTrafficSecret($secret,
+        $cipher)
+    {
+        $key_len = ($cipher ===
+            Tls13Engine::CIPHER_AES_128_GCM_SHA256) ? 16 : 32;
+        $self = new self();
+        $self->cipher = $cipher;
+        $self->key = self::hkdfExpandLabel($secret,
+            'quic key', '', $key_len);
+        $self->iv = self::hkdfExpandLabel($secret,
+            'quic iv', '', 12);
+        $self->hp_key = self::hkdfExpandLabel($secret,
+            'quic hp', '', $key_len);
+        return $self;
+    }
+    /**
+     * RFC 5869 HKDF-Extract; small reimpl of the same
+     * helper Tls13Engine has, made static so this class
+     * doesn't have to construct an engine just to derive
+     * Initial keys.
+     */
+    protected static function hkdfExtract($salt, $ikm)
+    {
+        if ($salt === '') {
+            $salt = str_repeat("\x00", 32);
+        }
+        return hash_hmac('sha256', $ikm, $salt, true);
+    }
+    /**
+     * HKDF-Expand-Label per RFC 8446 sec 7.1, with the
+     * "tls13 " label prefix. QUIC labels are "client in",
+     * "server in", "quic key", "quic iv", "quic hp",
+     * "quic ku" (key update; unused here).
+     */
+    protected static function hkdfExpandLabel($secret,
+        $label, $context, $length)
+    {
+        $full = "tls13 " . $label;
+        $info = chr(($length >> 8) & 0xFF) .
+            chr($length & 0xFF) .
+            chr(strlen($full)) . $full .
+            chr(strlen($context)) . $context;
+        $out = '';
+        $t = '';
+        $ctr = 1;
+        while (strlen($out) < $length) {
+            $t = hash_hmac('sha256',
+                $t . $info . chr($ctr), $secret, true);
+            $out .= $t;
+            $ctr++;
+        }
+        return substr($out, 0, $length);
+    }
+    /**
+     * Computes the 16-byte sample-derived header-protection
+     * mask, per RFC 9001 sec 5.4.3. Sample length is
+     * always 16 bytes regardless of cipher.
+     *
+     * For AES-128-ECB: mask = AES-ECB(hp_key, sample),
+     *     keep low 5 bytes for header use.
+     * For ChaCha20: mask = ChaCha20(hp_key, counter, nonce,
+     *     5 zero bytes), where counter is the first 4
+     *     bytes of the sample (LE) and nonce is the next
+     *     12 bytes.
+     *
+     * Returns the 5-byte mask (1 byte for first-byte XOR,
+     * 4 bytes for packet-number XOR -- only as many as the
+     * actual packet-number length will be used).
+     */
+    public function headerProtectionMask($sample)
+    {
+        if (strlen($sample) < 16) {
+            return false;
+        }
+        if ($this->cipher ===
+            Tls13Engine::CIPHER_AES_128_GCM_SHA256) {
+            /*
+                AES-128-ECB on a single 16-byte block.
+                openssl_encrypt with no padding gives us
+                the raw block.
+             */
+            $block = openssl_encrypt(substr($sample, 0, 16),
+                'aes-128-ecb', $this->hp_key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
+            return substr($block, 0, 5);
+        }
+        /*
+            ChaCha20 with counter from sample[0..3] (LE),
+            nonce from sample[4..15]. The IETF variant
+            treats the first 4 bytes of the 16-byte counter
+            +nonce input as the counter.
+         */
+        $counter = unpack('V', substr($sample, 0, 4))[1];
+        $nonce = substr($sample, 4, 12);
+        return sodium_crypto_stream_chacha20_ietf_xor_ic(
+            "\x00\x00\x00\x00\x00",
+            $nonce, $counter, $this->hp_key);
+    }
+    /**
+     * Constructs the AEAD nonce by left-padding the 64-bit
+     * packet number to 12 bytes and XORing with the IV.
+     */
+    public function packetNonce($packet_number)
+    {
+        $padded = str_repeat("\x00", 4) .
+            pack('J', (int) $packet_number);
+        $out = '';
+        for ($i = 0; $i < 12; $i++) {
+            $out .= chr(ord($this->iv[$i]) ^
+                ord($padded[$i]));
+        }
+        return $out;
+    }
+    /**
+     * AEAD-seals $plaintext with the per-packet nonce
+     * derived from $packet_number, using $aad as the
+     * authenticated header. Returns ciphertext || tag.
+     */
+    public function seal($packet_number, $aad, $plaintext)
+    {
+        $nonce = $this->packetNonce($packet_number);
+        if ($this->cipher ===
+            Tls13Engine::CIPHER_AES_128_GCM_SHA256) {
+            $tag = '';
+            $ct = openssl_encrypt($plaintext, 'aes-128-gcm',
+                $this->key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
+                $nonce, $tag, $aad);
+            return $ct . $tag;
+        }
+        return sodium_crypto_aead_chacha20poly1305_ietf_encrypt(
+            $plaintext, $aad, $nonce, $this->key);
+    }
+    /**
+     * Inverse of seal. Returns plaintext on success, false
+     * on auth failure.
+     */
+    public function open($packet_number, $aad, $ciphertext)
+    {
+        $nonce = $this->packetNonce($packet_number);
+        if ($this->cipher ===
+            Tls13Engine::CIPHER_AES_128_GCM_SHA256) {
+            if (strlen($ciphertext) < 16) {
+                return false;
+            }
+            $ct = substr($ciphertext, 0, -16);
+            $tag = substr($ciphertext, -16);
+            return openssl_decrypt($ct, 'aes-128-gcm',
+                $this->key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
+                $nonce, $tag, $aad);
+        }
+        return @sodium_crypto_aead_chacha20poly1305_ietf_decrypt(
+            $ciphertext, $aad, $nonce, $this->key);
+    }
+}
+/**
+ * QUIC variable-length integer codec, RFC 9000 sec 16.
+ * The top two bits of the first byte encode the length:
+ *   00xxxxxx -- 1 byte,  values 0..63
+ *   01xxxxxx -- 2 bytes, values 0..16383
+ *   10xxxxxx -- 4 bytes, values 0..1073741823
+ *   11xxxxxx -- 8 bytes, values 0..(2^62 - 1)
+ *
+ * The remaining 6 bits of the first byte are the high
+ * 6 bits of the integer.
+ */
+class QuicVarint
+{
+    /**
+     * Decodes a varint at offset $off in $buf. Returns
+     * [value, new_off] or [false, $off] on underflow.
+     */
+    public static function read($buf, $off)
+    {
+        if (strlen($buf) < $off + 1) {
+            return [false, $off];
+        }
+        $first = ord($buf[$off]);
+        $size_class = $first >> 6;
+        $byte_count = 1 << $size_class; /* 1, 2, 4, or 8 */
+        if (strlen($buf) < $off + $byte_count) {
+            return [false, $off];
+        }
+        $value = $first & 0x3F;
+        for ($i = 1; $i < $byte_count; $i++) {
+            $value = ($value << 8) | ord($buf[$off + $i]);
+        }
+        return [$value, $off + $byte_count];
+    }
+    /**
+     * Encodes a value as a QUIC varint with minimal
+     * length. Returns the bytes.
+     */
+    public static function write($value)
+    {
+        if ($value < 0) {
+            return false;
+        }
+        if ($value < 64) {
+            return chr($value);
+        }
+        if ($value < 16384) {
+            return chr(0x40 | ($value >> 8)) .
+                chr($value & 0xFF);
+        }
+        if ($value < 1073741824) {
+            return chr(0x80 | (($value >> 24) & 0x3F)) .
+                chr(($value >> 16) & 0xFF) .
+                chr(($value >> 8) & 0xFF) .
+                chr($value & 0xFF);
+        }
+        /*
+            8-byte form: top two bits are 11, rest is the
+            62-bit integer in big-endian. PHP int is signed
+            64-bit but QUIC caps at 2^62 - 1, so packing
+            via 'J' (big-endian uint64) is safe.
+         */
+        $packed = pack('J', $value);
+        $first = ord($packed[0]) | 0xC0;
+        return chr($first) . substr($packed, 1);
+    }
+    /**
+     * Returns how many bytes a value will occupy when
+     * encoded -- useful for sizing payloads ahead of
+     * actual encoding.
+     */
+    public static function size($value)
+    {
+        if ($value < 64) {
+            return 1;
+        }
+        if ($value < 16384) {
+            return 2;
+        }
+        if ($value < 1073741824) {
+            return 4;
+        }
+        return 8;
+    }
+}
+/**
+ * Decoded QUIC packet structure. Long-header packets
+ * (Initial, 0-RTT, Handshake, Retry) have all the type-
+ * specific fields populated; short-header (1-RTT) packets
+ * fill only the destination_cid, packet_number, and payload
+ * fields. The fully-decoded payload (post-AEAD) is in
+ * $payload; the bytes that comprised the unprotected
+ * packet header are in $header_bytes (used as AEAD AAD on
+ * the receive side, and to check we encoded the header
+ * matching the sender's expectations).
+ */
+class QuicPacket
+{
+    /*
+        Header forms.
+     */
+    const FORM_LONG = 1;
+    const FORM_SHORT = 0;
+    /*
+        Long-header packet types (RFC 9000 sec 17.2).
+        These are the values of bits 4-5 of the first byte
+        when form=long (bit 7), fixed=1 (bit 6).
+     */
+    const LONG_INITIAL = 0;
+    const LONG_ZERO_RTT = 1;
+    const LONG_HANDSHAKE = 2;
+    const LONG_RETRY = 3;
+    /*
+        QUIC v1 version number (RFC 9000 sec 15).
+     */
+    const VERSION_QUIC_V1 = 0x00000001;
+    public $form = self::FORM_LONG;
+    public $long_type = self::LONG_INITIAL;
+    public $version = self::VERSION_QUIC_V1;
+    public $destination_cid = "";
+    public $source_cid = "";
+    public $token = "";
+    public $packet_number = 0;
+    public $packet_number_length = 0; /* 1..4 bytes on wire */
+    public $payload = "";
+    public $header_bytes = "";
+    /**
+     * Decodes one QUIC packet from $buf starting at $off.
+     * Returns [QuicPacket, new_off] on success or
+     * [false, $off, $reason_string] on failure.
+     *
+     * For Initial / Handshake packets, $keys is the
+     * QuicPacketKeys for the receive direction at that
+     * encryption level; we use it both to remove header
+     * protection (which gives us the packet-number length
+     * and therefore the position of the payload) and to
+     * decrypt the payload.
+     *
+     * For Retry packets we don't decrypt -- the integrity
+     * tag is verified against a fixed key rather than the
+     * Initial keys.
+     *
+     * One UDP datagram may coalesce multiple QUIC packets
+     * (e.g. an Initial followed by a Handshake). The
+     * caller should loop, calling decode() with the
+     * advanced offset until $off equals strlen($buf).
+     */
+    public static function decode($buf, $off, $keys,
+        $is_server_recv, $largest_pn_seen)
+    {
+        if (strlen($buf) < $off + 1) {
+            return [false, $off, "datagram too short"];
+        }
+        $first = ord($buf[$off]);
+        if (($first & 0x80) === 0) {
+            return self::decodeShort($buf, $off, $keys,
+                $largest_pn_seen);
+        }
+        return self::decodeLong($buf, $off, $keys,
+            $is_server_recv, $largest_pn_seen);
+    }
+    /**
+     * Decodes a long-header packet. Implements the bits-4-5
+     * type dispatch and runs the version, DCID, SCID, type-
+     * specific extras (token for Initial, integrity tag for
+     * Retry), then the protected payload.
+     */
+    protected static function decodeLong($buf, $off, $keys,
+        $is_server_recv, $largest_pn_seen)
+    {
+        $packet_off = $off;
+        $first = ord($buf[$off]);
+        if (($first & 0x40) === 0) {
+            /*
+                The "fixed bit" (bit 6) must be 1 in QUIC v1.
+                A zero indicates either a malformed packet or
+                a different protocol; reject.
+             */
+            return [false, $off, "fixed bit not set"];
+        }
+        $long_type = ($first >> 4) & 0x03;
+        if (strlen($buf) < $off + 7) {
+            return [false, $off, "long header truncated"];
+        }
+        $off++;
+        $version = unpack('N', substr($buf, $off, 4))[1];
+        $off += 4;
+        $dcid_len = ord($buf[$off]);
+        $off++;
+        if (strlen($buf) < $off + $dcid_len + 1) {
+            return [false, $off, "DCID truncated"];
+        }
+        $dcid = substr($buf, $off, $dcid_len);
+        $off += $dcid_len;
+        $scid_len = ord($buf[$off]);
+        $off++;
+        if (strlen($buf) < $off + $scid_len) {
+            return [false, $off, "SCID truncated"];
+        }
+        $scid = substr($buf, $off, $scid_len);
+        $off += $scid_len;
+        $token = "";
+        if ($long_type === self::LONG_INITIAL) {
+            list($token_len, $off) = QuicVarint::read($buf,
+                $off);
+            if ($token_len === false ||
+                strlen($buf) < $off + $token_len) {
+                return [false, $off, "token truncated"];
+            }
+            $token = substr($buf, $off, $token_len);
+            $off += $token_len;
+        }
+        if ($long_type === self::LONG_RETRY) {
+            /*
+                Retry packets are not encrypted; everything
+                after the SCID is the retry token followed
+                by a 16-byte integrity tag. We surface the
+                raw contents and let the caller verify the
+                tag via the QUIC v1 retry integrity key.
+             */
+            $rest = substr($buf, $off);
+            $packet = new self();
+            $packet->form = self::FORM_LONG;
+            $packet->long_type = self::LONG_RETRY;
+            $packet->version = $version;
+            $packet->destination_cid = $dcid;
+            $packet->source_cid = $scid;
+            $packet->payload = $rest;
+            $packet->header_bytes = substr($buf,
+                $packet_off, $off - $packet_off);
+            return [$packet, strlen($buf)];
+        }
+        /*
+            Initial / Handshake / 0-RTT all carry a varint
+            "Length" field followed by Length bytes of
+            (packet number || protected payload).
+         */
+        list($length, $off) = QuicVarint::read($buf, $off);
+        if ($length === false ||
+            strlen($buf) < $off + $length) {
+            return [false, $off, "length field bad"];
+        }
+        $pn_offset = $off;
+        $sample_offset = $pn_offset + 4;
+        if (strlen($buf) < $sample_offset + 16) {
+            return [false, $off, "no room for HP sample"];
+        }
+        $sample = substr($buf, $sample_offset, 16);
+        $mask = $keys->headerProtectionMask($sample);
+        if ($mask === false) {
+            return [false, $off, "HP mask failed"];
+        }
+        /*
+            Long-header HP unmask: low 4 bits of byte 0
+            (packet number length lives in low 2 bits).
+         */
+        $unprotected_first = $first ^ (ord($mask[0]) & 0x0F);
+        $pn_length = ($unprotected_first & 0x03) + 1;
+        $pn_truncated = 0;
+        for ($i = 0; $i < $pn_length; $i++) {
+            $b = ord($buf[$pn_offset + $i]) ^
+                ord($mask[$i + 1]);
+            $pn_truncated = ($pn_truncated << 8) | $b;
+        }
+        $packet_number = self::decodePacketNumber(
+            $pn_truncated, $pn_length, $largest_pn_seen);
+        $body_start = $pn_offset + $pn_length;
+        $body_len = $length - $pn_length;
+        if (strlen($buf) < $body_start + $body_len) {
+            return [false, $off, "body truncated"];
+        }
+        /*
+            Reassemble the AAD. AAD is the unprotected
+            packet header: bytes from $packet_off through
+            (but not including) $body_start, with byte 0
+            replaced by $unprotected_first and the
+            packet-number bytes replaced by their
+            unprotected values.
+         */
+        $hdr = chr($unprotected_first) .
+            substr($buf, $packet_off + 1,
+                $pn_offset - $packet_off - 1);
+        $pn_bytes = '';
+        for ($i = $pn_length - 1; $i >= 0; $i--) {
+            $pn_bytes .= chr(($packet_number >> ($i * 8))
+                & 0xFF);
+        }
+        $aad = $hdr . $pn_bytes;
+        $protected = substr($buf, $body_start, $body_len);
+        $plaintext = $keys->open($packet_number, $aad,
+            $protected);
+        if ($plaintext === false) {
+            return [false, $body_start,
+                "AEAD authentication failed"];
+        }
+        $packet = new self();
+        $packet->form = self::FORM_LONG;
+        $packet->long_type = $long_type;
+        $packet->version = $version;
+        $packet->destination_cid = $dcid;
+        $packet->source_cid = $scid;
+        $packet->token = $token;
+        $packet->packet_number = $packet_number;
+        $packet->packet_number_length = $pn_length;
+        $packet->payload = $plaintext;
+        $packet->header_bytes = $aad;
+        return [$packet, $body_start + $body_len];
+    }
+    /**
+     * Decodes a short-header (1-RTT) packet. Phase 2 stub:
+     * 1-RTT requires keys derived from TLS application
+     * traffic secrets, which we'll have in Phase 3 once
+     * the QUIC handshake completes end-to-end.
+     */
+    protected static function decodeShort($buf, $off, $keys,
+        $largest_pn_seen)
+    {
+        return [false, $off,
+            "1-RTT decode not yet implemented"];
+    }
+    /**
+     * Decodes a truncated packet number into the full
+     * 62-bit packet number. RFC 9000 sec A.3.
+     */
+    public static function decodePacketNumber($truncated,
+        $pn_length, $largest_pn_seen)
+    {
+        $pn_nbits = $pn_length * 8;
+        $expected = $largest_pn_seen + 1;
+        $pn_win = 1 << $pn_nbits;
+        $pn_hwin = $pn_win >> 1;
+        $pn_mask = $pn_win - 1;
+        $candidate = ($expected & ~$pn_mask) | $truncated;
+        if ($candidate <= $expected - $pn_hwin &&
+            $candidate < (1 << 62) - $pn_win) {
+            $candidate += $pn_win;
+        } else if ($candidate > $expected + $pn_hwin &&
+            $candidate >= $pn_win) {
+            $candidate -= $pn_win;
+        }
+        return $candidate;
+    }
+    /**
+     * Encodes a long-header packet. The caller supplies
+     * the unprotected payload (frames concatenated; will
+     * be padded out by the caller for Initial packets per
+     * RFC 9000 sec 14.1) and the packet-keys for sealing
+     * + HP. Returns the on-wire bytes. $packet_number
+     * here is the *full* PN (the function chooses an
+     * encoding length and truncates).
+     *
+     * Always uses 4-byte PN encoding for simplicity.
+     * Works as long as the connection sends fewer than
+     * 2^31 packets per PN space, always true in practice.
+     */
+    public function encodeLong($keys, $packet_number,
+        $payload_unprotected)
+    {
+        $pn_length = 4;
+        $pn_low_bits = $pn_length - 1;
+        $first = 0xC0 | ($this->long_type << 4) |
+            $pn_low_bits;
+        $hdr = chr($first) .
+            pack('N', $this->version) .
+            chr(strlen($this->destination_cid)) .
+            $this->destination_cid .
+            chr(strlen($this->source_cid)) .
+            $this->source_cid;
+        if ($this->long_type === self::LONG_INITIAL) {
+            $hdr .= QuicVarint::write(strlen($this->token)) .
+                $this->token;
+        }
+        $body_len = $pn_length + strlen($payload_unprotected)
+            + 16; /* +tag */
+        $hdr .= QuicVarint::write($body_len);
+        $pn_bytes = '';
+        for ($i = $pn_length - 1; $i >= 0; $i--) {
+            $pn_bytes .= chr(($packet_number >> ($i * 8))
+                & 0xFF);
+        }
+        $aad = $hdr . $pn_bytes;
+        $sealed = $keys->seal($packet_number, $aad,
+            $payload_unprotected);
+        $unprotected_packet = $aad . $sealed;
+        /*
+            Apply header protection. Sample is 16 bytes
+            starting 4 bytes into the protected payload
+            (always at the same offset regardless of
+            actual PN length, per RFC 9001 sec 5.4.2).
+         */
+        $sample_offset = strlen($hdr) + 4;
+        $sample = substr($unprotected_packet, $sample_offset,
+            16);
+        $mask = $keys->headerProtectionMask($sample);
+        if ($mask === false) {
+            return false;
+        }
+        $protected_first = ord($unprotected_packet[0]) ^
+            (ord($mask[0]) & 0x0F);
+        $packet = chr($protected_first) .
+            substr($unprotected_packet, 1, strlen($hdr) - 1);
+        for ($i = 0; $i < $pn_length; $i++) {
+            $packet .= chr(
+                ord($unprotected_packet[strlen($hdr) + $i])
+                ^ ord($mask[$i + 1]));
+        }
+        $packet .= substr($unprotected_packet,
+            strlen($hdr) + $pn_length);
+        return $packet;
+    }
+}

@@ -3586,6 +3586,27 @@ class QuicStream
         }
         return [$offset, $data, $fin];
     }
+    /**
+     * True when there are more bytes queued in send_buf
+     * that haven't been packetized into STREAM frames yet,
+     * or when send_fin is set but the FIN-bearing frame
+     * hasn't been emitted yet. flushStreams uses this to
+     * tell its caller whether the next event-loop tick
+     * needs to come back for more.
+     */
+    public function hasPendingSend()
+    {
+        if ($this->send_state === self::SEND_RESET) {
+            return false;
+        }
+        if ($this->send_buf !== '') {
+            return true;
+        }
+        if ($this->send_fin && !$this->send_fin_sent) {
+            return true;
+        }
+        return false;
+    }
 }
 /**
  * One QUIC connection's state. Owns:
@@ -3775,6 +3796,45 @@ class QuicConnection
      *      Tls13Engine::clientQuicTransportParameters.
      */
     public $peer_max_idle_ms = 30000;
+    /**
+     * @var int peer's initial_max_data transport parameter
+     *      (TP id 0x04, RFC 9000 sec 18.2). The maximum
+     *      number of bytes we may send across all streams
+     *      until the peer grants more via MAX_DATA. Default
+     *      until the peer's TPs are parsed is large enough
+     *      to handle a 1 MiB response without immediate
+     *      stall. This field is currently informational; we
+     *      don't yet enforce a connection-level send cap
+     *      (Phase 9b will). Per-stream caps below are the
+     *      enforced ones for now, since real clients
+     *      typically advertise per-stream caps that match
+     *      or exceed the connection cap.
+     */
+    public $peer_initial_max_data = 16777216;
+    /**
+     * @var int peer's initial_max_stream_data_bidi_local
+     *      (TP id 0x05, RFC 9000 sec 18.2): the receive cap
+     *      the peer applies to streams the peer itself
+     *      initiated. Server-initiated responses to a
+     *      client-opened bidi request stream are bound by
+     *      this value. Default 16 MiB until parsed.
+     */
+    public $peer_initial_max_stream_data_bidi_local = 16777216;
+    /**
+     * @var int peer's initial_max_stream_data_bidi_remote
+     *      (TP id 0x06): cap the peer applies to streams
+     *      the local endpoint initiates. Used when the
+     *      server opens a bidi stream toward the client
+     *      (rare in HTTP/3; mostly for symmetry).
+     */
+    public $peer_initial_max_stream_data_bidi_remote = 16777216;
+    /**
+     * @var int peer's initial_max_stream_data_uni (TP id
+     *      0x07): cap on uni streams the local endpoint
+     *      opens (for example, the HTTP/3 server control
+     *      stream). Default 16 MiB.
+     */
+    public $peer_initial_max_stream_data_uni = 16777216;
     /**
      * Constructs a server-side connection. $cert_pem and
      * $key_pem are the server's certificate and key for
@@ -4057,6 +4117,37 @@ class QuicConnection
                 case QuicFrame::F_NEW_CONNECTION_ID:
                 case QuicFrame::F_NEW_TOKEN:
                     break;
+                case QuicFrame::F_MAX_DATA:
+                    if ($f['value'] >
+                            $this->peer_initial_max_data) {
+                        $this->peer_initial_max_data =
+                            (int) $f['value'];
+                    }
+                    if (getenv('ATTO_H3_TRACE')) {
+                        error_log(sprintf(
+                            "[H3TRACE]   F_MAX_DATA "
+                            . "value=%d", (int) $f['value']));
+                    }
+                    break;
+                case QuicFrame::F_MAX_STREAM_DATA:
+                    if (isset(
+                        $this->streams[$f['stream_id']])) {
+                        $stream = $this->streams[
+                            $f['stream_id']];
+                        if ($f['value'] >
+                                $stream->send_window) {
+                            $stream->send_window =
+                                (int) $f['value'];
+                        }
+                    }
+                    if (getenv('ATTO_H3_TRACE')) {
+                        error_log(sprintf(
+                            "[H3TRACE]   F_MAX_STREAM_DATA "
+                            . "sid=%d value=%d",
+                            (int) $f['stream_id'],
+                            (int) $f['value']));
+                    }
+                    break;
                 case QuicFrame::F_RESET_STREAM:
                     /*
                         Peer abandoned the send side of a
@@ -4193,6 +4284,36 @@ class QuicConnection
         }
     }
     /**
+     * Picks the per-stream send-window cap for a stream of
+     * the given ID, based on the peer's transport parameters
+     * and the stream's "kind" (low 2 bits per RFC 9000 sec
+     * 2.1). For HTTP/3:
+     *   0b00 client-initiated bidi: server replies bound by
+     *        peer's initial_max_stream_data_bidi_local
+     *   0b01 server-initiated bidi: bound by bidi_remote
+     *   0b03 server-initiated uni  (control stream): bound
+     *        by initial_max_stream_data_uni
+     *   0b02 client-initiated uni  (encoder/decoder/QPACK):
+     *        receive-side from server's perspective; we
+     *        return a sane fallback for symmetry.
+     */
+    protected function pickStreamSendWindow($sid)
+    {
+        $kind = $sid & 0x03;
+        if ($kind === 0x00) {
+            return
+                $this->peer_initial_max_stream_data_bidi_local;
+        }
+        if ($kind === 0x01) {
+            return
+                $this->peer_initial_max_stream_data_bidi_remote;
+        }
+        if ($kind === 0x03) {
+            return $this->peer_initial_max_stream_data_uni;
+        }
+        return 1048576;
+    }
+    /**
      * STREAM frame handler: route to the per-stream
      * QuicStream, allocating one if this is the first
      * frame on that stream ID.
@@ -4201,7 +4322,8 @@ class QuicConnection
     {
         $sid = $f['stream_id'];
         if (!isset($this->streams[$sid])) {
-            $this->streams[$sid] = new QuicStream($sid);
+            $this->streams[$sid] = new QuicStream($sid,
+                1048576, $this->pickStreamSendWindow($sid));
         }
         $this->streams[$sid]->deliverIncoming(
             $f['offset'], $f['data'], $f['fin']);
@@ -4316,13 +4438,18 @@ class QuicConnection
     }
     /**
      * Walks the peer's QUIC transport parameters block
-     * (RFC 9000 sec 18) and surfaces the few values atto
-     * cares about. Each parameter is encoded as
+     * (RFC 9000 sec 18) and surfaces the values atto
+     * tracks. Each parameter is encoded as
      *   (varint id, varint length, value bytes).
-     * Phase 5 only extracts max_idle_timeout (id 0x01).
+     * Currently extracts:
+     *   0x01 max_idle_timeout (ms)
+     *   0x04 initial_max_data
+     *   0x05 initial_max_stream_data_bidi_local
+     *   0x06 initial_max_stream_data_bidi_remote
+     *   0x07 initial_max_stream_data_uni
      * Other parameters (max_udp_payload_size,
-     * initial_max_data, etc.) are accepted by the wire
-     * but currently used only at their defaults.
+     * initial_max_streams_*, etc.) are accepted by the wire
+     * but used only at their defaults.
      */
     protected function parsePeerTransportParams()
     {
@@ -4337,18 +4464,34 @@ class QuicConnection
             }
             $value = substr($tp, $off, $len);
             $off += $len;
-            if ($id === 0x01) {
-                /*
-                    max_idle_timeout, in milliseconds. The
-                    value is itself a varint inside the
-                    length-delimited bytes. A value of 0 means
-                    "no timeout"; we cap at our local 30s in
-                    that case so we still reap stuck peers.
-                 */
-                list($v, ) = QuicVarint::read($value, 0);
-                if ($v !== false && $v > 0) {
-                    $this->peer_max_idle_ms = (int) $v;
-                }
+            list($v, ) = QuicVarint::read($value, 0);
+            if ($v === false) {
+                continue;
+            }
+            switch ($id) {
+                case 0x01:
+                    /* max_idle_timeout in ms. 0 = no timeout;
+                       we keep our 30s default so a stuck peer
+                       still gets reaped. */
+                    if ($v > 0) {
+                        $this->peer_max_idle_ms = (int) $v;
+                    }
+                    break;
+                case 0x04:
+                    $this->peer_initial_max_data = (int) $v;
+                    break;
+                case 0x05:
+                    $this->peer_initial_max_stream_data_bidi_local
+                        = (int) $v;
+                    break;
+                case 0x06:
+                    $this->peer_initial_max_stream_data_bidi_remote
+                        = (int) $v;
+                    break;
+                case 0x07:
+                    $this->peer_initial_max_stream_data_uni
+                        = (int) $v;
+                    break;
             }
         }
     }
@@ -4581,7 +4724,8 @@ class QuicConnection
     public function sendStreamData($sid, $data, $fin = false)
     {
         if (!isset($this->streams[$sid])) {
-            $this->streams[$sid] = new QuicStream($sid);
+            $this->streams[$sid] = new QuicStream($sid,
+                1048576, $this->pickStreamSendWindow($sid));
         }
         $this->streams[$sid]->write($data);
         if ($fin) {
@@ -4594,14 +4738,72 @@ class QuicConnection
      * bytes so multiple frames fit comfortably in a single
      * ~1200-byte UDP datagram.
      */
-    public function flushStreams()
+    /**
+     * Default per-tick byte budget for flushStreams. Caps how
+     * many bytes of stream data the connection emits in a
+     * single event-loop iteration so we don't burst more
+     * than the peer's UDP receive buffer can hold (default
+     * 212 KiB on Linux loopback). At ~320 KB/sec this lets
+     * the typical 1 MiB response complete in 3-4 seconds
+     * without packet loss, while still keeping latency low
+     * for normal-sized responses (which fit in one tick).
+     * Phase 10 will replace this with real congestion-
+     * controlled pacing per RFC 9002.
+     */
+    const DEFAULT_FLUSH_BUDGET = 32768;
+    /**
+     * Drains pending stream-send buffers into 1-RTT STREAM
+     * frames, queued for emit(). Caps the total bytes
+     * pushed per call to $budget; returns true if more
+     * data remains in any stream's send_buf and the caller
+     * should call again on the next event-loop tick.
+     *
+     * The cap protects against bursting more than the
+     * peer's UDP recv buffer (typically 212 KiB on Linux
+     * loopback) can hold between drain reads. Without it,
+     * a 1 MiB response would lose ~80% of packets to
+     * kernel-level UDP drops, and the H3 stream would
+     * eventually stall waiting for retransmits we don't
+     * yet implement.
+     */
+    public function flushStreams($budget = self::DEFAULT_FLUSH_BUDGET)
     {
         if (!isset($this->keys[self::LEVEL_APPLICATION])) {
-            return;
+            return false;
         }
-        foreach ($this->streams as $sid => $stream) {
-            while (true) {
-                $tup = $stream->takeForFrame(1100);
+        $sent = 0;
+        $more = false;
+        /*
+            Order streams so the smallest pending buffer
+            drains first. The HTTP/3 server control stream
+            (~12 bytes of stream-type + SETTINGS) MUST reach
+            the client before any HEADERS/DATA on a request
+            stream, per RFC 9114 sec 6.2.1. Without this
+            ordering a long response on a request stream
+            would consume the whole tick budget and starve
+            the control stream, leaving the client unable to
+            advance its H3 state machine -- aioquic in
+            particular silently stops surfacing DataReceived
+            events under that condition. Sorting by buffer
+            size ascending also lets short responses overlap
+            cheaply alongside long ones.
+         */
+        $sids = array_keys($this->streams);
+        usort($sids, function ($a, $b) {
+            $la = strlen($this->streams[$a]->send_buf);
+            $lb = strlen($this->streams[$b]->send_buf);
+            return $la - $lb;
+        });
+        foreach ($sids as $sid) {
+            $stream = $this->streams[$sid];
+            while ($sent < $budget) {
+                $remaining = $budget - $sent;
+                /* Cap each STREAM frame at the smaller of
+                   1100 bytes (leaves UDP/QUIC headroom under
+                   the 1200-byte default max datagram) and
+                   what's left of this tick's budget. */
+                $chunk = min(1100, $remaining);
+                $tup = $stream->takeForFrame($chunk);
                 if ($tup === null) {
                     break;
                 }
@@ -4617,8 +4819,13 @@ class QuicConnection
                     'fin' => $fin,
                 ]);
                 $this->queue1Rtt($frame);
+                $sent += strlen($data);
+            }
+            if ($stream->hasPendingSend()) {
+                $more = true;
             }
         }
+        return $more;
     }
     /**
      * Returns true once the QUIC + TLS handshake has
@@ -5849,6 +6056,18 @@ class H3NativeListener extends Listener
                 unset($this->last_activity[$kh]);
                 continue;
             }
+            /*
+                Drain any STREAM data that didn't fit in the
+                previous tick's flush budget. Without this,
+                a 1 MiB response would emit ~32 KB on the
+                tick that started it (during driveConnection)
+                and then sit forever waiting for new inbound
+                traffic to trigger another flushStreams.
+                Calling it here lets pending bytes drain on
+                every event-loop iteration even if no new
+                packets arrive from the peer.
+             */
+            $h3->quic->flushStreams();
             foreach ($h3->quic->emit() as $datagram) {
                 @stream_socket_sendto($this->server,
                     $datagram, 0, $h3->peer_address);

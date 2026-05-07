@@ -411,6 +411,26 @@ class Tls13Engine
         return $this->error;
     }
     /**
+     * Returns the negotiated cipher suite code, or 0 if no
+     * cipher has been picked yet. Used by trace and key-
+     * derivation paths that need to know whether to use
+     * AES-128-GCM or ChaCha20-Poly1305.
+     */
+    public function negotiatedCipher()
+    {
+        return $this->cipher;
+    }
+    /**
+     * Returns the selected named group code (X25519 or
+     * SECP256R1), or 0 if no ClientHello has been
+     * processed. Diagnostic only; the TLS engine drives
+     * its own ECDHE internally.
+     */
+    public function selectedGroup()
+    {
+        return $this->selected_group;
+    }
+    /**
      * Returns true once the handshake has completed.
      */
     public function isComplete()
@@ -2116,16 +2136,27 @@ class QuicPacketKeys
             return substr($block, 0, 5);
         }
         /*
-            ChaCha20 with counter from sample[0..3] (LE),
-            nonce from sample[4..15]. The IETF variant
-            treats the first 4 bytes of the 16-byte counter
-            +nonce input as the counter.
+            ChaCha20 keystream block. RFC 9001 sec 5.4.4
+            uses sample[0..3] as a 32-bit LE counter and
+            sample[4..15] as the 12-byte nonce, then takes
+            the first 5 bytes of the keystream as the mask.
+            PHP's libsodium binding doesn't expose raw
+            ChaCha20 (only AEAD wrappers and XChaCha20), so
+            we go through openssl. OpenSSL 3.x's chacha20
+            EVP cipher takes a 16-byte IV laid out as
+            counter(4 LE) || nonce(12), which matches the
+            RFC layout exactly -- verified against RFC 8439
+            section 2.4.2 test vector.
          */
-        $counter = unpack('V', substr($sample, 0, 4))[1];
-        $nonce = substr($sample, 4, 12);
-        return sodium_crypto_stream_chacha20_ietf_xor_ic(
-            "\x00\x00\x00\x00\x00",
-            $nonce, $counter, $this->hp_key);
+        $iv = substr($sample, 0, 16);
+        $ks = openssl_encrypt(
+            "\x00\x00\x00\x00\x00", 'chacha20',
+            $this->hp_key,
+            OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $iv);
+        if ($ks === false) {
+            return false;
+        }
+        return substr($ks, 0, 5);
     }
     /**
      * Constructs the AEAD nonce by left-padding the 64-bit
@@ -4229,10 +4260,13 @@ class QuicConnection
                     error_log(sprintf(
                         "[H3TRACE]   buildServerFlight "
                         . "result=%s flight_len=%d "
+                        . "cipher=0x%04x group=0x%04x "
                         . "tls_err=%s",
                         $flight === false ? 'fail' : 'ok',
                         $flight === false ? 0
                             : strlen($flight),
+                        $this->tls->negotiatedCipher(),
+                        $this->tls->selectedGroup(),
                         $this->tls->getError() === ''
                             ? '(none)'
                             : $this->tls->getError()));
@@ -4247,25 +4281,29 @@ class QuicConnection
                    has 'c_hs' and 's_hs' secrets ready --
                    Handshake-level keys can be derived. */
                 $secrets = $this->tls->trafficSecrets();
+                /*
+                    Use whatever cipher TLS actually
+                    negotiated, not a hard-coded
+                    AES-128-GCM. RFC 9001 sec 5.1: QUIC
+                    Handshake and 1-RTT keys derive from
+                    the same AEAD as TLS picked for the
+                    handshake. (Initial keys are always
+                    AES-128-GCM-SHA256 per sec 5.2; that
+                    derivation is in the Initial-key path
+                    and unchanged.)
+                 */
+                $hs_cipher = $this->tls->negotiatedCipher();
                 $this->keys[self::LEVEL_HANDSHAKE] = [
                     'rx' => QuicPacketKeys::fromTrafficSecret(
-                        $secrets['c_hs'],
-                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
-                    ),
+                        $secrets['c_hs'], $hs_cipher),
                     'tx' => QuicPacketKeys::fromTrafficSecret(
-                        $secrets['s_hs'],
-                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
-                    ),
+                        $secrets['s_hs'], $hs_cipher),
                 ];
                 $this->keys[self::LEVEL_APPLICATION] = [
                     'rx' => QuicPacketKeys::fromTrafficSecret(
-                        $secrets['c_ap'],
-                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
-                    ),
+                        $secrets['c_ap'], $hs_cipher),
                     'tx' => QuicPacketKeys::fromTrafficSecret(
-                        $secrets['s_ap'],
-                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
-                    ),
+                        $secrets['s_ap'], $hs_cipher),
                 ];
                 $this->state = self::ST_HANDSHAKING;
             }

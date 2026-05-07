@@ -391,6 +391,18 @@ class Tls13Engine
         return $this->alpn_selected;
     }
     /**
+     * Sets the QUIC transport parameters bytes the engine
+     * will emit in EncryptedExtensions. Called by
+     * QuicConnection right before buildServerFlight, once
+     * the original DCID is known so the
+     * original_destination_connection_id parameter can
+     * be included.
+     */
+    public function setServerQuicTransportParameters($tp)
+    {
+        $this->server_quic_tp = (string) $tp;
+    }
+    /**
      * Returns the peer's quic_transport_parameters bytes
      * captured from ClientHello.
      */
@@ -2339,5 +2351,1558 @@ class QuicPacket
         $packet .= substr($unprotected_packet,
             strlen($hdr) + $pn_length);
         return $packet;
+    }
+}
+/**
+ * QUIC frame codec, RFC 9000 sec 19. A frame is the payload
+ * unit of a QUIC packet; one packet's payload is a sequence
+ * of contiguous frames (no length prefixes between them --
+ * each frame's own type byte determines how many bytes it
+ * consumes).
+ *
+ * Atto handles all 28 type codes defined in QUIC v1, though
+ * many are simple stubs:
+ *
+ *   0x00          PADDING
+ *   0x01          PING
+ *   0x02-0x03     ACK (with / without ECN counts)
+ *   0x04          RESET_STREAM
+ *   0x05          STOP_SENDING
+ *   0x06          CRYPTO
+ *   0x07          NEW_TOKEN
+ *   0x08-0x0F     STREAM (8 variants by FIN/LEN/OFF bits)
+ *   0x10          MAX_DATA
+ *   0x11          MAX_STREAM_DATA
+ *   0x12-0x13     MAX_STREAMS (bidi / uni)
+ *   0x14          DATA_BLOCKED
+ *   0x15          STREAM_DATA_BLOCKED
+ *   0x16-0x17     STREAMS_BLOCKED (bidi / uni)
+ *   0x18          NEW_CONNECTION_ID
+ *   0x19          RETIRE_CONNECTION_ID
+ *   0x1A          PATH_CHALLENGE
+ *   0x1B          PATH_RESPONSE
+ *   0x1C-0x1D     CONNECTION_CLOSE (transport / app)
+ *   0x1E          HANDSHAKE_DONE
+ *
+ * Decoded frames are returned as associative arrays with a
+ * 'type' key plus per-type payload fields, kept loose to
+ * avoid the ceremony of one PHP class per type. The encoder
+ * functions take the same array shape.
+ */
+class QuicFrame
+{
+    /*
+        Frame type codes, RFC 9000 sec 19.
+     */
+    const F_PADDING = 0x00;
+    const F_PING = 0x01;
+    const F_ACK = 0x02;
+    const F_ACK_ECN = 0x03;
+    const F_RESET_STREAM = 0x04;
+    const F_STOP_SENDING = 0x05;
+    const F_CRYPTO = 0x06;
+    const F_NEW_TOKEN = 0x07;
+    const F_STREAM_BASE = 0x08;
+    /* bits: 0x01 = FIN, 0x02 = LEN, 0x04 = OFF */
+    const F_STREAM_FIN = 0x01;
+    const F_STREAM_LEN = 0x02;
+    const F_STREAM_OFF = 0x04;
+    const F_MAX_DATA = 0x10;
+    const F_MAX_STREAM_DATA = 0x11;
+    const F_MAX_STREAMS_BIDI = 0x12;
+    const F_MAX_STREAMS_UNI = 0x13;
+    const F_DATA_BLOCKED = 0x14;
+    const F_STREAM_DATA_BLOCKED = 0x15;
+    const F_STREAMS_BLOCKED_BIDI = 0x16;
+    const F_STREAMS_BLOCKED_UNI = 0x17;
+    const F_NEW_CONNECTION_ID = 0x18;
+    const F_RETIRE_CONNECTION_ID = 0x19;
+    const F_PATH_CHALLENGE = 0x1A;
+    const F_PATH_RESPONSE = 0x1B;
+    const F_CONNECTION_CLOSE = 0x1C;
+    const F_CONNECTION_CLOSE_APP = 0x1D;
+    const F_HANDSHAKE_DONE = 0x1E;
+    /**
+     * Decodes a sequence of frames from $buf starting at
+     * $off through end of buffer. Returns
+     * [array_of_frames, error] where error is "" on
+     * success or a description on failure (in which case
+     * the partial frame list is still returned so the
+     * caller can ACK what was successfully parsed).
+     *
+     * Each returned frame is an array; the 'type' key is
+     * always present, plus type-specific fields:
+     *   PADDING/PING/HANDSHAKE_DONE: just type.
+     *   ACK: type, largest, delay, ranges (array of pairs
+     *        [gap, ack_range_length]), first_range,
+     *        ecn (optional).
+     *   CRYPTO: type, offset, data.
+     *   STREAM: type, stream_id, offset, data, fin (bool).
+     *   RESET_STREAM: type, stream_id, error_code,
+     *                 final_size.
+     *   STOP_SENDING: type, stream_id, error_code.
+     *   MAX_DATA / MAX_STREAMS_*: type, value.
+     *   MAX_STREAM_DATA: type, stream_id, value.
+     *   DATA_BLOCKED / STREAMS_BLOCKED_*: type, value.
+     *   STREAM_DATA_BLOCKED: type, stream_id, value.
+     *   NEW_CONNECTION_ID: type, sequence, retire_prior_to,
+     *                      cid, stateless_reset_token.
+     *   RETIRE_CONNECTION_ID: type, sequence.
+     *   PATH_CHALLENGE / PATH_RESPONSE: type, data (8 B).
+     *   NEW_TOKEN: type, token.
+     *   CONNECTION_CLOSE / _APP: type, error_code,
+     *                             frame_type (0x1C only),
+     *                             reason.
+     */
+    public static function decodeAll($buf, $off = 0)
+    {
+        $frames = [];
+        while ($off < strlen($buf)) {
+            list($type, $off2) = QuicVarint::read($buf, $off);
+            if ($type === false) {
+                return [$frames, "frame type truncated"];
+            }
+            $off = $off2;
+            /* PADDING is type 0x00 with no body; collapse
+               consecutive padding bytes into one frame for
+               cleanliness. */
+            if ($type === self::F_PADDING) {
+                $start = $off - 1;
+                while ($off < strlen($buf) &&
+                    ord($buf[$off]) === self::F_PADDING) {
+                    $off++;
+                }
+                $frames[] = ['type' => self::F_PADDING,
+                    'count' => $off - $start];
+                continue;
+            }
+            list($frame, $off, $err) = self::decodeOne($type,
+                $buf, $off);
+            if ($err !== '') {
+                return [$frames, $err];
+            }
+            $frames[] = $frame;
+        }
+        return [$frames, ''];
+    }
+    /**
+     * Decodes a single frame whose type byte has already
+     * been consumed. Returns [frame, new_off, err].
+     */
+    protected static function decodeOne($type, $buf, $off)
+    {
+        switch ($type) {
+            case self::F_PING:
+                return [['type' => $type], $off, ''];
+            case self::F_HANDSHAKE_DONE:
+                return [['type' => $type], $off, ''];
+            case self::F_ACK:
+            case self::F_ACK_ECN:
+                return self::decodeAck($type, $buf, $off);
+            case self::F_CRYPTO:
+                return self::decodeCrypto($buf, $off);
+            case self::F_NEW_TOKEN:
+                list($len, $off) = QuicVarint::read($buf,
+                    $off);
+                if ($len === false ||
+                    strlen($buf) < $off + $len) {
+                    return [null, $off,
+                        "NEW_TOKEN truncated"];
+                }
+                return [['type' => $type,
+                    'token' => substr($buf, $off, $len)],
+                    $off + $len, ''];
+            case self::F_RESET_STREAM:
+                list($sid, $off) = QuicVarint::read($buf,
+                    $off);
+                list($ec, $off) = QuicVarint::read($buf,
+                    $off);
+                list($fs, $off) = QuicVarint::read($buf,
+                    $off);
+                if ($fs === false) {
+                    return [null, $off,
+                        "RESET_STREAM truncated"];
+                }
+                return [['type' => $type,
+                    'stream_id' => $sid,
+                    'error_code' => $ec,
+                    'final_size' => $fs], $off, ''];
+            case self::F_STOP_SENDING:
+                list($sid, $off) = QuicVarint::read($buf,
+                    $off);
+                list($ec, $off) = QuicVarint::read($buf,
+                    $off);
+                if ($ec === false) {
+                    return [null, $off,
+                        "STOP_SENDING truncated"];
+                }
+                return [['type' => $type,
+                    'stream_id' => $sid,
+                    'error_code' => $ec], $off, ''];
+            case self::F_MAX_DATA:
+            case self::F_MAX_STREAMS_BIDI:
+            case self::F_MAX_STREAMS_UNI:
+            case self::F_DATA_BLOCKED:
+            case self::F_STREAMS_BLOCKED_BIDI:
+            case self::F_STREAMS_BLOCKED_UNI:
+                list($v, $off) = QuicVarint::read($buf, $off);
+                if ($v === false) {
+                    return [null, $off, "varint frame trunc"];
+                }
+                return [['type' => $type, 'value' => $v],
+                    $off, ''];
+            case self::F_MAX_STREAM_DATA:
+            case self::F_STREAM_DATA_BLOCKED:
+                list($sid, $off) = QuicVarint::read($buf,
+                    $off);
+                list($v, $off) = QuicVarint::read($buf, $off);
+                if ($v === false) {
+                    return [null, $off,
+                        "stream-id frame trunc"];
+                }
+                return [['type' => $type,
+                    'stream_id' => $sid,
+                    'value' => $v], $off, ''];
+            case self::F_NEW_CONNECTION_ID:
+                return self::decodeNewConnectionId($buf, $off);
+            case self::F_RETIRE_CONNECTION_ID:
+                list($seq, $off) = QuicVarint::read($buf,
+                    $off);
+                if ($seq === false) {
+                    return [null, $off,
+                        "RETIRE_CONNECTION_ID truncated"];
+                }
+                return [['type' => $type, 'sequence' => $seq],
+                    $off, ''];
+            case self::F_PATH_CHALLENGE:
+            case self::F_PATH_RESPONSE:
+                if (strlen($buf) < $off + 8) {
+                    return [null, $off, "PATH_* trunc"];
+                }
+                return [['type' => $type,
+                    'data' => substr($buf, $off, 8)],
+                    $off + 8, ''];
+            case self::F_CONNECTION_CLOSE:
+            case self::F_CONNECTION_CLOSE_APP:
+                return self::decodeConnectionClose($type,
+                    $buf, $off);
+        }
+        if ($type >= self::F_STREAM_BASE && $type <= 0x0F) {
+            return self::decodeStream($type, $buf, $off);
+        }
+        return [null, $off, sprintf(
+            "unknown frame type 0x%02x", $type)];
+    }
+    /**
+     * ACK frame body. Fields per RFC 9000 sec 19.3:
+     *   Largest Acknowledged (varint)
+     *   ACK Delay (varint, in microseconds * 2^ack_delay_exp)
+     *   ACK Range Count (varint)
+     *   First ACK Range (varint)
+     *   ACK Range[] each: Gap (varint), ACK Range Length
+     *     (varint)
+     *   ECN counts (3 varints, only if type == F_ACK_ECN)
+     */
+    protected static function decodeAck($type, $buf, $off)
+    {
+        list($largest, $off) = QuicVarint::read($buf, $off);
+        list($delay, $off) = QuicVarint::read($buf, $off);
+        list($range_count, $off) = QuicVarint::read($buf,
+            $off);
+        list($first_range, $off) = QuicVarint::read($buf,
+            $off);
+        if ($first_range === false) {
+            return [null, $off, "ACK head truncated"];
+        }
+        $ranges = [];
+        for ($i = 0; $i < $range_count; $i++) {
+            list($gap, $off) = QuicVarint::read($buf, $off);
+            list($ack_len, $off) = QuicVarint::read($buf,
+                $off);
+            if ($ack_len === false) {
+                return [null, $off, "ACK range truncated"];
+            }
+            $ranges[] = [$gap, $ack_len];
+        }
+        $frame = ['type' => $type, 'largest' => $largest,
+            'delay' => $delay, 'first_range' => $first_range,
+            'ranges' => $ranges];
+        if ($type === self::F_ACK_ECN) {
+            list($e0, $off) = QuicVarint::read($buf, $off);
+            list($e1, $off) = QuicVarint::read($buf, $off);
+            list($ce, $off) = QuicVarint::read($buf, $off);
+            if ($ce === false) {
+                return [null, $off, "ACK ECN truncated"];
+            }
+            $frame['ecn'] = ['ect0' => $e0, 'ect1' => $e1,
+                'ce' => $ce];
+        }
+        return [$frame, $off, ''];
+    }
+    /**
+     * CRYPTO frame body, RFC 9000 sec 19.6:
+     *   Offset (varint), Length (varint), Crypto Data.
+     */
+    protected static function decodeCrypto($buf, $off)
+    {
+        list($offset, $off) = QuicVarint::read($buf, $off);
+        list($len, $off) = QuicVarint::read($buf, $off);
+        if ($len === false ||
+            strlen($buf) < $off + $len) {
+            return [null, $off, "CRYPTO truncated"];
+        }
+        return [['type' => self::F_CRYPTO,
+            'offset' => $offset,
+            'data' => substr($buf, $off, $len)],
+            $off + $len, ''];
+    }
+    /**
+     * STREAM frame body, RFC 9000 sec 19.8. The type-byte
+     * low 3 bits (FIN, LEN, OFF) toggle the optional
+     * Offset / Length fields and the FIN flag.
+     *
+     * If LEN is unset, the frame extends to the end of the
+     * containing packet's payload, so we consume all
+     * remaining bytes.
+     */
+    protected static function decodeStream($type, $buf, $off)
+    {
+        $fin = (bool)($type & self::F_STREAM_FIN);
+        $has_len = (bool)($type & self::F_STREAM_LEN);
+        $has_off = (bool)($type & self::F_STREAM_OFF);
+        list($sid, $off) = QuicVarint::read($buf, $off);
+        if ($sid === false) {
+            return [null, $off, "STREAM sid trunc"];
+        }
+        $offset = 0;
+        if ($has_off) {
+            list($offset, $off) = QuicVarint::read($buf,
+                $off);
+            if ($offset === false) {
+                return [null, $off, "STREAM offset trunc"];
+            }
+        }
+        if ($has_len) {
+            list($len, $off) = QuicVarint::read($buf, $off);
+            if ($len === false ||
+                strlen($buf) < $off + $len) {
+                return [null, $off, "STREAM data trunc"];
+            }
+            $data = substr($buf, $off, $len);
+            $off += $len;
+        } else {
+            $data = substr($buf, $off);
+            $off = strlen($buf);
+        }
+        return [['type' => self::F_STREAM_BASE,
+            'stream_id' => $sid, 'offset' => $offset,
+            'data' => $data, 'fin' => $fin,
+            'wire_type' => $type], $off, ''];
+    }
+    /**
+     * NEW_CONNECTION_ID frame body, RFC 9000 sec 19.15:
+     *   Sequence Number (varint), Retire Prior To (varint),
+     *   Length (1 byte), Connection ID, Stateless Reset
+     *   Token (16 bytes).
+     */
+    protected static function decodeNewConnectionId($buf, $off)
+    {
+        list($seq, $off) = QuicVarint::read($buf, $off);
+        list($retire, $off) = QuicVarint::read($buf, $off);
+        if ($retire === false || strlen($buf) < $off + 1) {
+            return [null, $off,
+                "NEW_CONNECTION_ID head trunc"];
+        }
+        $cid_len = ord($buf[$off]);
+        $off++;
+        if (strlen($buf) < $off + $cid_len + 16) {
+            return [null, $off,
+                "NEW_CONNECTION_ID body trunc"];
+        }
+        $cid = substr($buf, $off, $cid_len);
+        $off += $cid_len;
+        $token = substr($buf, $off, 16);
+        $off += 16;
+        return [['type' => self::F_NEW_CONNECTION_ID,
+            'sequence' => $seq,
+            'retire_prior_to' => $retire,
+            'cid' => $cid,
+            'stateless_reset_token' => $token],
+            $off, ''];
+    }
+    /**
+     * CONNECTION_CLOSE frame body, RFC 9000 sec 19.19.
+     * Transport variant (0x1C) carries a Frame Type field
+     * indicating which frame triggered the close; the
+     * application variant (0x1D) does not.
+     */
+    protected static function decodeConnectionClose($type,
+        $buf, $off)
+    {
+        list($ec, $off) = QuicVarint::read($buf, $off);
+        $frame_type = 0;
+        if ($type === self::F_CONNECTION_CLOSE) {
+            list($frame_type, $off) = QuicVarint::read($buf,
+                $off);
+        }
+        list($reason_len, $off) = QuicVarint::read($buf, $off);
+        if ($reason_len === false ||
+            strlen($buf) < $off + $reason_len) {
+            return [null, $off, "CONNECTION_CLOSE trunc"];
+        }
+        return [['type' => $type, 'error_code' => $ec,
+            'frame_type' => $frame_type,
+            'reason' => substr($buf, $off, $reason_len)],
+            $off + $reason_len, ''];
+    }
+    /*
+        ============================================================
+        --- Encoders ---
+        ============================================================
+     */
+    /**
+     * Encodes a frame array. Reverse of decodeOne().
+     */
+    public static function encode($frame)
+    {
+        $type = $frame['type'];
+        switch ($type) {
+            case self::F_PADDING:
+                $count = $frame['count'] ?? 1;
+                return str_repeat("\x00", $count);
+            case self::F_PING:
+            case self::F_HANDSHAKE_DONE:
+                return chr($type);
+            case self::F_ACK:
+            case self::F_ACK_ECN:
+                return self::encodeAck($frame);
+            case self::F_CRYPTO:
+                return chr($type) .
+                    QuicVarint::write($frame['offset']) .
+                    QuicVarint::write(strlen($frame['data']))
+                    . $frame['data'];
+            case self::F_NEW_TOKEN:
+                return chr($type) .
+                    QuicVarint::write(strlen($frame['token']))
+                    . $frame['token'];
+            case self::F_RESET_STREAM:
+                return chr($type) .
+                    QuicVarint::write($frame['stream_id']) .
+                    QuicVarint::write($frame['error_code']) .
+                    QuicVarint::write($frame['final_size']);
+            case self::F_STOP_SENDING:
+                return chr($type) .
+                    QuicVarint::write($frame['stream_id']) .
+                    QuicVarint::write($frame['error_code']);
+            case self::F_MAX_DATA:
+            case self::F_MAX_STREAMS_BIDI:
+            case self::F_MAX_STREAMS_UNI:
+            case self::F_DATA_BLOCKED:
+            case self::F_STREAMS_BLOCKED_BIDI:
+            case self::F_STREAMS_BLOCKED_UNI:
+                return chr($type) .
+                    QuicVarint::write($frame['value']);
+            case self::F_MAX_STREAM_DATA:
+            case self::F_STREAM_DATA_BLOCKED:
+                return chr($type) .
+                    QuicVarint::write($frame['stream_id']) .
+                    QuicVarint::write($frame['value']);
+            case self::F_NEW_CONNECTION_ID:
+                return chr($type) .
+                    QuicVarint::write($frame['sequence']) .
+                    QuicVarint::write(
+                        $frame['retire_prior_to']) .
+                    chr(strlen($frame['cid'])) .
+                    $frame['cid'] .
+                    $frame['stateless_reset_token'];
+            case self::F_RETIRE_CONNECTION_ID:
+                return chr($type) .
+                    QuicVarint::write($frame['sequence']);
+            case self::F_PATH_CHALLENGE:
+            case self::F_PATH_RESPONSE:
+                return chr($type) . $frame['data'];
+            case self::F_CONNECTION_CLOSE:
+                return chr($type) .
+                    QuicVarint::write($frame['error_code']) .
+                    QuicVarint::write(
+                        $frame['frame_type'] ?? 0) .
+                    QuicVarint::write(
+                        strlen($frame['reason'])) .
+                    $frame['reason'];
+            case self::F_CONNECTION_CLOSE_APP:
+                return chr($type) .
+                    QuicVarint::write($frame['error_code']) .
+                    QuicVarint::write(
+                        strlen($frame['reason'])) .
+                    $frame['reason'];
+            case self::F_STREAM_BASE:
+                return self::encodeStream($frame);
+        }
+        return false;
+    }
+    /**
+     * Encodes an ACK frame from a frame array of the same
+     * shape decodeAck produces.
+     */
+    protected static function encodeAck($frame)
+    {
+        $type = $frame['type'];
+        $body = QuicVarint::write($frame['largest']) .
+            QuicVarint::write($frame['delay']) .
+            QuicVarint::write(count($frame['ranges'])) .
+            QuicVarint::write($frame['first_range']);
+        foreach ($frame['ranges'] as $r) {
+            $body .= QuicVarint::write($r[0]) .
+                QuicVarint::write($r[1]);
+        }
+        if ($type === self::F_ACK_ECN &&
+            isset($frame['ecn'])) {
+            $body .= QuicVarint::write(
+                $frame['ecn']['ect0']) .
+                QuicVarint::write($frame['ecn']['ect1']) .
+                QuicVarint::write($frame['ecn']['ce']);
+        }
+        return chr($type) . $body;
+    }
+    /**
+     * Encodes a STREAM frame. Always sets LEN=1 and OFF=1
+     * for clarity; the FIN flag is taken from the frame
+     * array.
+     */
+    protected static function encodeStream($frame)
+    {
+        $type = self::F_STREAM_BASE | self::F_STREAM_LEN |
+            self::F_STREAM_OFF;
+        if (!empty($frame['fin'])) {
+            $type |= self::F_STREAM_FIN;
+        }
+        return chr($type) .
+            QuicVarint::write($frame['stream_id']) .
+            QuicVarint::write($frame['offset']) .
+            QuicVarint::write(strlen($frame['data'])) .
+            $frame['data'];
+    }
+    /**
+     * Builds an ACK frame from a sorted list of received
+     * packet numbers in one PN space. RFC 9000 sec 13.2.4.
+     */
+    public static function buildAck($received_pns,
+        $delay = 0)
+    {
+        if (empty($received_pns)) {
+            return false;
+        }
+        rsort($received_pns);
+        $largest = $received_pns[0];
+        /* Walk through gaps, building (gap, ack-range-len)
+           pairs. A run is a maximal contiguous descending
+           subsequence; gaps are between runs. */
+        $first_range = 0;
+        $ranges = [];
+        $i = 0;
+        $n = count($received_pns);
+        $cur = $largest;
+        while ($i + 1 < $n &&
+            $received_pns[$i + 1] === $cur - 1) {
+            $first_range++;
+            $cur--;
+            $i++;
+        }
+        $i++;
+        $prev_run_smallest = $cur;
+        while ($i < $n) {
+            $gap_top = $received_pns[$i];
+            $gap = $prev_run_smallest - $gap_top - 2;
+            $run_len = 0;
+            $cur = $gap_top;
+            while ($i + 1 < $n &&
+                $received_pns[$i + 1] === $cur - 1) {
+                $run_len++;
+                $cur--;
+                $i++;
+            }
+            $i++;
+            $ranges[] = [$gap, $run_len];
+            $prev_run_smallest = $cur;
+        }
+        return ['type' => self::F_ACK,
+            'largest' => $largest, 'delay' => $delay,
+            'first_range' => $first_range,
+            'ranges' => $ranges];
+    }
+    /**
+     * Inverse of buildAck: walks an ACK frame's ranges and
+     * returns the explicit list of packet numbers covered.
+     * Used by the loss-detection layer.
+     */
+    public static function expandAckRanges($frame)
+    {
+        $largest = $frame['largest'];
+        $first = $frame['first_range'];
+        $out = [];
+        $cur = $largest;
+        for ($k = 0; $k <= $first; $k++) {
+            $out[] = $cur - $k;
+        }
+        $smallest = $largest - $first;
+        foreach ($frame['ranges'] as $r) {
+            list($gap, $ack_len) = $r;
+            $top = $smallest - $gap - 2;
+            for ($k = 0; $k <= $ack_len; $k++) {
+                $out[] = $top - $k;
+            }
+            $smallest = $top - $ack_len;
+        }
+        return $out;
+    }
+}
+/**
+ * Per-stream state for one QUIC stream. Streams are
+ * identified by a 62-bit stream ID; bits 0-1 of the ID
+ * encode the stream's initiator (client / server) and
+ * type (bidi / uni) per RFC 9000 sec 2.1.
+ *
+ * This class keeps it minimal: a receive-side reassembly
+ * map (offset -> bytes) so out-of-order STREAM frames can
+ * be coalesced into in-order delivery, plus a send-side
+ * buffer that the QuicConnection's emit loop chunks into
+ * STREAM frames as packets are built.
+ *
+ * Flow control windows are per-stream (MAX_STREAM_DATA)
+ * and connection-wide (MAX_DATA, owned by QuicConnection,
+ * not here). We track the per-stream values; the
+ * connection updates them on receipt of frames.
+ */
+class QuicStream
+{
+    /*
+        Stream-side state flags. Names mirror RFC 9000
+        sec 3.1 / 3.2 but we collapse the substates that
+        differ only in whether a STREAM frame with FIN
+        has been buffered vs. delivered.
+     */
+    const RECV_OPEN = 0;
+    const RECV_SIZE_KNOWN = 1; /* FIN seen, more bytes
+                                  may still arrive */
+    const RECV_DONE = 2; /* FIN seen and all bytes
+                            delivered to app */
+    const SEND_READY = 0;
+    const SEND_DATA = 1;
+    const SEND_DATA_SENT = 2;
+    const SEND_DONE = 3;
+    /**
+     * @var int 62-bit stream ID
+     */
+    public $id = 0;
+    /**
+     * @var int the receive-side state flag
+     */
+    public $recv_state = self::RECV_OPEN;
+    /**
+     * @var int the send-side state flag
+     */
+    public $send_state = self::SEND_READY;
+    /**
+     * @var array offset => bytes, for out-of-order
+     *      reassembly. Cleared as in-order data is
+     *      delivered to the app via consume().
+     */
+    public $recv_chunks = [];
+    /**
+     * @var int next offset the app expects to receive on
+     *      this stream. consume() returns bytes starting
+     *      at this offset.
+     */
+    public $recv_next_offset = 0;
+    /**
+     * @var int largest offset+length received on this
+     *      stream. When recv_state is SIZE_KNOWN, this
+     *      equals the final size.
+     */
+    public $recv_seen_max = 0;
+    /**
+     * @var int receive-side flow-control window
+     *      (MAX_STREAM_DATA we've granted the peer).
+     */
+    public $recv_window = 1048576;
+    /**
+     * @var string send-side outgoing buffer (not yet
+     *      packaged into STREAM frames).
+     */
+    public $send_buf = "";
+    /**
+     * @var int next offset to use for an outgoing STREAM
+     *      frame.
+     */
+    public $send_next_offset = 0;
+    /**
+     * @var bool true when the app has signaled FIN on the
+     *      send side (no more data will be appended).
+     */
+    public $send_fin = false;
+    /**
+     * @var int send-side flow-control window the peer
+     *      has granted us via MAX_STREAM_DATA.
+     */
+    public $send_window = 1048576;
+    /**
+     * @var bool true once a STREAM frame with FIN has been
+     *      transmitted by us. Used to skip retransmission
+     *      of the FIN.
+     */
+    public $send_fin_sent = false;
+    /**
+     * Constructor: assigns the stream ID and bootstraps
+     * receive flow-control window from the
+     * initial_max_stream_data_* transport parameter the
+     * QuicConnection passes through.
+     */
+    public function __construct($id, $recv_window = 1048576,
+        $send_window = 1048576)
+    {
+        $this->id = $id;
+        $this->recv_window = $recv_window;
+        $this->send_window = $send_window;
+    }
+    /**
+     * Buffers incoming STREAM-frame bytes. RFC 9000
+     * sec 19.8: bytes at an offset already received are
+     * silently discarded; new bytes are merged into the
+     * reassembly map. Returns true on success, false if
+     * the bytes would exceed our advertised
+     * flow-control window.
+     */
+    public function deliverIncoming($offset, $data, $fin)
+    {
+        if ($offset + strlen($data) > $this->recv_window) {
+            return false; /* FLOW_CONTROL_ERROR */
+        }
+        $end = $offset + strlen($data);
+        if ($end > $this->recv_seen_max) {
+            $this->recv_seen_max = $end;
+        }
+        if (strlen($data) > 0) {
+            $this->recv_chunks[$offset] = $data;
+        }
+        if ($fin) {
+            $this->recv_state = self::RECV_SIZE_KNOWN;
+        }
+        return true;
+    }
+    /**
+     * Returns whatever in-order bytes are immediately
+     * available, advancing recv_next_offset past them.
+     * Empty string when nothing new (e.g. waiting on a
+     * gap).
+     */
+    public function consume()
+    {
+        $out = "";
+        while (isset($this->recv_chunks[
+                $this->recv_next_offset])) {
+            $chunk = $this->recv_chunks[
+                $this->recv_next_offset];
+            unset($this->recv_chunks[
+                $this->recv_next_offset]);
+            $out .= $chunk;
+            $this->recv_next_offset += strlen($chunk);
+        }
+        /* Coalesce overlapping / adjacent entries. The
+           map keys are offsets; if the next offset to
+           deliver matches some earlier-buffered chunk
+           starting before recv_next_offset, slice and
+           include the suffix. */
+        foreach ($this->recv_chunks as $off => $chunk) {
+            $end = $off + strlen($chunk);
+            if ($end <= $this->recv_next_offset) {
+                unset($this->recv_chunks[$off]);
+            } else if ($off < $this->recv_next_offset) {
+                $skip = $this->recv_next_offset - $off;
+                $tail = substr($chunk, $skip);
+                unset($this->recv_chunks[$off]);
+                $this->recv_chunks[
+                    $this->recv_next_offset] = $tail;
+            }
+        }
+        if ($this->recv_state === self::RECV_SIZE_KNOWN &&
+            $this->recv_next_offset >=
+            $this->recv_seen_max) {
+            $this->recv_state = self::RECV_DONE;
+        }
+        return $out;
+    }
+    /**
+     * Returns true once no more data will arrive on the
+     * receive side and everything queued has been
+     * consumed.
+     */
+    public function isReceiveDone()
+    {
+        return $this->recv_state === self::RECV_DONE;
+    }
+    /**
+     * Appends bytes to the send buffer. The
+     * QuicConnection's emit loop chunks them into STREAM
+     * frames in flight, taking flow-control limits into
+     * account.
+     */
+    public function write($bytes)
+    {
+        $this->send_buf .= (string) $bytes;
+        if ($this->send_state === self::SEND_READY) {
+            $this->send_state = self::SEND_DATA;
+        }
+    }
+    /**
+     * Marks the send-side as finished. Once the buffer
+     * drains, the next STREAM frame carries FIN.
+     */
+    public function finish()
+    {
+        $this->send_fin = true;
+        if ($this->send_buf === '' &&
+            $this->send_state === self::SEND_READY) {
+            $this->send_state = self::SEND_DATA_SENT;
+        }
+    }
+    /**
+     * Consumes up to $max_bytes for the next outgoing
+     * STREAM frame, returning [offset, data, fin] or
+     * null if nothing to send. Updates send_next_offset.
+     * Caller writes the returned tuple into a STREAM
+     * frame.
+     */
+    public function takeForFrame($max_bytes)
+    {
+        if ($this->send_buf === '' && !$this->send_fin) {
+            return null;
+        }
+        if ($this->send_buf === '' && $this->send_fin
+            && $this->send_fin_sent) {
+            return null;
+        }
+        $allowed = min(strlen($this->send_buf), $max_bytes,
+            max(0, $this->send_window
+                - $this->send_next_offset));
+        $data = substr($this->send_buf, 0, $allowed);
+        $this->send_buf = substr($this->send_buf, $allowed);
+        $offset = $this->send_next_offset;
+        $this->send_next_offset += $allowed;
+        $fin = ($this->send_fin &&
+            $this->send_buf === '');
+        if ($fin) {
+            $this->send_fin_sent = true;
+            $this->send_state = self::SEND_DATA_SENT;
+        }
+        return [$offset, $data, $fin];
+    }
+}
+/**
+ * One QUIC connection's state. Owns:
+ *
+ *   - the TLS 1.3 engine (Tls13Engine)
+ *   - per-encryption-level packet keys (Initial, Handshake,
+ *     1-RTT) for each direction (rx vs tx)
+ *   - per-PN-space received packet numbers (so we can ACK)
+ *   - per-PN-space next-PN-to-send (so we can number our
+ *     own outgoing packets correctly)
+ *   - the crypto receive buffer per encryption level (for
+ *     reassembling handshake messages from CRYPTO frames
+ *     that may arrive in pieces)
+ *   - the local + peer connection IDs
+ *   - the stream table
+ *   - peer + local QUIC transport parameters
+ *
+ * Phase 3 implements the server side of the handshake
+ * end-to-end: receive an Initial, decrypt, parse CRYPTO
+ * frames, feed Tls13Engine, build server flight, split it
+ * across CRYPTO frames in Initial+Handshake packets, queue
+ * them for transmit. ACK incoming packets per PN space.
+ * Mark handshake done once the client's Finished is
+ * received (in Handshake-level CRYPTO).
+ */
+class QuicConnection
+{
+    /*
+        Encryption levels. Mirror the QUIC v1 packet types
+        with an extra slot for 1-RTT (which uses short-
+        header packets, not long ones).
+     */
+    const LEVEL_INITIAL = 0;
+    const LEVEL_HANDSHAKE = 1;
+    const LEVEL_APPLICATION = 2;
+    /*
+        Connection states.
+     */
+    const ST_NEW = 0;
+    const ST_HANDSHAKING = 1;
+    const ST_ESTABLISHED = 2;
+    const ST_CLOSED = 3;
+    /**
+     * @var int current connection state
+     */
+    public $state = self::ST_NEW;
+    /**
+     * @var Tls13Engine the TLS handshake engine
+     */
+    public $tls = null;
+    /**
+     * @var array level => ['rx' => QuicPacketKeys, 'tx' =>
+     *      QuicPacketKeys]. Initial keys populated on first
+     *      packet receipt; Handshake keys populated when
+     *      Tls13Engine surfaces handshake-traffic secrets
+     *      after ClientHello has been processed; 1-RTT
+     *      keys populated when the TLS handshake completes
+     *      (after client Finished).
+     */
+    public $keys = [];
+    /**
+     * @var array level => list of received packet numbers
+     *      (for building outgoing ACK frames).
+     */
+    public $received_pns = [];
+    /**
+     * @var array level => next packet number to use for
+     *      outgoing packets.
+     */
+    public $next_pn = [];
+    /**
+     * @var array level => largest received packet number
+     *      so far (for packet-number recovery on the next
+     *      receive).
+     */
+    public $largest_pn = [];
+    /**
+     * @var array level => crypto data byte buffer
+     *      (offset => bytes) and next-expected-offset for
+     *      in-order delivery to Tls13Engine.
+     */
+    public $crypto_buf = [
+        self::LEVEL_INITIAL => ['chunks' => [],
+            'next_offset' => 0],
+        self::LEVEL_HANDSHAKE => ['chunks' => [],
+            'next_offset' => 0],
+        self::LEVEL_APPLICATION => ['chunks' => [],
+            'next_offset' => 0],
+    ];
+    /**
+     * @var int outgoing CRYPTO frame offset per level
+     *      (we never split or reorder our own crypto
+     *      stream, but the offset must still be tracked).
+     */
+    public $crypto_send_offset = [
+        self::LEVEL_INITIAL => 0,
+        self::LEVEL_HANDSHAKE => 0,
+        self::LEVEL_APPLICATION => 0,
+    ];
+    /**
+     * @var string the destination connection ID the peer
+     *      uses when sending packets to us. Initially
+     *      taken from the client's first Initial.
+     */
+    public $local_cid = "";
+    /**
+     * @var string the destination connection ID we use
+     *      when sending packets to the peer. Initially
+     *      taken from the client's source CID.
+     */
+    public $peer_cid = "";
+    /**
+     * @var string the original DCID the client used on
+     *      its first Initial -- this is what derives
+     *      Initial keys, and we must echo it as our
+     *      original_destination_connection_id transport
+     *      parameter.
+     */
+    public $original_dcid = "";
+    /**
+     * @var array stream_id => QuicStream
+     */
+    public $streams = [];
+    /**
+     * @var array of [level, packet_bytes] -- packets queued
+     *      to send on the next emit() call.
+     */
+    public $send_queue = [];
+    /**
+     * @var string verbatim QUIC transport parameters from
+     *      the peer's TLS handshake (parsed by the QUIC
+     *      layer in Phase 4 when HTTP/3 cares about them).
+     */
+    public $peer_transport_params = "";
+    /**
+     * @var string our QUIC transport parameters, encoded
+     *      ready to drop into the TLS quic_transport_-
+     *      parameters extension.
+     */
+    public $local_transport_params = "";
+    /**
+     * @var string most recent error (empty on success).
+     */
+    public $error = "";
+    /**
+     * Constructs a server-side connection. $cert_pem and
+     * $key_pem are the server's certificate and key for
+     * the TLS 1.3 handshake; $alpn is the list of ALPN
+     * byte-strings the server offers.
+     */
+    public function __construct($cert_pem, $key_pem, $alpn)
+    {
+        /*
+            Generate our own connection ID. This is what the
+            peer will use as DCID on packets after the first
+            Initial; we look up the connection by this value.
+            8 bytes is the conventional length.
+         */
+        $this->local_cid = random_bytes(8);
+        $this->local_transport_params =
+            self::buildLocalTransportParams();
+        $this->tls = new Tls13Engine($cert_pem, $key_pem,
+            $alpn, $this->local_transport_params);
+        if ($this->tls->getError()) {
+            $this->error = $this->tls->getError();
+            $this->state = self::ST_CLOSED;
+            return;
+        }
+        $this->next_pn = [self::LEVEL_INITIAL => 0,
+            self::LEVEL_HANDSHAKE => 0,
+            self::LEVEL_APPLICATION => 0];
+        $this->largest_pn = [self::LEVEL_INITIAL => -1,
+            self::LEVEL_HANDSHAKE => -1,
+            self::LEVEL_APPLICATION => -1];
+        $this->received_pns = [self::LEVEL_INITIAL => [],
+            self::LEVEL_HANDSHAKE => [],
+            self::LEVEL_APPLICATION => []];
+    }
+    /**
+     * Builds the transport parameters block per RFC 9000
+     * sec 18. Each parameter is (varint id, varint length,
+     * value). Phase 3 emits a small fixed set: enough for
+     * a real client to accept the handshake. Phase 4 will
+     * extend this.
+     */
+    protected static function buildLocalTransportParams()
+    {
+        $tp = "";
+        $tp .= self::tpVarint(0x04, 1048576);
+        /* initial_max_data = 1 MiB */
+        $tp .= self::tpVarint(0x05, 1048576);
+        /* initial_max_stream_data_bidi_local */
+        $tp .= self::tpVarint(0x06, 1048576);
+        /* initial_max_stream_data_bidi_remote */
+        $tp .= self::tpVarint(0x07, 1048576);
+        /* initial_max_stream_data_uni */
+        $tp .= self::tpVarint(0x08, 100);
+        /* initial_max_streams_bidi */
+        $tp .= self::tpVarint(0x09, 100);
+        /* initial_max_streams_uni */
+        $tp .= self::tpVarint(0x01, 30000);
+        /* max_idle_timeout in milliseconds */
+        $tp .= self::tpVarint(0x03, 1452);
+        /* max_udp_payload_size */
+        return $tp;
+    }
+    /**
+     * Helper: encodes one transport parameter whose value
+     * is a single varint.
+     */
+    protected static function tpVarint($id, $value)
+    {
+        $val = QuicVarint::write($value);
+        return QuicVarint::write($id) .
+            QuicVarint::write(strlen($val)) . $val;
+    }
+    /**
+     * Helper: encodes one transport parameter whose value
+     * is opaque bytes (used for the connection-ID-binding
+     * parameters: original_destination_connection_id,
+     * initial_source_connection_id, retry_source_-
+     * connection_id).
+     */
+    protected static function tpBytes($id, $bytes)
+    {
+        return QuicVarint::write($id) .
+            QuicVarint::write(strlen($bytes)) . $bytes;
+    }
+    /**
+     * Main entry: feeds a UDP datagram from $peer into the
+     * connection. Decodes any contained QUIC packets,
+     * processes their frames, advances the handshake,
+     * queues outgoing packets onto $this->send_queue.
+     *
+     * Returns true on success, false on fatal error
+     * (caller should close the connection).
+     */
+    public function processDatagram($buf, $peer)
+    {
+        $off = 0;
+        while ($off < strlen($buf)) {
+            $start = $off;
+            $first = ord($buf[$off]);
+            if (($first & 0x80) === 0) {
+                /*
+                    Short-header (1-RTT) packet, OR trailing
+                    UDP-level padding bytes after a long-
+                    header packet. Either way, we can't
+                    process the rest of the datagram in
+                    Phase 3. Break (don't return) so
+                    driveHandshake still gets called below.
+                 */
+                break;
+            }
+            /* Long-header packet. Determine the level
+               from bits 4-5, then derive / look up the
+               keys for that level. */
+            $long_type = ($first >> 4) & 0x03;
+            if ($long_type === QuicPacket::LONG_INITIAL) {
+                $level = self::LEVEL_INITIAL;
+                /* Bootstrap Initial keys from the DCID on
+                   the first Initial. We need the DCID to
+                   derive keys before we can decrypt. */
+                if (!isset($this->keys[$level])) {
+                    $dcid = self::peekInitialDcid($buf,
+                        $start);
+                    if ($dcid === false) {
+                        return true;
+                    }
+                    /*
+                        Save the client's original DCID
+                        (used to derive Initial keys and
+                        echoed in the
+                        original_destination_connection_id
+                        transport parameter). Do NOT
+                        overwrite our own local_cid -- the
+                        server uses its own freshly-
+                        generated CID for everything it
+                        sends.
+                     */
+                    $this->original_dcid = $dcid;
+                    $pair = QuicPacketKeys::fromInitialDcid(
+                        $dcid);
+                    /* Server perspective: client encrypts
+                       with client keys, server decrypts
+                       with client keys. Server encrypts
+                       with server keys for replies. */
+                    $this->keys[$level] = [
+                        'rx' => $pair['client'],
+                        'tx' => $pair['server']];
+                }
+            } else if ($long_type ===
+                QuicPacket::LONG_HANDSHAKE) {
+                $level = self::LEVEL_HANDSHAKE;
+                if (!isset($this->keys[$level])) {
+                    /* We can't decrypt Handshake-level
+                       packets until our Tls13Engine has
+                       surfaced handshake-traffic secrets
+                       (which happens during
+                       buildServerFlight()). If we get a
+                       Handshake packet before then,
+                       discard it. */
+                    return true;
+                }
+            } else {
+                /* 0-RTT and Retry: not implemented in
+                   Phase 3. */
+                return true;
+            }
+            $result = QuicPacket::decode($buf, $start,
+                $this->keys[$level]['rx'], true,
+                $this->largest_pn[$level]);
+            $pkt = $result[0];
+            $end = $result[1];
+            $err = $result[2] ?? '';
+            if ($pkt === false) {
+                /* Could not decode this packet (HP/AEAD
+                   failure or truncation). Per RFC 9000
+                   sec 5.2.2, drop and continue scanning
+                   the datagram for more packets. */
+                if ($end <= $start) {
+                    /* No progress; bail to avoid loop. */
+                    return true;
+                }
+                $off = $end;
+                continue;
+            }
+            $off = $end;
+            $this->received_pns[$level][] =
+                $pkt->packet_number;
+            if ($pkt->packet_number >
+                $this->largest_pn[$level]) {
+                $this->largest_pn[$level] =
+                    $pkt->packet_number;
+            }
+            $this->processPacketFrames($level, $pkt);
+        }
+        $this->driveHandshake();
+        return true;
+    }
+    /**
+     * Reads the destination connection ID out of a
+     * long-header Initial packet without parsing the
+     * whole packet -- needed before keys are available.
+     */
+    protected static function peekInitialDcid($buf, $off)
+    {
+        if (strlen($buf) < $off + 7) {
+            return false;
+        }
+        $dcid_len = ord($buf[$off + 5]);
+        if (strlen($buf) < $off + 6 + $dcid_len) {
+            return false;
+        }
+        return substr($buf, $off + 6, $dcid_len);
+    }
+    /**
+     * Walks the frames in a decoded packet and dispatches
+     * each to its handler. Phase 3 routes CRYPTO,
+     * STREAM, ACK, PADDING, PING, CONNECTION_CLOSE; the
+     * rest are accepted but ignored.
+     */
+    protected function processPacketFrames($level, $pkt)
+    {
+        list($frames, $err) = QuicFrame::decodeAll(
+            $pkt->payload);
+        if ($err !== '' && $err !== 'unknown frame type') {
+            /* Partial decode -- still process what we got. */
+        }
+        foreach ($frames as $f) {
+            switch ($f['type']) {
+                case QuicFrame::F_CRYPTO:
+                    $this->onCrypto($level, $f);
+                    break;
+                case QuicFrame::F_STREAM_BASE:
+                    $this->onStream($f);
+                    break;
+                case QuicFrame::F_ACK:
+                case QuicFrame::F_ACK_ECN:
+                    /* Phase 3: just note them; no real
+                       loss detection / RTT smoothing yet.
+                       Phase 5 will. */
+                    break;
+                case QuicFrame::F_PING:
+                case QuicFrame::F_PADDING:
+                case QuicFrame::F_HANDSHAKE_DONE:
+                case QuicFrame::F_NEW_CONNECTION_ID:
+                case QuicFrame::F_NEW_TOKEN:
+                    break;
+                case QuicFrame::F_CONNECTION_CLOSE:
+                case QuicFrame::F_CONNECTION_CLOSE_APP:
+                    $this->state = self::ST_CLOSED;
+                    return;
+                /* All other frame types: silently ignore.
+                   They aren't needed to complete a basic
+                   handshake. */
+            }
+            /* On the first Initial packet, capture the
+               peer's source connection ID so we know
+               where to send our reply. */
+            if ($this->peer_cid === '' &&
+                $pkt->source_cid !== '') {
+                $this->peer_cid = $pkt->source_cid;
+            }
+        }
+    }
+    /**
+     * CRYPTO frame handler: append the bytes to the
+     * level's crypto receive buffer (offset-keyed for
+     * reassembly), then deliver any complete TLS
+     * handshake messages to the engine.
+     *
+     * A complete TLS handshake message is type byte +
+     * uint24 length + body, so 4+length bytes total. We
+     * may receive partial messages across multiple CRYPTO
+     * frames; the buffer accumulates until enough bytes
+     * are present.
+     */
+    protected function onCrypto($level, $f)
+    {
+        $buf = &$this->crypto_buf[$level];
+        $buf['chunks'][$f['offset']] = $f['data'];
+        /* Coalesce contiguous chunks starting at next_off
+           into a single accumulator string. */
+        if (!isset($buf['accum'])) {
+            $buf['accum'] = '';
+        }
+        while (isset($buf['chunks'][$buf['next_offset']])) {
+            $chunk = $buf['chunks'][$buf['next_offset']];
+            unset($buf['chunks'][$buf['next_offset']]);
+            $buf['next_offset'] += strlen($chunk);
+            $buf['accum'] .= $chunk;
+        }
+        /* Drain complete TLS messages from accum. */
+        while (strlen($buf['accum']) >= 4) {
+            $msg_len = (ord($buf['accum'][1]) << 16) |
+                (ord($buf['accum'][2]) << 8) |
+                ord($buf['accum'][3]);
+            $total = 4 + $msg_len;
+            if (strlen($buf['accum']) < $total) {
+                break;
+            }
+            $msg = substr($buf['accum'], 0, $total);
+            $buf['accum'] = substr($buf['accum'], $total);
+            $this->feedTlsCrypto($level, $msg);
+        }
+    }
+    /**
+     * Routes crypto bytes from one encryption level to the
+     * appropriate Tls13Engine method. Initial-level CRYPTO
+     * carries ClientHello; Handshake-level CRYPTO carries
+     * the client's Finished after the server flight has
+     * been sent.
+     */
+    protected function feedTlsCrypto($level, $bytes)
+    {
+        if ($level === self::LEVEL_INITIAL) {
+            $this->tls->feedClientHello($bytes);
+            return;
+        }
+        if ($level === self::LEVEL_HANDSHAKE) {
+            $this->tls->feedClientFinished($bytes);
+            if ($this->tls->isComplete()) {
+                $this->state = self::ST_ESTABLISHED;
+            }
+            return;
+        }
+    }
+    /**
+     * STREAM frame handler: route to the per-stream
+     * QuicStream, allocating one if this is the first
+     * frame on that stream ID.
+     */
+    protected function onStream($f)
+    {
+        $sid = $f['stream_id'];
+        if (!isset($this->streams[$sid])) {
+            $this->streams[$sid] = new QuicStream($sid);
+        }
+        $this->streams[$sid]->deliverIncoming(
+            $f['offset'], $f['data'], $f['fin']);
+    }
+    /**
+     * Advances the handshake whenever something has just
+     * changed (typically: just received a CRYPTO frame).
+     * Walks the TLS engine's state and queues the
+     * appropriate outgoing packets.
+     */
+    protected function driveHandshake()
+    {
+        if ($this->tls->getError() !== '') {
+            $this->error = $this->tls->getError();
+            $this->state = self::ST_CLOSED;
+            return;
+        }
+        /* If we just received the ClientHello and haven't
+           sent our flight yet, build it now. */
+        if ($this->state === self::ST_NEW &&
+            $this->tls->isComplete() === false) {
+            $secrets = $this->tls->trafficSecrets();
+            if (empty($secrets)) {
+                /*
+                    Extend our local transport parameters
+                    with the two CID-binding fields that
+                    require knowledge of the peer's first
+                    Initial. The client validates these
+                    against the actual on-wire CIDs and
+                    drops the connection on mismatch.
+                 */
+                $tp = $this->local_transport_params .
+                    self::tpBytes(0x00,
+                        $this->original_dcid) .
+                    self::tpBytes(0x0F,
+                        $this->local_cid);
+                $this->tls->setServerQuicTransportParameters(
+                    $tp);
+                $flight = $this->tls->buildServerFlight(
+                    'quic');
+                if ($flight === false) {
+                    $this->error = $this->tls->getError();
+                    $this->state = self::ST_CLOSED;
+                    return;
+                }
+                $this->splitServerFlight($flight);
+                /* After buildServerFlight, the TLS engine
+                   has 'c_hs' and 's_hs' secrets ready --
+                   Handshake-level keys can be derived. */
+                $secrets = $this->tls->trafficSecrets();
+                $this->keys[self::LEVEL_HANDSHAKE] = [
+                    'rx' => QuicPacketKeys::fromTrafficSecret(
+                        $secrets['c_hs'],
+                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
+                    ),
+                    'tx' => QuicPacketKeys::fromTrafficSecret(
+                        $secrets['s_hs'],
+                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
+                    ),
+                ];
+                $this->keys[self::LEVEL_APPLICATION] = [
+                    'rx' => QuicPacketKeys::fromTrafficSecret(
+                        $secrets['c_ap'],
+                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
+                    ),
+                    'tx' => QuicPacketKeys::fromTrafficSecret(
+                        $secrets['s_ap'],
+                        Tls13Engine::CIPHER_AES_128_GCM_SHA256
+                    ),
+                ];
+                $this->state = self::ST_HANDSHAKING;
+            }
+        }
+        $this->peer_transport_params =
+            $this->tls->clientQuicTransportParameters();
+    }
+    /**
+     * Splits the bytes returned by Tls13Engine::build-
+     * ServerFlight('quic') into Initial-level and
+     * Handshake-level CRYPTO frames, then packetizes them.
+     *
+     * The first message in the flight (ServerHello) goes
+     * in an Initial packet; everything after (Encrypted-
+     * Extensions, Certificate, CertificateVerify,
+     * Finished) goes in Handshake packets.
+     */
+    protected function splitServerFlight($flight)
+    {
+        if (strlen($flight) < 4) {
+            return;
+        }
+        /* The flight is a concatenation of complete TLS
+           handshake messages; each message is type byte +
+           uint24 length + body. ServerHello is first. */
+        $sh_len = (ord($flight[1]) << 16) |
+            (ord($flight[2]) << 8) | ord($flight[3]);
+        $sh = substr($flight, 0, 4 + $sh_len);
+        $rest = substr($flight, 4 + $sh_len);
+        /* Build Initial packet carrying the ServerHello
+           in a CRYPTO frame, plus an ACK frame for the
+           client's Initial. */
+        $initial_payload = $this->ackFrameBytes(
+            self::LEVEL_INITIAL);
+        $crypto = QuicFrame::encode([
+            'type' => QuicFrame::F_CRYPTO,
+            'offset' => $this->crypto_send_offset[
+                self::LEVEL_INITIAL],
+            'data' => $sh,
+        ]);
+        $this->crypto_send_offset[self::LEVEL_INITIAL] +=
+            strlen($sh);
+        $initial_payload .= $crypto;
+        $this->queuePacket(self::LEVEL_INITIAL,
+            $initial_payload);
+        /* Build Handshake packet carrying the rest of the
+           flight. The Handshake-level keys aren't yet in
+           $this->keys, but driveHandshake will populate
+           them right after this method returns; we emit
+           the packet at that point via emit(). For now
+           save the payload bytes. */
+        if ($rest !== '') {
+            $crypto2 = QuicFrame::encode([
+                'type' => QuicFrame::F_CRYPTO,
+                'offset' => $this->crypto_send_offset[
+                    self::LEVEL_HANDSHAKE],
+                'data' => $rest,
+            ]);
+            $this->crypto_send_offset[
+                self::LEVEL_HANDSHAKE] += strlen($rest);
+            /* Defer the Handshake packet until keys
+               exist. We just queue the level + payload
+               and let emit() encrypt at flush time. */
+            $this->send_queue[] = [self::LEVEL_HANDSHAKE,
+                $crypto2, 'pending'];
+        }
+    }
+    /**
+     * Builds an ACK frame's wire bytes covering all
+     * received packet numbers in the given PN space.
+     * Returns "" if nothing to ACK.
+     */
+    protected function ackFrameBytes($level)
+    {
+        if (empty($this->received_pns[$level])) {
+            return "";
+        }
+        $ack = QuicFrame::buildAck(
+            $this->received_pns[$level]);
+        if ($ack === false) {
+            return "";
+        }
+        return QuicFrame::encode($ack);
+    }
+    /**
+     * Encrypts and queues a packet for sending. $payload
+     * is the unprotected frame sequence; we wrap it in a
+     * QuicPacket with the right keys and queue the wire
+     * bytes onto $send_queue.
+     */
+    protected function queuePacket($level, $payload)
+    {
+        $pn = $this->next_pn[$level]++;
+        $packet = new QuicPacket();
+        $packet->long_type = ($level ===
+            self::LEVEL_INITIAL) ? QuicPacket::LONG_INITIAL
+            : QuicPacket::LONG_HANDSHAKE;
+        $packet->version = QuicPacket::VERSION_QUIC_V1;
+        $packet->destination_cid = $this->peer_cid;
+        $packet->source_cid = $this->local_cid;
+        if ($level === self::LEVEL_INITIAL) {
+            /* RFC 9000 sec 14.1: client Initial packets
+               must be padded to >= 1200 bytes. The
+               server's Initial ACK packets don't have to
+               be (the inflation rule is one-way), so we
+               leave ours at natural size. */
+        }
+        $wire = $packet->encodeLong(
+            $this->keys[$level]['tx'], $pn, $payload);
+        $this->send_queue[] = [$level, $wire, 'ready'];
+    }
+    /**
+     * Returns datagrams (concatenations of one or more
+     * encoded packets) ready to send to the peer, then
+     * clears the queue. Pending Handshake-level entries
+     * waiting for keys are encrypted now if the keys are
+     * available.
+     */
+    public function emit()
+    {
+        $out = [];
+        $current = "";
+        $pending_remaining = [];
+        foreach ($this->send_queue as $entry) {
+            list($level, $bytes, $status) = $entry;
+            if ($status === 'pending') {
+                if (!isset($this->keys[$level])) {
+                    $pending_remaining[] = $entry;
+                    continue;
+                }
+                /* $bytes is the unprotected payload; wrap
+                   it now. */
+                $pn = $this->next_pn[$level]++;
+                $packet = new QuicPacket();
+                $packet->long_type = ($level ===
+                    self::LEVEL_HANDSHAKE) ?
+                    QuicPacket::LONG_HANDSHAKE :
+                    QuicPacket::LONG_INITIAL;
+                $packet->version =
+                    QuicPacket::VERSION_QUIC_V1;
+                $packet->destination_cid = $this->peer_cid;
+                $packet->source_cid = $this->local_cid;
+                $bytes = $packet->encodeLong(
+                    $this->keys[$level]['tx'], $pn, $bytes);
+            }
+            $current .= $bytes;
+        }
+        if ($current !== '') {
+            $out[] = $current;
+        }
+        $this->send_queue = $pending_remaining;
+        return $out;
+    }
+    /**
+     * Returns true once the QUIC + TLS handshake has
+     * completed end-to-end (server has received and
+     * verified the client's Finished).
+     */
+    public function isEstablished()
+    {
+        return $this->state === self::ST_ESTABLISHED;
     }
 }

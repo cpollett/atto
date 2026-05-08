@@ -10,7 +10,7 @@
  * that don't expose the raw 'chacha20' EVP cipher.
  *
  * Run from the repo root:
- *     php "examples/18 HTTP Benchmarks/test_chacha_paths.php"
+ *     php tests/http3/test_chacha_paths.php
  *
  * Exits 0 on full pass, 1 on any failure.
  *

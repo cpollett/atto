@@ -3982,6 +3982,34 @@ class QuicConnection
      */
     public $loss_detection_timer = null;
     /**
+     * @var array level => float|null. Earliest microtime
+     *      at which a still-in-flight packet at this level
+     *      will cross the RFC 9002 sec 6.1.2 time-
+     *      threshold and be declared lost. Maintained by
+     *      detectAndRemoveLostPackets(); consumed by
+     *      setLossDetectionTimer() so the timer fires for
+     *      a time-loss event rather than a PTO event when
+     *      the former comes first.
+     */
+    public $loss_time = [
+        self::LEVEL_INITIAL => null,
+        self::LEVEL_HANDSHAKE => null,
+        self::LEVEL_APPLICATION => null,
+    ];
+    /**
+     * @var array level => int largest acknowledged packet
+     *      number we have ever observed at this level.
+     *      Loss detection (RFC 9002 sec 6.1.1) needs this
+     *      to apply the packet-number reordering threshold
+     *      against the most recent ACK rather than the one
+     *      currently being processed.
+     */
+    public $largest_acked_pn = [
+        self::LEVEL_INITIAL => -1,
+        self::LEVEL_HANDSHAKE => -1,
+        self::LEVEL_APPLICATION => -1,
+    ];
+    /**
      * @var float minimum loss-detection granularity per
      *      RFC 9002 sec A.2 (kGranularity). Clamps the
      *      4*rttvar term in the PTO formula so very
@@ -3998,6 +4026,28 @@ class QuicConnection
      *      TP 0x0b out of EncryptedExtensions.
      */
     const PEER_MAX_ACK_DELAY_SEC = 0.025;
+    /**
+     * @var int RFC 9002 sec 6.1.1 kPacketThreshold. A
+     *      packet is declared lost via the reordering
+     *      threshold when its packet number is at least
+     *      this many below the largest acknowledged packet
+     *      in the same number space. The value of 3 is
+     *      the RFC's recommended default; smaller values
+     *      cause spurious retransmissions on out-of-order
+     *      delivery, larger values delay loss recovery.
+     */
+    const LOSS_PKT_THRESHOLD = 3;
+    /**
+     * @var float RFC 9002 sec 6.1.2 kTimeThreshold,
+     *      expressed as a multiplier on max(latest_rtt,
+     *      smoothed_rtt). A packet is declared lost via
+     *      the time threshold when it was sent more than
+     *      kTimeThreshold * max(latest_rtt, smoothed_rtt)
+     *      ago. The 9/8 default tolerates one round of
+     *      delayed-ACK without false-positive loss
+     *      declarations.
+     */
+    const LOSS_TIME_THRESHOLD = 1.125;
     /**
      * @var array level => crypto data byte buffer
      *      (offset => bytes) and next-expected-offset for
@@ -4996,16 +5046,165 @@ class QuicConnection
         }
         if ($newly_acked_count > 0) {
             /*
-                RFC 9002 sec 6.2.1: progress was made, so
-                reset the PTO backoff and re-arm the timer
-                (it might fire later than before because
-                bytes_in_flight may have shrunk). Phase 11c
-                will also use this hook to declare any
-                packets that are far enough behind the
-                largest acked as lost.
+                RFC 9002 sec 6.2.1: progress was made.
+                Track largest_acked_pn for the reordering
+                threshold, declare any older still-in-
+                flight packets lost (sec 6.1), reset PTO
+                backoff, and rearm the timer.
              */
+            if ($largest > $this->largest_acked_pn[$level]) {
+                $this->largest_acked_pn[$level] = $largest;
+            }
+            $this->detectAndRemoveLostPackets($level);
             $this->pto_count = 0;
             $this->setLossDetectionTimer();
+        }
+    }
+    /**
+     * Walks $sent_packets[$level] applying the RFC 9002
+     * sec 6.1 loss-detection thresholds and removes any
+     * packet that meets either: (a) the packet-number
+     * reordering threshold (largest_acked_pn - pn >=
+     * LOSS_PKT_THRESHOLD), or (b) the time threshold
+     * (time_sent + loss_delay <= now). Re-queues the
+     * frames carried by those packets via onPacketsLost,
+     * and updates loss_time[level] to point at the next
+     * packet that is going to cross the time threshold.
+     * Returns the count of packets declared lost.
+     */
+    protected function detectAndRemoveLostPackets($level)
+    {
+        $this->loss_time[$level] = null;
+        if (empty($this->sent_packets[$level])) {
+            return 0;
+        }
+        $largest_acked = $this->largest_acked_pn[$level];
+        /*
+            loss_delay = kTimeThreshold *
+                max(latest_rtt, smoothed_rtt), floored at
+            kGranularity to keep the threshold meaningful
+            on extremely-low-RTT paths (loopback can show
+            sub-millisecond latest_rtt). Before the first
+            RTT sample we use kInitialRtt (333 ms) so the
+            packet-number threshold dominates.
+         */
+        $rtt = $this->smoothed_rtt;
+        if ($this->latest_rtt !== null
+            && $this->latest_rtt > $rtt) {
+            $rtt = $this->latest_rtt;
+        }
+        if ($rtt === null) {
+            $rtt = 0.333;
+        }
+        $loss_delay = self::LOSS_TIME_THRESHOLD * $rtt;
+        if ($loss_delay < self::PTO_GRANULARITY_SEC) {
+            $loss_delay = self::PTO_GRANULARITY_SEC;
+        }
+        $now = microtime(true);
+        $lost_send_time_threshold = $now - $loss_delay;
+        $lost_packets = [];
+        foreach ($this->sent_packets[$level] as $pn => $entry) {
+            if ($pn > $largest_acked) {
+                /* This packet is newer than anything the
+                   peer has acknowledged; cannot yet be
+                   declared lost. */
+                continue;
+            }
+            $time_threshold_lost =
+                $entry['time_sent'] <=
+                $lost_send_time_threshold;
+            $pn_threshold_lost =
+                ($largest_acked - $pn) >=
+                self::LOSS_PKT_THRESHOLD;
+            if ($time_threshold_lost ||
+                $pn_threshold_lost) {
+                $lost_packets[] = $entry;
+                unset($this->sent_packets[$level][$pn]);
+                continue;
+            }
+            /*
+                Not yet lost, but track the earliest moment
+                a still-in-flight packet at or below
+                largest_acked will cross the time threshold
+                so the loss-detection timer can fire then.
+             */
+            $deadline = $entry['time_sent'] + $loss_delay;
+            if ($this->loss_time[$level] === null ||
+                $deadline < $this->loss_time[$level]) {
+                $this->loss_time[$level] = $deadline;
+            }
+        }
+        if (!empty($lost_packets)) {
+            $this->onPacketsLost($level, $lost_packets);
+        }
+        return count($lost_packets);
+    }
+    /**
+     * Re-queues frames from packets that
+     * detectAndRemoveLostPackets has just declared lost.
+     * Per RFC 9002 sec 6.1, lost frames that carry data
+     * the application still cares about MUST be
+     * retransmitted; PADDING and ACK frames are
+     * regenerated rather than copied. The current
+     * implementation handles CRYPTO (re-emit at the
+     * original offset), STREAM (re-emit at the original
+     * offset; the peer dedups by stream offset and we
+     * tolerate a small amount of duplicate transmission
+     * in exchange for not having to track per-byte
+     * acknowledgement), and HANDSHAKE_DONE (re-arm the
+     * one-shot send flag so emit() ships it again on the
+     * next tick). MAX_DATA / MAX_STREAM_DATA / MAX_-
+     * STREAMS_* / NEW_CONNECTION_ID / RETIRE_CONNECTION_-
+     * ID are skipped here; they are infrequent in the
+     * server-initiated direction and the peer rarely
+     * needs them retransmitted -- a follow-up phase will
+     * either retransmit them or document the gap.
+     */
+    protected function onPacketsLost($level, $lost_packets)
+    {
+        foreach ($lost_packets as $entry) {
+            foreach ($entry['frames'] as $f) {
+                $type = $f['type'];
+                if ($type === QuicFrame::F_CRYPTO) {
+                    /* Re-encode at the original offset. */
+                    $bytes = QuicFrame::encode([
+                        'type' => QuicFrame::F_CRYPTO,
+                        'offset' => $f['offset'],
+                        'data' => $f['data'],
+                    ]);
+                    if ($level ===
+                        self::LEVEL_APPLICATION) {
+                        $this->queue1Rtt($bytes);
+                    } else {
+                        $this->send_queue[] = [$level,
+                            $bytes, 'pending'];
+                    }
+                    continue;
+                }
+                if ($type === QuicFrame::F_STREAM_BASE) {
+                    $bytes = QuicFrame::encode([
+                        'type' => QuicFrame::F_STREAM_BASE,
+                        'stream_id' => $f['stream_id'],
+                        'offset' => $f['offset'],
+                        'data' => $f['data'],
+                        'fin' => !empty($f['fin']),
+                    ]);
+                    /* STREAM frames only ever ride 1-RTT
+                       packets, so this path is always
+                       LEVEL_APPLICATION. Use queue1Rtt for
+                       symmetry with normal stream sends. */
+                    $this->queue1Rtt($bytes);
+                    continue;
+                }
+                if ($type === QuicFrame::F_HANDSHAKE_DONE) {
+                    /* Re-arm the one-shot flag so emit()
+                       ships HANDSHAKE_DONE again. */
+                    $this->handshake_done_sent = false;
+                    continue;
+                }
+                /* Other frame types fall through silently
+                   for now -- see method docblock. */
+            }
         }
     }
     /**
@@ -5078,15 +5277,38 @@ class QuicConnection
     }
     /**
      * (Re-)arms the loss-detection timer per RFC 9002 sec
-     * 6.2.2. If there is no ack-eliciting packet in flight
-     * the timer disarms. Otherwise it fires
-     * basePto * 2^pto_count seconds in the future,
-     * measured from the most recent ack-eliciting send.
-     * Phase 11c will replace this with a combined PTO +
-     * loss-time selector once we declare packets lost.
+     * 6.2.2. The timer fires at the earliest of:
+     *   - the next loss_time across all packet-number
+     *     spaces (a packet about to cross the time-
+     *     threshold for being declared lost), or
+     *   - basePto * 2^pto_count seconds after the oldest
+     *     in-flight ack-eliciting send (RFC 9002 sec
+     *     6.2.1, the probe-timeout deadline).
+     * Disarms when there is no ack-eliciting packet in
+     * flight at all. The dispatcher in
+     * onLossDetectionTimeout decides which case fired
+     * by re-running detectAndRemoveLostPackets first --
+     * if it removes anything the firing was a loss
+     * event, otherwise it was a PTO event and we send a
+     * PING.
      */
     public function setLossDetectionTimer()
     {
+        $earliest_loss_time = null;
+        foreach ($this->loss_time as $lt) {
+            if ($lt === null) {
+                continue;
+            }
+            if ($earliest_loss_time === null
+                || $lt < $earliest_loss_time) {
+                $earliest_loss_time = $lt;
+            }
+        }
+        if ($earliest_loss_time !== null) {
+            $this->loss_detection_timer =
+                $earliest_loss_time;
+            return;
+        }
         $oldest_eliciting_send = null;
         foreach ($this->sent_packets as $level => $pkts) {
             foreach ($pkts as $entry) {
@@ -5112,17 +5334,35 @@ class QuicConnection
     }
     /**
      * Called by the listener tick loop when the loss-
-     * detection timer expires. Implements RFC 9002 sec
-     * 6.2.4 probe behaviour: send a single ack-eliciting
-     * PING in the application packet number space, double
-     * the backoff exponent, and rearm. Phase 11c will
-     * additionally walk sent_packets here and declare
-     * stale entries lost so their frames can be requeued
-     * for retransmission.
+     * detection timer expires. RFC 9002 sec 6.2.2 / 6.2.4:
+     * if any packet-number space has a non-null loss_time
+     * the firing was a time-threshold loss event -- run
+     * loss detection there, retransmit the lost frames,
+     * and rearm the timer. Otherwise the firing was a PTO
+     * event -- send a PING in 1-RTT to elicit fresh ACK
+     * coverage, double the backoff exponent, and rearm.
      */
     public function onLossDetectionTimeout()
     {
         if ($this->loss_detection_timer === null) {
+            return;
+        }
+        $loss_event_level = null;
+        $earliest_loss_time = null;
+        foreach ($this->loss_time as $level => $lt) {
+            if ($lt === null) {
+                continue;
+            }
+            if ($earliest_loss_time === null
+                || $lt < $earliest_loss_time) {
+                $earliest_loss_time = $lt;
+                $loss_event_level = $level;
+            }
+        }
+        if ($loss_event_level !== null) {
+            $this->detectAndRemoveLostPackets(
+                $loss_event_level);
+            $this->setLossDetectionTimer();
             return;
         }
         if (!isset($this->keys[self::LEVEL_APPLICATION])) {

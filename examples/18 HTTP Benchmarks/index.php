@@ -150,24 +150,29 @@ $test->get('/', function () {
             JSON: bench progress + raw output (polled by the
             dashboard while a run is in flight).</li>
         <li><a href="/h3stats" target="_blank">/h3stats</a>
-            &mdash; JSON: libquiche transport-level counters
-            (sent / recv / lost / retrans / RTT / cwnd) for
-            every active H3 connection. Empty when libquiche
-            is missing or no H3 traffic has hit the server
-            yet. Add <code>?keep=1</code>
-            (<a href="/h3stats?keep=1" target="_blank">try it</a>)
-            to also include the post-mortem stats ring buffer
-            for connections that have already been reaped, or
-            <code>?snapshot=1</code>
-            (<a href="/h3stats?snapshot=1" target="_blank"
-            >try it</a>) to also push every live connection's
-            current stats into the ring buffer first &mdash;
-            useful for capturing connections that completed
-            their work but were left dangling by a client that
-            kept them in its pool. To populate: open
+            &mdash; JSON: per-connection counters from atto's
+            pure-PHP HTTP/3 listener
+            (<code>H3Listener.php</code>, no FFI, no
+            libquiche). Each entry reports the local and peer
+            connection IDs, handshake state
+            (<code>established</code> / <code>closed</code>),
+            <code>created_at</code> / <code>last_packet_at</code>
+            timestamps, byte and packet totals
+            (<code>bytes_sent</code>, <code>bytes_received</code>,
+            <code>packets_sent</code>, <code>packets_received</code>),
+            and the open-stream count. Empty when the H3
+            listener is not bound or no H3 traffic has hit
+            the server yet. To populate: open
             <a href="https://localhost:8443/" target="_blank">
             https://localhost:8443/</a> in a browser that
-            speaks H3, then refresh /h3stats.</li>
+            speaks H3, then refresh /h3stats. Also accepts
+            <code>?keep=1</code> and <code>?snapshot=1</code>;
+            both are no-ops against the pure-PHP listener
+            (it computes stats live from connection state and
+            doesn't currently retain a reaped-connection ring
+            buffer) but turn into post-mortem and forced-
+            snapshot views when the libquiche-FFI row is
+            included via the checkbox below.</li>
         <li><a href="/small" target="_blank">/small</a>,
             <a href="/big" target="_blank">/big</a>,
             <a href="/headers" target="_blank">/headers</a>,
@@ -558,33 +563,41 @@ $test->post('/echo-post', function () use ($test) {
 });
 $test->get('/h3stats', function () use ($test) {
     /*
-        Returns a JSON snapshot of libquiche's transport-level
-        counters (sent, recv, lost, retrans, RTT, cwnd) for
-        every currently-tracked H3 connection on this server.
-        Returns an empty list if no H3 listener is bound (e.g.
-        libquiche missing) or no H3 connections are active.
+        Returns a JSON snapshot of per-connection counters
+        from every H3 listener currently bound. The pure-PHP
+        listener (H3Listener.php) reports state, local /
+        peer CIDs, established / closed flags, created_at /
+        last_packet_at timestamps, byte and packet totals,
+        and open-stream count -- everything it computes
+        live from QuicConnection state. The libquiche-FFI
+        listener (H3QuicheListener.php), when included via
+        the checkbox in the dashboard, additionally reports
+        lost / retransmitted counts, RTT, and cwnd.
 
-        Useful for diagnosing H3 perf: compare cwnd against the
-        bench's observed throughput, or look for non-zero lost
-        / retrans counters. This route is GET so it can be hit
-        from any browser / curl / dashboard fetch.
+        Returns an empty list when no H3 listener is bound
+        or no H3 connections are active. This route is GET
+        so it can be hit from any browser / curl / dashboard
+        fetch.
 
         Query parameters:
-        - ?keep=1: include the listener's ring buffer of stats
-          from connections that have already been reaped. Each
-          entry has a 'reason' field ('closed' for orderly
-          shutdown, 'stale_handshake' for forced reap of an
-          abandoned handshake, 'forced_snapshot' for a snapshot
-          taken via ?snapshot=1) and a 'reaped_at' microtime
-          float.
-        - ?snapshot=1: before snapshotting, capture every live
-          connection's current stats into the ring buffer. Lets
-          you see the final state of a connection that
-          completed its work but was kept alive by the client
-          (e.g. curl --http3 leaves the QUIC connection in its
-          pool and never sends CONNECTION_CLOSE before exiting,
-          so the server won't reap it until the 30-second idle
-          timeout fires). Implies ?keep=1.
+        - ?keep=1: include the listener's ring buffer of
+          stats from connections that have already been
+          reaped. Implemented by H3QuicheListener (each
+          reaped entry carries a 'reason' field for the
+          shutdown trigger and a 'reaped_at' microtime
+          float). The pure-PHP listener does not currently
+          retain a reaped-connection history; this query
+          parameter is a no-op against it.
+        - ?snapshot=1: before snapshotting, capture every
+          live connection's current stats into the ring
+          buffer. Useful with the libquiche row for
+          inspecting connections that completed their work
+          but were kept alive by the client (e.g. curl
+          --http3 leaves the QUIC connection in its pool
+          and never sends CONNECTION_CLOSE, so the server
+          won't reap it until the idle timer fires).
+          Implies ?keep=1; also a no-op on the pure-PHP
+          listener.
      */
     $test->header("Content-Type: application/json");
     $stats = [];

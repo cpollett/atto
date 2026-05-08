@@ -3586,10 +3586,38 @@ class QuicStream
      */
     public $recv_window = 1048576;
     /**
-     * @var string send-side outgoing buffer (not yet
-     *      packaged into STREAM frames).
+     * @var string send-side outgoing buffer. Append-only
+     *      from the application side; the takeForFrame
+     *      reader advances $send_buf_off rather than
+     *      mutating the buffer. Without that the buffer
+     *      shift was O(n) per drained frame and the
+     *      cumulative cost of draining a single 1 MiB
+     *      response in 1100-byte STREAM frames was
+     *      O(n^2) -- about 47 ms of pure substr-shift
+     *      cost per request observed in profiling. The
+     *      buffer is compacted in place when send_buf_off
+     *      crosses SEND_BUF_COMPACT_THRESHOLD so memory
+     *      does not grow unboundedly across long-lived
+     *      streams.
      */
     public $send_buf = "";
+    /**
+     * @var int byte offset into $send_buf marking the next
+     *      byte not yet handed to a STREAM frame. Always
+     *      <= strlen(send_buf). The exposed
+     *      bufferedLength() returns
+     *      strlen(send_buf) - send_buf_off.
+     */
+    public $send_buf_off = 0;
+    /**
+     * @var int compaction threshold. When $send_buf_off
+     *      grows past this many bytes we substr the
+     *      consumed prefix away in one shot. 64 KiB is
+     *      large enough that compactions are rare on
+     *      bursty traffic but small enough that idle
+     *      memory does not bloat per stream.
+     */
+    const SEND_BUF_COMPACT_THRESHOLD = 65536;
     /**
      * @var int next offset to use for an outgoing STREAM
      *      frame.
@@ -3721,39 +3749,71 @@ class QuicStream
     public function finish()
     {
         $this->send_fin = true;
-        if ($this->send_buf === '' &&
+        if ($this->bufferedLength() === 0 &&
             $this->send_state === self::SEND_READY) {
             $this->send_state = self::SEND_DATA_SENT;
         }
     }
     /**
+     * Number of bytes still queued in $send_buf and not
+     * yet handed to a STREAM frame. Cheap (two strlen +
+     * one subtract) and the canonical replacement for
+     * send_buf === '' / strlen(send_buf) tests so the
+     * head-pointer optimisation stays opaque to callers.
+     */
+    public function bufferedLength()
+    {
+        return strlen($this->send_buf) - $this->send_buf_off;
+    }
+    /**
      * Consumes up to $max_bytes for the next outgoing
      * STREAM frame, returning [offset, data, fin] or
-     * null if nothing to send. Updates send_next_offset.
-     * Caller writes the returned tuple into a STREAM
-     * frame.
+     * null if nothing to send. Updates send_next_offset
+     * and advances the send_buf head pointer so the
+     * underlying string is not rewritten on every call --
+     * see the $send_buf docblock for why that matters.
      */
     public function takeForFrame($max_bytes)
     {
         if ($this->send_state === self::SEND_RESET) {
             return null;
         }
-        if ($this->send_buf === '' && !$this->send_fin) {
+        $buffered = $this->bufferedLength();
+        if ($buffered === 0 && !$this->send_fin) {
             return null;
         }
-        if ($this->send_buf === '' && $this->send_fin
+        if ($buffered === 0 && $this->send_fin
             && $this->send_fin_sent) {
             return null;
         }
-        $allowed = min(strlen($this->send_buf), $max_bytes,
+        $allowed = min($buffered, $max_bytes,
             max(0, $this->send_window
                 - $this->send_next_offset));
-        $data = substr($this->send_buf, 0, $allowed);
-        $this->send_buf = substr($this->send_buf, $allowed);
+        $data = substr($this->send_buf,
+            $this->send_buf_off, $allowed);
+        $this->send_buf_off += $allowed;
+        /*
+            Periodic compaction: when the head pointer has
+            crossed SEND_BUF_COMPACT_THRESHOLD (and at
+            least half the buffer is consumed prefix), drop
+            the consumed prefix in one shot. This bounds
+            steady-state memory regardless of how long the
+            stream stays open. The compaction itself is
+            O(unconsumed-tail), so amortised it is O(1)
+            per byte across the lifetime of the stream.
+         */
+        if ($this->send_buf_off >=
+                self::SEND_BUF_COMPACT_THRESHOLD
+            && $this->send_buf_off * 2 >=
+                strlen($this->send_buf)) {
+            $this->send_buf = substr($this->send_buf,
+                $this->send_buf_off);
+            $this->send_buf_off = 0;
+        }
         $offset = $this->send_next_offset;
         $this->send_next_offset += $allowed;
         $fin = ($this->send_fin &&
-            $this->send_buf === '');
+            $this->bufferedLength() === 0);
         if ($fin) {
             $this->send_fin_sent = true;
             $this->send_state = self::SEND_DATA_SENT;
@@ -3773,7 +3833,7 @@ class QuicStream
         if ($this->send_state === self::SEND_RESET) {
             return false;
         }
-        if ($this->send_buf !== '') {
+        if ($this->bufferedLength() > 0) {
             return true;
         }
         if ($this->send_fin && !$this->send_fin_sent) {
@@ -5731,8 +5791,8 @@ class QuicConnection
          */
         $sids = array_keys($this->streams);
         usort($sids, function ($a, $b) {
-            $la = strlen($this->streams[$a]->send_buf);
-            $lb = strlen($this->streams[$b]->send_buf);
+            $la = $this->streams[$a]->bufferedLength();
+            $lb = $this->streams[$b]->bufferedLength();
             return $la - $lb;
         });
         foreach ($sids as $sid) {

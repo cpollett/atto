@@ -60,6 +60,30 @@ class WebSite
     const DATA = 1;
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
+    /**
+     * Subkey for the per-socket head pointer into
+     * $out_streams[self::DATA][$key]. The drain loop in
+     * processResponseStreams advances this offset rather
+     * than mutating the DATA buffer with a substr-shift,
+     * which avoids an O(n^2) cost when fwrite() returns
+     * partial-write counts repeatedly across a single
+     * large response (e.g. a 1 MiB body that drains in
+     * 64 KiB-or-smaller kernel sendbuf bites). Compaction
+     * of the consumed prefix happens in-place once the
+     * offset crosses OUT_DATA_COMPACT_THRESHOLD so memory
+     * usage on long-lived connections stays bounded.
+     */
+    const DATA_OFFSET = 4;
+    /**
+     * Threshold for compacting the consumed prefix of
+     * $out_streams[self::DATA][$key] when DATA_OFFSET
+     * grows past this many bytes (and at least half the
+     * buffer is consumed prefix). 64 KiB is large enough
+     * that compactions are rare on bursty traffic and
+     * small enough that idle memory does not bloat per
+     * connection.
+     */
+    const OUT_DATA_COMPACT_THRESHOLD = 65536;
     /*
       CONNECT OPTIONS and the longest named HTTP method. It has length 7
      */
@@ -1146,6 +1170,7 @@ class WebSite
         } else {
             $this->out_streams[self::CONNECTION][$key] = $socket;
             $this->out_streams[self::DATA][$key] = $out;
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
             $this->out_streams[self::CONTEXT][$key] = [];
         }
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
@@ -1774,7 +1799,8 @@ class WebSite
             }
         }
         $this->in_streams = [self::CONNECTION => [], self::DATA => [""]];
-        $this->out_streams = [self::CONNECTION => [], self::DATA => []];
+        $this->out_streams = [self::CONNECTION => [], self::DATA => [],
+            self::DATA_OFFSET => []];
         /*
             Wire up the per-protocol Transports. Each Transport
             owns the readable-event handling for its protocol;
@@ -2473,6 +2499,7 @@ class WebSite
         if (empty($this->out_streams[self::CONNECTION][$key])) {
             $this->out_streams[self::CONNECTION][$key] = $in_stream;
             $this->out_streams[self::DATA][$key] = $out_data;
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
             $this->out_streams[self::CONTEXT][$key] = $_SERVER;
             $this->out_streams[self::MODIFIED_TIME][$key] = time();
         }
@@ -3194,6 +3221,7 @@ class WebSite
         } else {
             $this->out_streams[self::CONNECTION][$key] = $connection;
             $this->out_streams[self::DATA][$key] = $out;
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
             $this->out_streams[self::CONTEXT][$key] = [];
         }
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
@@ -3416,6 +3444,7 @@ class WebSite
             $this->out_streams[self::CONNECTION][$key] =
                 $this->in_streams[self::CONNECTION][$key];
             $this->out_streams[self::DATA][$key] = $data;
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
             /*
                 The drain code in processResponseStreams reads
                 the WebSocket flag from the Connection object,
@@ -3719,17 +3748,48 @@ class WebSite
         foreach ($out_streams_with_data as $out_stream) {
             $key = (int)$out_stream;
             $data = $this->out_streams[self::DATA][$key];
+            $offset =
+                $this->out_streams[self::DATA_OFFSET][$key] ?? 0;
+            $unsent = strlen($data) - $offset;
             $custom_error_handler =
                 $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ?? null;
             //suppress connection reset notices
             set_error_handler(null);
-            $num_bytes = @fwrite($out_stream, $data);
+            /*
+                fwrite second arg is "the data to write". When
+                we're past the head pointer we want only the tail
+                from $offset onwards. substr is constant-time
+                relative to the slice length (the tail), not the
+                whole buffer. Advancing $offset rather than
+                rewriting $data avoids the O(n^2) cumulative cost
+                that hit large responses on slow drains.
+             */
+            $tail = ($offset === 0)
+                ? $data : substr($data, $offset);
+            $num_bytes = @fwrite($out_stream, $tail);
             set_error_handler($custom_error_handler);
             $remaining_bytes = ($num_bytes === false) ? 0
-                : max(0, strlen($data) - $num_bytes);
+                : max(0, $unsent - $num_bytes);
             if ($num_bytes > 0) {
-                $this->out_streams[self::DATA][$key] = substr($data,
-                    $num_bytes);
+                $offset += $num_bytes;
+                $this->out_streams[self::DATA_OFFSET][$key] =
+                    $offset;
+                /*
+                    Periodic compaction: when the head pointer
+                    has crossed OUT_DATA_COMPACT_THRESHOLD and at
+                    least half the buffer is consumed prefix,
+                    drop the consumed prefix in one shot. This
+                    keeps memory bounded on long-lived
+                    connections regardless of how slowly the
+                    peer drains.
+                 */
+                if ($offset >= self::OUT_DATA_COMPACT_THRESHOLD
+                    && $offset * 2 >= strlen($data)) {
+                    $this->out_streams[self::DATA][$key] =
+                        substr($data, $offset);
+                    $this->out_streams[self::DATA_OFFSET][$key] =
+                        0;
+                }
                 $this->out_streams[self::MODIFIED_TIME][$key] = time();
             }
             if ($remaining_bytes == 0) {
@@ -3751,6 +3811,7 @@ class WebSite
                     $ws = $conn_obj->ws;
                     unset($this->out_streams[self::CONNECTION][$key],
                         $this->out_streams[self::DATA][$key],
+                        $this->out_streams[self::DATA_OFFSET][$key],
                         $this->out_streams[self::CONTEXT][$key],
                         $this->out_streams[self::MODIFIED_TIME][$key]);
                     if ($ws !== null && $ws->closed) {
@@ -4174,6 +4235,7 @@ class WebSite
             $this->out_streams[self::CONNECTION][$key],
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::DATA][$key],
+            $this->out_streams[self::DATA_OFFSET][$key],
             $this->out_streams[self::MODIFIED_TIME][$key],
             $this->connections[$key]
         );
@@ -4191,6 +4253,7 @@ class WebSite
         unset($this->out_streams[self::CONNECTION][$key],
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::DATA][$key],
+            $this->out_streams[self::DATA_OFFSET][$key],
             $this->out_streams[self::MODIFIED_TIME][$key]
         );
     }

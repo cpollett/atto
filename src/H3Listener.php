@@ -4119,6 +4119,42 @@ class QuicConnection
      */
     public $peer_cid = "";
     /**
+     * @var array path-validation state for client-initiated
+     *      migration per RFC 9000 sec 8.2 + sec 9. Empty when
+     *      no migration is in progress. Populated when an
+     *      inbound datagram arrives from a source address
+     *      different from the one the H3Listener has recorded
+     *      for this connection. Shape:
+     *        'address'      => string "ip:port" of the
+     *                          alternative path
+     *        'challenge'    => string 8 random bytes that the
+     *                          peer must echo via PATH_-
+     *                          RESPONSE on the alternative
+     *                          path
+     *        'first_seen'   => float microtime when validation
+     *                          began (used for timeout)
+     *        'response_received' => bool flipped true when
+     *                          the matching PATH_RESPONSE
+     *                          arrives; the H3Listener
+     *                          consults this to perform the
+     *                          peer_address swap and CC reset
+     *      The H3Listener owns peer_address and the address-
+     *      change detection; QuicConnection owns the wire-
+     *      level challenge/response correlation. Splitting
+     *      it this way keeps the per-path bookkeeping where
+     *      it can see all addresses (the listener) while the
+     *      protocol logic stays with the QUIC stack.
+     */
+    public $pending_path = [];
+    /**
+     * @var array list of 8-byte data values pending an
+     *      outbound PATH_RESPONSE frame. Filled when an
+     *      inbound PATH_CHALLENGE is parsed; drained by
+     *      emit() onto the same path the challenge arrived
+     *      on (so the peer can validate its own path).
+     */
+    public $path_responses_pending = [];
+    /**
      * @var array sequence => cid_bytes for every local CID
      *      we've issued to the peer. Sequence 0 is the
      *      initial $local_cid (set in the constructor);
@@ -4710,6 +4746,34 @@ class QuicConnection
                 case QuicFrame::F_CONNECTION_CLOSE_APP:
                     $this->state = self::ST_CLOSED;
                     return;
+                case QuicFrame::F_PATH_CHALLENGE:
+                    /*
+                        RFC 9000 sec 8.2.2: server MUST echo
+                        the 8-byte data verbatim in a PATH_-
+                        RESPONSE on the same path the
+                        challenge arrived on. Queue here;
+                        emit() encodes the frame.
+                     */
+                    $this->path_responses_pending[] =
+                        $f['data'];
+                    break;
+                case QuicFrame::F_PATH_RESPONSE:
+                    /*
+                        RFC 9000 sec 8.2.2: a PATH_RESPONSE
+                        whose 8-byte data matches a challenge
+                        we sent confirms the alternative path.
+                        Mark the pending entry; the listener
+                        will see this on its next inspection
+                        and perform the peer_address swap +
+                        CC reset.
+                     */
+                    if (!empty($this->pending_path)
+                        && $this->pending_path['challenge']
+                        === $f['data']) {
+                        $this->pending_path[
+                            'response_received'] = true;
+                    }
+                    break;
                 /* All other frame types: silently ignore.
                    They aren't needed to complete a basic
                    handshake. */
@@ -5906,6 +5970,30 @@ class QuicConnection
                 $this->queue1Rtt($payload, $hint);
             }
             $this->new_cids_pending = [];
+        }
+        /*
+            Drain any pending PATH_RESPONSE frames -- one per
+            PATH_CHALLENGE the peer sent us. RFC 9000 sec 8.2:
+            response goes on the same path the challenge
+            arrived on, so we ride the standard 1-RTT queue
+            (the listener uses peer_address for sendto, which
+            is the path the inbound packet came from). Each
+            response is its own packet so the encoded frame
+            type 0x1B carries 8 bytes; trivially fits.
+         */
+        if (!empty($this->path_responses_pending) &&
+            isset($this->keys[self::LEVEL_APPLICATION])) {
+            foreach ($this->path_responses_pending
+                as $data) {
+                $frame = ['type' => QuicFrame::F_PATH_RESPONSE,
+                    'data' => $data];
+                $payload = QuicFrame::encode($frame);
+                $hint = ['ack_eliciting' => true,
+                    'in_flight' => true,
+                    'frames' => [$frame]];
+                $this->queue1Rtt($payload, $hint);
+            }
+            $this->path_responses_pending = [];
         }
         /*
             Discharge any pending ACK obligation in the
@@ -7213,6 +7301,21 @@ class H3Listener extends Listener
      */
     protected $stateless_reset_secret = "";
     /**
+     * @var int total stateless-reset packets emitted in
+     *      response to inbound 1-RTT packets bearing a
+     *      DCID we no longer recognize (RFC 9000 sec 10.3).
+     *      Surfaced for ops debugging via /h3stats; expected
+     *      to stay at zero in healthy steady state.
+     */
+    public $stats_resets_sent = 0;
+    /**
+     * @var int total successful client-initiated migrations:
+     *      a connection's peer_address was switched after
+     *      PATH_RESPONSE confirmed the new path. Surfaced
+     *      via /h3stats for ops debugging.
+     */
+    public $stats_path_migrations = 0;
+    /**
      * @var WebSite|null back-reference to the WebSite that
      *      opened this listener. Set by WebSite::listen()
      *      right after tryOpen() returns. Used by
@@ -7464,11 +7567,29 @@ class H3Listener extends Listener
                 brand-new client Initial this is expected
                 (the DCID is whatever value the client
                 picked before learning ours), so accept it
-                if the packet looks like an Initial; for
-                anything else, drop.
+                if the packet looks like an Initial; for a
+                short-header (1-RTT) packet on an unknown
+                DCID, attempt a stateless reset per RFC
+                9000 sec 10.3 to nudge the peer to give up
+                on a connection we no longer know about.
              */
             if (strlen($buf) < 1 ||
                 (ord($buf[0]) & 0x80) === 0) {
+                $reset = self::buildStatelessReset(
+                    $dcid, $this->stateless_reset_secret,
+                    strlen($buf));
+                if ($reset !== '') {
+                    @stream_socket_sendto($this->server,
+                        $reset, 0, $peer);
+                    $this->stats_resets_sent++;
+                    if (getenv('ATTO_H3_TRACE')) {
+                        error_log(sprintf(
+                            "[H3TRACE]   stateless reset "
+                            . "%dB to %s for DCID %s",
+                            strlen($reset), $peer,
+                            $key_h_dcid));
+                    }
+                }
                 return [null, false];
             }
             $quic = new QuicConnection(
@@ -7517,7 +7638,90 @@ class H3Listener extends Listener
             $is_new = true;
         }
         $h3 = $this->connections[$key_h];
+        /*
+            Detect a peer-address change on an established
+            connection: client migration per RFC 9000 sec 9.
+            If the inbound datagram's source address differs
+            from the one we've recorded and this isn't a
+            brand-new connection, queue a PATH_CHALLENGE on
+            the new path. We continue replying to the old
+            address until the matching PATH_RESPONSE confirms
+            the new path is reachable and not spoofed.
+            Pre-handshake migration isn't supported: only
+            mark a pending path once ST_ESTABLISHED so the
+            challenge has 1-RTT keys to ride. If validation
+            is already in progress for a different alternative,
+            cancel and start fresh against the new address;
+            queueing two challenges simultaneously would
+            cross-validate paths the peer didn't ask about.
+         */
+        if (!$is_new
+            && $h3->isEstablished()
+            && $h3->peer_address !== $peer) {
+            $alt = $h3->quic->pending_path['address'] ?? null;
+            if ($alt !== $peer) {
+                $challenge = random_bytes(8);
+                $h3->quic->pending_path = [
+                    'address' => $peer,
+                    'challenge' => $challenge,
+                    'first_seen' => microtime(true),
+                    'response_received' => false,
+                ];
+                /*
+                    Build a single 1-RTT packet carrying just
+                    the PATH_CHALLENGE frame and send it
+                    directly to the new path. We bypass the
+                    normal emit() queue here because that
+                    queue's sendto target is bound to one
+                    address per call -- the peer_address
+                    we're still validating. A direct send
+                    keeps the contract simple: validated
+                    traffic on the old path, the lone
+                    challenge on the new path.
+                 */
+                $packet =
+                    self::buildPathChallengePacket($h3->quic,
+                        $challenge);
+                if ($packet !== '') {
+                    @stream_socket_sendto($this->server,
+                        $packet, 0, $peer);
+                }
+                if (getenv('ATTO_H3_TRACE')) {
+                    error_log(sprintf(
+                        "[H3TRACE]   path validation start: "
+                        . "old=%s new=%s challenge=%s",
+                        $h3->peer_address, $peer,
+                        bin2hex($challenge)));
+                }
+            }
+        }
         $ok = $h3->quic->processDatagram($buf, $peer);
+        /*
+            If the inbound datagram carried a PATH_RESPONSE
+            that confirmed our pending path, swap the
+            connection's peer_address to the new one and
+            reset RFC 9000 sec 9.4 congestion-control state.
+            cwnd resets to its initial value, bytes_in_flight
+            zeros (the prior counts were against the old path
+            and don't apply to the new one).
+         */
+        if (!empty($h3->quic->pending_path)
+            && !empty(
+                $h3->quic->pending_path['response_received'])) {
+            $new_address = $h3->quic->pending_path['address'];
+            if (getenv('ATTO_H3_TRACE')) {
+                error_log(sprintf(
+                    "[H3TRACE]   path validation done: "
+                    . "swapping peer_address %s -> %s",
+                    $h3->peer_address, $new_address));
+            }
+            $h3->peer_address = $new_address;
+            $h3->quic->congestion_window =
+                QuicConnection::CC_INITIAL_WINDOW_BYTES;
+            $h3->quic->bytes_in_flight = 0;
+            $h3->quic->pending_path = [];
+            $this->stats_path_migrations++;
+        }
         if (!$ok || $h3->isClosed()) {
             unset($this->connections[$key_h]);
             unset($this->last_activity[$key_h]);
@@ -7558,15 +7762,23 @@ class H3Listener extends Listener
             $this->site->transports['h3']
                 ->driveConnection($this, $h3);
         }
-        /* Send any datagrams the QUIC layer has produced. */
+        /* Send any datagrams the QUIC layer has produced.
+           Per RFC 9000 sec 9, replies go to the *validated*
+           peer_address, never to a freshly-observed source
+           that hasn't yet completed PATH_CHALLENGE/PATH_-
+           RESPONSE; sending to an unvalidated address would
+           let an attacker amplify reflected traffic to a
+           victim by spoofing the source. The above
+           address-change branch handles the validation
+           dance separately. */
         foreach ($h3->quic->emit() as $datagram) {
             if (getenv('ATTO_H3_TRACE')) {
                 error_log(sprintf(
                     "[H3TRACE] SEND %dB to %s",
-                    strlen($datagram), $peer));
+                    strlen($datagram), $h3->peer_address));
             }
             @stream_socket_sendto($this->server, $datagram,
-                0, $peer);
+                0, $h3->peer_address);
         }
         /*
             Sync the routing index with the connection's
@@ -7583,6 +7795,50 @@ class H3Listener extends Listener
             $this->cid_index[bin2hex($cid)] = $key_h;
         }
         return [$h3, $is_new];
+    }
+    /**
+     * Builds a single 1-RTT QUIC packet carrying just one
+     * PATH_CHALLENGE frame for the supplied $challenge
+     * (8 random bytes). Used by the address-change branch
+     * to send the challenge directly to a not-yet-validated
+     * peer source address, bypassing the QuicConnection's
+     * normal emit() queue (whose sendto target is one
+     * address per call). Returns the encoded wire bytes,
+     * or '' if 1-RTT keys are not yet available or the
+     * encoding fails.
+     */
+    public static function buildPathChallengePacket($conn,
+        $challenge)
+    {
+        if (!isset($conn->keys[
+                QuicConnection::LEVEL_APPLICATION])) {
+            return '';
+        }
+        $payload = QuicFrame::encode([
+            'type' => QuicFrame::F_PATH_CHALLENGE,
+            'data' => $challenge,
+        ]);
+        $packet = new QuicPacket();
+        $packet->destination_cid = $conn->peer_cid;
+        /*
+            Use a fresh PN from the application space; the
+            packet is real 1-RTT data and the peer will ACK
+            it the same way as any other 1-RTT packet. We
+            do not enter it into sent_packets here (no loss
+            recovery for path probes -- if the peer never
+            sees the challenge, the validation just times
+            out and the migration is abandoned, which is
+            the simplest sound behaviour).
+         */
+        $pn = $conn->next_pn[
+            QuicConnection::LEVEL_APPLICATION]++;
+        $tx = $conn->keys[
+            QuicConnection::LEVEL_APPLICATION]['tx'];
+        $bytes = $packet->encodeShort($tx, $pn, $payload);
+        if ($bytes === false) {
+            return '';
+        }
+        return $bytes;
     }
     /**
      * Peeks the DCID out of a datagram. For long-header
@@ -7611,6 +7867,54 @@ class H3Listener extends Listener
             return false;
         }
         return substr($buf, 1, $short_dcid_len);
+    }
+    /**
+     * Builds a stateless reset packet per RFC 9000 sec 10.3
+     * for $dcid: a short-header-shaped packet whose trailing
+     * 16 bytes are the stateless-reset token derived from
+     * $secret and $dcid (HMAC-SHA256 truncated to 16 bytes,
+     * matching the token we previously gave the peer for any
+     * CID we issued). The leading bytes are random padding
+     * bounded so the reset is shorter than $triggering_len
+     * (RFC 9000 sec 10.3.1: a reset MUST be smaller than the
+     * packet that triggered it, which prevents reset loops).
+     * Returns the wire bytes, or '' if no reset is possible
+     * (no secret available, triggering packet too small to
+     * fit even the minimum 21-byte reset, or HMAC failure).
+     */
+    public static function buildStatelessReset($dcid, $secret,
+        $triggering_len)
+    {
+        if ($secret === '' || strlen($dcid) === 0) {
+            return '';
+        }
+        /*
+            Reset is at most $triggering_len - 1 bytes (so
+            it's strictly smaller) and at most a normal QUIC
+            datagram size. Floor at 21 bytes (1 first-byte +
+            4 random + 16 token, the RFC 9000 fig 16
+            minimum); if the triggering packet is too small,
+            don't reset.
+         */
+        $max_len = min($triggering_len - 1, 1200);
+        if ($max_len < 21) {
+            return '';
+        }
+        $token = substr(hash_hmac('sha256', $dcid, $secret,
+            true), 0, 16);
+        if (strlen($token) !== 16) {
+            return '';
+        }
+        $padding_len = $max_len - 16;
+        /*
+            RFC 9000 sec 10.3 figure 16: first byte must
+            have header form (top bit) clear and fixed bit
+            (second bit) set, so it looks like a 1-RTT
+            packet. The remaining bits are random.
+         */
+        $first = chr((ord(random_bytes(1)) & 0x3f) | 0x40);
+        $padding = $first . random_bytes($padding_len - 1);
+        return $padding . $token;
     }
     /**
      * Tick all live connections: send any queued packets

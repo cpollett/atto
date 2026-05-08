@@ -92,7 +92,6 @@ $conn->sent_packets = [
 $conn->latest_rtt = null;
 
 $rm = $rc->getMethod('processAck');
-$rm->setAccessible(true);
 
 $L = QuicConnection::LEVEL_APPLICATION;
 

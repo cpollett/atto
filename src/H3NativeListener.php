@@ -3938,6 +3938,67 @@ class QuicConnection
      */
     public $latest_rtt = null;
     /**
+     * @var float|null exponentially-smoothed RTT estimate
+     *      per RFC 9002 sec 5.3. First sample seeds the
+     *      EWMA (smoothed_rtt = latest_rtt, rttvar =
+     *      latest_rtt / 2); subsequent samples blend
+     *      latest_rtt at weight 1/8 against the prior
+     *      smoothed_rtt at weight 7/8. Null until the
+     *      first ack-eliciting packet is acknowledged.
+     */
+    public $smoothed_rtt = null;
+    /**
+     * @var float|null RTT variance estimator per RFC 9002
+     *      sec 5.3. Half of latest_rtt on first sample,
+     *      then EWMA at weight 1/4 against |smoothed_rtt -
+     *      latest_rtt|.
+     */
+    public $rttvar = null;
+    /**
+     * @var float|null minimum observed RTT sample. RFC
+     *      9002 sec 5.2: used to clamp ack_delay so a
+     *      misbehaving (or simply long-paused) peer's
+     *      reported ack_delay can't push smoothed_rtt
+     *      below the observed floor.
+     */
+    public $min_rtt = null;
+    /**
+     * @var int RFC 9002 sec 6.2 PTO backoff exponent.
+     *      Reset to 0 on every ACK that acknowledges new
+     *      ack-eliciting packets; doubles each time the
+     *      timer fires without progress. Effective PTO is
+     *      base_pto << pto_count.
+     */
+    public $pto_count = 0;
+    /**
+     * @var float|null microtime(true) at which the
+     *      probe-timeout timer fires. Set whenever there
+     *      is at least one ack-eliciting packet in flight
+     *      and cleared once sent_packets is empty (or all
+     *      remaining entries are non-eliciting). The
+     *      listener's tick loop dispatches
+     *      onLossDetectionTimeout() when now >= this
+     *      value.
+     */
+    public $loss_detection_timer = null;
+    /**
+     * @var float minimum loss-detection granularity per
+     *      RFC 9002 sec A.2 (kGranularity). Clamps the
+     *      4*rttvar term in the PTO formula so very
+     *      small variance estimates don't shrink the PTO
+     *      below useful resolution. Seconds.
+     */
+    const PTO_GRANULARITY_SEC = 0.001;
+    /**
+     * @var float fallback peer max_ack_delay in seconds.
+     *      RFC 9000 sec 18.2: default value when the peer
+     *      does not advertise transport parameter 0x0b.
+     *      We currently use this constant for every peer
+     *      because the H3NativeListener doesn't yet parse
+     *      TP 0x0b out of EncryptedExtensions.
+     */
+    const PEER_MAX_ACK_DELAY_SEC = 0.025;
+    /**
      * @var array level => crypto data byte buffer
      *      (offset => bytes) and next-expected-offset for
      *      in-order delivery to Tls13Engine.
@@ -4907,6 +4968,7 @@ class QuicConnection
         }
         $largest_acked_time = null;
         $largest_was_ack_eliciting = false;
+        $newly_acked_count = 0;
         foreach ($ranges as $r) {
             list($lo, $hi) = $r;
             for ($pn = $hi; $pn >= $lo; $pn--) {
@@ -4922,6 +4984,7 @@ class QuicConnection
                     }
                     unset(
                         $this->sent_packets[$level][$pn]);
+                    $newly_acked_count++;
                 }
             }
         }
@@ -4929,7 +4992,150 @@ class QuicConnection
             $largest_acked_time !== null) {
             $this->latest_rtt = microtime(true) -
                 $largest_acked_time;
+            $this->updateRtt((float) $frame['delay']);
         }
+        if ($newly_acked_count > 0) {
+            /*
+                RFC 9002 sec 6.2.1: progress was made, so
+                reset the PTO backoff and re-arm the timer
+                (it might fire later than before because
+                bytes_in_flight may have shrunk). Phase 11c
+                will also use this hook to declare any
+                packets that are far enough behind the
+                largest acked as lost.
+             */
+            $this->pto_count = 0;
+            $this->setLossDetectionTimer();
+        }
+    }
+    /**
+     * Folds latest_rtt into smoothed_rtt and rttvar per
+     * RFC 9002 sec 5.3. $ack_delay is the peer-reported
+     * delay (in microseconds, scaled by ack_delay_exponent
+     * which defaults to 3 -- so the wire value times 8 is
+     * microseconds; QuicFrame::decodeAck already returns
+     * the raw varint, so we treat it as the encoded form
+     * and multiply by 8 to get microseconds, then convert
+     * to seconds for arithmetic against smoothed_rtt).
+     */
+    protected function updateRtt($ack_delay_raw)
+    {
+        if ($this->latest_rtt === null) {
+            return;
+        }
+        /*
+            ack_delay_exponent default is 3; we don't yet
+            parse a peer override, so ack_delay seconds =
+            ack_delay_raw * 2^3 / 1e6.
+         */
+        $ack_delay_sec = ((float) $ack_delay_raw * 8.0)
+            / 1000000.0;
+        if ($this->min_rtt === null ||
+            $this->latest_rtt < $this->min_rtt) {
+            $this->min_rtt = $this->latest_rtt;
+        }
+        /*
+            RFC 9002 sec 5.3: subtract ack_delay from
+            latest_rtt before folding it in, but only if
+            doing so keeps the result >= min_rtt. This
+            guards against a peer that misreports its delay
+            and would otherwise drag smoothed_rtt below the
+            real floor.
+         */
+        $adjusted = $this->latest_rtt;
+        if ($adjusted >= $this->min_rtt + $ack_delay_sec) {
+            $adjusted -= $ack_delay_sec;
+        }
+        if ($this->smoothed_rtt === null) {
+            /* RFC 9002 sec 5.3: first sample. */
+            $this->smoothed_rtt = $adjusted;
+            $this->rttvar = $adjusted / 2.0;
+            return;
+        }
+        $diff = abs($this->smoothed_rtt - $adjusted);
+        $this->rttvar = 0.75 * $this->rttvar + 0.25 * $diff;
+        $this->smoothed_rtt =
+            0.875 * $this->smoothed_rtt + 0.125 * $adjusted;
+    }
+    /**
+     * Returns the RFC 9002 sec 6.2.1 base PTO duration in
+     * seconds. Uses kInitialRtt (333 ms) before any RTT
+     * sample has been collected. Caller multiplies by
+     * 2^pto_count for backoff.
+     */
+    protected function basePto()
+    {
+        if ($this->smoothed_rtt === null) {
+            /* RFC 9002 sec A.2 kInitialRtt = 333 ms */
+            return 0.333 + self::PEER_MAX_ACK_DELAY_SEC;
+        }
+        $rttvar4 = 4.0 * $this->rttvar;
+        if ($rttvar4 < self::PTO_GRANULARITY_SEC) {
+            $rttvar4 = self::PTO_GRANULARITY_SEC;
+        }
+        return $this->smoothed_rtt + $rttvar4
+            + self::PEER_MAX_ACK_DELAY_SEC;
+    }
+    /**
+     * (Re-)arms the loss-detection timer per RFC 9002 sec
+     * 6.2.2. If there is no ack-eliciting packet in flight
+     * the timer disarms. Otherwise it fires
+     * basePto * 2^pto_count seconds in the future,
+     * measured from the most recent ack-eliciting send.
+     * Phase 11c will replace this with a combined PTO +
+     * loss-time selector once we declare packets lost.
+     */
+    public function setLossDetectionTimer()
+    {
+        $oldest_eliciting_send = null;
+        foreach ($this->sent_packets as $level => $pkts) {
+            foreach ($pkts as $entry) {
+                if (!$entry['ack_eliciting']) {
+                    continue;
+                }
+                if ($oldest_eliciting_send === null ||
+                    $entry['time_sent'] <
+                        $oldest_eliciting_send) {
+                    $oldest_eliciting_send =
+                        $entry['time_sent'];
+                }
+            }
+        }
+        if ($oldest_eliciting_send === null) {
+            $this->loss_detection_timer = null;
+            return;
+        }
+        $pto = $this->basePto() *
+            (1 << $this->pto_count);
+        $this->loss_detection_timer =
+            $oldest_eliciting_send + $pto;
+    }
+    /**
+     * Called by the listener tick loop when the loss-
+     * detection timer expires. Implements RFC 9002 sec
+     * 6.2.4 probe behaviour: send a single ack-eliciting
+     * PING in the application packet number space, double
+     * the backoff exponent, and rearm. Phase 11c will
+     * additionally walk sent_packets here and declare
+     * stale entries lost so their frames can be requeued
+     * for retransmission.
+     */
+    public function onLossDetectionTimeout()
+    {
+        if ($this->loss_detection_timer === null) {
+            return;
+        }
+        if (!isset($this->keys[self::LEVEL_APPLICATION])) {
+            /* Should not happen -- timer is only armed
+               once we have ack-eliciting packets in
+               flight, which implies keys exist -- but
+               guard defensively. */
+            return;
+        }
+        $ping = chr(QuicFrame::F_PING);
+        $this->queue1Rtt($ping);
+        $this->pto_count++;
+        $this->setLossDetectionTimer();
     }
     /**
      * Encrypts and queues a packet for sending. $payload
@@ -4987,6 +5193,9 @@ class QuicConnection
                 'sent_bytes' => strlen($wire),
                 'frames' => $pkt_frames,
             ];
+            if ($pkt_ack_eliciting) {
+                $this->setLossDetectionTimer();
+            }
         }
         $this->send_queue[] = [$level, $wire, 'ready'];
     }
@@ -5123,6 +5332,9 @@ class QuicConnection
                             'sent_bytes' => strlen($bytes),
                             'frames' => $pkt_frames,
                         ];
+                        if ($pkt_ack_eliciting) {
+                            $this->setLossDetectionTimer();
+                        }
                     }
                     /*
                         RFC 9000 sec 12.2: short-header
@@ -5161,6 +5373,9 @@ class QuicConnection
                         'sent_bytes' => strlen($bytes),
                         'frames' => $pkt_frames,
                     ];
+                    if ($pkt_ack_eliciting) {
+                        $this->setLossDetectionTimer();
+                    }
                 }
             }
             $current .= $bytes;
@@ -6582,11 +6797,24 @@ class H3NativeListener extends Listener
      */
     public function tickAllConnections()
     {
+        $now = microtime(true);
         foreach ($this->connections as $kh => $h3) {
             if ($h3->isClosed()) {
                 unset($this->connections[$kh]);
                 unset($this->last_activity[$kh]);
                 continue;
+            }
+            /*
+                Phase 11b: dispatch the loss-detection timer
+                if it has expired. onLossDetectionTimeout()
+                queues a PING and rearms with backoff. This
+                runs before flushStreams so the PING gets
+                included in any datagram emit() builds for
+                this tick.
+             */
+            if ($h3->quic->loss_detection_timer !== null &&
+                $now >= $h3->quic->loss_detection_timer) {
+                $h3->quic->onLossDetectionTimeout();
             }
             /*
                 Drain any STREAM data that didn't fit in the

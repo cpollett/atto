@@ -4109,6 +4109,77 @@ class QuicConnection
      */
     const LOSS_TIME_THRESHOLD = 1.125;
     /**
+     * @var int RFC 9002 sec B.2 kInitialWindow. The
+     *      initial congestion window in bytes; here
+     *      14 * MAX_DATAGRAM_SIZE = 14 * 1200, matching
+     *      the RFC's recommended starting point. Smaller
+     *      values delay cwnd's exit from slow-start;
+     *      larger values invite congestion on bandwidth-
+     *      constrained paths.
+     */
+    const CC_INITIAL_WINDOW_BYTES = 16800;
+    /**
+     * @var int RFC 9002 sec B.2 kMinimumWindow. cwnd
+     *      never falls below this even after loss. Two
+     *      max-datagrams' worth ensures we can always
+     *      send at least one ack-eliciting probe.
+     */
+    const CC_MINIMUM_WINDOW_BYTES = 2400;
+    /**
+     * @var int the maximum-size datagram we transmit, in
+     *      bytes. Used as the MSS in cwnd arithmetic.
+     *      Conservative 1200 since we don't yet probe
+     *      Path MTU and 1200 is the RFC 9000 sec 14.1
+     *      minimum every QUIC implementation must accept.
+     */
+    const CC_MAX_DATAGRAM_BYTES = 1200;
+    /**
+     * @var int RFC 9002 sec B.2 kLossReductionFactor as a
+     *      pair of integers (numerator / denominator) so
+     *      we can multiply cwnd in integer arithmetic.
+     *      0.5 is NewReno's recommended halving.
+     */
+    const CC_LOSS_REDUCTION_NUMERATOR = 1;
+    const CC_LOSS_REDUCTION_DENOMINATOR = 2;
+    /**
+     * @var int total bytes of packets that have been
+     *      handed to the network and are not yet
+     *      acknowledged or declared lost. Bookkeeping
+     *      lives in addToBytesInFlight() /
+     *      removeFromBytesInFlight() which are called from
+     *      every site that adds to or removes from
+     *      sent_packets. emit() consults this against
+     *      congestion_window before encrypting a queued
+     *      payload.
+     */
+    public $bytes_in_flight = 0;
+    /**
+     * @var int RFC 9002 sec 7 congestion window in bytes.
+     *      Starts at CC_INITIAL_WINDOW_BYTES, grows on
+     *      ACK (slow-start while < ssthresh, then linear
+     *      congestion-avoidance), drops to ssthresh on
+     *      declared-lost. Floor at CC_MINIMUM_WINDOW_BYTES.
+     */
+    public $congestion_window = self::CC_INITIAL_WINDOW_BYTES;
+    /**
+     * @var int slow-start threshold. Stays at PHP_INT_MAX
+     *      until first loss event; dropping below pushes
+     *      cwnd updates from exponential to linear. Per
+     *      RFC 9002 sec 7.3 the threshold is set to half
+     *      the in-flight cwnd at the moment of loss.
+     */
+    public $ssthresh = PHP_INT_MAX;
+    /**
+     * @var float|null microtime(true) at which the most
+     *      recent loss event was observed. ACKs that
+     *      acknowledge packets sent before this timestamp
+     *      do NOT grow cwnd (RFC 9002 sec 7.3.2 fast-
+     *      recovery: the connection stays in recovery
+     *      until the largest pre-loss packet is acked).
+     *      Null when not in a recovery period.
+     */
+    public $congestion_recovery_start = null;
+    /**
      * @var array level => crypto data byte buffer
      *      (offset => bytes) and next-expected-offset for
      *      in-order delivery to Tls13Engine.
@@ -5092,6 +5163,12 @@ class QuicConnection
                             $entry['time_sent'];
                         $largest_was_ack_eliciting = true;
                     }
+                    if (!empty($entry['in_flight'])) {
+                        $this->removeFromBytesInFlight(
+                            $entry['sent_bytes']);
+                        $this->onPacketAckedForCwnd(
+                            $entry);
+                    }
                     unset(
                         $this->sent_packets[$level][$pn]);
                     $newly_acked_count++;
@@ -5179,6 +5256,10 @@ class QuicConnection
             if ($time_threshold_lost ||
                 $pn_threshold_lost) {
                 $lost_packets[] = $entry;
+                if (!empty($entry['in_flight'])) {
+                    $this->removeFromBytesInFlight(
+                        $entry['sent_bytes']);
+                }
                 unset($this->sent_packets[$level][$pn]);
                 continue;
             }
@@ -5222,6 +5303,24 @@ class QuicConnection
      */
     protected function onPacketsLost($level, $lost_packets)
     {
+        /*
+            RFC 9002 sec 7.6: the congestion event uses the
+            largest time_sent across the lost batch so an
+            ACK that simultaneously declares many packets
+            lost only triggers ONE cwnd halving. Already-
+            in-recovery duplicates are filtered out by
+            inCongestionRecovery() inside onCongestionEvent.
+         */
+        $latest_lost_time = null;
+        foreach ($lost_packets as $entry) {
+            if ($latest_lost_time === null
+                || $entry['time_sent'] > $latest_lost_time) {
+                $latest_lost_time = $entry['time_sent'];
+            }
+        }
+        if ($latest_lost_time !== null) {
+            $this->onCongestionEvent($latest_lost_time);
+        }
         foreach ($lost_packets as $entry) {
             foreach ($entry['frames'] as $f) {
                 $type = $f['type'];
@@ -5315,6 +5414,107 @@ class QuicConnection
         $this->rttvar = 0.75 * $this->rttvar + 0.25 * $diff;
         $this->smoothed_rtt =
             0.875 * $this->smoothed_rtt + 0.125 * $adjusted;
+    }
+    /**
+     * Adds an in-flight packet's wire size to bytes_in_-
+     * flight. Called from queuePacket() and emit() each
+     * time a packet is encrypted into a sent_packets entry
+     * that has in_flight = true. Pure-ACK packets are not
+     * tracked because they do not consume cwnd per RFC
+     * 9002 sec A.1.
+     */
+    protected function addToBytesInFlight($bytes)
+    {
+        $this->bytes_in_flight += $bytes;
+    }
+    /**
+     * Subtracts a packet's wire size from bytes_in_flight.
+     * Called when a packet is removed from sent_packets,
+     * either because an ACK covered it (processAck) or
+     * because it was declared lost (detectAndRemoveLost-
+     * Packets). Floor at zero in case bookkeeping
+     * disagrees -- safer than letting bytes_in_flight go
+     * negative and gating emit() forever.
+     */
+    protected function removeFromBytesInFlight($bytes)
+    {
+        $this->bytes_in_flight = max(0,
+            $this->bytes_in_flight - $bytes);
+    }
+    /**
+     * Returns true if the packet at $entry was sent during
+     * the current congestion-recovery period and so should
+     * not contribute to cwnd growth on ACK. RFC 9002 sec
+     * 7.3.2: while in recovery, ACKs only exit recovery
+     * once the largest packet sent before recovery is
+     * acked.
+     */
+    protected function inCongestionRecovery($time_sent)
+    {
+        return $this->congestion_recovery_start !== null
+            && $time_sent <= $this->congestion_recovery_start;
+    }
+    /**
+     * Grows cwnd in response to an ACK that newly
+     * acknowledged $newly_acked_bytes worth of in-flight
+     * data. Slow-start while cwnd < ssthresh: cwnd grows
+     * by exactly the bytes acked (exponential per RTT).
+     * Otherwise congestion-avoidance: cwnd grows by
+     * approximately one MSS per RTT, computed as
+     * MSS * acked_bytes / cwnd. Both modes skip packets
+     * sent during the current recovery period.
+     */
+    protected function onPacketAckedForCwnd($entry)
+    {
+        if ($this->inCongestionRecovery($entry['time_sent'])) {
+            return;
+        }
+        if ($this->congestion_window < $this->ssthresh) {
+            /* Slow start. */
+            $this->congestion_window +=
+                $entry['sent_bytes'];
+            return;
+        }
+        /*
+            Congestion avoidance: integer-arithmetic
+            equivalent of cwnd += MSS * acked / cwnd. The
+            CC_MAX_DATAGRAM_BYTES factor and integer
+            division mean very small ACKs may not bump
+            cwnd at all on a given iteration, which is the
+            correct quantization behaviour.
+         */
+        $delta = intdiv(self::CC_MAX_DATAGRAM_BYTES
+            * $entry['sent_bytes'],
+            max(1, $this->congestion_window));
+        $this->congestion_window += $delta;
+    }
+    /**
+     * Halves cwnd in response to a declared-lost packet
+     * and enters a recovery period. Subsequent acks for
+     * packets sent before $time_sent_lost will not grow
+     * cwnd; acks for packets sent after will. Per RFC
+     * 9002 sec 7.6.2 we use the NewReno reduction (cwnd
+     * halved, ssthresh = new cwnd) rather than the
+     * deprecated rate-halving variant.
+     */
+    protected function onCongestionEvent($time_sent_lost)
+    {
+        /*
+            Don't double-react if we're already in recovery
+            from an earlier loss in the same RTT (RFC 9002
+            sec 7.3.2).
+         */
+        if ($this->inCongestionRecovery($time_sent_lost)) {
+            return;
+        }
+        $this->congestion_recovery_start = microtime(true);
+        $halved = intdiv(
+            $this->congestion_window
+            * self::CC_LOSS_REDUCTION_NUMERATOR,
+            self::CC_LOSS_REDUCTION_DENOMINATOR);
+        $this->ssthresh = max($halved,
+            self::CC_MINIMUM_WINDOW_BYTES);
+        $this->congestion_window = $this->ssthresh;
     }
     /**
      * Returns the RFC 9002 sec 6.2.1 base PTO duration in
@@ -5493,6 +5693,7 @@ class QuicConnection
                 'sent_bytes' => strlen($wire),
                 'frames' => $pkt_frames,
             ];
+            $this->addToBytesInFlight(strlen($wire));
             if ($pkt_ack_eliciting) {
                 $this->setLossDetectionTimer();
             }
@@ -5577,21 +5778,22 @@ class QuicConnection
                     $pending_remaining[] = $entry;
                     continue;
                 }
-                $pn = $this->next_pn[$level]++;
                 /*
-                    Phase 11a: classify the unencrypted
-                    payload's frames before we hand it to
-                    encodeShort/encodeLong. Subsequent
-                    phases consume time_sent (RTT smoothing
-                    in 11b), the frames list (loss
-                    retransmission in 11c), and sent_bytes
-                    (congestion-window accounting in 11d).
-                    decodeAll re-parses bytes we just
-                    finished assembling; it is cheap (a
-                    handful of frames per packet at typical
-                    1-RTT sizes) and avoids threading
-                    metadata through every queue1Rtt /
-                    queuePacket call site.
+                    Phase 11e: peek at the payload's frame
+                    set BEFORE consuming a packet number,
+                    so we can gate on cwnd without burning
+                    pn space on packets we end up deferring.
+                    Two extra decodeAll passes per packet is
+                    cheaper than the consequences of pn-
+                    gaps in the sent-packet bookkeeping. Pure-
+                    ACK packets and non-in-flight packets
+                    are exempt from the gate per RFC 9002
+                    sec A.1; we use bytes_in_flight as the
+                    measure and CC_MAX_DATAGRAM_BYTES as a
+                    lower-bound estimate of the encoded
+                    packet size since header-protection adds
+                    a small variable amount we do not yet
+                    know.
                  */
                 list($pkt_frames, $_dec_err) =
                     QuicFrame::decodeAll($bytes);
@@ -5601,19 +5803,20 @@ class QuicConnection
                     if (self::isAckEliciting($pf['type'])) {
                         $pkt_ack_eliciting = true;
                     }
-                    /*
-                        RFC 9002 sec A.1: a packet is "in
-                        flight" if it is ack-eliciting OR
-                        contains PADDING. ACK-only packets
-                        (and the empty connection-close
-                        path) do not consume cwnd.
-                     */
                     if ($pf['type'] !== QuicFrame::F_ACK
                         && $pf['type'] !==
                             QuicFrame::F_ACK_ECN) {
                         $pkt_in_flight = true;
                     }
                 }
+                if ($pkt_in_flight
+                    && $this->bytes_in_flight
+                        + self::CC_MAX_DATAGRAM_BYTES
+                    > $this->congestion_window) {
+                    $pending_remaining[] = $entry;
+                    continue;
+                }
+                $pn = $this->next_pn[$level]++;
                 if ($level === self::LEVEL_APPLICATION) {
                     /* Short-header packet. */
                     $packet = new QuicPacket();
@@ -5632,6 +5835,8 @@ class QuicConnection
                             'sent_bytes' => strlen($bytes),
                             'frames' => $pkt_frames,
                         ];
+                        $this->addToBytesInFlight(
+                            strlen($bytes));
                         if ($pkt_ack_eliciting) {
                             $this->setLossDetectionTimer();
                         }
@@ -5673,6 +5878,8 @@ class QuicConnection
                         'sent_bytes' => strlen($bytes),
                         'frames' => $pkt_frames,
                     ];
+                    $this->addToBytesInFlight(
+                        strlen($bytes));
                     if ($pkt_ack_eliciting) {
                         $this->setLossDetectionTimer();
                     }

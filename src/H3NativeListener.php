@@ -3883,6 +3883,61 @@ class QuicConnection
         self::LEVEL_APPLICATION => false,
     ];
     /**
+     * @var array level => packet_number => entry. Records
+     *      every packet emit() has encrypted and queued
+     *      for sendto, until the peer ACKs it (entry
+     *      removed) or we declare it lost (Phase 11c will
+     *      remove it then too). Each entry is an array:
+     *          'pn'            => int packet number
+     *          'time_sent'     => float microtime(true) at
+     *                             emit time
+     *          'ack_eliciting' => bool whether the packet
+     *                             carries any ack-eliciting
+     *                             frames; non-eliciting
+     *                             packets are tracked for
+     *                             congestion accounting but
+     *                             do not advance loss
+     *                             detection
+     *          'in_flight'     => bool whether the packet
+     *                             counts toward bytes in
+     *                             flight (anything except
+     *                             pure ACK frames; RFC 9002
+     *                             sec A.1 definition)
+     *          'sent_bytes'    => int wire-encoded packet
+     *                             length, summed into
+     *                             bytes_in_flight by
+     *                             Phase 11d congestion
+     *                             control
+     *          'frames'        => array of decoded frame
+     *                             dicts. Phase 11c walks
+     *                             this list when declaring
+     *                             a packet lost so it can
+     *                             requeue the underlying
+     *                             CRYPTO / STREAM bytes for
+     *                             retransmission.
+     *      The map is consumed by processAck (every entry
+     *      whose PN is covered by an arriving ACK frame
+     *      gets removed) and by Phase 11b's PTO timer
+     *      (the oldest unACKed ack-eliciting entry sets
+     *      the loss-detection deadline). Phase 11a (this
+     *      patch) only writes to and reads from the map
+     *      for ACK-driven removal; later phases consume
+     *      the time_sent and frames fields.
+     */
+    public $sent_packets = [
+        self::LEVEL_INITIAL => [],
+        self::LEVEL_HANDSHAKE => [],
+        self::LEVEL_APPLICATION => [],
+    ];
+    /**
+     * @var float|null microtime(true) at which the most
+     *      recently observed largest-acked packet was
+     *      originally sent. Phase 11b folds this into
+     *      smoothed_rtt and rttvar; Phase 11a only
+     *      records it.
+     */
+    public $latest_rtt = null;
+    /**
      * @var array level => crypto data byte buffer
      *      (offset => bytes) and next-expected-offset for
      *      in-order delivery to Tls13Engine.
@@ -4320,9 +4375,7 @@ class QuicConnection
                     break;
                 case QuicFrame::F_ACK:
                 case QuicFrame::F_ACK_ECN:
-                    /* Phase 3: just note them; no real
-                       loss detection / RTT smoothing yet.
-                       Phase 5 will. */
+                    $this->processAck($level, $f);
                     break;
                 case QuicFrame::F_PING:
                 case QuicFrame::F_PADDING:
@@ -4806,6 +4859,79 @@ class QuicConnection
         return QuicFrame::encode($ack);
     }
     /**
+     * Phase 11a: handles an inbound ACK frame at $level.
+     * Removes every ACKed packet number from
+     * $sent_packets[$level] and records latest_rtt as
+     * (now - time_sent of the largest ACKed packet) when
+     * that largest packet was ack-eliciting (RFC 9002 sec
+     * 5.1: only ack-eliciting packets contribute valid
+     * RTT samples). Phase 11b consumes latest_rtt to
+     * smooth RTT and arm the PTO timer; phase 11c will
+     * also use the removal to drive loss detection.
+     */
+    protected function processAck($level, $frame)
+    {
+        $largest = (int) $frame['largest'];
+        $first_range = (int) $frame['first_range'];
+        /*
+            Walk the ACK ranges from highest to lowest
+            packet number per RFC 9000 sec 19.3. The first
+            range covers [largest - first_range, largest];
+            each subsequent (gap, length) entry skips
+            (gap + 1) packet numbers and then acks the next
+            (length + 1) of them.
+         */
+        $cursor = $largest;
+        $ranges = [[$cursor - $first_range, $cursor]];
+        if (!empty($frame['ranges'])) {
+            $cursor = $cursor - $first_range;
+            foreach ($frame['ranges'] as $r) {
+                list($gap, $ack_len) = $r;
+                /* RFC 9000 sec 19.3.1: Smallest = Largest -
+                   ACK Range Length. The next range's
+                   "Largest Acknowledged" is computed as
+                   previous-smallest - gap - 2 because the
+                   gap field is 1 less than the actual gap
+                   size and ranges don't overlap. */
+                $next_largest = $cursor - (int) $gap - 2;
+                $next_smallest = $next_largest -
+                    (int) $ack_len;
+                if ($next_largest < 0 ||
+                    $next_smallest < 0) {
+                    /* Malformed range; stop processing. */
+                    break;
+                }
+                $ranges[] = [$next_smallest, $next_largest];
+                $cursor = $next_smallest;
+            }
+        }
+        $largest_acked_time = null;
+        $largest_was_ack_eliciting = false;
+        foreach ($ranges as $r) {
+            list($lo, $hi) = $r;
+            for ($pn = $hi; $pn >= $lo; $pn--) {
+                if (isset(
+                    $this->sent_packets[$level][$pn])) {
+                    $entry =
+                        $this->sent_packets[$level][$pn];
+                    if ($pn === $largest &&
+                        $entry['ack_eliciting']) {
+                        $largest_acked_time =
+                            $entry['time_sent'];
+                        $largest_was_ack_eliciting = true;
+                    }
+                    unset(
+                        $this->sent_packets[$level][$pn]);
+                }
+            }
+        }
+        if ($largest_was_ack_eliciting &&
+            $largest_acked_time !== null) {
+            $this->latest_rtt = microtime(true) -
+                $largest_acked_time;
+        }
+    }
+    /**
      * Encrypts and queues a packet for sending. $payload
      * is the unprotected frame sequence; we wrap it in a
      * QuicPacket with the right keys and queue the wire
@@ -4828,8 +4954,40 @@ class QuicConnection
                be (the inflation rule is one-way), so we
                leave ours at natural size. */
         }
+        /*
+            Phase 11a: classify the unencrypted payload
+            for sent_packets bookkeeping before we encrypt.
+            See the matching block in emit() for the
+            rationale -- congestion control / loss
+            detection in 11b-d need a packet's frame list
+            and in_flight bytes regardless of whether the
+            packet was encoded here or in emit().
+         */
+        list($pkt_frames, $_dec_err) =
+            QuicFrame::decodeAll($payload);
+        $pkt_ack_eliciting = false;
+        $pkt_in_flight = false;
+        foreach ($pkt_frames as $pf) {
+            if (self::isAckEliciting($pf['type'])) {
+                $pkt_ack_eliciting = true;
+            }
+            if ($pf['type'] !== QuicFrame::F_ACK
+                && $pf['type'] !== QuicFrame::F_ACK_ECN) {
+                $pkt_in_flight = true;
+            }
+        }
         $wire = $packet->encodeLong(
             $this->keys[$level]['tx'], $pn, $payload);
+        if ($pkt_in_flight) {
+            $this->sent_packets[$level][$pn] = [
+                'pn' => $pn,
+                'time_sent' => microtime(true),
+                'ack_eliciting' => $pkt_ack_eliciting,
+                'in_flight' => true,
+                'sent_bytes' => strlen($wire),
+                'frames' => $pkt_frames,
+            ];
+        }
         $this->send_queue[] = [$level, $wire, 'ready'];
     }
     /**
@@ -4911,6 +5069,42 @@ class QuicConnection
                     continue;
                 }
                 $pn = $this->next_pn[$level]++;
+                /*
+                    Phase 11a: classify the unencrypted
+                    payload's frames before we hand it to
+                    encodeShort/encodeLong. Subsequent
+                    phases consume time_sent (RTT smoothing
+                    in 11b), the frames list (loss
+                    retransmission in 11c), and sent_bytes
+                    (congestion-window accounting in 11d).
+                    decodeAll re-parses bytes we just
+                    finished assembling; it is cheap (a
+                    handful of frames per packet at typical
+                    1-RTT sizes) and avoids threading
+                    metadata through every queue1Rtt /
+                    queuePacket call site.
+                 */
+                list($pkt_frames, $_dec_err) =
+                    QuicFrame::decodeAll($bytes);
+                $pkt_ack_eliciting = false;
+                $pkt_in_flight = false;
+                foreach ($pkt_frames as $pf) {
+                    if (self::isAckEliciting($pf['type'])) {
+                        $pkt_ack_eliciting = true;
+                    }
+                    /*
+                        RFC 9002 sec A.1: a packet is "in
+                        flight" if it is ack-eliciting OR
+                        contains PADDING. ACK-only packets
+                        (and the empty connection-close
+                        path) do not consume cwnd.
+                     */
+                    if ($pf['type'] !== QuicFrame::F_ACK
+                        && $pf['type'] !==
+                            QuicFrame::F_ACK_ECN) {
+                        $pkt_in_flight = true;
+                    }
+                }
                 if ($level === self::LEVEL_APPLICATION) {
                     /* Short-header packet. */
                     $packet = new QuicPacket();
@@ -4919,6 +5113,17 @@ class QuicConnection
                     $bytes = $packet->encodeShort(
                         $this->keys[$level]['tx'],
                         $pn, $bytes);
+                    if ($pkt_in_flight) {
+                        $this->sent_packets[$level][$pn] = [
+                            'pn' => $pn,
+                            'time_sent' => microtime(true),
+                            'ack_eliciting' =>
+                                $pkt_ack_eliciting,
+                            'in_flight' => true,
+                            'sent_bytes' => strlen($bytes),
+                            'frames' => $pkt_frames,
+                        ];
+                    }
                     /*
                         RFC 9000 sec 12.2: short-header
                         packets MUST be the last packet in a
@@ -4946,6 +5151,17 @@ class QuicConnection
                 $packet->source_cid = $this->local_cid;
                 $bytes = $packet->encodeLong(
                     $this->keys[$level]['tx'], $pn, $bytes);
+                if ($pkt_in_flight) {
+                    $this->sent_packets[$level][$pn] = [
+                        'pn' => $pn,
+                        'time_sent' => microtime(true),
+                        'ack_eliciting' =>
+                            $pkt_ack_eliciting,
+                        'in_flight' => true,
+                        'sent_bytes' => strlen($bytes),
+                        'frames' => $pkt_frames,
+                    ];
+                }
             }
             $current .= $bytes;
         }

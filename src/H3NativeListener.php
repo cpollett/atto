@@ -7115,6 +7115,31 @@ class H3NativeListener extends Listener
         }
         stream_set_blocking($server, false);
         /*
+            Bump the kernel UDP send buffer if we can.
+            Default Linux net.core.wmem_default is ~208 KiB
+            which is smaller than a typical RFC 9002 cwnd
+            after a few RTTs of slow-start. emit() can hand
+            sendto more bytes than that fit in one go --
+            the kernel silently drops the overflow, which
+            our peer treats as packet loss, which trips
+            NewReno halving and stalls /big throughput. A
+            larger buffer absorbs the bursts. We ask for
+            2 MiB; Linux doubles that internally (man
+            socket(7) SO_SNDBUF) so the effective ceiling
+            is ~4 MiB. socket_import_stream + socket_set_-
+            option is the only way to tune this on a
+            stream_socket_server resource. Best-effort: if
+            the ext/sockets functions aren't compiled in,
+            we proceed with the default buffer.
+         */
+        if (function_exists('socket_import_stream')) {
+            $sock = @socket_import_stream($server);
+            if ($sock !== false && $sock !== null) {
+                @socket_set_option($sock, SOL_SOCKET,
+                    SO_SNDBUF, 2 * 1024 * 1024);
+            }
+        }
+        /*
             Pass the udp:// form to the parent so dashboard
             output ("SERVER listening at ...") shows the real
             transport instead of the tcp:// alias the user

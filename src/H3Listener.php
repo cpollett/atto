@@ -4119,6 +4119,63 @@ class QuicConnection
      */
     public $peer_cid = "";
     /**
+     * @var array sequence => cid_bytes for every local CID
+     *      we've issued to the peer. Sequence 0 is the
+     *      initial $local_cid (set in the constructor);
+     *      additional entries are added as we emit
+     *      NEW_CONNECTION_ID frames after the handshake to
+     *      fill the peer's active_connection_id_limit.
+     *      Entries are removed when the peer sends
+     *      RETIRE_CONNECTION_ID with the matching sequence,
+     *      at which point we top the pool back up.
+     */
+    public $issued_cids = [];
+    /**
+     * @var int sequence number to assign to the next CID we
+     *      issue. Starts at 1 because seq 0 is reserved for
+     *      $local_cid (issued during the handshake via the
+     *      long-header SCID).
+     */
+    public $cid_seq_next = 1;
+    /**
+     * @var int how many CIDs we make active for the peer at
+     *      a time. RFC 9000 sec 18.2 caps the count at the
+     *      peer's active_connection_id_limit transport
+     *      parameter; we top the pool up to that minus 1
+     *      (since seq 0 is the original $local_cid).
+     */
+    public $active_cid_limit_peer = 2;
+    /**
+     * @var array list of [sequence, cid_bytes,
+     *      stateless_reset_token] pending emit() of a
+     *      NEW_CONNECTION_ID frame. fillCidPool() pushes
+     *      onto this; the emit loop drains it into 1-RTT
+     *      packets after ST_ESTABLISHED.
+     */
+    public $new_cids_pending = [];
+    /**
+     * @var string 32-byte secret keying material for
+     *      deriving stateless-reset tokens (RFC 9000 sec
+     *      10.3). Stamped onto the connection by the
+     *      listener at construction time so all connections
+     *      under one listener use the same token derivation
+     *      key. Empty in unit-test contexts; fallback there
+     *      is a random per-call token.
+     */
+    public $stateless_reset_secret = "";
+    /**
+     * @var callable|null callback invoked whenever the peer
+     *      retires one of our local CIDs. Receives the
+     *      retired CID bytes; the listener uses it to drop
+     *      the corresponding routing-table entry. Set by
+     *      the listener at construction time. Stays null
+     *      in unit-test contexts; the protocol logic still
+     *      runs and retireLocalCid() still issues a
+     *      replacement, the listener just doesn't get
+     *      notified.
+     */
+    public $on_cid_retired = null;
+    /**
      * @var string the original DCID the client used on
      *      its first Initial -- this is what derives
      *      Initial keys, and we must echo it as our
@@ -4252,6 +4309,13 @@ class QuicConnection
             8 bytes is the conventional length.
          */
         $this->local_cid = random_bytes(8);
+        /*
+            Sequence 0 in the CID pool is the original CID we
+            generated above; record it now so RETIRE_-
+            CONNECTION_ID(seq=0) can find it later if the
+            peer migrates off this CID first.
+         */
+        $this->issued_cids[0] = $this->local_cid;
         $this->local_transport_params =
             self::buildLocalTransportParams();
         $this->tls = new Tls13Engine($cert_pem, $key_pem,
@@ -4297,6 +4361,14 @@ class QuicConnection
         /* max_idle_timeout in milliseconds */
         $tp .= self::tpVarint(0x03, 1452);
         /* max_udp_payload_size */
+        $tp .= self::tpVarint(0x0e, 4);
+        /*
+            active_connection_id_limit (RFC 9000 sec 18.2).
+            The peer may keep up to this many CIDs active
+            for us at once; we offer 4 so the client has
+            headroom for a couple of NAT rebindings without
+            re-handshaking.
+         */
         return $tp;
     }
     /**
@@ -4529,6 +4601,40 @@ class QuicConnection
                 case QuicFrame::F_HANDSHAKE_DONE:
                 case QuicFrame::F_NEW_CONNECTION_ID:
                 case QuicFrame::F_NEW_TOKEN:
+                    /*
+                        NEW_CONNECTION_ID from the peer adds
+                        to the pool of DCIDs we may use on
+                        outbound packets. atto does not yet
+                        actively migrate (we always reply to
+                        the original $peer_cid), so we
+                        accept the frame -- the peer needs
+                        us to ack it so it can rotate its
+                        own pool -- but discard the values.
+                        Activating peer-side migration is a
+                        follow-up phase.
+                     */
+                    break;
+                case QuicFrame::F_RETIRE_CONNECTION_ID:
+                    /*
+                        Peer is dropping one of the local
+                        CIDs we issued. Remove it from
+                        $issued_cids, tell the listener to
+                        drop its routing entry, and queue
+                        a fresh NEW_CONNECTION_ID to top
+                        the pool back up. RFC 9000 sec
+                        19.16: it's a protocol violation
+                        for the peer to RETIRE a sequence
+                        we never issued, but we tolerate
+                        it (idempotently no-op).
+                     */
+                    $retired_cid = $this->retireLocalCid(
+                        $f['sequence']);
+                    if ($retired_cid !== ''
+                        && $this->on_cid_retired !== null) {
+                        call_user_func(
+                            $this->on_cid_retired,
+                            $retired_cid);
+                    }
                     break;
                 case QuicFrame::F_MAX_DATA:
                     if ($f['value'] >
@@ -4905,6 +5011,20 @@ class QuicConnection
                     $this->peer_initial_max_stream_data_uni
                         = (int) $v;
                     break;
+                case 0x0e:
+                    /*
+                        active_connection_id_limit (RFC 9000
+                        sec 18.2). Minimum legal value is 2.
+                        Caps how many additional CIDs we may
+                        issue to the peer; emit() tops up
+                        the pool to (limit - 1) NEW_CONNEC-
+                        TION_ID frames once ST_ESTABLISHED.
+                     */
+                    if ($v >= 2) {
+                        $this->active_cid_limit_peer =
+                            (int) $v;
+                    }
+                    break;
             }
         }
     }
@@ -5003,6 +5123,73 @@ class QuicConnection
             return "";
         }
         return QuicFrame::encode($ack);
+    }
+    /**
+     * Derives a 16-byte stateless-reset token for a CID per
+     * RFC 9000 sec 10.3. The token is HMAC-SHA256 of the CID
+     * bytes truncated to 16 bytes, keyed by the listener's
+     * stateless-reset secret. The listener stamps the
+     * secret onto the connection at construction; if it's
+     * absent (e.g. a unit test) we fall back to a random
+     * 16-byte token, which is correct as long as the peer
+     * never tries to validate it (atto doesn't currently
+     * generate stateless resets, only emit tokens for the
+     * peer's records).
+     */
+    public function statelessResetToken($cid)
+    {
+        if ($this->stateless_reset_secret !== "") {
+            return substr(hash_hmac('sha256',
+                $cid, $this->stateless_reset_secret, true),
+                0, 16);
+        }
+        return random_bytes(16);
+    }
+    /**
+     * Tops the local CID pool up to the peer's
+     * active_connection_id_limit by minting fresh CIDs and
+     * pushing them onto $new_cids_pending for emit() to
+     * encode as NEW_CONNECTION_ID frames. Called once after
+     * ST_ESTABLISHED and again after each RETIRE_CONNECTION
+     * _ID, so the peer always has spare CIDs available for
+     * migration. Returns the count of CIDs queued by this
+     * call.
+     */
+    public function fillCidPool()
+    {
+        $queued = 0;
+        $target = $this->active_cid_limit_peer;
+        while (count($this->issued_cids) < $target) {
+            $cid = random_bytes(8);
+            $seq = $this->cid_seq_next++;
+            $this->issued_cids[$seq] = $cid;
+            $this->new_cids_pending[] = [
+                'sequence' => $seq,
+                'cid' => $cid,
+                'token' => $this->statelessResetToken($cid),
+            ];
+            $queued++;
+        }
+        return $queued;
+    }
+    /**
+     * Honors a RETIRE_CONNECTION_ID frame from the peer.
+     * Removes the matching sequence from $issued_cids and
+     * tops the pool back up. Returns the retired CID bytes
+     * so the listener can drop its routing-table entry, or
+     * '' if the sequence wasn't issued (which is a protocol
+     * violation but we tolerate it -- the peer may be
+     * retiring a CID we already retired ourselves).
+     */
+    public function retireLocalCid($sequence)
+    {
+        if (!isset($this->issued_cids[$sequence])) {
+            return "";
+        }
+        $cid = $this->issued_cids[$sequence];
+        unset($this->issued_cids[$sequence]);
+        $this->fillCidPool();
+        return $cid;
     }
     /**
      * Phase 11a: handles an inbound ACK frame at $level.
@@ -5191,12 +5378,13 @@ class QuicConnection
      * than copied. We handle CRYPTO (re-emit at original
      * offset), STREAM (same; the peer dedups by stream
      * offset, so a small amount of duplicate transmission is
-     * tolerated rather than per-byte ACK tracking), and
-     * HANDSHAKE_DONE (re-arm the one-shot flag). MAX_DATA /
-     * MAX_STREAM_DATA / MAX_STREAMS_* / NEW_CONNECTION_ID /
-     * RETIRE_CONNECTION_ID are skipped: rare server-initiated
-     * frames whose retransmission a follow-up phase will
-     * either add or document.
+     * tolerated rather than per-byte ACK tracking),
+     * HANDSHAKE_DONE (re-arm the one-shot flag), and
+     * NEW_CONNECTION_ID (re-emit the same frame verbatim per
+     * RFC 9000 sec 13.3). MAX_DATA / MAX_STREAM_DATA /
+     * MAX_STREAMS_* / RETIRE_CONNECTION_ID are skipped: rare
+     * server-initiated frames whose retransmission a follow-
+     * up phase will either add or document.
      */
     protected function onPacketsLost($level, $lost_packets)
     {
@@ -5256,6 +5444,34 @@ class QuicConnection
                     /* Re-arm the one-shot flag so emit()
                        ships HANDSHAKE_DONE again. */
                     $this->handshake_done_sent = false;
+                    continue;
+                }
+                if ($type === QuicFrame::F_NEW_CONNECTION_ID) {
+                    /*
+                        RFC 9000 sec 13.3: NEW_CONNECTION_ID
+                        frames MUST be retransmitted if lost.
+                        The CID and stateless-reset token in
+                        the original frame are still the ones
+                        we want the peer to know -- our
+                        $issued_cids entry hasn't gone
+                        anywhere -- so re-emit the same frame
+                        verbatim. retire_prior_to is preserved
+                        from the original (always 0 in atto's
+                        current emit path).
+                     */
+                    $bytes = QuicFrame::encode([
+                        'type' => QuicFrame::F_NEW_CONNECTION_ID,
+                        'sequence' => $f['sequence'],
+                        'retire_prior_to' =>
+                            $f['retire_prior_to'] ?? 0,
+                        'cid' => $f['cid'],
+                        'stateless_reset_token' =>
+                            $f['stateless_reset_token'],
+                    ]);
+                    $hint = ['ack_eliciting' => true,
+                        'in_flight' => true,
+                        'frames' => [$f]];
+                    $this->queue1Rtt($bytes, $hint);
                     continue;
                 }
                 /* Other frame types fall through silently
@@ -5655,6 +5871,41 @@ class QuicConnection
             $this->handshake_done_sent = true;
             $this->ack_pending[self::LEVEL_APPLICATION] =
                 false;
+            /*
+                Now that we're established and the peer has
+                advertised its active_connection_id_limit,
+                top the local CID pool up to that limit.
+                Each fresh CID emits as a NEW_CONNECTION_ID
+                frame in 1-RTT data so the peer can rotate
+                or migrate without re-handshaking.
+             */
+            $this->fillCidPool();
+        }
+        /*
+            Drain queued NEW_CONNECTION_ID frames into 1-RTT
+            payloads. Each frame goes in its own packet so
+            the peer's ACK granularity is per CID; a packet
+            carrying just one frame stays well under the
+            anti-amp gate's per-packet bound. Frames are
+            ack-eliciting and in_flight per RFC 9002 A.1.
+         */
+        if (!empty($this->new_cids_pending) &&
+            isset($this->keys[self::LEVEL_APPLICATION])) {
+            foreach ($this->new_cids_pending as $entry) {
+                $frame = ['type'
+                    => QuicFrame::F_NEW_CONNECTION_ID,
+                    'sequence' => $entry['sequence'],
+                    'retire_prior_to' => 0,
+                    'cid' => $entry['cid'],
+                    'stateless_reset_token' =>
+                        $entry['token']];
+                $payload = QuicFrame::encode($frame);
+                $hint = ['ack_eliciting' => true,
+                    'in_flight' => true,
+                    'frames' => [$frame]];
+                $this->queue1Rtt($payload, $hint);
+            }
+            $this->new_cids_pending = [];
         }
         /*
             Discharge any pending ACK obligation in the
@@ -6941,6 +7192,27 @@ class H3Listener extends Listener
      */
     public $last_activity = [];
     /**
+     * @var array cid-hex => primary key in $connections.
+     *      Every active local CID for every connection has
+     *      an entry here. The first CID a connection mints
+     *      (sequence 0) keeps its hex as the primary key,
+     *      so $connections[$primary] === the H3Connection
+     *      and $cid_index[$primary] === $primary; later
+     *      CIDs (issued via NEW_CONNECTION_ID) point at the
+     *      same primary, letting the peer use any active
+     *      CID as the DCID on outbound packets without us
+     *      having to scan.
+     */
+    public $cid_index = [];
+    /**
+     * @var string 32-byte secret used to derive stateless
+     *      reset tokens (RFC 9000 sec 10.3) for every CID
+     *      this listener issues. Generated once at tryOpen
+     *      time so all connections under one listener share
+     *      a derivation key.
+     */
+    protected $stateless_reset_secret = "";
+    /**
      * @var WebSite|null back-reference to the WebSite that
      *      opened this listener. Set by WebSite::listen()
      *      right after tryOpen() returns. Used by
@@ -7037,8 +7309,17 @@ class H3Listener extends Listener
             transport instead of the tcp:// alias the user
             wrote in their listen spec.
          */
-        return new self($server, $udp_address, $globals,
+        $listener = new self($server, $udp_address, $globals,
             $cert_pem, $key_pem, ['h3']);
+        /*
+            Generate the per-listener stateless-reset secret
+            once at open time. Every connection under this
+            listener uses it (via $stateless_reset_secret on
+            each QuicConnection) to derive consistent reset
+            tokens for the CIDs it issues.
+         */
+        $listener->stateless_reset_secret = random_bytes(32);
+        return $listener;
     }
     /**
      * Closes the UDP socket and tears down all tracked
@@ -7173,50 +7454,84 @@ class H3Listener extends Listener
             }
             return [null, false];
         }
-        $key_h = bin2hex($dcid);
+        $key_h_dcid = bin2hex($dcid);
         $is_new = false;
-        if (!isset($this->connections[$key_h])) {
+        if (isset($this->cid_index[$key_h_dcid])) {
+            $key_h = $this->cid_index[$key_h_dcid];
+        } else {
             /*
-                Could be a brand-new client Initial whose
-                DCID was the value the client picked, OR a
-                follow-up packet whose DCID is our local_cid
-                from an earlier reply. Look up by local_cid
-                first.
+                The DCID isn't one we recognize. For a
+                brand-new client Initial this is expected
+                (the DCID is whatever value the client
+                picked before learning ours), so accept it
+                if the packet looks like an Initial; for
+                anything else, drop.
              */
-            $existing_h = null;
-            foreach ($this->connections as $kh => $cc) {
-                if ($cc->quic->local_cid === $dcid) {
-                    $existing_h = $kh;
-                    break;
-                }
+            if (strlen($buf) < 1 ||
+                (ord($buf[0]) & 0x80) === 0) {
+                return [null, false];
             }
-            if ($existing_h !== null) {
-                $key_h = $existing_h;
-            } else {
-                /* New connection -- only accept if this is
-                   a long-header Initial. */
-                if (strlen($buf) < 1 ||
-                    (ord($buf[0]) & 0x80) === 0) {
-                    return [null, false];
-                }
-                $quic = new QuicConnection(
-                    $this->cert_pem, $this->key_pem,
-                    $this->alpn_offered);
-                $h3 = new H3Connection($quic,
-                    bin2hex($quic->local_cid), $peer);
-                $h3->listener_name =
-                    $this->globals['SERVER_NAME'] ?? '';
-                $h3->listener_port =
-                    $this->globals['SERVER_PORT'] ?? '';
-                $this->connections[$key_h] = $h3;
-                $is_new = true;
-            }
+            $quic = new QuicConnection(
+                $this->cert_pem, $this->key_pem,
+                $this->alpn_offered);
+            /*
+                Stamp the per-listener stateless-reset
+                secret onto the connection so its
+                statelessResetToken() emits stable,
+                listener-wide consistent tokens; and
+                install the retired-CID callback so the
+                listener's $cid_index drops the entry when
+                the peer retires a CID.
+             */
+            $quic->stateless_reset_secret =
+                $this->stateless_reset_secret;
+            $primary_h = bin2hex($quic->local_cid);
+            $cid_index_ref =& $this->cid_index;
+            $quic->on_cid_retired =
+                function ($retired_cid)
+                    use (&$cid_index_ref, $primary_h) {
+                    $hex = bin2hex($retired_cid);
+                    if ($hex !== $primary_h) {
+                        unset($cid_index_ref[$hex]);
+                    }
+                };
+            $h3 = new H3Connection($quic,
+                $primary_h, $peer);
+            $h3->listener_name =
+                $this->globals['SERVER_NAME'] ?? '';
+            $h3->listener_port =
+                $this->globals['SERVER_PORT'] ?? '';
+            $this->connections[$primary_h] = $h3;
+            /*
+                Register both routing keys in the index:
+                (a) the DCID the client picked for its very
+                first packet, valid until it switches to
+                ours; (b) our generated local_cid which the
+                peer adopts after seeing our reply.
+                Additional CIDs minted later by fillCidPool
+                land in the index via syncCidIndex below.
+             */
+            $this->cid_index[$key_h_dcid] = $primary_h;
+            $this->cid_index[$primary_h] = $primary_h;
+            $key_h = $primary_h;
+            $is_new = true;
         }
         $h3 = $this->connections[$key_h];
         $ok = $h3->quic->processDatagram($buf, $peer);
         if (!$ok || $h3->isClosed()) {
             unset($this->connections[$key_h]);
             unset($this->last_activity[$key_h]);
+            /*
+                Drop every $cid_index entry pointing at
+                this connection so a stray late datagram on
+                a CID we used to recognize doesn't try to
+                route into a dropped connection.
+             */
+            foreach ($this->cid_index as $hex => $primary) {
+                if ($primary === $key_h) {
+                    unset($this->cid_index[$hex]);
+                }
+            }
             return [$h3, false];
         }
         /*
@@ -7252,6 +7567,20 @@ class H3Listener extends Listener
             }
             @stream_socket_sendto($this->server, $datagram,
                 0, $peer);
+        }
+        /*
+            Sync the routing index with the connection's
+            current set of issued CIDs. fillCidPool()
+            populates new entries in $issued_cids; emit()
+            ships them as NEW_CONNECTION_ID frames; we
+            register them here so a future inbound packet
+            using one of them as DCID routes back to this
+            connection. Idempotent across repeated entries
+            and cheap (the set is bounded by
+            active_connection_id_limit, default 4).
+         */
+        foreach ($h3->quic->issued_cids as $cid) {
+            $this->cid_index[bin2hex($cid)] = $key_h;
         }
         return [$h3, $is_new];
     }

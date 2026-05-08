@@ -4025,6 +4025,27 @@ class QuicConnection
     const CC_LOSS_REDUCTION_NUMERATOR = 1;
     const CC_LOSS_REDUCTION_DENOMINATOR = 2;
     /**
+     * @var int RFC 9000 sec 8.1 anti-amplification factor.
+     *      Before path validation, the server MUST NOT send
+     *      more than this many times the bytes received from
+     *      the client. The path is validated implicitly when
+     *      the server receives a Handshake-level packet whose
+     *      AEAD authenticates (only the legitimate client can
+     *      produce one), at which point the cap lifts.
+     */
+    const ANTI_AMP_FACTOR = 3;
+    /**
+     * @var int per-packet overhead headroom for the
+     *      anti-amplification gate. Bounds the difference
+     *      between the unencrypted payload length we have at
+     *      gate time and the encoded wire-packet length
+     *      (header + variable PN + 16-byte AEAD tag). Long-
+     *      header packets carry the largest header so 80 is
+     *      a safe upper bound for any real QUIC v1 packet
+     *      atto produces.
+     */
+    const ANTI_AMP_PACKET_OVERHEAD = 80;
+    /**
      * @var int total bytes of packets that have been
      *      handed to the network and are not yet
      *      acknowledged or declared lost. Bookkeeping
@@ -5589,6 +5610,29 @@ class QuicConnection
         $current = "";
         $pending_remaining = [];
         /*
+            Anti-amplification budget per RFC 9000 sec 8.1.
+            Before the path is validated (handshake-level
+            packet authenticates -> ST_ESTABLISHED), the
+            server may send at most ANTI_AMP_FACTOR times
+            the bytes received from this peer, total. We
+            capture the budget once at the start of emit()
+            and decrement it as packets are added to $out
+            or $current; once exhausted, remaining queued
+            payloads are pushed to $pending_remaining and
+            re-attempted on the next emit() call (which
+            fires after the next inbound datagram grows the
+            budget). After ST_ESTABLISHED the cap no longer
+            applies; we use PHP_INT_MAX as a sentinel so
+            the per-packet gate cheaply short-circuits.
+         */
+        if ($this->state === self::ST_ESTABLISHED) {
+            $amp_budget = PHP_INT_MAX;
+        } else {
+            $amp_budget = self::ANTI_AMP_FACTOR
+                * $this->stats_bytes_received
+                - $this->stats_bytes_sent;
+        }
+        /*
             Queue HANDSHAKE_DONE the first time we hit
             ESTABLISHED. RFC 9001 sec 4.1.2: server must
             send HANDSHAKE_DONE to inform the client that
@@ -5699,6 +5743,23 @@ class QuicConnection
                     $pending_remaining[] = $entry;
                     continue;
                 }
+                /*
+                    Anti-amplification gate (RFC 9000 sec
+                    8.1). $bytes here is the unencrypted
+                    payload; the encoded wire packet adds a
+                    header plus a 16-byte AEAD tag.
+                    ANTI_AMP_PACKET_OVERHEAD bounds that
+                    difference. Defer the entry when the
+                    estimate exceeds the remaining budget;
+                    the budget grows on the next inbound
+                    datagram and the entry retries.
+                 */
+                if (strlen($bytes)
+                        + self::ANTI_AMP_PACKET_OVERHEAD
+                    > $amp_budget) {
+                    $pending_remaining[] = $entry;
+                    continue;
+                }
                 $pn = $this->next_pn[$level]++;
                 if ($level === self::LEVEL_APPLICATION) {
                     /* Short-header packet. */
@@ -5737,6 +5798,7 @@ class QuicConnection
                         $current = "";
                     }
                     $out[] = $bytes;
+                    $amp_budget -= strlen($bytes);
                     continue;
                 }
                 $packet = new QuicPacket();
@@ -5769,6 +5831,7 @@ class QuicConnection
                 }
             }
             $current .= $bytes;
+            $amp_budget -= strlen($bytes);
         }
         if ($current !== '') {
             $out[] = $current;

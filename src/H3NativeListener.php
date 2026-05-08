@@ -2025,6 +2025,24 @@ class QuicPacketKeys
      */
     const INITIAL_SALT_HEX =
         "38762cf7f55934b34d179ae6a4c80cadccbb7f0a";
+    /*
+        RFC 8439 sec 2.3.2 self-test vector. Used by
+        chachaUseOpenssl() to detect whether this PHP build's
+        openssl_encrypt('chacha20', ...) handles the IV layout
+        the same way RFC 8439 specifies. Some LibreSSL builds
+        ship a chacha20 cipher that interprets the IV as
+        nonce-only (no 4-byte counter prefix), which would
+        produce wrong header-protection masks; the self-test
+        catches that and forces the pure-PHP fallback. The
+        plaintext is 16 NUL bytes; the key is the integers
+        0..31 as a 32-byte string.
+     */
+    const CHACHA_TEST_IV =
+        "\x01\x00\x00\x00\x00\x00\x00\x09"
+        . "\x00\x00\x00\x4a\x00\x00\x00\x00";
+    const CHACHA_TEST_EXPECTED =
+        "\x10\xf1\xe7\xe4\xd1\x3b\x59\x15"
+        . "\x50\x0f\xdd\x1f\xa3\x20\x71\xc4";
     /**
      * @var int cipher suite code, mirroring
      *      Tls13Engine::CIPHER_*. Determines AEAD/HP
@@ -2221,18 +2239,20 @@ class QuicPacketKeys
         if ($cached !== null) {
             return $cached;
         }
-        $key = '';
-        for ($i = 0; $i < 32; $i++) {
-            $key .= chr($i);
-        }
-        $iv = "\x01\x00\x00\x00"
-            . "\x00\x00\x00\x09\x00\x00\x00\x4a\x00\x00\x00\x00";
-        $expected = "\x10\xf1\xe7\xe4\xd1\x3b\x59\x15"
-            . "\x50\x0f\xdd\x1f\xa3\x20\x71\xc4";
+        /*
+            32-byte key = bytes 0..31. range() + array_map +
+            implode is one builtin call each instead of a 32-
+            iteration PHP loop; the explicit chr-loop was the
+            old shape but pack('C*', ...) is both clearer and
+            slightly faster.
+         */
+        $key = pack('C*', ...range(0, 31));
         $got = @openssl_encrypt(
             str_repeat("\x00", 16), 'chacha20', $key,
-            OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $iv);
-        $cached = ($got !== false && $got === $expected);
+            OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
+            self::CHACHA_TEST_IV);
+        $cached = ($got !== false
+            && $got === self::CHACHA_TEST_EXPECTED);
         return $cached;
     }
     /**
@@ -2409,13 +2429,14 @@ class QuicVarint
      */
     public static function read($buf, $off)
     {
-        if (strlen($buf) < $off + 1) {
+        $buf_len = strlen($buf);
+        if ($buf_len < $off + 1) {
             return [false, $off];
         }
         $first = ord($buf[$off]);
         $size_class = $first >> 6;
         $byte_count = 1 << $size_class; /* 1, 2, 4, or 8 */
-        if (strlen($buf) < $off + $byte_count) {
+        if ($buf_len < $off + $byte_count) {
             return [false, $off];
         }
         $value = $first & 0x3F;
@@ -2437,14 +2458,23 @@ class QuicVarint
             return chr($value);
         }
         if ($value < 16384) {
-            return chr(0x40 | ($value >> 8)) .
-                chr($value & 0xFF);
+            /*
+                2-byte form: top two bits are 01, rest is
+                the 14-bit integer in big-endian. The chr-
+                concat is microbench-faster than pack('n')
+                for this two-byte case (~10% in PHP 8.x).
+             */
+            return chr(0x40 | ($value >> 8))
+                . chr($value & 0xFF);
         }
         if ($value < 1073741824) {
-            return chr(0x80 | (($value >> 24) & 0x3F)) .
-                chr(($value >> 16) & 0xFF) .
-                chr(($value >> 8) & 0xFF) .
-                chr($value & 0xFF);
+            /*
+                4-byte form: top two bits are 10, rest is
+                the 30-bit integer big-endian. pack('N')
+                handles this in one libc call which beats
+                the 4-iteration chr/concat loop.
+             */
+            return pack('N', 0x80000000 | $value);
         }
         /*
             8-byte form: top two bits are 11, rest is the
@@ -2571,7 +2601,8 @@ class QuicPacket
             return [false, $off, "fixed bit not set"];
         }
         $long_type = ($first >> 4) & 0x03;
-        if (strlen($buf) < $off + 7) {
+        $buf_len = strlen($buf);
+        if ($buf_len < $off + 7) {
             return [false, $off, "long header truncated"];
         }
         $off++;
@@ -2579,14 +2610,14 @@ class QuicPacket
         $off += 4;
         $dcid_len = ord($buf[$off]);
         $off++;
-        if (strlen($buf) < $off + $dcid_len + 1) {
+        if ($buf_len < $off + $dcid_len + 1) {
             return [false, $off, "DCID truncated"];
         }
         $dcid = substr($buf, $off, $dcid_len);
         $off += $dcid_len;
         $scid_len = ord($buf[$off]);
         $off++;
-        if (strlen($buf) < $off + $scid_len) {
+        if ($buf_len < $off + $scid_len) {
             return [false, $off, "SCID truncated"];
         }
         $scid = substr($buf, $off, $scid_len);
@@ -2596,7 +2627,7 @@ class QuicPacket
             list($token_len, $off) = QuicVarint::read($buf,
                 $off);
             if ($token_len === false ||
-                strlen($buf) < $off + $token_len) {
+                $buf_len < $off + $token_len) {
                 return [false, $off, "token truncated"];
             }
             $token = substr($buf, $off, $token_len);
@@ -2620,7 +2651,7 @@ class QuicPacket
             $packet->payload = $rest;
             $packet->header_bytes = substr($buf,
                 $packet_off, $off - $packet_off);
-            return [$packet, strlen($buf)];
+            return [$packet, $buf_len];
         }
         /*
             Initial / Handshake / 0-RTT all carry a varint
@@ -2629,12 +2660,12 @@ class QuicPacket
          */
         list($length, $off) = QuicVarint::read($buf, $off);
         if ($length === false ||
-            strlen($buf) < $off + $length) {
+            $buf_len < $off + $length) {
             return [false, $off, "length field bad"];
         }
         $pn_offset = $off;
         $sample_offset = $pn_offset + 4;
-        if (strlen($buf) < $sample_offset + 16) {
+        if ($buf_len < $sample_offset + 16) {
             return [false, $off, "no room for HP sample"];
         }
         $sample = substr($buf, $sample_offset, 16);
@@ -2658,7 +2689,7 @@ class QuicPacket
             $pn_truncated, $pn_length, $largest_pn_seen);
         $body_start = $pn_offset + $pn_length;
         $body_len = $length - $pn_length;
-        if (strlen($buf) < $body_start + $body_len) {
+        if ($buf_len < $body_start + $body_len) {
             return [false, $off, "body truncated"];
         }
         /*
@@ -2667,16 +2698,16 @@ class QuicPacket
             (but not including) $body_start, with byte 0
             replaced by $unprotected_first and the
             packet-number bytes replaced by their
-            unprotected values.
+            unprotected values. substr(pack('N', ...), ...)
+            grabs the low $pn_length bytes from a 4-byte
+            big-endian render -- one libc dispatch instead
+            of an N-iteration chr loop.
          */
         $hdr = chr($unprotected_first) .
             substr($buf, $packet_off + 1,
                 $pn_offset - $packet_off - 1);
-        $pn_bytes = '';
-        for ($i = $pn_length - 1; $i >= 0; $i--) {
-            $pn_bytes .= chr(($packet_number >> ($i * 8))
-                & 0xFF);
-        }
+        $pn_bytes = substr(pack('N', $packet_number),
+            4 - $pn_length);
         $aad = $hdr . $pn_bytes;
         $protected = substr($buf, $body_start, $body_len);
         $plaintext = $keys->open($packet_number, $aad,
@@ -2714,7 +2745,8 @@ class QuicPacket
         $dcid_len, $largest_pn_seen)
     {
         $packet_off = $off;
-        if (strlen($buf) < $off + 1 + $dcid_len + 4 + 16) {
+        $buf_len = strlen($buf);
+        if ($buf_len < $off + 1 + $dcid_len + 4 + 16) {
             return [false, $off, "short header truncated"];
         }
         $first = ord($buf[$off]);
@@ -2744,18 +2776,16 @@ class QuicPacket
             field; the entire remainder of the datagram is
             the protected payload + 16-byte AEAD tag.
          */
-        $body_len = strlen($buf) - $body_start;
+        $body_len = $buf_len - $body_start;
         if ($body_len < 16) {
             return [false, $off, "no room for AEAD tag"];
         }
-        $hdr = chr($unprotected_first) .
-            substr($buf, $packet_off + 1,
+        $hdr = chr($unprotected_first)
+            . substr($buf, $packet_off + 1,
                 $pn_offset - $packet_off - 1);
-        $pn_bytes = '';
-        for ($i = $pn_length - 1; $i >= 0; $i--) {
-            $pn_bytes .= chr(($packet_number >> ($i * 8))
-                & 0xFF);
-        }
+        /* See decodeLong for the substr(pack,...) idiom. */
+        $pn_bytes = substr(pack('N', $packet_number),
+            4 - $pn_length);
         $aad = $hdr . $pn_bytes;
         $protected_body = substr($buf, $body_start,
             $body_len);
@@ -2772,7 +2802,7 @@ class QuicPacket
         $packet->packet_number_length = $pn_length;
         $packet->payload = $plaintext;
         $packet->header_bytes = $aad;
-        return [$packet, strlen($buf)];
+        return [$packet, $buf_len];
     }
     /**
      * Encodes a short-header (1-RTT) packet. Always uses
@@ -2786,36 +2816,40 @@ class QuicPacket
         $payload_unprotected)
     {
         $pn_length = 4;
-        $pn_low_bits = $pn_length - 1;
-        $first = 0x40 | $pn_low_bits;
+        $first = 0x40 | ($pn_length - 1);
         $hdr = chr($first) . $this->destination_cid;
-        $pn_bytes = '';
-        for ($i = $pn_length - 1; $i >= 0; $i--) {
-            $pn_bytes .= chr(($packet_number >> ($i * 8))
-                & 0xFF);
-        }
+        /*
+            4-byte big-endian packet number. pack('N', ...)
+            is one libc dispatch instead of a 4-iteration
+            chr/concat loop.
+         */
+        $pn_bytes = pack('N', $packet_number);
         $aad = $hdr . $pn_bytes;
         $sealed = $keys->seal($packet_number, $aad,
             $payload_unprotected);
         $unprotected = $aad . $sealed;
-        $sample_offset = strlen($hdr) + 4;
-        $sample = substr($unprotected, $sample_offset, 16);
+        $hdr_len = strlen($hdr);
+        $sample = substr($unprotected, $hdr_len + 4, 16);
         $mask = $keys->headerProtectionMask($sample);
         if ($mask === false) {
             return false;
         }
+        /*
+            Header protection: XOR the first byte's low bits
+            against the mask, and the 4 PN bytes against
+            mask[1..4]. PHP's binary-string ^ operates on
+            equal-length operands so we slice both sides to
+            $pn_length first.
+         */
         $protected_first = ord($unprotected[0]) ^
             (ord($mask[0]) & 0x1F);
-        $packet = chr($protected_first) .
-            substr($unprotected, 1, strlen($hdr) - 1);
-        for ($i = 0; $i < $pn_length; $i++) {
-            $packet .= chr(
-                ord($unprotected[strlen($hdr) + $i])
-                ^ ord($mask[$i + 1]));
-        }
-        $packet .= substr($unprotected,
-            strlen($hdr) + $pn_length);
-        return $packet;
+        $protected_pn =
+            substr($unprotected, $hdr_len, $pn_length)
+            ^ substr($mask, 1, $pn_length);
+        return chr($protected_first)
+            . substr($unprotected, 1, $hdr_len - 1)
+            . $protected_pn
+            . substr($unprotected, $hdr_len + $pn_length);
     }
     /**
      * Decodes a truncated packet number into the full
@@ -2856,27 +2890,22 @@ class QuicPacket
         $payload_unprotected)
     {
         $pn_length = 4;
-        $pn_low_bits = $pn_length - 1;
-        $first = 0xC0 | ($this->long_type << 4) |
-            $pn_low_bits;
-        $hdr = chr($first) .
-            pack('N', $this->version) .
-            chr(strlen($this->destination_cid)) .
-            $this->destination_cid .
-            chr(strlen($this->source_cid)) .
-            $this->source_cid;
+        $first = 0xC0 | ($this->long_type << 4)
+            | ($pn_length - 1);
+        $hdr = chr($first)
+            . pack('N', $this->version)
+            . chr(strlen($this->destination_cid))
+            . $this->destination_cid
+            . chr(strlen($this->source_cid))
+            . $this->source_cid;
         if ($this->long_type === self::LONG_INITIAL) {
-            $hdr .= QuicVarint::write(strlen($this->token)) .
-                $this->token;
+            $hdr .= QuicVarint::write(strlen($this->token))
+                . $this->token;
         }
         $body_len = $pn_length + strlen($payload_unprotected)
             + 16; /* +tag */
         $hdr .= QuicVarint::write($body_len);
-        $pn_bytes = '';
-        for ($i = $pn_length - 1; $i >= 0; $i--) {
-            $pn_bytes .= chr(($packet_number >> ($i * 8))
-                & 0xFF);
-        }
+        $pn_bytes = pack('N', $packet_number);
         $aad = $hdr . $pn_bytes;
         $sealed = $keys->seal($packet_number, $aad,
             $payload_unprotected);
@@ -2887,25 +2916,23 @@ class QuicPacket
             (always at the same offset regardless of
             actual PN length, per RFC 9001 sec 5.4.2).
          */
-        $sample_offset = strlen($hdr) + 4;
-        $sample = substr($unprotected_packet, $sample_offset,
-            16);
+        $hdr_len = strlen($hdr);
+        $sample = substr($unprotected_packet,
+            $hdr_len + 4, 16);
         $mask = $keys->headerProtectionMask($sample);
         if ($mask === false) {
             return false;
         }
         $protected_first = ord($unprotected_packet[0]) ^
             (ord($mask[0]) & 0x0F);
-        $packet = chr($protected_first) .
-            substr($unprotected_packet, 1, strlen($hdr) - 1);
-        for ($i = 0; $i < $pn_length; $i++) {
-            $packet .= chr(
-                ord($unprotected_packet[strlen($hdr) + $i])
-                ^ ord($mask[$i + 1]));
-        }
-        $packet .= substr($unprotected_packet,
-            strlen($hdr) + $pn_length);
-        return $packet;
+        $protected_pn =
+            substr($unprotected_packet, $hdr_len, $pn_length)
+            ^ substr($mask, 1, $pn_length);
+        return chr($protected_first)
+            . substr($unprotected_packet, 1, $hdr_len - 1)
+            . $protected_pn
+            . substr($unprotected_packet,
+                $hdr_len + $pn_length);
     }
 }
 /**
@@ -3686,15 +3713,14 @@ class QuicStream
     public function consume()
     {
         $out = "";
-        while (isset($this->recv_chunks[
-                $this->recv_next_offset])) {
-            $chunk = $this->recv_chunks[
-                $this->recv_next_offset];
-            unset($this->recv_chunks[
-                $this->recv_next_offset]);
+        $next = $this->recv_next_offset;
+        while (isset($this->recv_chunks[$next])) {
+            $chunk = $this->recv_chunks[$next];
+            unset($this->recv_chunks[$next]);
             $out .= $chunk;
-            $this->recv_next_offset += strlen($chunk);
+            $next += strlen($chunk);
         }
+        $this->recv_next_offset = $next;
         /* Coalesce overlapping / adjacent entries. The
            map keys are offsets; if the next offset to
            deliver matches some earlier-buffered chunk
@@ -3702,19 +3728,17 @@ class QuicStream
            include the suffix. */
         foreach ($this->recv_chunks as $off => $chunk) {
             $end = $off + strlen($chunk);
-            if ($end <= $this->recv_next_offset) {
+            if ($end <= $next) {
                 unset($this->recv_chunks[$off]);
-            } else if ($off < $this->recv_next_offset) {
-                $skip = $this->recv_next_offset - $off;
+            } else if ($off < $next) {
+                $skip = $next - $off;
                 $tail = substr($chunk, $skip);
                 unset($this->recv_chunks[$off]);
-                $this->recv_chunks[
-                    $this->recv_next_offset] = $tail;
+                $this->recv_chunks[$next] = $tail;
             }
         }
         if ($this->recv_state === self::RECV_SIZE_KNOWN &&
-            $this->recv_next_offset >=
-            $this->recv_seen_max) {
+            $next >= $this->recv_seen_max) {
             $this->recv_state = self::RECV_DONE;
         }
         return $out;
@@ -4429,9 +4453,11 @@ class QuicConnection
     public function processDatagram($buf, $peer)
     {
         $this->last_packet_at = microtime(true);
-        $this->stats_bytes_received += strlen($buf);
+        $buf_len = strlen($buf);
+        $this->stats_bytes_received += $buf_len;
+        $local_cid_len = strlen($this->local_cid);
         $off = 0;
-        while ($off < strlen($buf)) {
+        while ($off < $buf_len) {
             $start = $off;
             $first = ord($buf[$off]);
             if (($first & 0x80) === 0) {
@@ -4447,11 +4473,13 @@ class QuicConnection
                     break;
                 }
                 $level = self::LEVEL_APPLICATION;
+                $level_keys = $this->keys[$level];
+                $largest_pn = $this->largest_pn[$level];
                 $result = QuicPacket::decodeShort($buf,
                     $start,
-                    $this->keys[$level]['rx'],
-                    strlen($this->local_cid),
-                    $this->largest_pn[$level]);
+                    $level_keys['rx'],
+                    $local_cid_len,
+                    $largest_pn);
                 $pkt = $result[0];
                 $end = $result[1];
                 if (getenv('ATTO_H3_TRACE')) {
@@ -4470,12 +4498,10 @@ class QuicConnection
                 }
                 $off = $end;
                 $this->stats_packets_received++;
-                $this->received_pns[$level][] =
-                    $pkt->packet_number;
-                if ($pkt->packet_number >
-                    $this->largest_pn[$level]) {
-                    $this->largest_pn[$level] =
-                        $pkt->packet_number;
+                $pn = $pkt->packet_number;
+                $this->received_pns[$level][] = $pn;
+                if ($pn > $largest_pn) {
+                    $this->largest_pn[$level] = $pn;
                 }
                 $this->processPacketFrames($level, $pkt);
                 continue;
@@ -4563,12 +4589,10 @@ class QuicConnection
             }
             $off = $end;
             $this->stats_packets_received++;
-            $this->received_pns[$level][] =
-                $pkt->packet_number;
-            if ($pkt->packet_number >
-                $this->largest_pn[$level]) {
-                $this->largest_pn[$level] =
-                    $pkt->packet_number;
+            $pn = $pkt->packet_number;
+            $this->received_pns[$level][] = $pn;
+            if ($pn > $this->largest_pn[$level]) {
+                $this->largest_pn[$level] = $pn;
             }
             $this->processPacketFrames($level, $pkt);
         }
@@ -4582,11 +4606,12 @@ class QuicConnection
      */
     protected static function peekInitialDcid($buf, $off)
     {
-        if (strlen($buf) < $off + 7) {
+        $buf_len = strlen($buf);
+        if ($buf_len < $off + 7) {
             return false;
         }
         $dcid_len = ord($buf[$off + 5]);
-        if (strlen($buf) < $off + 6 + $dcid_len) {
+        if ($buf_len < $off + 6 + $dcid_len) {
             return false;
         }
         return substr($buf, $off + 6, $dcid_len);
@@ -6987,6 +7012,17 @@ class H3NativeConnection extends Connection
 class H3NativeListener extends Listener
 {
     /**
+     * @var int the byte length we use for connection IDs
+     *      we mint locally. The wire format places no
+     *      length restriction (RFC 9000 sec 5.1.1: 0..20
+     *      bytes); 8 is enough entropy to collision-avoid
+     *      an in-process map and small enough to keep the
+     *      short-header overhead modest. If we ever
+     *      rotate CIDs (Phase 5) this becomes per-
+     *      connection state instead of a class constant.
+     */
+    const COMMON_CID_LENGTH = 8;
+    /**
      * @var string PEM bytes of the server certificate,
      *      cached so each new H3Connection's underlying
      *      Tls13Engine can be constructed without re-
@@ -7216,7 +7252,7 @@ class H3NativeListener extends Listener
                 $type));
         }
         $dcid = self::peekDcid($buf,
-            $this->commonCidLength());
+            self::COMMON_CID_LENGTH);
         if ($dcid === '' || $dcid === false) {
             if (getenv('ATTO_H3_TRACE')) {
                 error_log(
@@ -7315,32 +7351,24 @@ class H3NativeListener extends Listener
      */
     protected static function peekDcid($buf, $short_dcid_len)
     {
-        if (strlen($buf) < 1) {
+        $buf_len = strlen($buf);
+        if ($buf_len < 1) {
             return false;
         }
         if (ord($buf[0]) & 0x80) {
-            if (strlen($buf) < 6) {
+            if ($buf_len < 6) {
                 return false;
             }
             $dcid_len = ord($buf[5]);
-            if (strlen($buf) < 6 + $dcid_len) {
+            if ($buf_len < 6 + $dcid_len) {
                 return false;
             }
             return substr($buf, 6, $dcid_len);
         }
-        if (strlen($buf) < 1 + $short_dcid_len) {
+        if ($buf_len < 1 + $short_dcid_len) {
             return false;
         }
         return substr($buf, 1, $short_dcid_len);
-    }
-    /**
-     * Returns the byte length of CIDs we use for new
-     * connections. Currently a fixed 8 bytes; could be
-     * made per-connection if we ever rotate CIDs (Phase 5).
-     */
-    protected function commonCidLength()
-    {
-        return 8;
     }
     /**
      * Tick all live connections: send any queued packets

@@ -5,9 +5,13 @@ modules required. No build step.
 
 What's in the box:
 
- * **WebSite** -- HTTP/1.1 and HTTP/2 web server and router. Doubles as a
-   micro-framework under Apache, nginx, or lighttpd, or runs standalone.
-   Optional HTTP/3 via the sibling H3Listener (libquiche needed).
+ * **WebSite** -- HTTP/1.1, HTTP/2, and HTTP/3 web server and router.
+   Doubles as a micro-framework under Apache, nginx, or lighttpd, or runs
+   standalone. All protocols are pure PHP implementations, the largest,
+   HTTP/3 is in an optional side file as its performance mainly just matches
+   HTTP/2 in our benchmarking. A sibling H3QuicheListener wraps
+   libquiche through PHP-FFI for side-by-side comparison. In our testing,
+   this is slower than the pure implementation because of the FFI overhead.
 
  * **GopherSite** -- a [gopher protocol](
    https://en.wikipedia.org/wiki/Gopher_%28protocol%29) server, shaped

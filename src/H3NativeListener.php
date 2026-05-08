@@ -5772,41 +5772,48 @@ class QuicConnection
                 false;
         }
         foreach ($this->send_queue as $entry) {
-            list($level, $bytes, $status) = $entry;
+            $level = $entry[0];
+            $bytes = $entry[1];
+            $status = $entry[2];
+            $hint = $entry[3] ?? null;
             if ($status === 'pending') {
                 if (!isset($this->keys[$level])) {
                     $pending_remaining[] = $entry;
                     continue;
                 }
                 /*
-                    Phase 11e: peek at the payload's frame
-                    set BEFORE consuming a packet number,
-                    so we can gate on cwnd without burning
-                    pn space on packets we end up deferring.
-                    Two extra decodeAll passes per packet is
-                    cheaper than the consequences of pn-
-                    gaps in the sent-packet bookkeeping. Pure-
-                    ACK packets and non-in-flight packets
-                    are exempt from the gate per RFC 9002
-                    sec A.1; we use bytes_in_flight as the
-                    measure and CC_MAX_DATAGRAM_BYTES as a
-                    lower-bound estimate of the encoded
-                    packet size since header-protection adds
-                    a small variable amount we do not yet
-                    know.
+                    Classify the payload. Callers who built
+                    the payload from a single known frame
+                    (the dominant case: flushStreams
+                    queueing one STREAM frame per packet)
+                    pass a $hint that gives us the answer
+                    in O(1). Otherwise we decodeAll the
+                    payload back -- a hot-path fallback
+                    that costs ~1.8 µs per packet and adds
+                    up over a 1 MiB response shipped in
+                    ~950 packets.
                  */
-                list($pkt_frames, $_dec_err) =
-                    QuicFrame::decodeAll($bytes);
-                $pkt_ack_eliciting = false;
-                $pkt_in_flight = false;
-                foreach ($pkt_frames as $pf) {
-                    if (self::isAckEliciting($pf['type'])) {
-                        $pkt_ack_eliciting = true;
-                    }
-                    if ($pf['type'] !== QuicFrame::F_ACK
-                        && $pf['type'] !==
-                            QuicFrame::F_ACK_ECN) {
-                        $pkt_in_flight = true;
+                if ($hint !== null) {
+                    $pkt_frames = $hint['frames'];
+                    $pkt_ack_eliciting =
+                        $hint['ack_eliciting'];
+                    $pkt_in_flight = $hint['in_flight'];
+                } else {
+                    list($pkt_frames, $_dec_err) =
+                        QuicFrame::decodeAll($bytes);
+                    $pkt_ack_eliciting = false;
+                    $pkt_in_flight = false;
+                    foreach ($pkt_frames as $pf) {
+                        if (self::isAckEliciting(
+                            $pf['type'])) {
+                            $pkt_ack_eliciting = true;
+                        }
+                        if ($pf['type']
+                                !== QuicFrame::F_ACK
+                            && $pf['type']
+                                !== QuicFrame::F_ACK_ECN) {
+                            $pkt_in_flight = true;
+                        }
                     }
                 }
                 if ($pkt_in_flight
@@ -5911,18 +5918,54 @@ class QuicConnection
         return $out;
     }
     /**
-     * Queues a payload (sequence of QUIC frames) for
-     * emission as a 1-RTT packet. Actual encoding + AEAD
-     * happens lazily inside emit() once the queue is
-     * flushed.
+     * Queues a 1-RTT payload (one or more frames already
+     * encoded into wire bytes) for emission on the next
+     * emit() call. Actual AEAD + header-protection happens
+     * lazily inside emit() once the queue is flushed.
+     *
+     * The optional $hint allows callers that already know
+     * the frame contents to skip emit()'s decode-classify
+     * pass. The hint shape is:
+     *     ['ack_eliciting' => bool, 'in_flight' => bool,
+     *      'frames' => array of decoded-frame dicts]
+     * frames is consumed by Phase 11c retransmission so it
+     * needs to be the same shape as QuicFrame::decodeAll
+     * would produce -- the helper singleFrameHint() builds
+     * it cheaply for the common single-frame case.
      */
-    public function queue1Rtt($payload)
+    public function queue1Rtt($payload, $hint = null)
     {
         if ($payload === '') {
             return;
         }
+        if ($hint === null) {
+            $this->send_queue[] = [self::LEVEL_APPLICATION,
+                $payload, 'pending'];
+            return;
+        }
         $this->send_queue[] = [self::LEVEL_APPLICATION,
-            $payload, 'pending'];
+            $payload, 'pending', $hint];
+    }
+    /**
+     * Builds a queue1Rtt hint for a payload that contains
+     * exactly one frame whose decoded form is already in
+     * hand. Cheap (no decode) and lets callers like
+     * flushStreams skip emit()'s decodeAll pass entirely
+     * for the dominant STREAM-frame-per-packet case.
+     *
+     * @param array $frame already-decoded frame dict
+     */
+    public static function singleFrameHint($frame)
+    {
+        $type = $frame['type'];
+        $ack_eliciting = self::isAckEliciting($type);
+        $in_flight = ($type !== QuicFrame::F_ACK
+            && $type !== QuicFrame::F_ACK_ECN);
+        return [
+            'ack_eliciting' => $ack_eliciting,
+            'in_flight' => $in_flight,
+            'frames' => [$frame],
+        ];
     }
     /**
      * Convenience: write data to a QUIC stream and
@@ -6019,14 +6062,16 @@ class QuicConnection
                 if ($data === '' && !$fin) {
                     break;
                 }
-                $frame = QuicFrame::encode([
+                $stream_frame = [
                     'type' => QuicFrame::F_STREAM_BASE,
                     'stream_id' => $sid,
                     'offset' => $offset,
                     'data' => $data,
                     'fin' => $fin,
-                ]);
-                $this->queue1Rtt($frame);
+                ];
+                $frame = QuicFrame::encode($stream_frame);
+                $this->queue1Rtt($frame,
+                    self::singleFrameHint($stream_frame));
                 $sent += strlen($data);
             }
             if ($stream->hasPendingSend()) {

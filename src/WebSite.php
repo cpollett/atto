@@ -1709,32 +1709,32 @@ class WebSite
             }
             $merged_context = array_replace_recursive($shared_context,
                 $spec_context);
-            if ($spec_protocol === 'h3-native'
-                || $spec_protocol === 'h3') {
+            if ($spec_protocol === 'h3'
+                || $spec_protocol === 'h3-quiche') {
                 /*
                     H3 listener. Two implementations are
-                    available: 'h3' loads the libquiche-FFI
-                    H3Listener, 'h3-native' loads the pure-PHP
-                    H3NativeListener. The two listeners coexist
-                    -- both define tryOpen() / accept() /
-                    nextTimeoutMillis() / tickAllConnections()
-                    so the event loop drives them
-                    interchangeably below via duck-typing on
-                    those method names.
+                    available: 'h3' loads the pure-PHP
+                    H3Listener, 'h3-quiche' loads the
+                    libquiche-FFI H3QuicheListener. The two
+                    listeners coexist -- both define
+                    tryOpen() / accept() / nextTimeoutMillis()
+                    / tickAllConnections() so the event loop
+                    drives them interchangeably below via
+                    duck-typing on those method names.
 
                     Either implementation may be unavailable:
-                    'h3' needs FFI + libquiche, 'h3-native'
+                    'h3-quiche' needs FFI + libquiche, 'h3'
                     only needs ext-openssl + ext-sodium and
                     optionally ext-gmp for RSA certs. Both
                     fall through quietly when the optional
                     pieces are missing.
                  */
-                $is_native = ($spec_protocol === 'h3-native');
-                $cls = $is_native
-                    ? '\seekquarry\atto\H3NativeListener'
+                $is_quiche = ($spec_protocol === 'h3-quiche');
+                $cls = $is_quiche
+                    ? '\seekquarry\atto\H3QuicheListener'
                     : '\seekquarry\atto\H3Listener';
-                $file = $is_native
-                    ? 'H3NativeListener.php'
+                $file = $is_quiche
+                    ? 'H3QuicheListener.php'
                     : 'H3Listener.php';
                 if (!class_exists($cls, false)) {
                     $h3_path = __DIR__ . '/' . $file;
@@ -1817,10 +1817,10 @@ class WebSite
             $this->transports['h3'] = new H3Transport($this);
         }
         if (class_exists(
-                '\seekquarry\atto\H3NativeTransport',
+                '\seekquarry\atto\H3QuicheTransport',
                 false)) {
-            $this->transports['h3-native'] =
-                new H3NativeTransport($this);
+            $this->transports['h3-quiche'] =
+                new H3QuicheTransport($this);
         }
         foreach ($opened as $entry) {
             $server = $entry->server;
@@ -1879,8 +1879,8 @@ class WebSite
                 /*
                     Duck-type any UDP-driven listener that
                     exposes nextTimeoutMillis(). Both
-                    H3Listener (FFI) and H3NativeListener
-                    (pure-PHP) define the method.
+                    H3Listener (pure-PHP) and H3QuicheListener
+                    (FFI) define the method.
                  */
                 if (method_exists($listener_entry,
                         'nextTimeoutMillis')) {
@@ -2533,7 +2533,7 @@ class WebSite
             return;
         }
         if ($connection->protocol === 'h3' ||
-            $connection->protocol === 'h3-native') {
+            $connection->protocol === 'h3-quiche') {
             /*
                 H3 connections have no PHP stream resource; the
                 listener's UDP socket carries traffic for all of
@@ -4291,8 +4291,9 @@ class WebException extends \Exception
  * stream_socket_get_name) the resource() method is available.
  *
  * Subclasses extend this for transports that do not map cleanly to
- * a single TCP stream. H3Connection wraps a quiche_conn pointer
- * and overrides protocol/state semantics for QUIC streams.
+ * a single TCP stream. H3QuicheConnection wraps a quiche_conn
+ * pointer and overrides protocol/state semantics for QUIC streams;
+ * H3Connection (pure-PHP) carries equivalent state in PHP.
  */
 class Connection
 {
@@ -4406,7 +4407,7 @@ class Connection
      * Storing these here, rather than in WebSite's
      * in_streams[CONTEXT] array, keeps connection-lifetime state
      * with the connection object itself and provides a single
-     * place a future H3Connection subclass can override.
+     * place an H3 subclass can override.
      * @var array
      */
     public $protocol_state = [];

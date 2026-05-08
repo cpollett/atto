@@ -71,6 +71,20 @@ $bench_out_file = sys_get_temp_dir() . "/atto_bench_dashboard_" .
     getmypid() . ".out";
 
 $test->get('/', function () {
+    /*
+        Pre-load H3QuicheListener so we can probe for libquiche
+        availability and conditionally render the opt-in
+        checkbox below. Idempotent (require_once); if the file
+        is missing or the FFI extension isn't there, we just
+        skip the checkbox.
+     */
+    $quiche_path = __DIR__ . '/../../src/H3QuicheListener.php';
+    if (is_file($quiche_path)) {
+        require_once $quiche_path;
+    }
+    $libquiche_ok =
+        class_exists('\seekquarry\atto\H3FFI')
+        && \seekquarry\atto\H3FFI::isAvailable();
     ?><!DOCTYPE html>
 <html>
 <head>
@@ -177,6 +191,13 @@ $test->get('/', function () {
             <option value="100">100ms each way (200ms RTT)</option>
         </select>
     </label>
+<?php if ($libquiche_ok): ?>
+    <label style="margin-left: 1em; font-size: 0.9em;
+        color: #555;">
+        <input type="checkbox" id="include_quiche">
+        Include libquiche (HTTP/3-quiche) row
+    </label>
+<?php endif; ?>
 </div>
 <div id="global_status"></div>
 <div id="results"></div>
@@ -355,6 +376,10 @@ btn.addEventListener('click', function () {
     raw_el.textContent = '';
     var latency = document.getElementById('latency_sel').value;
     var body = 'latency_ms=' + encodeURIComponent(latency);
+    var quiche_cb = document.getElementById('include_quiche');
+    if (quiche_cb && quiche_cb.checked) {
+        body += '&include_quiche=1';
+    }
     fetch('/run', {
         method: 'POST',
         headers: {'Content-Type':
@@ -404,7 +429,9 @@ $test->post('/run', function () use (
         --latency-ms flag; bench will spawn proxy.php in front
         of the plain and TLS ports for the duration of the run.
         Validate the input as a non-negative number to keep
-        shell-injection at bay.
+        shell-injection at bay. The dashboard can also post
+        include_quiche=1 to add the libquiche-FFI row to the
+        run; off by default.
      */
     $extra = '';
     $latency = $_POST['latency_ms'] ?? '0';
@@ -412,6 +439,9 @@ $test->post('/run', function () use (
         $latency_arg = (float) $latency;
         $extra = ' --latency-ms=' . escapeshellarg(
             (string) $latency_arg);
+    }
+    if (!empty($_POST['include_quiche'])) {
+        $extra .= ' --include-quiche';
     }
     if (strstr(PHP_OS, "WIN")) {
         $job = "start /B $php $script$extra > $out 2>&1";
@@ -563,11 +593,11 @@ $test->get('/h3stats', function () use ($test) {
     $include_reaped = !empty($_GET['keep']) || $force_snapshot;
     foreach ($test->listeners() as $listener) {
         /*
-            Both H3Listener (FFI) and H3NativeListener
-            (pure-PHP) expose the same snapshot/forceSnapshot
-            API surface, so duck-type by method existence.
-            Plain Listener / TcpListener instances don't
-            define snapshotAllStats and are skipped.
+            Both H3Listener (pure-PHP) and H3QuicheListener
+            (FFI) expose the same snapshot/forceSnapshot API
+            surface, so duck-type by method existence. Plain
+            Listener / TcpListener instances don't define
+            snapshotAllStats and are skipped.
          */
         if (!method_exists($listener, 'snapshotAllStats')) {
             continue;
@@ -660,17 +690,17 @@ if ($test->isCli()) {
     echo "  'Run benchmark'. Press Ctrl+C to stop.\n";
     echo "\n";
     /*
-        Listen on plain HTTP, TLS, and (if libquiche is
-        available) QUIC. The TLS listener advertises h2 +
-        http/1.1 via ALPN so clients can negotiate either over
-        the same TCP port. The H3 listener binds the same port
-        number as TLS but on UDP; it is silently skipped when
-        libquiche/PHP FFI is unavailable. The runner uses plain
-        HTTP for H1-only tests, TLS for H1+TLS / H2 tests, and
-        QUIC for H3 tests (the runner probes each protocol's
-        endpoint and skips the row when no server answers).
+        Listen on plain HTTP, TLS, the pure-PHP HTTP/3 listener
+        ('h3' on UDP 8444), and -- if libquiche/PHP-FFI is
+        available -- the libquiche-FFI HTTP/3 listener
+        ('h3-quiche' on UDP 8443, sharing the TLS port number).
+        The TLS listener advertises h2 + http/1.1 via ALPN so
+        clients can negotiate either over the same TCP port.
+        The runner uses plain HTTP for H1-only tests, TLS for
+        H1+TLS / H2 tests, and QUIC for H3 tests; each row is
+        probed and silently skipped if no server answers.
      */
-    $test->listen([
+    $listen_specs = [
         8080,
         ['address' => 8443, 'context' => ['ssl' => [
             'local_cert' => $cert,
@@ -679,28 +709,38 @@ if ($test->isCli()) {
             'verify_peer' => false,
             'alpn_protocols' => 'h2,http/1.1',
         ]]],
-        ['address' => 8443, 'protocol' => 'h3',
+        ['address' => 8444, 'protocol' => 'h3',
             'context' => ['ssl' => [
                 'local_cert' => $cert,
                 'local_pk' => $key,
             ]]],
-        /*
-            Pure-PHP HTTP/3 listener on a separate UDP port
-            (8444) so it doesn't compete with the FFI 'h3'
-            listener if both are present. h3-native needs
-            no FFI / libquiche; ext-openssl + ext-sodium
-            (and ext-gmp for RSA certs) is the full
-            requirement set. Comment this entry out if you
-            don't want a second H3 backend on a different
-            port; everything else in the bench works
-            without it.
-         */
-        ['address' => 8444, 'protocol' => 'h3-native',
+    ];
+    /*
+        Add the libquiche-FFI listener only when its
+        dependencies are present. We pre-load
+        H3QuicheListener.php so H3FFI is in scope, then ask
+        H3FFI::isAvailable() (which probes for the FFI
+        extension and a loadable libquiche.{so,dylib,dll}).
+        When unavailable the listener spec would print a
+        skip message and noise up the startup log; gating it
+        here keeps the dashboard quiet on default systems.
+     */
+    $quiche_path = __DIR__ . '/../../src/H3QuicheListener.php';
+    if (is_file($quiche_path)) {
+        require_once $quiche_path;
+    }
+    $libquiche_ok =
+        class_exists('\seekquarry\atto\H3FFI')
+        && \seekquarry\atto\H3FFI::isAvailable();
+    if ($libquiche_ok) {
+        $listen_specs[] = ['address' => 8443,
+            'protocol' => 'h3-quiche',
             'context' => ['ssl' => [
                 'local_cert' => $cert,
                 'local_pk' => $key,
-            ]]],
-    ]);
+            ]]];
+    }
+    $test->listen($listen_specs);
 } else {
     $test->process();
 }

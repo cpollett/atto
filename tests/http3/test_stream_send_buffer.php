@@ -36,7 +36,7 @@ abstract class Transport
     public function __construct($s) {}
 }
 
-require __DIR__ . '/../../src/H3NativeListener.php';
+require __DIR__ . '/../../src/H3Listener.php';
 
 $tests = 0;
 $pass = 0;

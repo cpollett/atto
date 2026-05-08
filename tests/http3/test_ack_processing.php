@@ -22,7 +22,7 @@
 namespace seekquarry\atto;
 
 /*
-    Stub the parent classes that H3NativeListener.php's classes
+    Stub the parent classes that H3Listener.php's classes
     extend. WebSite.php normally provides these; loading it just
     to run the unit tests would drag in the whole framework.
  */
@@ -37,7 +37,7 @@ abstract class Transport
     public function __construct($s) {}
 }
 
-require __DIR__ . '/../../src/H3NativeListener.php';
+require __DIR__ . '/../../src/H3Listener.php';
 
 $tests = 0;
 $pass = 0;

@@ -19,7 +19,7 @@
         connect (errno=7), or some other curl-level error,
         plus the negotiated HTTP version per success so you
         can see if libcurl is silently falling back to H2.
-            ATTO_BENCH_DEBUG=1 php bench.php --only=h3-native
+            ATTO_BENCH_DEBUG=1 php bench.php --only=h3
 
     PREREQ:
         Start the server first in another shell:
@@ -109,28 +109,28 @@ Options:
     --host=HOST           default 127.0.0.1
     --plain-port=PORT     default 8080
     --tls-port=PORT       default 8443
-    --quic-port=PORT      default same as --tls-port (HTTP/3 over
-                          QUIC binds the same port number as H2,
-                          but on UDP rather than TCP)
-    --quic-native-port=PORT
-                          default 8444 (pure-PHP HTTP/3 listener,
-                          h3-native://, binds its own UDP port so
-                          it can run side-by-side with the FFI
-                          libquiche-backed h3 listener)
+    --quic-port=PORT      default 8444 (pure-PHP HTTP/3 listener,
+                          'h3' protocol code in atto's listen
+                          spec, bound on UDP)
+    --quiche-port=PORT    default 8443 (libquiche-FFI listener,
+                          'h3-quiche' protocol code, shares the
+                          TLS port number but on UDP)
+    --include-quiche      include the libquiche-FFI 'h3-quiche'
+                          row in the run. Default off because
+                          libquiche/PHP-FFI is an optional
+                          dependency that most users will not
+                          have. The dashboard renders a checkbox
+                          when libquiche is detected and forwards
+                          this flag through.
     --iterations=N        per single-shot case (default 100)
     --concurrency=N       parallel requests for asset case
                           (default 50)
     --latency-ms=N        simulate one-way network latency by
                           spawning a proxy in front of each
                           port (TCP for H1/H1+TLS/H2, UDP for
-                          H3); round-trip is 2*N. Useful for
-                          showing how H2's multiplexing crushes
-                          H1+TLS at parallel work over a real
-                          network, and how H3's 0-RTT
-                          handshake wins back time at high RTT.
-    --only=h1,h2,h3,h3-native
+                          H3); round-trip is 2*N.
+    --only=h1,h1s,h2,h3,h3-quiche
                           run only the listed protocols
-                          (h1, h1s, h2, h3, h3-native)
     --skip=case,case      skip the listed cases
                           (small,big,asset,headers,keepalive,post)
     --help                this message
@@ -141,15 +141,16 @@ TXT);
 $host = $opts['host'] ?? '127.0.0.1';
 $plain_port = (int) ($opts['plain-port'] ?? 8080);
 $tls_port = (int) ($opts['tls-port'] ?? 8443);
-$quic_port = (int) ($opts['quic-port'] ?? $tls_port);
 /*
-    The pure-PHP HTTP/3 listener (h3-native://) binds a
-    separate UDP port from the FFI 'h3' listener so both can
-    coexist on the same atto instance for side-by-side
-    comparison. index.php in this directory uses 8444 by
-    default; override here if you've moved it.
+    Pure-PHP HTTP/3 listener (atto's 'h3' protocol code) binds a
+    UDP-only port that's separate from the TLS port -- by default
+    8444. The FFI libquiche listener ('h3-quiche'), when included,
+    shares the TLS port number on UDP. index.php in this directory
+    uses these defaults; override if you've moved them.
  */
-$quic_native_port = (int) ($opts['quic-native-port'] ?? 8444);
+$quic_port = (int) ($opts['quic-port'] ?? 8444);
+$quiche_port = (int) ($opts['quiche-port'] ?? $tls_port);
+$include_quiche = !empty($opts['include-quiche']);
 $iterations = (int) ($opts['iterations'] ?? 100);
 $concurrency = (int) ($opts['concurrency'] ?? 50);
 $latency_ms = (float) ($opts['latency-ms'] ?? 0);
@@ -192,22 +193,25 @@ if ($latency_ms > 0) {
      */
     $proxy_quic_port = $quic_port + 20000;
     /*
-        Pure-PHP h3-native listener gets its own proxy port,
-        offset the same +20000 way (UDP, like the FFI h3
-        proxy) but applied to its native UDP port (default
-        8444) so the two can run in parallel without
-        clashing.
+        FFI libquiche listener gets its own proxy port. Same
+        +20000 offset (UDP) but applied to the libquiche's UDP
+        port (default 8443, shares with the TLS port number) so
+        when --include-quiche is set the two can run in parallel
+        without clashing.
      */
-    $proxy_quic_native_port = $quic_native_port + 20000;
+    $proxy_quiche_port = $quiche_port + 20000;
     $php = escapeshellarg(PHP_BINARY);
     $script = escapeshellarg(__DIR__ . "/proxy.php");
-    foreach ([
+    $proxy_specs = [
         [$proxy_plain_port, $host, $plain_port, 'tcp'],
         [$proxy_tls_port, $host, $tls_port, 'tcp'],
         [$proxy_quic_port, $host, $quic_port, 'udp'],
-        [$proxy_quic_native_port, $host, $quic_native_port,
-            'udp'],
-    ] as $proxy_spec) {
+    ];
+    if ($include_quiche) {
+        $proxy_specs[] = [$proxy_quiche_port, $host,
+            $quiche_port, 'udp'];
+    }
+    foreach ($proxy_specs as $proxy_spec) {
         list($listen, $thost, $tport, $proto) = $proxy_spec;
         $cmd = "$php $script $listen " . escapeshellarg($thost) .
             " $tport " . escapeshellarg((string) $latency_ms) .
@@ -301,7 +305,9 @@ if ($latency_ms > 0) {
     $plain_port = $proxy_plain_port;
     $tls_port = $proxy_tls_port;
     $quic_port = $proxy_quic_port;
-    $quic_native_port = $proxy_quic_native_port;
+    if ($include_quiche) {
+        $quiche_port = $proxy_quiche_port;
+    }
     fwrite(STDERR, "  latency: " . $latency_ms .
         "ms each way (RTT " . (2 * $latency_ms) . "ms)\n");
 }
@@ -369,20 +375,17 @@ $TRANSPORTS = [
         ],
     ],
     'h3' => [
+        /*
+            Pure-PHP HTTP/3 listener. No libquiche, no FFI --
+            ext-openssl + ext-sodium are the only requirements,
+            both of which ship with stock PHP. Runs by default
+            whenever atto's index.php has bound an h3:// listener
+            (default UDP port 8444). If curl supports HTTP/3 the
+            row probes successfully; if not, the row is skipped.
+         */
         'name' => 'HTTP/3',
         'available' => function () use (
             $host, $quic_port, $latency_ms) {
-            /*
-                Probe both: that libcurl knows about HTTP/3,
-                and that something is actually answering on the
-                QUIC port. The H3 listener is opt-in (requires
-                libquiche via PHP FFI) so it may legitimately
-                not be running even though atto and libcurl
-                both support H3. When --latency-ms > 0, the
-                $quic_port has already been rewritten to point
-                at the UDP proxy, so the probe traverses the
-                same path the bench cases will use.
-             */
             if (!defined('CURL_HTTP_VERSION_3')) {
                 return false;
             }
@@ -395,62 +398,12 @@ $TRANSPORTS = [
         'curl_opts' => [
             /*
                 Use CURL_HTTP_VERSION_3ONLY when available
-                (libcurl >= 7.88.0). With plain CURL_HTTP_-
-                VERSION_3, libcurl attempts HTTP/3 first but
-                silently falls back to HTTP/2 over TCP if
-                QUIC fails -- which can mask H3-specific
-                bugs and dramatically inflates per-iteration
-                latency on hosts where the QUIC port has no
-                TCP listener (the fallback connect() times
-                out before erroring). _3ONLY pins the row
-                to true HTTP/3, surfacing failures fast.
-             */
-            CURLOPT_HTTP_VERSION =>
-                defined('CURL_HTTP_VERSION_3ONLY')
-                    ? CURL_HTTP_VERSION_3ONLY
-                    : (defined('CURL_HTTP_VERSION_3')
-                        ? CURL_HTTP_VERSION_3 : 0),
-            CURLOPT_SSL_VERIFYPEER => false,
-            CURLOPT_SSL_VERIFYHOST => 0,
-        ],
-    ],
-    'h3-native' => [
-        /*
-            Pure-PHP HTTP/3 listener. No libquiche, no FFI --
-            ext-openssl + ext-sodium are the full requirement
-            set, both of which ship with stock PHP on every
-            platform we care about. Because there are no
-            external dependencies to gate on, this row runs
-            by default whenever atto's index.php has bound an
-            h3-native:// listener (default UDP port 8444). If
-            curl supports HTTP/3 the row probes successfully
-            and shows up alongside the FFI 'h3' row for
-            side-by-side comparison; if not, both H3 rows are
-            skipped together for the same reason.
-         */
-        'name' => 'HTTP/3-native',
-        'available' => function () use (
-            $host, $quic_native_port, $latency_ms) {
-            if (!defined('CURL_HTTP_VERSION_3')) {
-                return false;
-            }
-            return probe(
-                "https://{$host}:{$quic_native_port}/small",
-                CURL_HTTP_VERSION_3, true);
-        },
-        'endpoint' => function ($path)
-            use ($host, $quic_native_port) {
-            return "https://{$host}:{$quic_native_port}{$path}";
-        },
-        'curl_opts' => [
-            /*
-                See the matching comment on the 'h3' row
-                above for why we prefer _3ONLY: pinning to
-                true HTTP/3 keeps the row honest and stops
-                libcurl's silent TCP fallback from inflating
-                per-iteration latency to the connect-timeout
-                ceiling on hosts where the UDP port has no
-                paired TCP listener.
+                (libcurl >= 7.88.0). Plain CURL_HTTP_VERSION_3
+                lets libcurl silently fall back to HTTP/2 over
+                TCP if QUIC fails, which masks H3-specific
+                bugs and inflates per-iteration latency on
+                hosts where the UDP port has no TCP listener.
+                _3ONLY pins the row to true HTTP/3.
              */
             CURLOPT_HTTP_VERSION =>
                 defined('CURL_HTTP_VERSION_3ONLY')
@@ -462,6 +415,41 @@ $TRANSPORTS = [
         ],
     ],
 ];
+if ($include_quiche) {
+    /*
+        libquiche-FFI HTTP/3 listener. Opt-in because libquiche
+        and PHP-FFI are not stock dependencies; the dashboard
+        renders a checkbox when libquiche is detected and
+        forwards --include-quiche when checked. Endpoint mirrors
+        the 'h3' transport above but points at the libquiche
+        listener's UDP port (default 8443, shared with TLS).
+     */
+    $TRANSPORTS['h3-quiche'] = [
+        'name' => 'HTTP/3-quiche',
+        'available' => function () use (
+            $host, $quiche_port, $latency_ms) {
+            if (!defined('CURL_HTTP_VERSION_3')) {
+                return false;
+            }
+            return probe(
+                "https://{$host}:{$quiche_port}/small",
+                CURL_HTTP_VERSION_3, true);
+        },
+        'endpoint' => function ($path)
+            use ($host, $quiche_port) {
+            return "https://{$host}:{$quiche_port}{$path}";
+        },
+        'curl_opts' => [
+            CURLOPT_HTTP_VERSION =>
+                defined('CURL_HTTP_VERSION_3ONLY')
+                    ? CURL_HTTP_VERSION_3ONLY
+                    : (defined('CURL_HTTP_VERSION_3')
+                        ? CURL_HTTP_VERSION_3 : 0),
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => 0,
+        ],
+    ];
+}
 if (!empty($only)) {
     $TRANSPORTS = array_intersect_key(
         $TRANSPORTS, array_flip($only));

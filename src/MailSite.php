@@ -80,7 +80,7 @@ abstract class Authenticator
      * timing, by running password_verify against a fixed dummy
      * hash so the work factor is paid either way.
      *
-     * @param string $username
+     * @param string $username login name used to look up the credential record
      * @param string $password the candidate plaintext password
      * @return bool true on success
      */
@@ -119,7 +119,16 @@ abstract class Authenticator
  */
 class FileAuthenticator extends Authenticator
 {
+    /**
+     * Path to the password file from which credentials are loaded.
+     * @var string
+     */
     protected $path;
+    /**
+     * Lazily-loaded credential map (username => password); null
+     * until the file is first read.
+     * @var array|null
+     */
     protected $users;
     /**
      * @param string $path path to the password file
@@ -140,6 +149,7 @@ class FileAuthenticator extends Authenticator
     }
     /**
      * @inheritdoc
+     * @param string $username login name
      */
     public function userExists($username)
     {
@@ -148,6 +158,7 @@ class FileAuthenticator extends Authenticator
     }
     /**
      * @inheritdoc
+     * @param string $username login name
      */
     public function getPasswordHash($username)
     {
@@ -222,6 +233,7 @@ class AnonAuthenticator extends Authenticator
     }
     /**
      * @inheritdoc
+     * @param string $username login name
      */
     public function userExists($username)
     {
@@ -229,6 +241,7 @@ class AnonAuthenticator extends Authenticator
     }
     /**
      * @inheritdoc
+     * @param string $username login name
      */
     public function getPasswordHash($username)
     {
@@ -296,7 +309,7 @@ abstract class MailStorage
      * INBOX. Names are returned with their full hierarchy path
      * (e.g. "Archive/2026").
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @return array list of folder name strings
      */
     abstract public function listFolders($user);
@@ -304,7 +317,7 @@ abstract class MailStorage
      * Creates a new folder. Idempotent: creating an existing
      * folder returns true without error.
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @param string $folder e.g. "Archive/2026/Q1"
      * @return bool true on success
      */
@@ -315,8 +328,8 @@ abstract class MailStorage
      * subfolders (the IMAP convention; clients delete subtrees
      * recursively).
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return bool true on success
      */
     abstract public function deleteFolder($user, $folder);
@@ -325,24 +338,24 @@ abstract class MailStorage
      * the rename of INBOX has special semantics; we choose the
      * simpler "no" answer instead).
      *
-     * @param string $user
-     * @param string $old
-     * @param string $new
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $old current folder name to rename from
+     * @param string $new target folder name to rename to
      * @return bool true on success
      */
     abstract public function renameFolder($user, $old, $new);
     /**
      * Returns whether the named folder exists for this user.
      *
-     * @param string $user
-     * @param string $folder
-     * @return bool
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return bool true if the named folder exists under $user, false otherwise
      */
     abstract public function folderExists($user, $folder);
     /**
      * Stores a new message and returns its assigned UID.
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @param string $folder destination folder; will be auto-
      *      created if missing
      * @param string $bytes the full RFC 5322 message including
@@ -357,9 +370,9 @@ abstract class MailStorage
      * Returns the raw RFC 5322 bytes of a message, or false if
      * not found.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
      * @return string|false
      */
     abstract public function fetchMessage($user, $folder, $uid);
@@ -369,8 +382,8 @@ abstract class MailStorage
      * keys: uid (int), size (int), flags (array of strings),
      * internal_date (int unix ts).
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return array list of message metadata records
      */
     abstract public function listMessages($user, $folder);
@@ -378,20 +391,20 @@ abstract class MailStorage
      * Returns metadata for one message: same shape as one entry
      * of listMessages, or false if not found.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
-     * @return array|false
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @return array|false metadata record (uid, size, flags, internal_date), or false if the message does not exist
      */
     abstract public function messageMeta($user, $folder, $uid);
     /**
      * Replaces the flag set for a message. Pass an empty array
      * to clear all flags.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
-     * @param array $flags
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @param array $flags list of IMAP flag strings to set on the message
      * @return bool
      */
     abstract public function setFlags($user, $folder, $uid, $flags);
@@ -399,8 +412,8 @@ abstract class MailStorage
      * Permanently removes every message in $folder that has the
      * \Deleted flag set. Returns the UIDs that were removed.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return array list of expunged UIDs
      */
     abstract public function expunge($user, $folder);
@@ -408,19 +421,19 @@ abstract class MailStorage
      * Moves a message from one folder to another. The UID is
      * preserved (UIDs are per-user, not per-folder).
      *
-     * @param string $user
-     * @param string $from
-     * @param string $to
-     * @param int $uid
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $from source folder for the move operation
+     * @param string $to destination folder for the move operation
+     * @param int $uid persistent IMAP unique identifier of the message
      * @return bool
      */
     abstract public function moveMessage($user, $from, $to, $uid);
     /**
      * Returns the message count for the named folder.
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int number of messages currently in the folder, or -1 if the folder is unknown
      */
     abstract public function messageCount($user, $folder);
     /**
@@ -429,9 +442,9 @@ abstract class MailStorage
      * we issue one stable value per user account over its
      * lifetime.
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int fixed UIDVALIDITY value for the folder per RFC 3501 sec 2.3.1.1
      */
     abstract public function uidValidity($user, $folder);
     /**
@@ -439,9 +452,9 @@ abstract class MailStorage
      * appended (predicted, may not match reality under concurrent
      * appends).
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int next UID that will be assigned for an appended message in the folder
      */
     abstract public function uidNext($user, $folder);
     /**
@@ -453,8 +466,8 @@ abstract class MailStorage
      * by LSUB at connect time. Other folders are subscribed
      * only after an explicit SUBSCRIBE.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return bool
      */
     abstract public function isSubscribed($user, $folder);
@@ -464,8 +477,8 @@ abstract class MailStorage
      * subscribing to non-existent mailboxes (a remote-shared
      * folder might be unmounted at the moment). Idempotent.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return bool true on success
      */
     abstract public function subscribe($user, $folder);
@@ -473,8 +486,8 @@ abstract class MailStorage
      * Removes a subscription. Idempotent: unsubscribing a
      * folder that is not subscribed succeeds silently.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return bool true on success
      */
     abstract public function unsubscribe($user, $folder);
@@ -483,7 +496,7 @@ abstract class MailStorage
      * sorted ascending. INBOX is always present in the result
      * even if the per-user state file does not list it.
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @return string[]
      */
     abstract public function listSubscribed($user);
@@ -510,10 +523,10 @@ abstract class MailStorage
      *                   not exposed on ram (no shared store)
      *   'size'        - body length in bytes
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
-     * @return array|false
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @return array|false metadata record describing where the body bytes live, or false if (user, folder, uid) does not resolve to a stored message
      */
     abstract public function messageBodyLocation($user,
         $folder, $uid);
@@ -523,6 +536,7 @@ abstract class MailStorage
      * a strictly monotonic sequence even when two folders are
      * created in the same wall-clock second (RFC 3501 sec
      * 2.3.1.1 monotonic requirement).
+     * @var int
      */
     protected $last_uidvalidity = 0;
     /**
@@ -530,6 +544,7 @@ abstract class MailStorage
      * greater than any value previously returned by this
      * storage instance. Implementations should call this when
      * a folder is created or recreated.
+     * @return int fresh UIDVALIDITY value for a new folder
      */
     protected function nextUidValidity()
     {
@@ -555,6 +570,8 @@ abstract class MailStorage
      * Leading dots in a component are silently stripped:
      * ".foo" -> "foo", "...bar" -> "bar". A component that
      * reduces to empty after stripping is rejected.
+     * @param string $folder folder name with full hierarchy path
+     * @return string folder name normalized to canonical case and separator
      */
     protected function normalizeFolder($folder)
     {
@@ -597,6 +614,8 @@ abstract class MailStorage
      * try/catch at every public-method entry point. Callers
      * pattern: $folder = $this->safeNormalizeFolder($folder);
      * if ($folder === false) { return <appropriate sentinel>; }
+     * @param string $folder folder name with full hierarchy path
+     * @return string|false normalized folder name, or false if the input was unsafe
      */
     protected function safeNormalizeFolder($folder)
     {
@@ -654,6 +673,12 @@ class FileMailStorage extends MailStorage
      * line. Absent or empty means only INBOX is subscribed.
      */
     const USER_SUBSCRIBED_FILE = "subscribed.txt";
+    /**
+     * Filesystem directory under which the per-user storage
+     * tree is created. Set once by the constructor and never
+     * changed.
+     * @var string
+     */
     protected $base;
     /**
      * @param string $base directory under which the "users/"
@@ -666,6 +691,8 @@ class FileMailStorage extends MailStorage
     /**
      * Returns the absolute directory path for a user's account.
      * Does not check existence.
+     * @param string $user username (no @domain) identifying the mail account
+     * @return string absolute directory path for $user
      */
     protected function userDir($user)
     {
@@ -679,6 +706,9 @@ class FileMailStorage extends MailStorage
      * collide with the per-user metadata files (uidvalidity.txt,
      * uidnext.txt, subscribed.txt) since both live as siblings
      * under the same user directory.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return string absolute directory path for the folder
      */
     protected function folderDir($user, $folder)
     {
@@ -704,6 +734,10 @@ class FileMailStorage extends MailStorage
      * <uid>.eml (raw bytes), <uid>.flags (flag list), and
      * <uid>.date (internal-date timestamp). Callers pass the
      * extension as a string without the leading dot.
+     * @param string $folder_dir absolute folder directory path
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @param string $ext filename extension without leading dot
+     * @return string absolute path of the per-message file with the given extension
      */
     protected function messagePath($folder_dir, $uid, $ext)
     {
@@ -721,6 +755,8 @@ class FileMailStorage extends MailStorage
      * separators. After folding, leading dots are stripped to
      * prevent ".." or ".something" inputs from producing a
      * dot-prefixed directory name.
+     * @param string $user username (no @domain) identifying the mail account
+     * @return string sanitized username safe to use as a directory name
      */
     protected function safeName($user)
     {
@@ -736,6 +772,7 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function ensureUser($user)
     {
@@ -763,6 +800,7 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function listFolders($user)
     {
@@ -796,6 +834,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function createFolder($user, $folder)
     {
@@ -832,6 +872,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function deleteFolder($user, $folder)
     {
@@ -862,6 +904,9 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $old current folder name to rename from
+     * @param string $new target folder name to rename to
      */
     public function renameFolder($user, $old, $new)
     {
@@ -879,6 +924,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function folderExists($user, $folder)
     {
@@ -892,6 +939,8 @@ class FileMailStorage extends MailStorage
      * Atomically allocates and returns the next per-user UID.
      * Uses an exclusive flock on uidnext.txt so two concurrent
      * appendMessage calls cannot hand out the same number.
+     * @param string $user username (no @domain) identifying the mail account
+     * @return int next UID to assign to a new message in the user/folder
      */
     protected function allocUid($user)
     {
@@ -922,6 +971,11 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $bytes number of bytes
+     * @param array $flags list of IMAP flag strings
+     * @param int $internal_date Unix timestamp to record as the message internal date
      */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
@@ -958,6 +1012,9 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function fetchMessage($user, $folder, $uid)
     {
@@ -975,6 +1032,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function listMessages($user, $folder)
     {
@@ -1007,6 +1066,9 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function messageMeta($user, $folder, $uid)
     {
@@ -1047,6 +1109,10 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @param array $flags list of IMAP flag strings
      */
     public function setFlags($user, $folder, $uid, $flags)
     {
@@ -1073,6 +1139,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function expunge($user, $folder)
     {
@@ -1093,6 +1161,10 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $from source folder for the move operation
+     * @param string $to destination folder for the move operation
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function moveMessage($user, $from, $to, $uid)
     {
@@ -1122,6 +1194,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function messageCount($user, $folder)
     {
@@ -1137,6 +1211,8 @@ class FileMailStorage extends MailStorage
      * the fallback for folders that pre-date this scheme so
      * existing message stores keep working without
      * intervention.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function uidValidity($user, $folder)
     {
@@ -1158,6 +1234,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function uidNext($user, $folder)
     {
@@ -1172,6 +1250,8 @@ class FileMailStorage extends MailStorage
      * Returns the absolute path to the per-user subscription
      * state file. The file holds one folder name per line; an
      * empty or missing file means only INBOX is subscribed.
+     * @param string $user username (no @domain) identifying the mail account
+     * @return string absolute path to the per-user subscriptions file
      */
     protected function subscriptionFile($user)
     {
@@ -1184,6 +1264,8 @@ class FileMailStorage extends MailStorage
      * name per line; blank lines and leading/trailing whitespace
      * are ignored. INBOX is treated as implicitly subscribed
      * even if not listed (RFC 3501 sec 6.3.6 idempotency).
+     * @param string $user username (no @domain) identifying the mail account
+     * @return array list of subscribed folder names
      */
     protected function readSubscriptions($user)
     {
@@ -1208,6 +1290,9 @@ class FileMailStorage extends MailStorage
      * Writes a list of folder names to the subscription file
      * atomically (write-temp-then-rename) to avoid leaving a
      * half-written state file if the process is interrupted.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param mixed $folders folders parameter
+     * @return bool true on successful write
      */
     protected function writeSubscriptions($user, $folders)
     {
@@ -1229,6 +1314,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function isSubscribed($user, $folder)
     {
@@ -1237,6 +1324,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function subscribe($user, $folder)
     {
@@ -1249,6 +1338,8 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function unsubscribe($user, $folder)
     {
@@ -1272,6 +1363,7 @@ class FileMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function listSubscribed($user)
     {
@@ -1287,6 +1379,9 @@ class FileMailStorage extends MailStorage
      * dedup -- two messages with byte-identical bodies use
      * two separate files -- so refcount is always 1 and the
      * hash is computed on demand from the file's bytes.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -1361,6 +1456,10 @@ class RamMailStorage extends MailStorage
      * necessary. The reference shape is documented on the
      * class. Helper used by every mutator so a fresh
      * username gets a real, mutable record on first touch.
+     *
+     * @param string $user username (no @domain)
+     * @return array reference to the user record (mutable; see
+     *      class docblock for shape)
      */
     protected function & userRef($user)
     {
@@ -1381,6 +1480,7 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function ensureUser($user)
     {
@@ -1389,6 +1489,7 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function listFolders($user)
     {
@@ -1401,6 +1502,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function createFolder($user, $folder)
     {
@@ -1420,6 +1523,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function deleteFolder($user, $folder)
     {
@@ -1450,6 +1555,9 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $old current folder name to rename from
+     * @param string $new target folder name to rename to
      */
     public function renameFolder($user, $old, $new)
     {
@@ -1474,6 +1582,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function folderExists($user, $folder)
     {
@@ -1486,6 +1596,11 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $bytes number of bytes
+     * @param array $flags list of IMAP flag strings
+     * @param int $internal_date Unix timestamp to record as the message internal date
      */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
@@ -1520,6 +1635,9 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function fetchMessage($user, $folder, $uid)
     {
@@ -1537,6 +1655,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function listMessages($user, $folder)
     {
@@ -1563,6 +1683,9 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function messageMeta($user, $folder, $uid)
     {
@@ -1586,6 +1709,10 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @param array $flags list of IMAP flag strings
      */
     public function setFlags($user, $folder, $uid, $flags)
     {
@@ -1614,6 +1741,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function expunge($user, $folder)
     {
@@ -1639,6 +1768,10 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $from source folder for the move operation
+     * @param string $to destination folder for the move operation
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function moveMessage($user, $from, $to, $uid)
     {
@@ -1667,6 +1800,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function messageCount($user, $folder)
     {
@@ -1682,6 +1817,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function uidValidity($user, $folder)
     {
@@ -1699,6 +1836,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function uidNext($user, $folder)
     {
@@ -1707,6 +1846,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function isSubscribed($user, $folder)
     {
@@ -1725,6 +1866,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function subscribe($user, $folder)
     {
@@ -1740,6 +1883,8 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function unsubscribe($user, $folder)
     {
@@ -1761,6 +1906,7 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function listSubscribed($user)
     {
@@ -1785,6 +1931,9 @@ class RamMailStorage extends MailStorage
      * computed hash for callers that want to compare bodies
      * across messages even though storage slots are not
      * shared.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -1975,6 +2124,7 @@ class SqlMailStorage extends MailStorage
      * runs against the PDO instance immediately after open
      * (used to set per-connection pragmas, character sets, or
      * isolation levels).
+     * @return array map of SQL dialect name => template overrides
      */
     protected function builtInDialects()
     {
@@ -2086,6 +2236,7 @@ class SqlMailStorage extends MailStorage
      * call sites read like English rather than SQL fragments.
      * Every template uses positional ? placeholders to keep
      * parameter binding identical across drivers.
+     * @return array map of template key => SQL fragment for the active dialect
      */
     protected function buildSqlTemplates()
     {
@@ -2198,6 +2349,8 @@ class SqlMailStorage extends MailStorage
      * between unrelated callers. Per-call preparation costs
      * ~50 microseconds in SQLite, irrelevant against the disk
      * and network costs dominating mail-server throughput.
+     * @param string $name name
+     * @return \PDOStatement prepared statement ready to execute
      */
     protected function prepareStatement($name)
     {
@@ -2221,6 +2374,8 @@ class SqlMailStorage extends MailStorage
      * SQLite swaps "INSERT" for "INSERT OR IGNORE", MySQL uses
      * "INSERT IGNORE", Postgres keeps the leading verb and
      * appends "ON CONFLICT DO NOTHING".
+     * @param mixed $insert_sql insert_sql parameter
+     * @return string INSERT ... ON CONFLICT IGNORE statement appropriate to the active dialect
      */
     protected function insertIgnoreSql($insert_sql)
     {
@@ -2244,6 +2399,8 @@ class SqlMailStorage extends MailStorage
      * ensureUser side effect: any operation that touches a
      * username for the first time materializes a user row and
      * an INBOX folder row.
+     * @param string $user username (no @domain) identifying the mail account
+     * @return array|false user database row, or false if no such user exists
      */
     protected function userRow($user)
     {
@@ -2272,6 +2429,9 @@ class SqlMailStorage extends MailStorage
     /**
      * Returns the folder row for ($user, $folder) or false if
      * neither the user nor the folder exists.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return array|false folder database row, or false if no such folder exists
      */
     protected function folderRow($user, $folder)
     {
@@ -2292,6 +2452,7 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function ensureUser($user)
     {
@@ -2300,6 +2461,7 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function listFolders($user)
     {
@@ -2319,6 +2481,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function createFolder($user, $folder)
     {
@@ -2339,6 +2503,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function deleteFolder($user, $folder)
     {
@@ -2388,6 +2554,9 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $old current folder name to rename from
+     * @param string $new target folder name to rename to
      */
     public function renameFolder($user, $old, $new)
     {
@@ -2412,6 +2581,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function folderExists($user, $folder)
     {
@@ -2423,6 +2594,11 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $bytes number of bytes
+     * @param array $flags list of IMAP flag strings
+     * @param int $internal_date Unix timestamp to record as the message internal date
      */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
@@ -2488,6 +2664,9 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function fetchMessage($user, $folder, $uid)
     {
@@ -2509,6 +2688,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function listMessages($user, $folder)
     {
@@ -2530,6 +2711,9 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function messageMeta($user, $folder, $uid)
     {
@@ -2552,6 +2736,8 @@ class SqlMailStorage extends MailStorage
     /**
      * Shapes a raw mail_messages row into the public record
      * format that the abstract MailStorage interface promises.
+     * @param array $row database row
+     * @return array|false message metadata row, or false if no such message exists
      */
     protected function messageRecord($row)
     {
@@ -2567,6 +2753,10 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @param array $flags list of IMAP flag strings
      */
     public function setFlags($user, $folder, $uid, $flags)
     {
@@ -2601,6 +2791,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function expunge($user, $folder)
     {
@@ -2652,6 +2844,10 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $from source folder for the move operation
+     * @param string $to destination folder for the move operation
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function moveMessage($user, $from, $to, $uid)
     {
@@ -2687,6 +2883,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function messageCount($user, $folder)
     {
@@ -2705,6 +2903,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function uidValidity($user, $folder)
     {
@@ -2726,6 +2926,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function uidNext($user, $folder)
     {
@@ -2740,6 +2942,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function isSubscribed($user, $folder)
     {
@@ -2762,6 +2966,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function subscribe($user, $folder)
     {
@@ -2781,6 +2987,8 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
      */
     public function unsubscribe($user, $folder)
     {
@@ -2800,6 +3008,7 @@ class SqlMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
      */
     public function listSubscribed($user)
     {
@@ -2829,6 +3038,9 @@ class SqlMailStorage extends MailStorage
      * Callers can fetch messageBodyLocation for two messages
      * delivered to different users and observe that the
      * storage location coincides.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -2870,6 +3082,8 @@ class SqlMailStorage extends MailStorage
      * "abcd1234..." goes under "ab/cd/abcd1234.eml". The blob
      * store contains only .eml files; refcounts live in the
      * mail_blobs table for ACID crash-recovery.
+     * @param mixed $hash hash parameter
+     * @return string absolute filesystem path of the BLOB by content-id
      */
     protected function blobPath($hash)
     {
@@ -2888,6 +3102,9 @@ class SqlMailStorage extends MailStorage
      * transactional; we use temp-then-atomic-rename to avoid
      * torn writes). A rolled-back transaction can leave an
      * orphan .eml; a periodic reaper recovers it.
+     * @param mixed $hash hash parameter
+     * @param int $bytes number of bytes
+     * @return int new refcount after the increment
      */
     protected function blobIncRef($hash, $bytes)
     {
@@ -2926,6 +3143,8 @@ class SqlMailStorage extends MailStorage
      * as the mail_messages DELETE that triggered the drop,
      * so a crash mid-expunge cannot leave a row orphaned
      * with a stale refcount.
+     * @param mixed $hash hash parameter
+     * @return int new refcount after the decrement; zero triggers deletion
      */
     protected function blobDecRef($hash)
     {
@@ -2948,6 +3167,8 @@ class SqlMailStorage extends MailStorage
      * returns false if the blob is missing (a bug rather
      * than an expected condition once mail_blobs is the
      * authoritative refcount).
+     * @param mixed $hash hash parameter
+     * @return string|false raw blob bytes, or false if the content-id is unknown
      */
     protected function blobRead($hash)
     {
@@ -3070,6 +3291,8 @@ class MailSite
     }
     /**
      * Sets the authenticator used by SMTP AUTH and IMAP LOGIN.
+     * @param mixed $authenticator authenticator parameter
+     * @return Authenticator currently installed authenticator
      */
     public function auth(Authenticator $authenticator)
     {
@@ -3079,6 +3302,8 @@ class MailSite
     /**
      * Sets the storage backend used by both protocols and by
      * the direct-call public API.
+     * @param mixed $storage storage parameter
+     * @return MailStorage currently installed mail storage backend
      */
     public function storage(MailStorage $storage)
     {
@@ -3095,6 +3320,8 @@ class MailSite
      *     trailing CRLF is appended automatically)
      *   - 'reject': close the connection; SMTP gets 421, IMAP
      *     gets a "* BYE" before close
+     * @param callable $callback callback to invoke
+     * @return bool false to suppress emission of the banner; true to send it
      */
     public function onBanner(callable $callback)
     {
@@ -3107,6 +3334,8 @@ class MailSite
      * $info has 'remote_addr', 'remote_port', 'protocol',
      * 'tls_active'. Returning 'reject' closes the connection.
      * Useful for IP-based allow/deny lists.
+     * @param callable $callback callback to invoke
+     * @return bool false to immediately drop the connection; true to accept
      */
     public function onConnect(callable $callback)
     {
@@ -3118,6 +3347,8 @@ class MailSite
      * parsed. $info has 'domain', 'verb' ('EHLO'|'HELO').
      * Returning 'reject' replies 550 and the session stays in
      * INIT state.
+     * @param callable $callback callback to invoke
+     * @return bool false to reject HELO/EHLO; true to accept
      */
     public function onHelo(callable $callback)
     {
@@ -3128,6 +3359,8 @@ class MailSite
      * Registers a callback to run after MAIL FROM has been
      * parsed. $info has 'from'. Returning 'reject' replies
      * 550 5.7.1 and MAIL FROM is not accepted.
+     * @param callable $callback callback to invoke
+     * @return bool false to reject MAIL FROM; true to accept
      */
     public function onMailFrom(callable $callback)
     {
@@ -3140,6 +3373,8 @@ class MailSite
      * survive that check). $info has 'to' and 'local_user' (the
      * resolved local username). Returning 'reject' replies
      * 550 5.7.1 for that recipient only.
+     * @param callable $callback callback to invoke
+     * @return bool false to reject RCPT TO; true to accept
      */
     public function onRcptTo(callable $callback)
     {
@@ -3153,6 +3388,8 @@ class MailSite
      * of [name, value] pairs preserving order and case),
      * 'header_block', 'bytes'. Returning 'reject' replies
      * 550 5.6.0 and the message is discarded.
+     * @param callable $callback callback to invoke
+     * @return bool false to reject the message during header phase; true to continue
      */
     public function onHeader(callable $callback)
     {
@@ -3167,6 +3404,8 @@ class MailSite
      *   - false: drop silently (still 250 to client)
      *   - 'reject': SMTP-level reject with 550
      *   - ['folder'=>'Junk','flags'=>['\Recent']]: redirect
+     * @param callable $callback callback to invoke
+     * @return bool false to reject the delivered message; true to accept
      */
     public function onMessage(callable $callback)
     {
@@ -3178,6 +3417,10 @@ class MailSite
      * the first non-null verdict, or null if every hook returned
      * null/true. Hooks that throw are caught and treated as if
      * they returned null so a buggy filter cannot kill the loop.
+     * @param mixed $stage stage parameter
+     * @param mixed $info info parameter
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return bool true if every hook returned true; false if any returned false
      */
     protected function runHooks($stage, $info, $context)
     {
@@ -3203,6 +3446,8 @@ class MailSite
      * local; any other RCPT TO requires that the SMTP session
      * be authenticated, otherwise the server refuses with 550
      * to prevent open-relay use.
+     * @param mixed $domains domains parameter
+     * @return array list of configured mail domain names
      */
     public function domains(array $domains)
     {
@@ -3268,7 +3513,7 @@ class MailSite
      * "" "*", suitable for a webmail front-end that wants the
      * full folder tree without going through the wire protocol.
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @return array list of folder name strings, sorted
      */
     public function listFolders($user)
@@ -3280,7 +3525,7 @@ class MailSite
      * existing folder is a successful no-op. Mirrors the IMAP
      * CREATE command for direct callers.
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @param string $folder full folder path, e.g. "Archive/2026"
      * @return bool true on success
      */
@@ -3293,8 +3538,8 @@ class MailSite
      * INBOX or a folder with subfolders, matching the IMAP
      * DELETE semantics.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return bool true on success
      */
     public function deleteFolder($user, $folder)
@@ -3305,9 +3550,9 @@ class MailSite
      * Renames a folder. Refuses to rename INBOX. Subfolders move
      * with the renamed folder.
      *
-     * @param string $user
-     * @param string $old
-     * @param string $new
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $old current folder name to rename from
+     * @param string $new target folder name to rename to
      * @return bool true on success
      */
     public function renameFolder($user, $old, $new)
@@ -3321,8 +3566,8 @@ class MailSite
      * "Save Draft" or "Save Sent" actions that want a message
      * placed verbatim with caller-chosen flags.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @param string $bytes full RFC 5322 message
      * @param array $flags initial flag set
      * @param int $date Unix timestamp; 0 means "now"
@@ -3341,9 +3586,9 @@ class MailSite
     /**
      * Returns the raw RFC 5322 bytes of a single message.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
      * @return string|false the bytes, or false if not found
      */
     public function fetchMessage($user, $folder, $uid)
@@ -3356,10 +3601,10 @@ class MailSite
      * (user, folder, uid) physically live. See
      * MailStorage::messageBodyLocation for the return shape.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
-     * @return array|false
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @return array|false metadata record describing where the body bytes live, or false if (user, folder, uid) does not resolve to a stored message
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -3373,8 +3618,8 @@ class MailSite
      * strings), internal_date (Unix timestamp). This is the
      * direct-call shape a webmail message-list view consumes.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return array list of metadata records
      */
     public function listMessages($user, $folder)
@@ -3385,10 +3630,10 @@ class MailSite
      * Returns the metadata record for a single message, with
      * the same shape as one entry of listMessages.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
-     * @return array|false
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @return array|false metadata record (uid, size, flags, internal_date), or false if the message does not exist
      */
     public function messageMeta($user, $folder, $uid)
     {
@@ -3399,10 +3644,10 @@ class MailSite
      * Replaces the flag set on a message. Pass an empty array
      * to clear all flags.
      *
-     * @param string $user
-     * @param string $folder
-     * @param int $uid
-     * @param array $flags
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @param array $flags list of IMAP flag strings to set on the message
      * @return bool true on success
      */
     public function setFlags($user, $folder, $uid, $flags)
@@ -3419,8 +3664,8 @@ class MailSite
      * \Deleted flag set, and returns the list of UIDs that were
      * removed. Mirrors IMAP EXPUNGE.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      * @return array list of expunged UIDs
      */
     public function expunge($user, $folder)
@@ -3436,10 +3681,10 @@ class MailSite
      * because UIDs are per-user, not per-folder; this matches
      * the IMAP UIDPLUS expectation for COPY/MOVE.
      *
-     * @param string $user
+     * @param string $user username (no @domain) identifying the mail account
      * @param string $from source folder
      * @param string $to destination folder
-     * @param int $uid
+     * @param int $uid persistent IMAP unique identifier of the message
      * @return bool true on success
      */
     public function moveMessage($user, $from, $to, $uid)
@@ -3456,9 +3701,9 @@ class MailSite
      * Returns the number of messages currently in a folder.
      * Matches the count IMAP reports as EXISTS in SELECT.
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int number of messages currently in the folder, or -1 if the folder is unknown
      */
     public function messageCount($user, $folder)
     {
@@ -3469,9 +3714,9 @@ class MailSite
      * efficient than fetching listFolders() and checking
      * membership when the caller only needs a yes/no answer.
      *
-     * @param string $user
-     * @param string $folder
-     * @return bool
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return bool true if the named folder exists under $user, false otherwise
      */
     public function folderExists($user, $folder)
     {
@@ -3486,9 +3731,9 @@ class MailSite
      * actual UID handed out may be larger by the time the
      * caller acts on it.
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int next UID that will be assigned for an appended message in the folder
      */
     public function uidNext($user, $folder)
     {
@@ -3502,9 +3747,9 @@ class MailSite
      * folder at create time, so deleting and recreating a
      * folder hands out a fresh value.
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int fixed UIDVALIDITY value for the folder per RFC 3501 sec 2.3.1.1
      */
     public function uidValidity($user, $folder)
     {
@@ -3518,8 +3763,8 @@ class MailSite
      * because IDLE subscribers only care about deltas during
      * the idle window.
      *
-     * @param string $user
-     * @param string $folder
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
      */
     protected function bumpMailboxChange($user, $folder)
     {
@@ -3538,9 +3783,9 @@ class MailSite
      * idle entry, and by processIdleNotifications to compare
      * later.
      *
-     * @param string $user
-     * @param string $folder
-     * @return int
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @return int monotonic counter incremented on each storage change, used by IMAP IDLE to detect changes
      */
     protected function currentChangeCounter($user, $folder)
     {
@@ -3558,6 +3803,8 @@ class MailSite
      * three slots are kept null rather than deleted so later
      * isset() checks can short-circuit without keying through
      * an undefined index notice in strict environments.
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; IDLE state for the session is reset
      */
     protected function clearImapIdleState(&$context)
     {
@@ -3570,6 +3817,8 @@ class MailSite
      * Resolves a recipient address to a local username, or false
      * if the recipient is not local. The local part is returned
      * in its lowercased form because storage is case-insensitive.
+     * @param string $address address
+     * @return string|false local username if the address resolves to a local mailbox, false otherwise
      */
     public function resolveLocalUser($address)
     {
@@ -3597,6 +3846,10 @@ class MailSite
      * $repeating is true (default) the callable fires every
      * $time seconds; if false, just once. Returns an opaque
      * timer id that can be passed to clearTimer.
+     * @param int $time Unix timestamp
+     * @param callable $callback callback to invoke
+     * @param mixed $repeating repeating parameter
+     * @return string opaque timer id usable with clearTimer
      */
     public function setTimer($time, callable $callback,
         $repeating = true)
@@ -3616,7 +3869,7 @@ class MailSite
      * value returned by setTimer. Calling with an unknown id
      * is a silent no-op.
      *
-     * @param string $id
+     * @param string $id timer identifier returned by setTimer
      */
     public function clearTimer($id)
     {
@@ -3631,6 +3884,8 @@ class MailSite
      * (TLS is negotiated immediately on accept, no plaintext
      * greeting). STARTTLS is advertised on the plaintext SMTP
      * and IMAP listeners whenever a TLS context is configured.
+     * @param array $config configuration overrides
+     * @return void no return; the event loop runs until the process is killed or a fatal listener error
      */
     public function listen($config = [])
     {
@@ -3786,6 +4041,9 @@ class MailSite
      * SMTP greets with 220, IMAP with "* OK". The onConnect and
      * onBanner hooks fire after accept (and after TLS upgrade
      * if implicit) so they see the eventual TLS state.
+     * @param mixed $server server parameter
+     * @param mixed $listener listener parameter
+     * @return void no return; the new connection is registered in $this->in_streams
      */
     protected function acceptConnection($server, $listener)
     {
@@ -3892,6 +4150,8 @@ class MailSite
      * is up unless ALLOW_PLAINTEXT_AUTH is set. IDLE is offered
      * unconditionally since RFC 2177 places no auth requirement
      * on advertising it.
+     * @param mixed $tls_active tls_active parameter
+     * @return string CAPABILITY response string appropriate to the current TLS / auth state
      */
     protected function imapPreAuthCapabilities($tls_active)
     {
@@ -3923,6 +4183,8 @@ class MailSite
      * be attributed to this call (using error_get_last alone is
      * unreliable because that buffer is process-wide). Returns
      * true on success, false on failure (caller closes socket).
+     * @param resource $connection open connection resource
+     * @return bool true on successful TLS handshake
      */
     protected function upgradeToTls($connection)
     {
@@ -3991,6 +4253,10 @@ class MailSite
      * Centralizes CRLF framing. The detail text must not
      * contain CR or LF; we do no escaping because all call
      * sites supply fixed English literals.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $status status
+     * @param mixed $detail detail parameter
      */
     protected function imapResp($key, $tag, $status, $detail)
     {
@@ -4000,6 +4266,9 @@ class MailSite
     /**
      * Shorthand for the "$tag OK $verb completed" reply that
      * ends most successful IMAP commands.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param mixed $verb verb parameter
      */
     protected function imapOk($key, $tag, $verb)
     {
@@ -4011,6 +4280,7 @@ class MailSite
      * AUTH PLAIN / LOGIN over a plaintext (non-TLS) channel.
      * Default false; deployments that explicitly opt in to
      * loopback-only or test setups can flip this.
+     * @return bool true if plaintext AUTH (PLAIN/LOGIN) is permitted on this connection
      */
     protected function allowsPlaintextAuth()
     {
@@ -4054,6 +4324,8 @@ class MailSite
     /**
      * Returns true if it consumed a command (caller should loop),
      * false if it needs more bytes or the stream was destroyed.
+     * @param int $key connection key in the in_streams map
+     * @return bool true if one command line was processed; false if more input is needed
      */
     protected function processOne($key)
     {
@@ -4140,6 +4412,10 @@ class MailSite
      *   MAIL  + RCPT TO           -> RCPT
      *   RCPT  + DATA              -> DATA
      *   DATA  + ".\r\n"           -> READY (message accepted)
+     * @param int $key connection key in the in_streams map
+     * @param string $line raw line received from the client
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; one SMTP line was processed inline
      */
     protected function dispatchSmtp($key, $line, &$context)
     {
@@ -4242,6 +4518,9 @@ class MailSite
      * finishWrite once the 220 has been flushed to the wire,
      * because anything written before the handshake corrupts
      * the TLS framing the client expects.
+     * @param int $key connection key in the in_streams map
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the STARTTLS response was queued for the client
      */
     protected function dispatchSmtpStarttls($key, &$context)
     {
@@ -4264,6 +4543,10 @@ class MailSite
      * continuation line after a 334 challenge. LOGIN always
      * uses a two-line continuation: server prompts username
      * then password, both base64-encoded.
+     * @param int $key connection key in the in_streams map
+     * @param string $line raw line received from the client
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the AUTH continuation was queued for the client
      */
     protected function dispatchSmtpAuth($key, $line, &$context)
     {
@@ -4379,6 +4662,8 @@ class MailSite
      * around the address is ignored. Returns the address (which
      * may be the empty string for the null reverse-path "<>"),
      * or false if the line cannot be parsed.
+     * @param string $line raw line received from the client
+     * @param mixed $verb verb parameter
      */
     protected function parseSmtpAddress($line, $verb)
     {
@@ -4427,6 +4712,10 @@ class MailSite
      * session does not need to be authenticated to set a sender;
      * what is policed is the RCPT TO step. Fires the onMailFrom
      * hook; a 'reject' verdict refuses with 550 5.7.1.
+     * @param int $key connection key in the in_streams map
+     * @param string $line raw line received from the client
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the MAIL FROM response was queued for the client
      */
     protected function dispatchSmtpMailFrom($key, $line, &$context)
     {
@@ -4457,6 +4746,10 @@ class MailSite
      * This is what makes the server NOT an open relay. Fires
      * the onRcptTo hook only after the recipient has passed the
      * anti-relay check.
+     * @param int $key connection key in the in_streams map
+     * @param string $line raw line received from the client
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the RCPT TO response was queued for the client
      */
     protected function dispatchSmtpRcptTo($key, $line, &$context)
     {
@@ -4505,6 +4798,10 @@ class MailSite
      * variant). Returns true once one full message has been
      * consumed (caller will loop and try the next command).
      * Performs CRLF dot-unstuffing per RFC 5321 sec 4.5.2.
+     * @param int $key connection key in the in_streams map
+     * @param mixed $buffer buffer parameter
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return bool true if the DATA phase produced a complete message and was delivered
      */
     protected function consumeSmtpDataPhase($key, &$buffer, &$context)
     {
@@ -4590,6 +4887,8 @@ class MailSite
      * case. Continuation lines (RFC 5322 sec 2.2.3 folded white
      * space) are unfolded. The returned 'block' is the raw bytes
      * up to but not including the empty CRLF separator.
+     * @param string $message raw RFC 5322 message bytes
+     * @return array list of [name, value] header pairs in document order
      */
     protected function parseRfc5322Headers($message)
     {
@@ -4639,6 +4938,9 @@ class MailSite
      * the delivery chain. We include the remote address, our
      * server name, the protocol (ESMTPA when authenticated),
      * and the receipt timestamp.
+     * @param string $message raw RFC 5322 message bytes
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return string message with a Received: header prepended
      */
     protected function prependReceivedHeader($message, $context)
     {
@@ -4683,6 +4985,10 @@ class MailSite
      *   SELECTED -- authenticated + selected mailbox; adds
      *               FETCH/STORE/SEARCH/COPY/MOVE/CLOSE/etc.
      * Tags are echoed back in the tagged status response.
+     * @param int $key connection key in the in_streams map
+     * @param string $line raw line received from the client
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; one command was processed inline
      */
     protected function dispatchImap($key, $line, &$context)
     {
@@ -4865,6 +5171,10 @@ class MailSite
      * handles. Once the client is authenticated, STARTTLS and
      * LOGINDISABLED stop being relevant; the spec lets us
      * advertise the same string post-auth.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdCapability($key, $tag, $context)
     {
@@ -4882,6 +5192,11 @@ class MailSite
      * server's name and version. NIL is a valid argument
      * meaning the client wishes to identify nothing; we
      * accept that and still reply with our own identification.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdId($key, $tag, $arguments, $context)
     {
@@ -4898,6 +5213,10 @@ class MailSite
      * hierarchy delimiter, and no other-users / shared
      * namespaces. The reply form is three nested paren-lists
      * separated by spaces.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdNamespace($key, $tag, $context)
     {
@@ -4914,6 +5233,11 @@ class MailSite
      * for clients that send unprintable bytes (the literal
      * continuation arrives as the next line through
      * continueImapLiteral).
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdLogin($key, $tag, $arguments, &$context)
     {
@@ -4958,6 +5282,12 @@ class MailSite
      * connection to AUTH state. Invoked from the inline path
      * (imapCmdLogin) and from the literal-continuation path
      * (continueImapLiteral).
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $user username (no @domain) identifying the mail account
+     * @param mixed $pass pass parameter
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the login response was queued for the client
      */
     protected function finishImapLogin($key, $tag, $user, $pass,
         &$context)
@@ -4985,6 +5315,11 @@ class MailSite
      * username-then-password continuation. The mechanism name
      * is the only positional argument here; everything else
      * arrives via continueImapLiteral on subsequent lines.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdAuthenticate($key, $tag, $arguments, &$context)
     {
@@ -5021,6 +5356,10 @@ class MailSite
      * "continuation" key naming the expected next phase; once
      * the final line arrives we finish the operation and clear
      * the pending slot.
+     * @param int $key connection key in the in_streams map
+     * @param string $line raw line received from the client
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return bool true if the literal was fully consumed and the command was dispatched
      */
     protected function continueImapLiteral($key, $line, &$context)
     {
@@ -5146,6 +5485,8 @@ class MailSite
      * NIL decodes as an atom with value "NIL". Whitespace
      * between tokens is consumed. Returns an empty array on
      * a parse error; caller should treat that as BAD syntax.
+     * @param mixed $s s parameter
+     * @return array list of parsed IMAP tokens (strings, literals, paren-lists)
      */
     protected function parseImapTokens($s)
     {
@@ -5239,6 +5580,9 @@ class MailSite
      * tokens list, returning false if the list is empty or the
      * first token is a literal (literals require continuation
      * handling and cannot be returned synchronously).
+     * @param mixed $tokens tokens parameter
+     * @param mixed $index index parameter
+     * @return string IMAP wire representation of the token value (quoted, literal, or atom)
      */
     protected function tokenString($tokens, $index)
     {
@@ -5265,6 +5609,12 @@ class MailSite
      * "LIST (SPECIAL-USE) ...") are accepted but not filtered;
      * special-use attributes appear in the response either
      * way.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $is_lsub is_lsub parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdList($key, $tag, $arguments, &$context,
         $is_lsub)
@@ -5360,6 +5710,9 @@ class MailSite
      *      \Junk, \Archive, \All. INBOX is excluded; RFC 6154
      *      reserves special-use flags for non-INBOX folders.
      * Space-separated; may be empty.
+     * @param string $folder folder name with full hierarchy path
+     * @param mixed $all_folders all_folders parameter
+     * @return string space-separated IMAP folder attribute list
      */
     protected function imapFolderAttrs($folder, $all_folders)
     {
@@ -5389,6 +5742,8 @@ class MailSite
      * RFC 6154 sec 2 says the special-use attributes apply
      * to non-INBOX folders. Sub-folders under a special-use
      * parent (e.g. "Archive/2025") are not flagged.
+     * @param string $folder folder name with full hierarchy path
+     * @return string IMAP SPECIAL-USE attribute (\\Trash, \\Sent, ...) or empty string
      */
     protected function imapSpecialUseAttr($folder)
     {
@@ -5422,6 +5777,8 @@ class MailSite
      * including the hierarchy delimiter; "%" matches any
      * sequence not containing the delimiter. All other regex
      * metacharacters are escaped.
+     * @param string $pattern pattern string
+     * @return string regex equivalent of the IMAP LIST pattern (% / * wildcards)
      */
     protected function imapPatternToRegex($pattern)
     {
@@ -5451,6 +5808,8 @@ class MailSite
      * 3501 also allows literals here, but quoted strings are
      * easier for clients to parse and sufficient for our
      * folder namespace.
+     * @param string $name name
+     * @return string IMAP mailbox name in the wire-format encoding
      */
     protected function imapEncodeMailboxName($name)
     {
@@ -5473,6 +5832,12 @@ class MailSite
      * whether the mailbox exists, while UNSUBSCRIBE on a
      * never-subscribed folder returns OK as a no-op
      * (idempotency per RFC 3501 sec 6.3.7).
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param mixed $verb verb parameter
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdSubscribe($key, $tag, $arguments, $verb,
         &$context)
@@ -5497,6 +5862,11 @@ class MailSite
      * MESSAGES, RECENT, UIDNEXT, UIDVALIDITY, UNSEEN. Returns
      * an untagged STATUS response then the tagged OK. Folder
      * is NOT made the selected mailbox.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdStatus($key, $tag, $arguments, &$context)
     {
@@ -5549,6 +5919,9 @@ class MailSite
      * 0 if all are seen), and the UIDNEXT / UIDVALIDITY values.
      * Folders with no messages still report well-defined zero/
      * one values rather than failing.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return array folder statistics record (counts, uid info)
      */
     protected function imapFolderStats($user, $folder)
     {
@@ -5583,6 +5956,11 @@ class MailSite
      * Handles CREATE <mailbox>. Refuses to create INBOX (it
      * already exists) or names that fail the storage layer's
      * folder validation.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdCreate($key, $tag, $arguments, &$context)
     {
@@ -5622,6 +6000,11 @@ class MailSite
      * Handles DELETE <mailbox>. The storage layer refuses to
      * delete INBOX or a folder with subfolders; we propagate
      * those as NO responses.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdDelete($key, $tag, $arguments, &$context)
     {
@@ -5664,6 +6047,11 @@ class MailSite
      * Handles RENAME <old> <new>. INBOX is not renameable. If
      * the renamed folder was selected, selection updates to
      * the new name so the SELECTED state stays consistent.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdRename($key, $tag, $arguments, &$context)
     {
@@ -5707,6 +6095,12 @@ class MailSite
      * OK [UIDNEXT], optional OK [UNSEEN]) followed by the
      * tagged OK [READ-WRITE] or OK [READ-ONLY]. After SELECT
      * the connection STATE is SELECTED.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $is_examine is_examine parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdSelect($key, $tag, $arguments, &$context,
         $is_examine)
@@ -5780,6 +6174,10 @@ class MailSite
      * behavior should issue EXPUNGE before CLOSE. Mainstream
      * clients (Thunderbird, Outlook, mutt) issue an explicit
      * EXPUNGE either way, so the deviation is rarely visible.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdClose($key, $tag, &$context)
     {
@@ -5799,6 +6197,11 @@ class MailSite
      * interpreted as UIDs. We dispatch to the same handlers
      * with a by-uid flag, and the FETCH responses always
      * include the UID data item per the RFC.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdUid($key, $tag, $arguments, &$context)
     {
@@ -5841,6 +6244,9 @@ class MailSite
      * uid, last_uid); $by_uid selects whether the sequence or
      * UID is tested. "*" expands to last_seq in by-sequence
      * mode and to last_uid in by-uid mode.
+     * @param mixed $spec spec parameter
+     * @param mixed $by_uid by_uid parameter
+     * @return array list of integer UIDs covered by the sequence set
      */
     protected function imapParseMessageSet($spec, $by_uid)
     {
@@ -5883,6 +6289,11 @@ class MailSite
      * COPY, MOVE, and SEARCH. The list is in sequence-number
      * order (which is also UID order, since UIDs are assigned
      * monotonically).
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param array $set set of items
+     * @param mixed $by_uid by_uid parameter
+     * @return bool true if the candidate is in the IMAP message set
      */
     protected function imapMatchSet($user, $folder, $set, $by_uid)
     {
@@ -5914,6 +6325,11 @@ class MailSite
      * continuation kind that collects the literal bytes
      * across multiple readClient ticks (the body usually
      * arrives in many TCP fragments).
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdAppend($key, $tag, $arguments, &$context)
     {
@@ -5995,6 +6411,13 @@ class MailSite
      * payload, e.g. "(FLAGS UID INTERNALDATE RFC822.SIZE
      * BODY.PEEK[HEADER.FIELDS (Date Subject)])". We parse it
      * by walking and recognizing each top-level item.
+     * @param int $key connection key in the in_streams map
+     * @param mixed $sequence_number sequence_number parameter
+     * @param array $meta metadata record
+     * @param string $body message body bytes
+     * @param mixed $items_str items_str parameter
+     * @param mixed $is_uid_variant is_uid_variant parameter
+     * @param mixed $mark_seen mark_seen parameter
      */
     protected function imapEmitFetch($key, $sequence_number, $meta, $body,
         $items_str, $is_uid_variant, &$mark_seen)
@@ -6036,6 +6459,8 @@ class MailSite
      *   ['kind' => 'BODY', 'section' => 'HEADER',
      *    'fields' => ['Subject','From'], 'raw' => 'BODY[...]',
      *    'peek' => true]
+     * @param mixed $items_str items_str parameter
+     * @return array list of parsed FETCH item descriptions
      */
     protected function imapParseFetchItems($items_str)
     {
@@ -6106,6 +6531,8 @@ class MailSite
      * section spec, and field list. The kind is always upper-
      * cased; field names preserve their original case so the
      * response matches the request.
+     * @param string $token token string
+     * @return array parsed FETCH item description
      */
     protected function imapAnalyzeFetchItem($token)
     {
@@ -6162,6 +6589,11 @@ class MailSite
      * Renders one FETCH item to its IMAP-formatted form. The
      * mark_seen flag is set true when a non-PEEK BODY[*] is
      * served and we should set the \Seen flag after responding.
+     * @param mixed $item item
+     * @param array $meta metadata record
+     * @param string $body message body bytes
+     * @param mixed $mark_seen mark_seen parameter
+     * @return string IMAP wire encoding of one FETCH item
      */
     protected function imapRenderFetchItem($item, $meta, $body,
         &$mark_seen)
@@ -6226,6 +6658,8 @@ class MailSite
      * Used for any FETCH response data that is not a quoted
      * atom; the client reads exactly N bytes after the {N}\r\n
      * before resuming line-based parsing.
+     * @param mixed $s s parameter
+     * @return string IMAP literal-syntax encoding of the value (with {n}\r\n prefix)
      */
     protected function imapLiteralOf($s)
     {
@@ -6236,6 +6670,8 @@ class MailSite
      * including the blank line CRLF that terminates the header
      * section. If the message has no body separator the entire
      * message is treated as headers.
+     * @param string $body message body bytes
+     * @return string serialized RFC 5322 header block
      */
     protected function imapHeaderBlock($body)
     {
@@ -6252,6 +6688,8 @@ class MailSite
      * Returns the body text of a message: everything after the
      * header-section separator. Empty string if there is no
      * separator (a malformed message with only headers).
+     * @param string $body message body bytes
+     * @return string extracted text body of the message
      */
     protected function imapBodyText($body)
     {
@@ -6272,6 +6710,10 @@ class MailSite
      * multipart tree is parsed via imapParseEntity. Out-of-
      * range or unrecognized sections fall back to the whole
      * body so clients see data rather than an empty literal.
+     * @param string $body message body bytes
+     * @param string $section IMAP FETCH BODY section specifier
+     * @param mixed $fields fields parameter
+     * @return string requested BODY[section] data
      */
     protected function imapBodySection($body, $section, $fields)
     {
@@ -6354,6 +6796,9 @@ class MailSite
      * top-level entity, path "1" returns the entity itself
      * (per RFC 3501 sec 6.4.5: a single-part message has its
      * entire body addressable as part 1).
+     * @param mixed $entity entity parameter
+     * @param string $path filesystem path
+     * @return mixed sub-entity of the parsed MIME tree at the requested section
      */
     protected function imapNavigateEntity($entity, $path)
     {
@@ -6391,6 +6836,10 @@ class MailSite
      * $fields, preserving the original line content and
      * terminating with the standard blank line CRLF that
      * RFC 3501 sec 6.4.5 says clients expect.
+     * @param mixed $hdr_block hdr_block parameter
+     * @param mixed $fields fields parameter
+     * @param mixed $invert invert parameter
+     * @return string filtered subset of headers as a single bytes-string
      */
     protected function imapFilterHeaders($hdr_block, $fields,
         $invert)
@@ -6433,6 +6882,8 @@ class MailSite
      * to, message-id. Address lists are nested paren-lists
      * containing (name source-route mailbox-name host-name)
      * tuples; absent fields are NIL.
+     * @param string $body message body bytes
+     * @return string IMAP ENVELOPE response value
      */
     protected function imapEnvelope($body)
     {
@@ -6463,6 +6914,8 @@ class MailSite
      * unfolded with a single space. Repeated headers are
      * concatenated with comma+space (sufficient for envelope
      * use; full fidelity would need an array per name).
+     * @param string $message raw RFC 5322 message bytes
+     * @return array parsed [name => value] header map
      */
     protected function imapParseHeaders($message)
     {
@@ -6509,6 +6962,8 @@ class MailSite
      * outside encoded-words pass through. Unrecognized
      * charsets are left uninterpreted but still unwrapped,
      * good enough for substring searches.
+     * @param string $value value
+     * @return string decoded UTF-8 form of the header value
      */
     protected function imapDecodeMimeHeader($value)
     {
@@ -6556,6 +7011,8 @@ class MailSite
      * Renders a string as either an IMAP quoted string or NIL
      * if the value is null/empty. Used for ENVELOPE date,
      * subject, in-reply-to, and message-id slots.
+     * @param string $value value
+     * @return string IMAP nstring response value (quoted or NIL)
      */
     protected function imapEnvelopeNString($value)
     {
@@ -6574,6 +7031,8 @@ class MailSite
      * RFC 5321 deprecated source routes; we just split on the
      * @ to derive mailbox/host. Display names are extracted
      * from the "Name <email>" form when present.
+     * @param string $value value
+     * @return string IMAP envelope address-list response
      */
     protected function imapEnvelopeAddrs($value)
     {
@@ -6600,6 +7059,8 @@ class MailSite
      * host" form. Quoted display names with embedded commas
      * are handled; comments in parentheses are not preserved.
      * Returns a list of ['name','local','host'] records.
+     * @param mixed $s s parameter
+     * @return array list of address records (each [display, mailbox, host])
      */
     protected function imapSplitAddressList($s)
     {
@@ -6670,6 +7131,9 @@ class MailSite
      * BODY[part-number].
      *   $kind is "BODY" or "BODYSTRUCTURE"; the latter adds
      * extension fields (md5, disposition, language, location).
+     * @param string $body message body bytes
+     * @param mixed $kind kind parameter
+     * @return string IMAP BODYSTRUCTURE response value
      */
     protected function imapBodyStructure($body, $kind)
     {
@@ -6698,6 +7162,8 @@ class MailSite
      *   lines             -- number of body lines (text only)
      *   parts             -- list of child entities (multipart
      *                        only; empty for leaves)
+     * @param int $bytes number of bytes
+     * @return array parsed MIME entity (headers + body or multipart parts)
      */
     protected function imapParseEntity($bytes)
     {
@@ -6778,6 +7244,9 @@ class MailSite
      * Preamble text before the first delimiter and epilogue
      * text after the closing delimiter are discarded per the
      * RFC. Each part is recursively parsed via imapParseEntity.
+     * @param string $body message body bytes
+     * @param mixed $boundary boundary parameter
+     * @return array list of MIME part bodies split at the boundary
      */
     protected function imapSplitMultipart($body, $boundary)
     {
@@ -6849,6 +7318,9 @@ class MailSite
      *               for $extended
      *   message/rfc822: rare, treated as a generic part
      *   other:      7-tuple as text without the lines field
+     * @param mixed $entity entity parameter
+     * @param mixed $extended extended parameter
+     * @return string IMAP BODYSTRUCTURE wire string
      */
     protected function imapRenderBodyStructure($entity, $extended)
     {
@@ -6901,6 +7373,8 @@ class MailSite
      * IMAP NIL-or-paren-list form: NIL if empty, else
      * (\"NAME\" \"value\" \"NAME2\" \"value2\" ...). Names are
      * upper-cased per IMAP convention; values keep their case.
+     * @param mixed $params params parameter
+     * @return string IMAP wire encoding of a MIME parameter list
      */
     protected function imapRenderParams($params)
     {
@@ -6922,6 +7396,12 @@ class MailSite
      * line; the tagged OK is sent after the loop. \Seen flag
      * is set on messages whose body was served via a non-PEEK
      * BODY request.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $by_uid by_uid parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdFetch($key, $tag, $arguments, &$context,
         $by_uid)
@@ -6967,6 +7447,12 @@ class MailSite
      * (remove), each with optional .SILENT suffix that
      * suppresses the per-message FETCH response. The flag
      * list itself is a parenthesized atom list.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $by_uid by_uid parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdStore($key, $tag, $arguments, &$context,
         $by_uid)
@@ -7045,6 +7531,12 @@ class MailSite
      * file). Copying inherently allocates new UIDs because
      * the same per-user UID counter is used for the new
      * message.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $by_uid by_uid parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdCopy($key, $tag, $arguments, &$context,
         $by_uid)
@@ -7102,6 +7594,12 @@ class MailSite
      * relocates the same file rather than allocating a new
      * UID. Per the RFC the server emits an EXPUNGE response
      * for each removed source message after the move.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $by_uid by_uid parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdMove($key, $tag, $arguments, &$context,
         $by_uid)
@@ -7169,6 +7667,10 @@ class MailSite
      * count stays consistent as each removal shifts higher
      * sequences down. Not allowed on read-only mailboxes
      * (EXAMINE).
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdExpunge($key, $tag, &$context)
     {
@@ -7209,6 +7711,12 @@ class MailSite
      * and the boolean operators NOT and OR. AND is implicit
      * (juxtaposed keys are conjuncted). Sequence-set and
      * UID-set restrictions also work.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param string $arguments arguments substring following the IMAP command verb
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param mixed $by_uid by_uid parameter
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdSearch($key, $tag, $arguments, &$context,
         $by_uid)
@@ -7247,6 +7755,8 @@ class MailSite
      * are bracketed with synthetic '(' and ')' markers, and
      * literal forms are collapsed to their string content.
      * Returns null on a parse error.
+     * @param mixed $s s parameter
+     * @return array list of SEARCH-key tokens
      */
     protected function imapTokenizeSearch($s)
     {
@@ -7306,6 +7816,14 @@ class MailSite
      * disjunction; NOT <key> as inversion; (...) grouping for
      * arbitrary boolean trees. Side-loads the message body
      * lazily for keys that need it (BODY, TEXT, HEADER).
+     * @param mixed $tokens tokens parameter
+     * @param array $meta metadata record
+     * @param mixed $sequence_number sequence_number parameter
+     * @param mixed $last_seq last_seq parameter
+     * @param mixed $last_uid last_uid parameter
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return bool true if the message matches the parsed SEARCH expression
      */
     protected function imapEvalSearch(&$tokens, $meta, $sequence_number,
         $last_seq, $last_uid, $user, $folder)
@@ -7494,6 +8012,10 @@ class MailSite
      * counter at IDLE entry so the tick-side diff is cheap
      * (no diff if counter unchanged). The client sends DONE
      * to terminate; we ack with tagged OK and clear state.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response is queued for the client
      */
     protected function imapCmdIdle($key, $tag, &$context)
     {
@@ -7522,6 +8044,9 @@ class MailSite
      *             change without deep array compare
      *   count  -- number of messages, kept separate so the
      *             EXISTS push can use it without rewalking
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return array snapshot of folder counters and uids used by IMAP IDLE notifications
      */
     protected function captureFolderState($user, $folder)
     {
@@ -7548,6 +8073,10 @@ class MailSite
      * once the OK has been flushed. After upgrade, all CAPABILITY
      * results changes (LOGINDISABLED disappears) so a well-
      * behaved client re-issues CAPABILITY.
+     * @param int $key connection key in the in_streams map
+     * @param string $tag IMAP tag prefix the client used on the command line
+     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @return void no return; the response was queued for the client
      */
     protected function dispatchImapStarttls($key, $tag, &$context)
     {
@@ -7605,6 +8134,8 @@ class MailSite
      * drained: clears the entry and, if the connection was set
      * to QUIT during command processing, tears the stream down
      * for real. Splitting this out keeps writeClient short.
+     * @param int $key connection key in the in_streams map
+     * @return void no return; out_streams entry is cleared
      */
     protected function finishWrite($key)
     {

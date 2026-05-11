@@ -362,6 +362,7 @@ class Tls13Engine
     /**
      * Returns the most recent error message, or "" when no
      * error has been recorded.
+     * @return string|false most recent error message, or false if no error has been recorded
      */
     public function getError()
     {
@@ -372,6 +373,7 @@ class Tls13Engine
      * cipher has been picked yet. Used by trace and key-
      * derivation paths that need to know whether to use
      * AES-128-GCM or ChaCha20-Poly1305.
+     * @return int TLS cipher suite identifier negotiated during the handshake
      */
     public function negotiatedCipher()
     {
@@ -382,6 +384,7 @@ class Tls13Engine
      * SECP256R1), or 0 if no ClientHello has been
      * processed. Diagnostic only; the TLS engine drives
      * its own ECDHE internally.
+     * @return int TLS named group identifier selected for the key share
      */
     public function selectedGroup()
     {
@@ -389,6 +392,7 @@ class Tls13Engine
     }
     /**
      * Returns true once the handshake has completed.
+     * @return bool true if the operation has completed
      */
     public function isComplete()
     {
@@ -403,6 +407,7 @@ class Tls13Engine
      * example), the first Initial only carries a partial
      * CH and we should wait for the second before building
      * our reply.
+     * @return bool true if a ClientHello has been processed
      */
     public function hasClientHello()
     {
@@ -414,6 +419,7 @@ class Tls13Engine
     /**
      * Returns the four 1-RTT traffic secrets after handshake
      * completion. Empty array beforehand.
+     * @return array currently active traffic secrets (initial/handshake/application)
      */
     public function trafficSecrets()
     {
@@ -423,6 +429,7 @@ class Tls13Engine
      * Returns the 32-byte client_random from the
      * ClientHello, or "" if not yet seen. Useful for
      * SSLKEYLOGFILE-style key logging during debugging.
+     * @return string|false the client_random captured from the most recent ClientHello, or false if no ClientHello has been processed
      */
     public function clientRandom()
     {
@@ -430,6 +437,7 @@ class Tls13Engine
     }
     /**
      * Returns the negotiated ALPN, or "" if none.
+     * @return string ALPN protocol identifier negotiated for this connection
      */
     public function alpn()
     {
@@ -442,6 +450,7 @@ class Tls13Engine
      * the original DCID is known so the
      * original_destination_connection_id parameter can
      * be included.
+     * @param mixed $tp tp parameter
      */
     public function setServerQuicTransportParameters($tp)
     {
@@ -450,6 +459,7 @@ class Tls13Engine
     /**
      * Returns the peer's quic_transport_parameters bytes
      * captured from ClientHello.
+     * @return string|false raw bytes of the client transport parameters extension, or false if not present
      */
     public function clientQuicTransportParameters()
     {
@@ -458,6 +468,7 @@ class Tls13Engine
     /**
      * Records a fatal error and moves the engine into
      * ST_FAILED. After this, all feed* methods are no-ops.
+     * @param mixed $msg msg parameter
      */
     protected function fail($msg)
     {
@@ -476,6 +487,9 @@ class Tls13Engine
      * Reads a uint8 from $buf at offset $off, returns
      * [value, new_off]. Returns [false, $off] on
      * underflow.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [int $byte, int $new_off]
      */
     protected function readU8($buf, $off)
     {
@@ -487,6 +501,9 @@ class Tls13Engine
     /**
      * Reads a uint16. Returns [value, new_off] or
      * [false, $off] on underflow.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [int $value, int $new_off]
      */
     protected function readU16($buf, $off)
     {
@@ -498,6 +515,9 @@ class Tls13Engine
     }
     /**
      * Reads a uint24 (TLS-style 3-byte length).
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [int $value, int $new_off]
      */
     protected function readU24($buf, $off)
     {
@@ -512,6 +532,9 @@ class Tls13Engine
     /**
      * Reads a vector with a uint8 length prefix; returns
      * [bytes, new_off] or [false, $off] on underflow.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [string $bytes, int $new_off]
      */
     protected function readVec8($buf, $off)
     {
@@ -526,6 +549,9 @@ class Tls13Engine
     }
     /**
      * Reads a vector with a uint16 length prefix.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [string $bytes, int $new_off]
      */
     protected function readVec16($buf, $off)
     {
@@ -540,6 +566,9 @@ class Tls13Engine
     }
     /**
      * Reads a vector with a uint24 length prefix.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [string $bytes, int $new_off]
      */
     protected function readVec24($buf, $off)
     {
@@ -554,6 +583,8 @@ class Tls13Engine
     }
     /**
      * Encodes a uint16 in big-endian.
+     * @param mixed $v value
+     * @return string 2-byte big-endian encoding of the value
      */
     protected function packU16($v)
     {
@@ -561,6 +592,8 @@ class Tls13Engine
     }
     /**
      * Encodes a uint24 in big-endian.
+     * @param mixed $v value
+     * @return string 3-byte big-endian encoding of the value
      */
     protected function packU24($v)
     {
@@ -570,6 +603,8 @@ class Tls13Engine
     }
     /**
      * Wraps payload in a uint8-length-prefixed envelope.
+     * @param string $payload payload bytes
+     * @return string 1-byte length prefix followed by the vector bytes
      */
     protected function packVec8($payload)
     {
@@ -577,6 +612,8 @@ class Tls13Engine
     }
     /**
      * Wraps payload in a uint16-length-prefixed envelope.
+     * @param string $payload payload bytes
+     * @return string 2-byte length prefix followed by the vector bytes
      */
     protected function packVec16($payload)
     {
@@ -584,6 +621,8 @@ class Tls13Engine
     }
     /**
      * Wraps payload in a uint24-length-prefixed envelope.
+     * @param string $payload payload bytes
+     * @return string 3-byte length prefix followed by the vector bytes
      */
     protected function packVec24($payload)
     {
@@ -594,6 +633,9 @@ class Tls13Engine
      * type code and a uint24 length of the payload, and
      * also feeds the resulting bytes into the running
      * transcript.
+     * @param int $type type code
+     * @param string $body message body bytes
+     * @return string serialized handshake message: 1-byte type, 3-byte length, body bytes
      */
     protected function packHandshake($type, $body)
     {
@@ -619,6 +661,8 @@ class Tls13Engine
      * signature scheme, captures everything needed to build
      * the server flight. Returns true on success; false moves
      * the engine to ST_FAILED with getError() populated.
+     * @param string $bytes bytes to operate on
+     * @return bool true if the ClientHello was accepted
      */
     public function feedClientHello($bytes)
     {
@@ -665,6 +709,8 @@ class Tls13Engine
     /**
      * Parses the body (everything after the type+length
      * header) of a ClientHello.
+     * @param string $body message body bytes
+     * @return array parsed ClientHello fields
      */
     protected function parseClientHelloBody($body)
     {
@@ -758,6 +804,8 @@ class Tls13Engine
      * Walks the extension list. Each extension is a uint16
      * type, uint16-prefixed payload. Captures the ones we
      * care about; ignores the rest.
+     * @param mixed $blob blob parameter
+     * @return array parsed extensions map (extension type => extension data)
      */
     protected function parseClientHelloExtensions($blob)
     {
@@ -829,6 +877,8 @@ class Tls13Engine
     /**
      * Checks whether the client's supported_versions list
      * includes TLS 1.3 (0x0304).
+     * @param string $payload payload bytes
+     * @return bool true if the ClientHello indicates TLS 1.3 support
      */
     protected function checkClientSupportsTls13($payload)
     {
@@ -847,6 +897,8 @@ class Tls13Engine
     /**
      * Parses signature_algorithms extension into a flat
      * list of uint16 scheme codes.
+     * @param string $payload payload bytes
+     * @return array list of TLS signature scheme identifiers offered by the peer
      */
     protected function parseSigAlgs($payload)
     {
@@ -868,6 +920,8 @@ class Tls13Engine
      * Other groups are ignored. The selection between the
      * two happens later (we prefer X25519 when both are
      * offered).
+     * @param string $payload payload bytes
+     * @return array parsed key-share record (group => raw public key)
      */
     protected function parseClientKeyShare($payload)
     {
@@ -909,6 +963,7 @@ class Tls13Engine
     /**
      * Walks the ALPN list, picks the first protocol the
      * client offers that also appears in our offer.
+     * @param string $payload payload bytes
      */
     protected function parseClientAlpn($payload)
     {
@@ -964,6 +1019,9 @@ class Tls13Engine
     /**
      * RFC 5869 HKDF-Extract. Returns 32 bytes (SHA-256
      * output length) regardless of input length.
+     * @param string $salt HKDF salt
+     * @param string $ikm HKDF input keying material
+     * @return string HKDF-Extract output (PRK)
      */
     protected function hkdfExtract($salt, $ikm)
     {
@@ -975,6 +1033,11 @@ class Tls13Engine
     /**
      * HKDF-Expand-Label per RFC 8446 sec 7.1. The "TLS 1.3"
      * label prefix and length encoding are fixed.
+     * @param string $secret TLS 1.3 traffic secret
+     * @param string $label HKDF-Expand-Label label
+     * @param array $context per-listener stream context overrides
+     * @param int $length byte length
+     * @return string HKDF-Expand-Label output of the requested length
      */
     protected function hkdfExpandLabel($secret, $label,
         $context, $length)
@@ -988,6 +1051,10 @@ class Tls13Engine
     /**
      * RFC 5869 HKDF-Expand. We never need more than 32 bytes
      * of output here (one hash block) so the loop is trivial.
+     * @param mixed $prk prk parameter
+     * @param string $info HKDF Info parameter (label + context)
+     * @param int $length byte length
+     * @return string HKDF-Expand output of the requested length
      */
     protected function hkdfExpand($prk, $info, $length)
     {
@@ -1006,6 +1073,10 @@ class Tls13Engine
      * Convenience wrapper used by the HKDF chain when the
      * "Derive-Secret" step calls for an empty messages
      * field (the hash of an empty input).
+     * @param string $secret TLS 1.3 traffic secret
+     * @param string $label HKDF-Expand-Label label
+     * @param mixed $messages messages parameter
+     * @return string derived TLS 1.3 secret for the given label and transcript
      */
     protected function deriveSecret($secret, $label,
         $messages)
@@ -1019,6 +1090,7 @@ class Tls13Engine
      * which by spec is the concatenation of all handshake
      * messages exchanged so far (each as
      * type || uint24-length || body).
+     * @return string current handshake transcript hash digest
      */
     protected function transcriptHash()
     {
@@ -1030,6 +1102,7 @@ class Tls13Engine
      * $this->secrets after master_secret derivation. Called
      * from buildServerFlight() once the client's key share
      * is known.
+     * @return string derived secret bytes
      */
     protected function deriveHandshakeSecrets()
     {
@@ -1066,6 +1139,7 @@ class Tls13Engine
      * Computes the ECDHE shared secret for the negotiated
      * named group. Returns the 32-byte secret on success
      * or false (with $this->fail invoked) on error.
+     * @return string shared ECDHE secret with $peer_pub
      */
     protected function computeEcdheShared()
     {
@@ -1122,6 +1196,8 @@ class Tls13Engine
      * for P-256 is the same constant 21-byte sequence
      * for any P-256 key (id-ecPublicKey + prime256v1
      * named curve), so we can prepend it verbatim.
+     * @param mixed $point65 point65 parameter
+     * @return string PEM-encoded public key for the raw P-256 point
      */
     protected static function p256RawPointToPubPem($point65)
     {
@@ -1153,6 +1229,7 @@ class Tls13Engine
      * Derives master_secret and the application traffic
      * secrets c_ap / s_ap. Called after the server's
      * Finished message has been added to the transcript.
+     * @return string derived secret bytes
      */
     protected function deriveApplicationSecrets()
     {
@@ -1176,6 +1253,8 @@ class Tls13Engine
      * AES-128-GCM, 32 + 12 for ChaCha20-Poly1305).
      *
      * Returns ['key' => string, 'iv' => string].
+     * @param string $secret TLS 1.3 traffic secret
+     * @return array derived [aead_key, iv, hp_key] for the traffic secret
      */
     protected function deriveRecordKeys($secret)
     {
@@ -1205,6 +1284,12 @@ class Tls13Engine
      */
     /**
      * AEAD encrypt. Cipher dispatch on $this->cipher.
+     * @param string $key key
+     * @param string $iv initialization vector
+     * @param mixed $seq seq parameter
+     * @param string $aad additional authenticated data (AAD) for AEAD
+     * @param string $plaintext plaintext bytes
+     * @return string ciphertext including the AEAD authentication tag
      */
     protected function aeadSeal($key, $iv, $seq, $aad,
         $plaintext)
@@ -1224,6 +1309,12 @@ class Tls13Engine
     /**
      * AEAD decrypt. Returns plaintext on success, false on
      * authentication failure.
+     * @param string $key key
+     * @param string $iv initialization vector
+     * @param mixed $seq seq parameter
+     * @param string $aad additional authenticated data (AAD) for AEAD
+     * @param string $ciphertext ciphertext bytes including AEAD tag
+     * @return string|false plaintext on successful decryption, false if the AEAD tag does not verify
      */
     protected function aeadOpen($key, $iv, $seq, $aad,
         $ciphertext)
@@ -1246,6 +1337,9 @@ class Tls13Engine
      * Builds the AEAD nonce by left-padding the 64-bit
      * record-sequence-number to 12 bytes and XORing with
      * the IV.
+     * @param string $iv initialization vector
+     * @param mixed $seq seq parameter
+     * @return string AEAD nonce for the given packet number (IV XOR packet-number padded)
      */
     protected function aeadNonce($iv, $seq)
     {
@@ -1294,6 +1388,8 @@ class Tls13Engine
      * 'quic' (raw handshake messages, no record framing,
      * no encryption -- the QUIC packet protection
      * replaces it).
+     * @param mixed $mode mode parameter
+     * @return array list of handshake messages composing the server first flight
      */
     public function buildServerFlight($mode = 'tls')
     {
@@ -1428,6 +1524,7 @@ class Tls13Engine
      * encodes the chosen cipher suite, the chosen key
      * share (our X25519 public), and a supported_versions
      * extension committing us to TLS 1.3.
+     * @return string serialized ServerHello handshake message body
      */
     protected function buildServerHelloBody()
     {
@@ -1462,6 +1559,7 @@ class Tls13Engine
      * quic_transport_parameters (echo our QUIC layer's
      * blob if the caller passed one in, regardless of
      * whether the client sent one).
+     * @return string serialized EncryptedExtensions handshake message body
      */
     protected function buildEncryptedExtensionsBody()
     {
@@ -1491,6 +1589,7 @@ class Tls13Engine
      * We split $this->cert_pem on the BEGIN/END markers and
      * decode each block to DER; the leaf is first, any
      * intermediates follow.
+     * @return string serialized Certificate handshake message body
      */
     protected function buildCertificateBody()
     {
@@ -1507,6 +1606,8 @@ class Tls13Engine
      * Walks the certificate PEM blob and returns a list of
      * DER byte-strings, one per certificate. Tolerates
      * leading whitespace, comments, and CRLF line endings.
+     * @param mixed $pem pem parameter
+     * @return array list of PEM-formatted certificate strings split from a chain
      */
     protected function splitPemCerts($pem)
     {
@@ -1535,6 +1636,7 @@ class Tls13Engine
      * bytes in the message.
      *
      * Returns false (and calls fail) on signing error.
+     * @return string serialized CertificateVerify handshake message body
      */
     protected function buildCertificateVerifyBody()
     {
@@ -1566,6 +1668,8 @@ class Tls13Engine
      * 9.1.1, with hash = mgf-hash = SHA-256 and salt length =
      * hash length (32). The mask-generation function is
      * MGF1-SHA-256.
+     * @param string $message message bytes
+     * @return string RSA-PSS signature bytes over $message using the supplied private key
      */
     protected function rsaPssSign($message)
     {
@@ -1642,6 +1746,9 @@ class Tls13Engine
     }
     /**
      * MGF1 mask generation function with SHA-256.
+     * @param mixed $seed seed parameter
+     * @param int $length byte length
+     * @return string MGF1-SHA256 expansion of $seed to the requested length
      */
     protected function mgf1($seed, $length)
     {
@@ -1658,6 +1765,8 @@ class Tls13Engine
      * Finished message body: HMAC-SHA-256(finished_key,
      * transcript_hash) where finished_key =
      * HKDF-Expand-Label(traffic_secret, "finished", "", 32).
+     * @param mixed $traffic_secret traffic_secret parameter
+     * @return string serialized Finished handshake message body
      */
     protected function buildFinishedBody($traffic_secret)
     {
@@ -1682,6 +1791,10 @@ class Tls13Engine
      * inner-content-type byte at the end -- see RFC 8446 sec
      * 5.2) in an application_data record protected by the
      * AEAD derived from $secret with sequence number $seq.
+     * @param mixed $inner_plaintext inner_plaintext parameter
+     * @param string $secret TLS 1.3 traffic secret
+     * @param mixed $seq seq parameter
+     * @return string TLS record framing applied around $plaintext
      */
     protected function wrapRecord($inner_plaintext, $secret,
         $seq)
@@ -1699,6 +1812,10 @@ class Tls13Engine
      * Inverse of wrapRecord. Returns the inner plaintext
      * (with trailing content-type byte) on success, false
      * on AEAD failure.
+     * @param mixed $record_bytes record_bytes parameter
+     * @param string $secret TLS 1.3 traffic secret
+     * @param mixed $seq seq parameter
+     * @return string plaintext after the TLS record layer has been stripped
      */
     protected function unwrapRecord($record_bytes, $secret,
         $seq)
@@ -1724,6 +1841,8 @@ class Tls13Engine
      * decrypted handshake message: type byte + uint24 length
      * + body). Verifies the HMAC against c_hs_traffic_secret
      * and, on success, transitions to ST_HANDSHAKE_COMPLETE.
+     * @param string $bytes bytes to operate on
+     * @return bool true if the Finished MAC verifies
      */
     public function feedClientFinished($bytes)
     {
@@ -1784,6 +1903,8 @@ class Tls13Engine
      * Reads bytes from $sock until a complete TLS record is
      * available, parses it, and returns
      * ['type' => int, 'body' => string]. Returns null on EOF.
+     * @param resource $sock open UDP socket resource
+     * @return array two-element list [string $record_bytes, int $new_off]
      */
     public function readRecord($sock)
     {
@@ -1802,6 +1923,9 @@ class Tls13Engine
     /**
      * Reads exactly $n bytes from $sock, blocking up to
      * 5s. Returns the bytes or null on timeout / EOF.
+     * @param resource $sock open UDP socket resource
+     * @param int $n count
+     * @return string exactly $length bytes read from the buffer; throws if not enough are available
      */
     protected function fillExact($sock, $n)
     {
@@ -1833,6 +1957,8 @@ class Tls13Engine
      * returns true on success.
      *
      * This is the standalone-test path. QUIC will not call it.
+     * @param resource $sock open UDP socket resource
+     * @return bool true on successful handshake; provided for test harnesses that proxy QUIC over TCP
      */
     public function runHandshakeOverTcp($sock)
     {
@@ -1978,6 +2104,8 @@ class QuicPacketKeys
      * server-to-client directions from the client's
      * Destination Connection ID. Returns
      * ['client' => QuicPacketKeys, 'server' => QuicPacketKeys].
+     * @param string $dcid destination Connection ID
+     * @return QuicPacketKeys initial packet protection keys derived from the destination Connection ID
      */
     public static function fromInitialDcid($dcid)
     {
@@ -2001,6 +2129,9 @@ class QuicPacketKeys
      * (TLS handshake_traffic_secret_c/_s for Handshake-
      * level keys, or application_traffic_secret_c/_s for
      * 1-RTT keys). $cipher selects the primitive.
+     * @param string $secret TLS 1.3 traffic secret
+     * @param int $cipher TLS cipher suite identifier
+     * @return QuicPacketKeys packet protection keys derived from the given traffic secret
      */
     public static function fromTrafficSecret($secret,
         $cipher)
@@ -2022,6 +2153,9 @@ class QuicPacketKeys
      * helper Tls13Engine has, made static so this class
      * doesn't have to construct an engine just to derive
      * Initial keys.
+     * @param string $salt HKDF salt
+     * @param string $ikm HKDF input keying material
+     * @return string HKDF-Extract output (PRK)
      */
     protected static function hkdfExtract($salt, $ikm)
     {
@@ -2035,6 +2169,11 @@ class QuicPacketKeys
      * "tls13 " label prefix. QUIC labels are "client in",
      * "server in", "quic key", "quic iv", "quic hp",
      * "quic ku" (key update; unused here).
+     * @param string $secret TLS 1.3 traffic secret
+     * @param string $label HKDF-Expand-Label label
+     * @param array $context per-listener stream context overrides
+     * @param int $length byte length
+     * @return string HKDF-Expand-Label output of the requested length
      */
     protected static function hkdfExpandLabel($secret,
         $label, $context, $length)
@@ -2070,6 +2209,8 @@ class QuicPacketKeys
      * Returns the 5-byte mask (1 byte for first-byte XOR,
      * 4 bytes for packet-number XOR -- only as many as the
      * actual packet-number length will be used).
+     * @param string $sample header protection sample bytes (16 bytes typically)
+     * @return string 5-byte header-protection mask derived from the sample
      */
     public function headerProtectionMask($sample)
     {
@@ -2136,6 +2277,7 @@ class QuicPacketKeys
      * falls back to pure PHP. Self-tests against the RFC
      * 8439 sec 2.3.2 vector; a mismatch is treated as the
      * cipher being absent.
+     * @return bool true if the OpenSSL ChaCha20 path should be used; false to fall back to the pure-PHP implementation
      */
     public static function chachaUseOpenssl()
     {
@@ -2168,6 +2310,10 @@ class QuicPacketKeys
      * first 5 bytes of output are needed there. Slower than
      * OpenSSL by ~10x but inconsequential for QUIC HP at
      * realistic packet rates (5 bytes per packet).
+     * @param string $key key
+     * @param mixed $counter counter parameter
+     * @param string $nonce AEAD nonce
+     * @return string 64-byte ChaCha20 keystream block for the given counter
      */
     public static function chacha20Block($key, $counter,
         $nonce)
@@ -2232,6 +2378,11 @@ class QuicPacketKeys
      * the working state. RFC 8439 sec 2.1. PHP integers
      * are 64-bit on every platform we run on, so we mask
      * with 0xffffffff to keep additions in 32-bit space.
+     * @param mixed $w w parameter
+     * @param mixed $a first operand
+     * @param mixed $b second operand
+     * @param mixed $c c parameter
+     * @param mixed $d d parameter
      */
     protected static function chacha20Qr(&$w, $a, $b, $c, $d)
     {
@@ -2259,6 +2410,8 @@ class QuicPacketKeys
     /**
      * Constructs the AEAD nonce by left-padding the 64-bit
      * packet number to 12 bytes and XORing with the IV.
+     * @param int $packet_number packet number for the packet number space
+     * @return string AEAD nonce for the given packet number
      */
     public function packetNonce($packet_number)
     {
@@ -2275,6 +2428,10 @@ class QuicPacketKeys
      * AEAD-seals $plaintext with the per-packet nonce
      * derived from $packet_number, using $aad as the
      * authenticated header. Returns ciphertext || tag.
+     * @param int $packet_number packet number for the packet number space
+     * @param string $aad additional authenticated data (AAD) for AEAD
+     * @param string $plaintext plaintext bytes
+     * @return string AEAD-sealed bytes (ciphertext including authentication tag)
      */
     public function seal($packet_number, $aad, $plaintext)
     {
@@ -2294,6 +2451,10 @@ class QuicPacketKeys
     /**
      * Inverse of seal. Returns plaintext on success, false
      * on auth failure.
+     * @param int $packet_number packet number for the packet number space
+     * @param string $aad additional authenticated data (AAD) for AEAD
+     * @param string $ciphertext ciphertext bytes including AEAD tag
+     * @return bool true on successful open
      */
     public function open($packet_number, $aad, $ciphertext)
     {
@@ -2330,6 +2491,9 @@ class QuicVarint
     /**
      * Decodes a varint at offset $off in $buf. Returns
      * [value, new_off] or [false, $off] on underflow.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return string|false bytes read, or false on error
      */
     public static function read($buf, $off)
     {
@@ -2352,6 +2516,8 @@ class QuicVarint
     /**
      * Encodes a value as a QUIC varint with minimal
      * length. Returns the bytes.
+     * @param mixed $value value
+     * @return int|false number of bytes written, or false on error
      */
     public static function write($value)
     {
@@ -2394,6 +2560,8 @@ class QuicVarint
      * Returns how many bytes a value will occupy when
      * encoded -- useful for sizing payloads ahead of
      * actual encoding.
+     * @param mixed $value value
+     * @return int byte length
      */
     public static function size($value)
     {
@@ -2440,15 +2608,74 @@ class QuicPacket
         QUIC v1 version number (RFC 9000 sec 15).
      */
     const VERSION_QUIC_V1 = 0x00000001;
+    /**
+     * Header form: FORM_LONG (long-header packets carry version
+     * and CIDs explicitly; used for Initial, Handshake, 0-RTT,
+     * Retry) or FORM_SHORT (1-RTT data packets where the
+     * connection has been established). RFC 9000 sec 17.
+     * @var int
+     */
     public $form = self::FORM_LONG;
+    /**
+     * Long-header packet sub-type when $form is FORM_LONG; one
+     * of LONG_INITIAL / LONG_ZERO_RTT / LONG_HANDSHAKE /
+     * LONG_RETRY.
+     * @var int
+     */
     public $long_type = self::LONG_INITIAL;
+    /**
+     * QUIC version number from the wire; VERSION_QUIC_V1 for
+     * RFC 9000 traffic.
+     * @var int
+     */
     public $version = self::VERSION_QUIC_V1;
+    /**
+     * Destination Connection ID as it appears on the wire; the
+     * peer's chosen CID that addresses this connection at the
+     * receiver.
+     * @var string
+     */
     public $destination_cid = "";
+    /**
+     * Source Connection ID as it appears on the wire; the
+     * sender's chosen CID that the receiver will use when
+     * sending packets back.
+     * @var string
+     */
     public $source_cid = "";
+    /**
+     * Token payload carried by Initial packets (server-issued
+     * retry token, RFC 9000 sec 8) or Retry packets. Empty
+     * string when no token is present.
+     * @var string
+     */
     public $token = "";
+    /**
+     * Decoded packet number after the truncated wire value is
+     * reconstructed against the largest acknowledged number
+     * for the corresponding packet number space.
+     * @var int
+     */
     public $packet_number = 0;
+    /**
+     * Length in bytes (1-4) of the on-wire packet-number field.
+     * @var int
+     */
     public $packet_number_length = 0; /* 1..4 bytes on wire */
+    /**
+     * Decrypted packet payload after header protection has been
+     * removed and AEAD decryption has succeeded; raw frames are
+     * still concatenated and must be parsed by QuicFrame.
+     * @var string
+     */
     public $payload = "";
+    /**
+     * Bytes of the packet header (form byte plus version, CIDs,
+     * token, packet-number depending on form). Stashed during
+     * parsing so the AEAD AAD can be reconstructed at decrypt
+     * time.
+     * @var string
+     */
     public $header_bytes = "";
     /**
      * Decodes one QUIC packet from $buf starting at $off.
@@ -2463,6 +2690,12 @@ class QuicPacket
      * datagram may coalesce multiple QUIC packets, so the
      * caller loops with the advanced offset until $off
      * equals strlen($buf).
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @param QuicPacketKeys $keys packet protection keys for this encryption level
+     * @param mixed $is_server_recv is_server_recv parameter
+     * @param mixed $largest_pn_seen largest_pn_seen parameter
+     * @return array two-element list [QuicPacket|false, int $new_off]; false on parse failure
      */
     public static function decode($buf, $off, $keys,
         $is_server_recv, $largest_pn_seen)
@@ -2483,6 +2716,12 @@ class QuicPacket
      * type dispatch and runs the version, DCID, SCID, type-
      * specific extras (token for Initial, integrity tag for
      * Retry), then the protected payload.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @param QuicPacketKeys $keys packet protection keys for this encryption level
+     * @param mixed $is_server_recv is_server_recv parameter
+     * @param mixed $largest_pn_seen largest_pn_seen parameter
+     * @return array two-element list [QuicPacket|false, int $new_off]; false on parse failure
      */
     protected static function decodeLong($buf, $off, $keys,
         $is_server_recv, $largest_pn_seen)
@@ -2637,6 +2876,12 @@ class QuicPacket
      * key-phase) -- we only XOR the low 5 bits with the
      * mask. This differs from long-header HP which only
      * touches the low 4 bits.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @param QuicPacketKeys $keys packet protection keys for this encryption level
+     * @param mixed $dcid_len dcid_len parameter
+     * @param mixed $largest_pn_seen largest_pn_seen parameter
+     * @return array two-element list [QuicPacket|false, int $new_off]; false on parse failure
      */
     public static function decodeShort($buf, $off, $keys,
         $dcid_len, $largest_pn_seen)
@@ -2708,6 +2953,10 @@ class QuicPacket
      * bit 6 = 1 (fixed), bit 5 = 0 (spin), bits 4-3 = 0
      * (reserved), bit 2 = 0 (key phase), bits 1-0 = pn
      * length - 1.
+     * @param QuicPacketKeys $keys packet protection keys for this encryption level
+     * @param int $packet_number packet number for the packet number space
+     * @param mixed $payload_unprotected payload_unprotected parameter
+     * @return string encoded short-header packet bytes
      */
     public function encodeShort($keys, $packet_number,
         $payload_unprotected)
@@ -2751,6 +3000,10 @@ class QuicPacket
     /**
      * Decodes a truncated packet number into the full
      * 62-bit packet number. RFC 9000 sec A.3.
+     * @param mixed $truncated truncated parameter
+     * @param mixed $pn_length pn_length parameter
+     * @param mixed $largest_pn_seen largest_pn_seen parameter
+     * @return int reconstructed full packet number
      */
     public static function decodePacketNumber($truncated,
         $pn_length, $largest_pn_seen)
@@ -2782,6 +3035,10 @@ class QuicPacket
      * Always uses 4-byte PN encoding for simplicity.
      * Works as long as the connection sends fewer than
      * 2^31 packets per PN space, always true in practice.
+     * @param QuicPacketKeys $keys packet protection keys for this encryption level
+     * @param int $packet_number packet number for the packet number space
+     * @param mixed $payload_unprotected payload_unprotected parameter
+     * @return string encoded long-header packet bytes
      */
     public function encodeLong($keys, $packet_number,
         $payload_unprotected)
@@ -2932,6 +3189,9 @@ class QuicFrame
      *   CONNECTION_CLOSE / _APP: type, error_code,
      *                             frame_type (0x1C only),
      *                             reason.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array list of parsed QuicPacket records
      */
     public static function decodeAll($buf, $off = 0)
     {
@@ -2967,6 +3227,10 @@ class QuicFrame
     /**
      * Decodes a single frame whose type byte has already
      * been consumed. Returns [frame, new_off, err].
+     * @param int $type type code
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return array two-element list [QuicPacket|false, int $new_off]
      */
     protected static function decodeOne($type, $buf, $off)
     {
@@ -3081,6 +3345,10 @@ class QuicFrame
      *   ACK Range[] each: Gap (varint), ACK Range Length
      *     (varint)
      *   ECN counts (3 varints, only if type == F_ACK_ECN)
+     * @param int $type type code
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return QuicFrame parsed ACK frame
      */
     protected static function decodeAck($type, $buf, $off)
     {
@@ -3121,6 +3389,9 @@ class QuicFrame
     /**
      * CRYPTO frame body, RFC 9000 sec 19.6:
      *   Offset (varint), Length (varint), Crypto Data.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return QuicFrame parsed CRYPTO frame
      */
     protected static function decodeCrypto($buf, $off)
     {
@@ -3143,6 +3414,10 @@ class QuicFrame
      * If LEN is unset, the frame extends to the end of the
      * containing packet's payload, so we consume all
      * remaining bytes.
+     * @param int $type type code
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return QuicFrame parsed STREAM frame
      */
     protected static function decodeStream($type, $buf, $off)
     {
@@ -3183,6 +3458,9 @@ class QuicFrame
      *   Sequence Number (varint), Retire Prior To (varint),
      *   Length (1 byte), Connection ID, Stateless Reset
      *   Token (16 bytes).
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return QuicFrame parsed NEW_CONNECTION_ID frame
      */
     protected static function decodeNewConnectionId($buf, $off)
     {
@@ -3214,6 +3492,10 @@ class QuicFrame
      * Transport variant (0x1C) carries a Frame Type field
      * indicating which frame triggered the close; the
      * application variant (0x1D) does not.
+     * @param int $type type code
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return QuicFrame parsed CONNECTION_CLOSE frame
      */
     protected static function decodeConnectionClose($type,
         $buf, $off)
@@ -3239,6 +3521,8 @@ class QuicFrame
      */
     /**
      * Encodes a frame array. Reverse of decodeOne().
+     * @param QuicFrame $frame parsed QUIC frame
+     * @return string encoded packet bytes ready to send
      */
     public static function encode($frame)
     {
@@ -3320,6 +3604,8 @@ class QuicFrame
     /**
      * Encodes an ACK frame from a frame array of the same
      * shape decodeAck produces.
+     * @param QuicFrame $frame parsed QUIC frame
+     * @return string encoded ACK frame bytes
      */
     protected static function encodeAck($frame)
     {
@@ -3345,6 +3631,8 @@ class QuicFrame
      * Encodes a STREAM frame. Always sets LEN=1 and OFF=1
      * for clarity; the FIN flag is taken from the frame
      * array.
+     * @param QuicFrame $frame parsed QUIC frame
+     * @return string encoded STREAM frame bytes
      */
     protected static function encodeStream($frame)
     {
@@ -3362,6 +3650,9 @@ class QuicFrame
     /**
      * Builds an ACK frame from a sorted list of received
      * packet numbers in one PN space. RFC 9000 sec 13.2.4.
+     * @param mixed $received_pns received_pns parameter
+     * @param mixed $delay delay parameter
+     * @return string encoded ACK frame bytes ready to include in an outgoing packet
      */
     public static function buildAck($received_pns,
         $delay = 0)
@@ -3411,6 +3702,8 @@ class QuicFrame
      * Inverse of buildAck: walks an ACK frame's ranges and
      * returns the explicit list of packet numbers covered.
      * Used by the loss-detection layer.
+     * @param QuicFrame $frame parsed QUIC frame
+     * @return array list of packet-number ranges encoded in the ACK frame
      */
     public static function expandAckRanges($frame)
     {
@@ -3566,6 +3859,9 @@ class QuicStream
      * receive flow-control window from the
      * initial_max_stream_data_* transport parameter the
      * QuicConnection passes through.
+     * @param mixed $id id parameter
+     * @param mixed $recv_window recv_window parameter
+     * @param mixed $send_window send_window parameter
      */
     public function __construct($id, $recv_window = 1048576,
         $send_window = 1048576)
@@ -3581,6 +3877,10 @@ class QuicStream
      * reassembly map. Returns true on success, false if
      * the bytes would exceed our advertised
      * flow-control window.
+     * @param int $offset byte offset into the buffer
+     * @param string $data data bytes
+     * @param bool $fin whether the FIN flag is set
+     * @return void no return; the received datagram is processed in place
      */
     public function deliverIncoming($offset, $data, $fin)
     {
@@ -3604,6 +3904,7 @@ class QuicStream
      * available, advancing recv_next_offset past them.
      * Empty string when nothing new (e.g. waiting on a
      * gap).
+     * @return int number of bytes consumed from the buffer
      */
     public function consume()
     {
@@ -3642,6 +3943,7 @@ class QuicStream
      * Returns true once no more data will arrive on the
      * receive side and everything queued has been
      * consumed.
+     * @return bool true if no more data is expected on the receive side
      */
     public function isReceiveDone()
     {
@@ -3653,6 +3955,8 @@ class QuicStream
      * QuicConnection's emit loop chunks them into STREAM
      * frames in flight, taking flow-control limits into
      * account.
+     * @param string $bytes bytes to operate on
+     * @return int|false number of bytes written, or false on error
      */
     public function write($bytes)
     {
@@ -3679,6 +3983,7 @@ class QuicStream
      * one subtract) and the canonical replacement for
      * send_buf === '' / strlen(send_buf) tests so the
      * head-pointer optimisation stays opaque to callers.
+     * @return int number of bytes currently buffered awaiting send
      */
     public function bufferedLength()
     {
@@ -3691,6 +3996,8 @@ class QuicStream
      * and advances the send_buf head pointer so the
      * underlying string is not rewritten on every call --
      * see the $send_buf docblock for why that matters.
+     * @param mixed $max_bytes max_bytes parameter
+     * @return string next chunk of bytes to send in a single STREAM frame
      */
     public function takeForFrame($max_bytes)
     {
@@ -3746,6 +4053,7 @@ class QuicStream
      * hasn't been emitted yet. flushStreams uses this to
      * tell its caller whether the next event-loop tick
      * needs to come back for more.
+     * @return bool true if there are pending bytes or control frames to send
      */
     public function hasPendingSend()
     {
@@ -4333,6 +4641,9 @@ class QuicConnection
      * $key_pem are the server's certificate and key for
      * the TLS 1.3 handshake; $alpn is the list of ALPN
      * byte-strings the server offers.
+     * @param string $cert_pem certificate in PEM format
+     * @param string $key_pem private key in PEM format
+     * @param mixed $alpn alpn parameter
      */
     public function __construct($cert_pem, $key_pem, $alpn)
     {
@@ -4377,6 +4688,7 @@ class QuicConnection
      * value). Phase 3 emits a small fixed set: enough for
      * a real client to accept the handshake. Phase 4 will
      * extend this.
+     * @return string serialized local QUIC transport parameters extension
      */
     protected static function buildLocalTransportParams()
     {
@@ -4410,6 +4722,9 @@ class QuicConnection
     /**
      * Helper: encodes one transport parameter whose value
      * is a single varint.
+     * @param mixed $id id parameter
+     * @param mixed $value value
+     * @return string varint-encoded transport-parameter value
      */
     protected static function tpVarint($id, $value)
     {
@@ -4423,6 +4738,9 @@ class QuicConnection
      * parameters: original_destination_connection_id,
      * initial_source_connection_id, retry_source_-
      * connection_id).
+     * @param mixed $id id parameter
+     * @param string $bytes bytes to operate on
+     * @return string serialized transport-parameter id+value pair
      */
     protected static function tpBytes($id, $bytes)
     {
@@ -4437,6 +4755,9 @@ class QuicConnection
      *
      * Returns true on success, false on fatal error
      * (caller should close the connection).
+     * @param string $buf raw byte buffer
+     * @param string $peer peer address as returned by stream_socket_recvfrom
+     * @return void no return; the datagram is processed in place
      */
     public function processDatagram($buf, $peer)
     {
@@ -4591,6 +4912,9 @@ class QuicConnection
      * Reads the destination connection ID out of a
      * long-header Initial packet without parsing the
      * whole packet -- needed before keys are available.
+     * @param string $buf raw byte buffer
+     * @param int $off byte offset into the buffer
+     * @return string|false destination Connection ID from an Initial packet, or false if not an Initial
      */
     protected static function peekInitialDcid($buf, $off)
     {
@@ -4609,6 +4933,8 @@ class QuicConnection
      * each to its handler. Phase 3 routes CRYPTO,
      * STREAM, ACK, PADDING, PING, CONNECTION_CLOSE; the
      * rest are accepted but ignored.
+     * @param int $level encryption level
+     * @param mixed $pkt pkt parameter
      */
     protected function processPacketFrames($level, $pkt)
     {
@@ -4798,6 +5124,8 @@ class QuicConnection
      * may receive partial messages across multiple CRYPTO
      * frames; the buffer accumulates until enough bytes
      * are present.
+     * @param int $level encryption level
+     * @param mixed $f f parameter
      */
     protected function onCrypto($level, $f)
     {
@@ -4834,6 +5162,8 @@ class QuicConnection
      * carries ClientHello; Handshake-level CRYPTO carries
      * the client's Finished after the server flight has
      * been sent.
+     * @param int $level encryption level
+     * @param string $bytes bytes to operate on
      */
     protected function feedTlsCrypto($level, $bytes)
     {
@@ -4879,6 +5209,8 @@ class QuicConnection
      *   0b02 client-initiated uni  (encoder/decoder/QPACK):
      *        receive-side from server's perspective; we
      *        return a sane fallback for symmetry.
+     * @param mixed $sid sid parameter
+     * @return int number of bytes that may be sent on the stream right now
      */
     protected function pickStreamSendWindow($sid)
     {
@@ -4900,6 +5232,7 @@ class QuicConnection
      * STREAM frame handler: route to the per-stream
      * QuicStream, allocating one if this is the first
      * frame on that stream ID.
+     * @param mixed $f f parameter
      */
     protected function onStream($f)
     {
@@ -5101,6 +5434,7 @@ class QuicConnection
      * in an Initial packet; everything after (Encrypted-
      * Extensions, Certificate, CertificateVerify,
      * Finished) goes in Handshake packets.
+     * @param mixed $flight flight parameter
      */
     protected function splitServerFlight($flight)
     {
@@ -5159,6 +5493,8 @@ class QuicConnection
      * ACK, ACK_ECN, PADDING, and the two CONNECTION_CLOSE
      * variants. Ack obligation is tracked per packet-number
      * space in $ack_pending and drained from emit().
+     * @param int $type type code
+     * @return bool true if the frame is ack-eliciting per RFC 9002
      */
     protected static function isAckEliciting($type)
     {
@@ -5175,6 +5511,8 @@ class QuicConnection
      * Builds an ACK frame's wire bytes covering all
      * received packet numbers in the given PN space.
      * Returns "" if nothing to ACK.
+     * @param int $level encryption level
+     * @return string encoded ACK frame bytes for the given packet number space
      */
     protected function ackFrameBytes($level)
     {
@@ -5199,6 +5537,8 @@ class QuicConnection
      * never tries to validate it (atto doesn't currently
      * generate stateless resets, only emit tokens for the
      * peer's records).
+     * @param string $cid QUIC Connection ID bytes
+     * @return string stateless-reset token for the given Connection ID
      */
     public function statelessResetToken($cid)
     {
@@ -5218,6 +5558,7 @@ class QuicConnection
      * _ID, so the peer always has spare CIDs available for
      * migration. Returns the count of CIDs queued by this
      * call.
+     * @return void no return; the connection-id pool is refilled in place
      */
     public function fillCidPool()
     {
@@ -5244,6 +5585,8 @@ class QuicConnection
      * '' if the sequence wasn't issued (which is a protocol
      * violation but we tolerate it -- the peer may be
      * retiring a CID we already retired ourselves).
+     * @param mixed $sequence sequence parameter
+     * @return void no return; the named local CID is retired and removed from the pool
      */
     public function retireLocalCid($sequence)
     {
@@ -5265,6 +5608,8 @@ class QuicConnection
      * RTT samples). Phase 11b consumes latest_rtt to
      * smooth RTT and arm the PTO timer; phase 11c will
      * also use the removal to drive loss detection.
+     * @param int $level encryption level
+     * @param QuicFrame $frame parsed QUIC frame
      */
     protected function processAck($level, $frame)
     {
@@ -5363,6 +5708,8 @@ class QuicConnection
      * and updates loss_time[level] to point at the next
      * packet that is going to cross the time threshold.
      * Returns the count of packets declared lost.
+     * @param int $level encryption level
+     * @return array list of lost packet records that have been removed from the in-flight set
      */
     protected function detectAndRemoveLostPackets($level)
     {
@@ -5449,6 +5796,8 @@ class QuicConnection
      * MAX_STREAMS_* / RETIRE_CONNECTION_ID are skipped: rare
      * server-initiated frames whose retransmission a follow-
      * up phase will either add or document.
+     * @param int $level encryption level
+     * @param mixed $lost_packets lost_packets parameter
      */
     protected function onPacketsLost($level, $lost_packets)
     {
@@ -5552,6 +5901,7 @@ class QuicConnection
      * the raw varint, so we treat it as the encoded form
      * and multiply by 8 to get microseconds, then convert
      * to seconds for arithmetic against smoothed_rtt).
+     * @param mixed $ack_delay_raw ack_delay_raw parameter
      */
     protected function updateRtt($ack_delay_raw)
     {
@@ -5599,6 +5949,7 @@ class QuicConnection
      * that has in_flight = true. Pure-ACK packets are not
      * tracked because they do not consume cwnd per RFC
      * 9002 sec A.1.
+     * @param string $bytes bytes to operate on
      */
     protected function addToBytesInFlight($bytes)
     {
@@ -5612,6 +5963,7 @@ class QuicConnection
      * Packets). Floor at zero in case bookkeeping
      * disagrees -- safer than letting bytes_in_flight go
      * negative and gating emit() forever.
+     * @param string $bytes bytes to operate on
      */
     protected function removeFromBytesInFlight($bytes)
     {
@@ -5625,6 +5977,8 @@ class QuicConnection
      * 7.3.2: while in recovery, ACKs only exit recovery
      * once the largest packet sent before recovery is
      * acked.
+     * @param mixed $time_sent time_sent parameter
+     * @return bool true if the sender is currently in the congestion-recovery state
      */
     protected function inCongestionRecovery($time_sent)
     {
@@ -5640,6 +5994,7 @@ class QuicConnection
      * approximately one MSS per RTT, computed as
      * MSS * acked_bytes / cwnd. Both modes skip packets
      * sent during the current recovery period.
+     * @param mixed $entry entry parameter
      */
     protected function onPacketAckedForCwnd($entry)
     {
@@ -5673,6 +6028,7 @@ class QuicConnection
      * 9002 sec 7.6.2 we use the NewReno reduction (cwnd
      * halved, ssthresh = new cwnd) rather than the
      * deprecated rate-halving variant.
+     * @param mixed $time_sent_lost time_sent_lost parameter
      */
     protected function onCongestionEvent($time_sent_lost)
     {
@@ -5698,6 +6054,7 @@ class QuicConnection
      * seconds. Uses kInitialRtt (333 ms) before any RTT
      * sample has been collected. Caller multiplies by
      * 2^pto_count for backoff.
+     * @return int baseline Probe Timeout in milliseconds per RFC 9002 sec 6.2.1
      */
     protected function basePto()
     {
@@ -5819,6 +6176,8 @@ class QuicConnection
      * is the unprotected frame sequence; we wrap it in a
      * QuicPacket with the right keys and queue the wire
      * bytes onto $send_queue.
+     * @param int $level encryption level
+     * @param string $payload payload bytes
      */
     protected function queuePacket($level, $payload)
     {
@@ -5883,6 +6242,7 @@ class QuicConnection
      * clears the queue. Pending Handshake-level entries
      * waiting for keys are encrypted now if the keys are
      * available.
+     * @return string serialized bytes ready to send
      */
     public function emit()
     {
@@ -6205,6 +6565,8 @@ class QuicConnection
      * QuicFrame::decodeAll output for retransmission.
      * singleFrameHint() builds it cheaply for the common
      * single-frame case.
+     * @param string $payload payload bytes
+     * @param mixed $hint hint parameter
      */
     public function queue1Rtt($payload, $hint = null)
     {
@@ -6227,6 +6589,7 @@ class QuicConnection
      * for the dominant STREAM-frame-per-packet case.
      *
      * @param array $frame already-decoded frame dict
+     * @return string|null a single-frame encoding when one fits, or null to fall back to general encoding
      */
     public static function singleFrameHint($frame)
     {
@@ -6244,6 +6607,9 @@ class QuicConnection
      * Convenience: write data to a QUIC stream and
      * optionally close the send side. Used by the H3
      * layer for response bodies.
+     * @param mixed $sid sid parameter
+     * @param string $data data bytes
+     * @param bool $fin whether the FIN flag is set
      */
     public function sendStreamData($sid, $data, $fin = false)
     {
@@ -6282,6 +6648,8 @@ class QuicConnection
      * any stream's send_buf so the caller can run again next
      * tick. The cap protects against bursting more than the
      * peer's UDP recv buffer can hold between reads.
+     * @param mixed $budget budget parameter
+     * @return void no return; pending stream bytes are queued for the next outgoing packet
      */
     public function flushStreams($budget = self::DEFAULT_FLUSH_BUDGET)
     {
@@ -6350,6 +6718,7 @@ class QuicConnection
      * Returns true once the QUIC + TLS handshake has
      * completed end-to-end (server has received and
      * verified the client's Finished).
+     * @return bool true if the QUIC handshake has completed
      */
     public function isEstablished()
     {
@@ -6359,6 +6728,7 @@ class QuicConnection
      * Returns true if the connection is in the closed
      * state (CONNECTION_CLOSE seen, idle timeout, or
      * local error).
+     * @return bool true if the connection has been closed
      */
     public function isClosed()
     {
@@ -6373,6 +6743,8 @@ class QuicConnection
      * peer can declare the connection dead per RFC 9000
      * sec 10.1 once min(local_max_idle_timeout,
      * peer_max_idle_timeout) elapses.
+     * @param int $now current Unix timestamp
+     * @return bool true if the idle timeout has elapsed since last activity
      */
     public function isIdleExpired($now)
     {
@@ -6391,6 +6763,8 @@ class QuicConnection
      * connection closed. Best-effort; the frame goes out
      * on the next emit() call (assuming we have keys at
      * the appropriate level).
+     * @param int $error_code error code
+     * @param string $reason reason phrase
      */
     public function close($error_code = 0, $reason = '')
     {
@@ -6424,6 +6798,7 @@ class QuicConnection
      * Returns a flat associative array of stats for this
      * connection, suitable for JSON encoding. Read-only;
      * does not mutate state.
+     * @return array live statistics for this connection
      */
     public function stats()
     {
@@ -6466,12 +6841,19 @@ class QuicConnection
  */
 class H3FrameCodec
 {
+    /** HTTP/3 DATA frame type (RFC 9114 §7.2.1). */
     const H3_DATA = 0x00;
+    /** HTTP/3 HEADERS frame type (RFC 9114 §7.2.2). */
     const H3_HEADERS = 0x01;
+    /** HTTP/3 CANCEL_PUSH frame type (RFC 9114 §7.2.3). */
     const H3_CANCEL_PUSH = 0x03;
+    /** HTTP/3 SETTINGS frame type (RFC 9114 §7.2.4). */
     const H3_SETTINGS = 0x04;
+    /** HTTP/3 PUSH_PROMISE frame type (RFC 9114 §7.2.5). */
     const H3_PUSH_PROMISE = 0x05;
+    /** HTTP/3 GOAWAY frame type (RFC 9114 §7.2.6). */
     const H3_GOAWAY = 0x07;
+    /** HTTP/3 MAX_PUSH_ID frame type (RFC 9114 §7.2.7). */
     const H3_MAX_PUSH_ID = 0x0D;
     /**
      * Decodes as many complete HTTP/3 frames as possible
@@ -6481,6 +6863,8 @@ class H3FrameCodec
      * because a frame was cut short; the caller should
      * accumulate it and re-feed once more bytes arrive.
      * err is "" on success.
+     * @param string $buf raw byte buffer
+     * @return array list of parsed QuicPacket records
      */
     public static function decodeAll($buf)
     {
@@ -6507,6 +6891,9 @@ class H3FrameCodec
     /**
      * Encodes a single frame (type + length-prefixed
      * body).
+     * @param int $type type code
+     * @param string $body message body bytes
+     * @return string encoded packet bytes ready to send
      */
     public static function encode($type, $body)
     {
@@ -6518,6 +6905,8 @@ class H3FrameCodec
      * associative array of setting_id => value, both
      * varints. RFC 9114 sec 7.2.4 plus RFC 9204 sec 5
      * for QPACK-related settings.
+     * @param mixed $settings settings parameter
+     * @return string serialized HTTP/3 SETTINGS frame body
      */
     public static function encodeSettingsBody($settings)
     {
@@ -6531,6 +6920,8 @@ class H3FrameCodec
     /**
      * Decodes a SETTINGS frame body into associative
      * array.
+     * @param string $body message body bytes
+     * @return array parsed HTTP/3 SETTINGS map
      */
     public static function decodeSettingsBody($body)
     {
@@ -6577,6 +6968,7 @@ class Qpack
     protected static $static_by_pair = null;
     /**
      * Returns the static table; built lazily.
+     * @return array reference to the QPACK static table from RFC 9204 Appendix A
      */
     public static function staticTable()
     {
@@ -6710,6 +7102,8 @@ class Qpack
      * encoded field section. The first two bytes are the
      * Required Insert Count and Base; we always emit
      * (0, 0) since we don't use the dynamic table.
+     * @param array $headers list of [name, value] header pairs
+     * @return string encoded packet bytes ready to send
      */
     public static function encode($headers)
     {
@@ -6744,6 +7138,9 @@ class Qpack
      * Indexed Field Line, sec 4.5.2.
      *   1 T x x x x x x  index (6-bit prefix integer)
      * T = 1 means static table.
+     * @param int $index index
+     * @param bool $is_static true to look up the static table; dynamic table is not implemented
+     * @return string QPACK indexed-field-line encoding bytes
      */
     protected static function encodeIndexedFieldLine($index,
         $is_static)
@@ -6756,6 +7153,10 @@ class Qpack
      *   0 1 N T x x x x  index (4-bit prefix)
      *   value as string-with-huffman (we omit huffman).
      * N = Never-Indexed flag (0 here), T = static.
+     * @param int $index index
+     * @param bool $is_static true to look up the static table; dynamic table is not implemented
+     * @param mixed $value value
+     * @return string QPACK literal-with-name-reference encoding bytes
      */
     protected static function encodeLiteralWithNameRef(
         $index, $is_static, $value)
@@ -6770,6 +7171,9 @@ class Qpack
      *   name bytes
      *   value (string-with-huffman)
      * H = use Huffman (we set 0).
+     * @param string $name name
+     * @param mixed $value value
+     * @return string QPACK literal-with-literal-name encoding bytes
      */
     protected static function encodeLiteralWithLiteralName(
         $name, $value)
@@ -6784,6 +7188,9 @@ class Qpack
      * variable-bit prefix. The Huffman bit is bit
      * (prefix_bits) of the first byte; we always set 0
      * (no Huffman on encode).
+     * @param mixed $s s parameter
+     * @param int $prefix_bits prefix width in bits for the QPACK length integer
+     * @return string QPACK string-literal encoding bytes
      */
     protected static function encodeString($s, $prefix_bits)
     {
@@ -6796,6 +7203,10 @@ class Qpack
      * number of bits in the first byte allocated to the
      * integer; the remaining (8-N) bits are flag bits the
      * caller pre-OR-ed into $high_bits.
+     * @param mixed $value value
+     * @param int $n_bits prefix width in bits (1..8) for the prefixed-integer encoding
+     * @param mixed $high_bits high_bits parameter
+     * @return string QPACK prefixed-integer encoding bytes
      */
     protected static function encodePrefixedInt($value,
         $n_bits, $high_bits)
@@ -6818,6 +7229,8 @@ class Qpack
      * field section) and returns a list of [name, value]
      * pairs. Throws on malformed input or dynamic-table
      * references.
+     * @param string $bytes bytes to operate on
+     * @return array two-element list [QuicPacket|false, int $new_off]; false on parse failure
      */
     public static function decode($bytes)
     {
@@ -6876,6 +7289,13 @@ class Qpack
         }
         return $headers;
     }
+    /**
+     * Reads a single byte from $buf at $off.
+     *
+     * @param string $buf raw buffer being decoded
+     * @param int $off current byte offset
+     * @return array two-element list [int $byte, int $new_off]
+     */
     protected static function readU8($buf, $off)
     {
         if (strlen($buf) <= $off) {
@@ -6883,6 +7303,16 @@ class Qpack
         }
         return [ord($buf[$off]), $off + 1];
     }
+    /**
+     * Reads a QPACK/HPACK-style prefixed integer (RFC 7541 sec
+     * 5.1) starting at $off. The first byte's low $n_bits hold
+     * the value (or signal continuation when all set).
+     *
+     * @param string $buf raw buffer being decoded
+     * @param int $off byte offset of the integer
+     * @param int $n_bits prefix width in bits (1..8)
+     * @return array two-element list [int $value, int $new_off]
+     */
     protected static function readPrefixedInt($buf, $off,
         $n_bits)
     {
@@ -6892,6 +7322,18 @@ class Qpack
         return self::readPrefixedIntFrom($buf, $off,
             $n_bits, $value);
     }
+    /**
+     * Continuation of readPrefixedInt: caller has already
+     * extracted the prefix-bits and passes the partial value
+     * in. Walks continuation bytes until the high bit clears.
+     *
+     * @param string $buf raw buffer being decoded
+     * @param int $off byte offset of the next continuation byte
+     * @param int $n_bits original prefix width
+     * @param int $value partial value extracted from the first
+     *      byte's prefix bits
+     * @return array two-element list [int $value, int $new_off]
+     */
     protected static function readPrefixedIntFrom($buf, $off,
         $n_bits, $value)
     {
@@ -6914,6 +7356,19 @@ class Qpack
         }
         return [$value, $off];
     }
+    /**
+     * Reads a QPACK string literal (RFC 9204 sec 4.1.1): a
+     * length-prefixed byte sequence with an optional Huffman
+     * flag bit one position above the length prefix.
+     *
+     * @param string $buf raw buffer being decoded
+     * @param int $off byte offset of the string's first byte
+     * @param int $prefix_bits prefix width for the length
+     *      integer (1..7); the Huffman flag occupies
+     *      $prefix_bits position above
+     * @return array two-element list [string $bytes,
+     *      int $new_off]
+     */
     protected static function readStringWithHuffman($buf,
         $off, $prefix_bits)
     {
@@ -6933,6 +7388,17 @@ class Qpack
         }
         return [$bytes, $off];
     }
+    /**
+     * Looks up an entry in the QPACK static table (RFC 9204
+     * Appendix A).
+     *
+     * @param int $index static-table index
+     * @param bool $is_static must be true; dynamic-table
+     *      indexing is not implemented (throws otherwise)
+     * @param bool $want_value if true return the value side of
+     *      the pair, otherwise the name side
+     * @return string name or value bytes from the static table
+     */
     protected static function lookupStatic($index,
         $is_static, $want_value)
     {
@@ -7060,6 +7526,7 @@ class QpackHuffman
     }
     /**
      * Builds the binary lookup tree from the codes table.
+     * @return string serialized bytes
      */
     protected static function buildTree()
     {
@@ -7091,6 +7558,8 @@ class QpackHuffman
      * stream is padded with the most significant bits of
      * the EOS symbol (all 1s); we ignore trailing bits
      * once we have walked through every full byte.
+     * @param string $bytes bytes to operate on
+     * @return array two-element list [QuicPacket|false, int $new_off]; false on parse failure
      */
     public static function decode($bytes)
     {
@@ -7189,6 +7658,9 @@ class H3Connection extends Connection
     public $next_server_uni = 3;
     /**
      * Constructor: wraps a QuicConnection.
+     * @param mixed $quic quic parameter
+     * @param mixed $scid_hex scid_hex parameter
+     * @param mixed $peer_address peer_address parameter
      */
     public function __construct($quic, $scid_hex,
         $peer_address)
@@ -7211,6 +7683,7 @@ class H3Connection extends Connection
     /**
      * True once the QUIC handshake has finished and the
      * connection can carry application data.
+     * @return bool true if the QUIC handshake has completed
      */
     public function isEstablished()
     {
@@ -7219,6 +7692,7 @@ class H3Connection extends Connection
     /**
      * True if the connection has gone into closed state
      * (CONNECTION_CLOSE seen, idle timeout, fatal error).
+     * @return bool true if the connection has been closed
      */
     public function isClosed()
     {
@@ -7227,6 +7701,8 @@ class H3Connection extends Connection
     /**
      * Tears down the connection, sending CONNECTION_CLOSE
      * if possible.
+     * @param int $error_code error code
+     * @param string $reason reason phrase
      */
     public function close($error_code = 0, $reason = '')
     {
@@ -7327,6 +7803,12 @@ class H3Listener extends Listener
     /**
      * Standard listener constructor; cert/key/alpn are
      * filled in by tryOpen.
+     * @param mixed $server server parameter
+     * @param string $address peer or local address
+     * @param array $globals per-listener server globals overrides
+     * @param string $cert_pem certificate in PEM format
+     * @param string $key_pem private key in PEM format
+     * @param mixed $alpn alpn parameter
      */
     public function __construct($server, $address, $globals,
         $cert_pem, $key_pem, $alpn = ['h3'])
@@ -7344,6 +7826,10 @@ class H3Listener extends Listener
      * 'local_cert' and 'local_pk' out of it. Returns null
      * if the listener cannot be opened (missing cert/key,
      * UDP bind failure).
+     * @param string $bind_address udp:// bind address for stream_socket_server
+     * @param array $context per-listener stream context overrides
+     * @param array $globals per-listener server globals overrides
+     * @return H3Listener|null newly opened listener, or null if the required extensions or key material are not available
      */
     public static function tryOpen($bind_address, $context,
         $globals)
@@ -7455,6 +7941,7 @@ class H3Listener extends Listener
      * from the listener's map. Safe to call on a closed or
      * partially-closed connection; emit() returns an empty
      * list when there's nothing to send.
+     * @param mixed $h3 h3 parameter
      */
     protected function flushConnectionOnce($h3)
     {
@@ -7534,6 +8021,9 @@ class H3Listener extends Listener
      *   [H3Connection|null, $is_new]
      * where $is_new is true if this datagram opened a new
      * connection.
+     * @param string $buf raw byte buffer
+     * @param string $peer peer address as returned by stream_socket_recvfrom
+     * @return void no return; the datagram is processed in place
      */
     public function processDatagram($buf, $peer)
     {
@@ -7806,6 +8296,9 @@ class H3Listener extends Listener
      * address per call). Returns the encoded wire bytes,
      * or '' if 1-RTT keys are not yet available or the
      * encoding fails.
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $challenge challenge parameter
+     * @return string encoded PATH_CHALLENGE packet bytes
      */
     public static function buildPathChallengePacket($conn,
         $challenge)
@@ -7846,6 +8339,9 @@ class H3Listener extends Listener
      * header packets we have to assume the locally chosen
      * length, which we standardize at 8 bytes for all
      * connections opened by this listener.
+     * @param string $buf raw byte buffer
+     * @param mixed $short_dcid_len short_dcid_len parameter
+     * @return string|false the destination Connection ID extracted without consuming the packet, or false if the buffer is not a parseable QUIC packet
      */
     protected static function peekDcid($buf, $short_dcid_len)
     {
@@ -7881,6 +8377,10 @@ class H3Listener extends Listener
      * Returns the wire bytes, or '' if no reset is possible
      * (no secret available, triggering packet too small to
      * fit even the minimum 21-byte reset, or HMAC failure).
+     * @param string $dcid destination Connection ID
+     * @param string $secret TLS 1.3 traffic secret
+     * @param mixed $triggering_len triggering_len parameter
+     * @return string stateless-reset packet bytes per RFC 9000 sec 10.3
      */
     public static function buildStatelessReset($dcid, $secret,
         $triggering_len)
@@ -8012,6 +8512,7 @@ class H3Listener extends Listener
      * compute the actual minimum across per-connection
      * PTO + idle timers if 100 ms wakeups become a CPU
      * concern.
+     * @return int|null milliseconds until the next timer fires, or null if none scheduled
      */
     public function nextTimeoutMillis()
     {
@@ -8023,6 +8524,7 @@ class H3Listener extends Listener
      * shape the FFI listener returns for sibling stats
      * tools. Each entry is the dict produced by
      * QuicConnection::stats().
+     * @return array snapshot of all per-connection statistics
      */
     public function snapshotAllStats()
     {
@@ -8053,6 +8555,7 @@ class H3Listener extends Listener
      * (it simply unsets entries on close); returns an
      * empty array for now. A future revision could keep
      * a small ring of recent closures.
+     * @return array snapshot of statistics for connections reaped in the last interval
      */
     public function snapshotReapedStats()
     {
@@ -8079,6 +8582,10 @@ class H3Transport extends Transport
      * driven by H3Listener::accept reading the shared UDP
      * socket and dispatching datagrams. WebSite never
      * adds an H3Connection to its select set.
+     * @param string $key key
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $in_stream in_stream parameter
+     * @param mixed $too_long too_long parameter
      */
     public function onReadable($key, $conn, $in_stream,
         $too_long)
@@ -8091,6 +8598,8 @@ class H3Transport extends Transport
      * application data, parses HTTP/3 frames, captures
      * HEADERS via Qpack::decode, dispatches the request
      * once FIN is seen, and ships back a response.
+     * @param mixed $listener listener parameter
+     * @param QuicConnection $conn live QUIC connection
      */
     public function driveConnection($listener, $conn)
     {
@@ -8131,6 +8640,8 @@ class H3Transport extends Transport
      * control stream, do so and write a SETTINGS frame
      * (RFC 9114 sec 6.2.1). Server-initiated uni streams
      * in QUIC have stream IDs of the form 4n + 3.
+     * @param mixed $listener listener parameter
+     * @param QuicConnection $conn live QUIC connection
      */
     protected function ensureControlStream($listener, $conn)
     {
@@ -8165,6 +8676,8 @@ class H3Transport extends Transport
     /**
      * RFC 9000 sec 2.1: stream IDs whose lowest bit is 1
      * are uni-directional.
+     * @param mixed $sid sid parameter
+     * @return bool true if the stream is unidirectional
      */
     protected static function isUni($sid)
     {
@@ -8173,6 +8686,8 @@ class H3Transport extends Transport
     /**
      * Stream IDs whose second-lowest bit is 0 are client-
      * initiated.
+     * @param mixed $sid sid parameter
+     * @return bool true if the stream id is client-initiated (low bit clear)
      */
     protected static function isClientInitiated($sid)
     {
@@ -8186,6 +8701,10 @@ class H3Transport extends Transport
      * the client's SETTINGS frame, and silently discard
      * other types (push, encoder, decoder streams) since
      * we don't use them.
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $sid sid parameter
+     * @param QuicStream $stream QUIC stream object
+     * @param string $bytes bytes to operate on
      */
     protected function handleUniStream($conn, $sid, $stream,
         $bytes)
@@ -8229,6 +8748,11 @@ class H3Transport extends Transport
      * stream. These carry HTTP/3 request frames: HEADERS
      * always first, optional DATA frames, eventually a
      * stream FIN.
+     * @param mixed $listener listener parameter
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $sid sid parameter
+     * @param QuicStream $stream QUIC stream object
+     * @param string $bytes bytes to operate on
      */
     protected function handleBidiStream($listener, $conn,
         $sid, $stream, $bytes)
@@ -8293,6 +8817,9 @@ class H3Transport extends Transport
      * setGlobals + getResponseData pipeline, then writes
      * the response back as an HTTP/3 HEADERS + DATA frame
      * pair.
+     * @param mixed $listener listener parameter
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $sid sid parameter
      */
     protected function dispatchRequest($listener, $conn, $sid)
     {
@@ -8336,6 +8863,10 @@ class H3Transport extends Transport
      * Builds an H1/H2-style $context array from captured
      * H3 request state. Mirrors what the FFI version
      * produces so apps don't see a difference.
+     * @param mixed $listener listener parameter
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $st st parameter
+     * @return array request context map suitable for setGlobals
      */
     protected function buildContext($listener, $conn, $st)
     {
@@ -8400,6 +8931,11 @@ class H3Transport extends Transport
      * Builds and queues a complete H3 response on $sid:
      * one HEADERS frame followed by one DATA frame, then
      * FIN.
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $sid sid parameter
+     * @param int $status HTTP response status code
+     * @param mixed $header_lines header_lines parameter
+     * @param string $body message body bytes
      */
     protected function sendResponse($conn, $sid, $status,
         $header_lines, $body)
@@ -8447,6 +8983,9 @@ class H3Transport extends Transport
     /**
      * Best-effort error response when the app handler
      * throws.
+     * @param QuicConnection $conn live QUIC connection
+     * @param mixed $sid sid parameter
+     * @param int $status HTTP response status code
      */
     protected function sendErrorResponse($conn, $sid,
         $status)

@@ -756,6 +756,10 @@ class WebSite
      * for a streaming response. Forces Transfer-Encoding: chunked
      * (no Content-Length, since the total length is unknown
      * during streaming). Called from flush() on the first call.
+     *
+     * @param string $chunk first chunk of body to send with the
+     *      response head; may be the empty string if the route
+     *      flushed only headers so far
      */
     protected function writeStreamingHead_H1($chunk)
     {
@@ -776,6 +780,8 @@ class WebSite
     /**
      * Writes a single H1 chunked-transfer chunk. RFC 7230 sec 4.1
      * format: <hex-length>\r\n<data>\r\n.
+     *
+     * @param string $chunk body bytes for this chunk
      */
     protected function writeStreamingChunk_H1($chunk)
     {
@@ -787,6 +793,9 @@ class WebSite
      * END_STREAM) plus first DATA frame for a streaming response.
      * Subsequent flushes are pure DATA frames. The terminating
      * empty DATA with END_STREAM is sent by getResponseData.
+     *
+     * @param string $chunk first chunk of body to send with the
+     *      HEADERS frame; may be the empty string
      */
     protected function writeStreamingHead_H2($chunk)
     {
@@ -845,6 +854,10 @@ class WebSite
      * Writes one or more H2 DATA frames for a streaming chunk,
      * splitting at H2_MAX_FRAME_SIZE per RFC 7540 sec 4.2.
      * No END_STREAM is set; the terminator comes later.
+     *
+     * @param string $chunk body bytes for this chunk; will be
+     *      split across multiple DATA frames if longer than
+     *      H2_MAX_FRAME_SIZE
      */
     protected function writeStreamingChunk_H2($chunk)
     {
@@ -1473,6 +1486,9 @@ class WebSite
      *
      * @param string $filename tmp_name in $_FILES of the uploaded file
      * @param string $destination where on server the file should be moved to
+     * @return bool true on a successful save, false when no matching
+     *      tmp_name was found in $_FILES; in non-CLI mode the
+     *      return value of move_uploaded_file is propagated
      */
     public function moveUploadedFile($filename , $destination)
     {
@@ -2145,6 +2161,10 @@ class WebSite
     }
     /**
      * Used to export info (but not change) about running sessions
+     *
+     * @return array map session id => session record (with TIME and
+     *      DATA fields); the live internal storage, callers must
+     *      not mutate it
      */
     public function getSessions()
     {
@@ -2768,6 +2788,10 @@ class WebSite
      *      caller has already consumed it (TLS detection via
      *      fread). Set to true for cleartext h2c where
      *      STREAM_PEEK was used and the magic is still buffered.
+     * @return array the peer's initial SETTINGS dictionary
+     *      (identifier => value), so the caller can mirror those
+     *      settings into per-connection state (ENABLE_PUSH,
+     *      HEADER_TABLE_SIZE, etc.)
      */
     protected function initH2Request($connection,
         $read_magic = false)
@@ -3232,9 +3256,11 @@ class WebSite
      * all bytes are available. Returns the binary string, or throws
      * if the connection closes before enough data arrives.
      *
-     * @param resource $connection
-     * @param int $length Number of bytes to read
-     * @return string
+     * @param resource $connection client connection to read from;
+     *      must be in blocking mode so fread won't return early
+     * @param int $length number of bytes to read
+     * @return string exactly $length binary bytes read from the
+     *      connection
      */
     protected function readExactly($connection, $length)
     {
@@ -3655,7 +3681,7 @@ class WebSite
      * an initial stream context. This context is used to populate the $_SERVER
      * variable when the request is later processed.
      *
-     * @param int key id of request stream to initialize context for
+     * @param int $key id of request stream to initialize context for
      * @param array $additional_context any additional key value field to
      *   set for the stream's context
      */
@@ -3960,6 +3986,11 @@ class WebSite
      *      with HTTP_ prefix (e.g. $context['HTTP_COOKIE']);
      *      Content-Type and Content-Length without prefix
      *      (CGI convention). Body is in $context['CONTENT'].
+     * @param Connection|null $conn live Connection for this request
+     *      (used to overlay listener-attached fields like
+     *      IS_SECURE, LISTENER_PORT, LISTENER_NAME, HTTPS onto
+     *      $_SERVER). Null is allowed for synthetic internal
+     *      requests with no real connection.
      */
     public function setGlobals($context, $conn = null)
     {
@@ -4927,6 +4958,9 @@ abstract class Transport
  */
 class H1Transport extends Transport
 {
+    /**
+     * {@inheritDoc}
+     */
     public function onReadable($key, $conn, $in_stream, $too_long)
     {
         $this->site->parseH1Request($key, $in_stream, $too_long);
@@ -4943,6 +4977,9 @@ class H1Transport extends Transport
  */
 class H2Transport extends Transport
 {
+    /**
+     * {@inheritDoc}
+     */
     public function onReadable($key, $conn, $in_stream, $too_long)
     {
         if ($too_long) {
@@ -4961,6 +4998,9 @@ class H2Transport extends Transport
  */
 class WsTransport extends Transport
 {
+    /**
+     * {@inheritDoc}
+     */
     public function onReadable($key, $conn, $in_stream, $too_long)
     {
         $this->site->parseWsRequest($key, $in_stream);
@@ -5345,18 +5385,71 @@ class WebSocket
 class Frame
 {
     // Properties
+    /**
+     * Map of flag-name => bit value; subclasses override with the
+     * flags that apply to their specific frame type.
+     * @var array
+     */
     protected $defined_flags = [];
+    /**
+     * 8-bit frame-type identifier per RFC 7540 §6; subclasses
+     * override with their wire-protocol value.
+     * @var int|null
+     */
     protected $type = null;
+    /**
+     * One of the STREAM_ASSOC_* constants describing whether this
+     * frame type belongs on the connection (stream 0), on a stream
+     * (stream != 0), or either.
+     * @var string|null
+     */
     protected $stream_association = null;
+    /**
+     * Decoded length of the frame payload (in bytes), set when the
+     * frame header is parsed.
+     * @var int
+     */
     protected $payload_length;
+    /**
+     * Stream identifier carried in the frame header (0 for
+     * connection-level frames).
+     * @var int
+     */
     public $stream_id;
+    /**
+     * Set of flag names currently active on this frame, drawn from
+     * $defined_flags by parseFlags.
+     * @var array
+     */
     public $flags;
 
     // Constants
+    /**
+     * stream_association sentinel: frame type MUST be sent on a
+     * stream (stream_id != 0); otherwise it's a connection error
+     */
     const STREAM_ASSOC_HAS_STREAM = "has-stream";
+    /**
+     * stream_association sentinel: frame type MUST be sent on the
+     * connection (stream_id == 0); otherwise it's a connection
+     * error
+     */
     const STREAM_ASSOC_NO_STREAM = "no-stream";
+    /**
+     * stream_association sentinel: frame type can be sent on
+     * either the connection (stream_id == 0) or any stream
+     */
     const STREAM_ASSOC_EITHER = "either";
+    /**
+     * RFC 7540 §6.5.2 initial value for SETTINGS_MAX_FRAME_SIZE;
+     * peers may negotiate a larger value up to FRAME_MAX_ALLOWED_LEN
+     */
     const FRAME_MAX_LEN = (2 ** 14); //initial
+    /**
+     * RFC 7540 §6.5.2 ceiling for SETTINGS_MAX_FRAME_SIZE; the
+     * frame-length field is 24 bits so no larger value can be
+     * encoded
+     */
     const FRAME_MAX_ALLOWED_LEN = (2 ** 24) - 1; //max-allowed
     /**
      * reads the stream id and flags set for the frame
@@ -5437,6 +5530,11 @@ class Frame
      *
      * @param string $data Binary data of the frame header in hexadecimal
      *  format.
+     * @return array two-element list [Frame $frame, int $length]: a
+     *      freshly-instantiated Frame subclass (resolved via
+     *      FrameFactory::$frames) with payload_length and flags
+     *      populated, plus the payload length the caller must
+     *      consume before calling parseBody
      */
     public static function parseFrameHeader($data)
     {
@@ -5463,6 +5561,9 @@ class Frame
      * which are present in each child class.
      * @param string $flag_byte Binary data representing the flag
      * byte in hexadecimal format.
+     * @return Flags the frame's flags collection populated with
+     *      the symbolic names of every defined flag whose bit is
+     *      set in $flag_byte
      */
     public function parseFlags($flag_byte)
     {
@@ -5489,6 +5590,13 @@ class Frame
  */
 class FrameFactory
 {
+    /**
+     * Map from RFC 7540 §11.2 frame-type identifier to the
+     * Frame subclass that handles it. Used by
+     * parseFrameHeader to instantiate the right Frame type
+     * when reading bytes off the wire.
+     * @var array
+     */
     public static $frames = [
         0x0 => DataFrame::class,
         0x1 => HeaderFrame::class,
@@ -5502,17 +5610,38 @@ class FrameFactory
         0x9 => ContinuationFrame::class,
     ];
 }
-/*
+/**
  * SettingsFrame class is responsible for handling the HTTP/2 SETTINGS frame,
  * helps configure communication parameters between the client and server.
  */
 class SettingsFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [
         'ACK' => 0x01
     ];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x04;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
+    /**
+     * Map from SETTINGS-frame parameter identifier (uint16) to the
+     * canonical RFC 7540 / 8441 parameter name. Used when parsing
+     * a peer's SETTINGS payload and when serialising one to send.
+     */
     const PAYLOAD_SETTINGS = [
         0x01 => 'HEADER_TABLE_SIZE',
         0x02 => 'ENABLE_PUSH',
@@ -5522,12 +5651,14 @@ class SettingsFrame extends Frame
         0x06 => 'MAX_HEADER_LIST_SIZE',
         0x08 => 'ENABLE_CONNECT_PROTOCOL',
     ];
-    /*
-        Public so callers (initH2Request, parseH2Request) can
-        read the parsed settings dictionary directly off the
-        frame after parseBody, without needing a getter. Frames
-        are always constructed inside this file so the broader
-        class-encapsulation cost is nil.
+    /**
+     * Parsed settings dictionary (identifier => value) after a
+     * call to parseBody, and the input to serializeBody when
+     * sending. Public so callers (initH2Request, parseH2Request)
+     * can read the parsed values directly off the frame without
+     * needing a getter. Frames are always constructed inside this
+     * file so the broader class-encapsulation cost is nil.
+     * @var array
      */
     public $settings = [];
     /**
@@ -5550,8 +5681,11 @@ class SettingsFrame extends Frame
      * Converts the settings into the format required for transmission.
      * Each setting is packed as 6 bytes: 2 bytes for the setting identifier
      * and 4 bytes for its value.
-     * @return string Returns the settings as serialized binary data.
-     */
+     * @param object $hpack HPack encoder for this connection; unused
+     *      for non-HEADERS frame bodies but accepted for signature
+     *      compatibility with HeaderFrame::serializeBody
+     
+     * @return string Returns the settings as serialized binary data.*/
     public function serializeBody($hpack = null)
     {
         $body = '';
@@ -5593,14 +5727,34 @@ class SettingsFrame extends Frame
  */
 class HeaderFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [
         'END_STREAM' => 0x01,
         'END_HEADERS' => 0x04,
         'PADDED' => 0x08,
         'PRIORITY' => 0x20
     ];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x01;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
+    /**
+     * Raw payload bytes carried by this frame.
+     * @var string
+     */
     public $data;
     /**
      * Constructor to create a new HeaderFrame object.
@@ -5753,18 +5907,38 @@ class HeaderFrame extends Frame
         return $context;
     }
 }
-/*
+/**
  * DataFrame class handles the HTTP/2 DATA frame,
  * which carries the data of a stream between the client and server.
  */
 class DataFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [
         'END_STREAM' => 0x01,
         'PADDED' => 0x08
     ];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x0;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
+    /**
+     * Raw payload bytes carried by this frame.
+     * @var string
+     */
     public $data;
     /**
      * Constructor to create a new DataFrame object.
@@ -5780,6 +5954,11 @@ class DataFrame extends Frame
     /**
      * Serializes the body of the frame into a binary string.
      * Converts the ASCII data to binary format for transmission.
+     * @param object $hpack HPack encoder for this connection; unused
+     *      for non-HEADERS frame bodies but accepted for signature
+     *      compatibility with HeaderFrame::serializeBody
+     * @return string the frame's $data buffer as-is (DATA frames
+     *      carry raw application bytes, no encoding)
      */
     public function serializeBody($hpack = null)
     {
@@ -5814,17 +5993,48 @@ class DataFrame extends Frame
             $this->payload_length - $offset - $padding);
     }
 }
-/*
+/**
  * PriorityFrame class handles the HTTP/2 PRIORITY frame,
  * which specifies the sender-advised priority of a stream.
  */
 class PriorityFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x02;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = self::STREAM_ASSOC_HAS_STREAM;
+    /**
+     * 31-bit stream id this stream depends on for ordering
+     * per RFC 7540 §5.3.2; 0 indicates no dependency.
+     * @var int
+     */
     protected $depends_on;
+    /**
+     * 8-bit priority weight (RFC 7540 §5.3.2) the peer
+     * advised; the server is not required to honor it.
+     * @var int
+     */
     protected $stream_weight;
+    /**
+     * Whether this stream wants the exclusive dependency
+     * flag set on $depends_on per RFC 7540 §5.3.1.
+     * @var bool
+     */
     protected $exclusive;
     /**
      * Constructor for PriorityFrame.
@@ -5842,8 +6052,11 @@ class PriorityFrame extends Frame
     /**
      * Serializes the PRIORITY frame body into binary format.
      *
-     * @return string 5-byte serialized priority data
-     */
+     * @param object $hpack HPack encoder for this connection; unused
+     *      for non-HEADERS frame bodies but accepted for signature
+     *      compatibility with HeaderFrame::serializeBody
+     
+     * @return string 5-byte serialized priority data*/
     public function serializeBody($hpack = null)
     {
         $dep = $this->depends_on
@@ -5869,20 +6082,44 @@ class PriorityFrame extends Frame
         $this->payload_length = 5;
     }
 }
-/*
+/**
  * RstStreamFrame class handles the HTTP/2 RST_STREAM frame,
  * which is used to abruptly terminate a stream.
  */
 class RstStreamFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x03;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
+    /**
+     * RFC 7540 §7 error code (NO_ERROR=0,
+     * PROTOCOL_ERROR=1, INTERNAL_ERROR=2, etc.) being
+     * reported.
+     * @var int
+     */
     protected $error_code;
     /**
      * Constructor to create a new RstStreamFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $error_code The error code for the RST_STREAM frame.
+     * @param array $kwargs flags passed through to the parent
+     *      Frame constructor
      */
     public function __construct($stream_id, $error_code = 0,
         array $kwargs = [])
@@ -5917,25 +6154,52 @@ class RstStreamFrame extends Frame
         $this->payload_length = 4;
     }
 }
-/*
+/**
  * PushPromiseFrame class handles the HTTP/2 PUSH_PROMISE frame,
  * which is used to notify the client of an upcoming stream.
  */
 class PushPromiseFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [
         'END_HEADERS' => 0x04,
         'PADDED' => 0x08
     ];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x05;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
+    /**
+     * Server-initiated stream id the server is promising
+     * to push a response on per RFC 7540 §6.6.
+     * @var int
+     */
     protected $promised_stream_id;
+    /**
+     * Raw payload bytes carried by this frame.
+     * @var string
+     */
     protected $data;
     /**
      * Constructor to create a new PushPromiseFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $promised_stream_id The promised stream ID.
      * @param string $data The data payload.
+     * @param array $kwargs flags passed through to the parent
+     *      Frame constructor
      */
     public function __construct($stream_id, $promised_stream_id = 0,
         $data = '', $kwargs = [])
@@ -5997,23 +6261,46 @@ class PushPromiseFrame extends Frame
         $this->payload_length = strlen($data);
     }
 }
-/*
+/**
  * PingFrame class handles the HTTP/2 PING frame,
  * which is used for measuring round-trip times or verifying connection health.
  */
 class PingFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [
         'ACK' => 0x01
     ];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x06;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
+    /**
+     * 8 bytes of opaque round-trip-timing payload echoed
+     * back in the PING ACK per RFC 7540 §6.7.
+     * @var string
+     */
     protected $opaque_data;
     /**
      * Constructor to create a new PingFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param string $opaque_data The opaque data (8 bytes)
      * associated with the PING frame.
+     * @param array $kwargs flags passed through to the parent
+     *      Frame constructor
      */
     public function __construct($stream_id = 0, $opaque_data = '',
         $kwargs = [])
@@ -6023,8 +6310,11 @@ class PingFrame extends Frame
     }
     /**
      * Serializes the PING frame body into binary format.
-     * @return string The serialized binary data.
-     */
+     * @param object $hpack HPack encoder for this connection; unused
+     *      for non-HEADERS frame bodies but accepted for signature
+     *      compatibility with HeaderFrame::serializeBody
+     
+     * @return string The serialized binary data.*/
     public function serializeBody($hpack = null)
     {
         if (strlen($this->opaque_data) != 8) {
@@ -6047,18 +6337,50 @@ class PingFrame extends Frame
         $this->payload_length = 8;
     }
 }
-/*
+/**
  * GoAwayFrame class handles the HTTP/2 GOAWAY frame,
  * which is used to indicate that the sender is gracefully
  * shutting down a connection.
  */
 class GoAwayFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x07;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
+    /**
+     * Highest stream id the sender will service before
+     * closing the connection per RFC 7540 §6.8.
+     * @var int
+     */
     protected $last_stream_id;
+    /**
+     * RFC 7540 §7 error code (NO_ERROR=0,
+     * PROTOCOL_ERROR=1, INTERNAL_ERROR=2, etc.) being
+     * reported.
+     * @var int
+     */
     protected $error_code;
+    /**
+     * Optional opaque debug data trailing the standard
+     * GOAWAY fields per RFC 7540 §6.8.
+     * @var string
+     */
     protected $additional_data;
     /**
      * Constructor to create a new GoAwayFrame object.
@@ -6066,6 +6388,8 @@ class GoAwayFrame extends Frame
      * @param int $last_stream_id last stream ID the sender will accept.
      * @param int $error_code indicating the reason for shutting down.
      * @param string $additional_data Additional debug data (optional).
+     * @param array $kwargs flags passed through to the parent
+     *      Frame constructor
      */
     public function __construct($stream_id = 0, $last_stream_id = 0,
         $error_code = 0, $additional_data = '', $kwargs = [])
@@ -6077,8 +6401,11 @@ class GoAwayFrame extends Frame
     }
     /**
      * Serializes the GOAWAY frame body into a binary format.
-     * @return string The serialized binary data.
-     */
+     * @param object $hpack HPack encoder for this connection; unused
+     *      for non-HEADERS frame bodies but accepted for signature
+     *      compatibility with HeaderFrame::serializeBody
+     
+     * @return string The serialized binary data.*/
     public function serializeBody($hpack = null)
     {
         $data = pack('N', $this->last_stream_id & 0x7FFFFFFF) .
@@ -6102,20 +6429,43 @@ class GoAwayFrame extends Frame
         $this->payload_length = strlen($data);
     }
 }
-/*
+/**
  * WindowUpdateFrame class handles the HTTP/2 WINDOW_UPDATE frame,
  * which is used to implement flow control.
  */
 class WindowUpdateFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x08;
+    /**
+     * STREAM_ASSOC_* sentinel describing which stream id this
+     * frame type is permitted on (overrides
+     * Frame::$stream_association).
+     * @var string
+     */
     protected $stream_association = '_STREAM_ASSOC_EITHER';
+    /**
+     * 31-bit non-zero credit being added to the flow-
+     * control window per RFC 7540 §6.9.
+     * @var int
+     */
     protected $window_increment;
     /**
      * Constructor to create a new WindowUpdateFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param int $window_increment The increment to the window size.
+     * @param array $kwargs flags passed through to the parent
+     *      Frame constructor
      */
     public function __construct($stream_id, $window_increment = 0,
         $kwargs = [])
@@ -6156,21 +6506,37 @@ class WindowUpdateFrame extends Frame
         $this->payload_length = 4;
     }
 }
-/*
+/**
  * ContinuationFrame class handles the HTTP/2 CONTINUATION frame,
  * which is used to continue a sequence of header block fragments.
  */
 class ContinuationFrame extends Frame
 {
+    /**
+     * Flag-name => bit-value map for this frame type per
+     * RFC 7540 §6 (overrides Frame::$defined_flags).
+     * @var array
+     */
     protected $defined_flags = [
         'END_HEADERS' => 0x04,
     ];
+    /**
+     * Wire-protocol frame-type identifier for this frame per
+     * RFC 7540 §11.2 (overrides Frame::$type).
+     * @var int
+     */
     protected $type = 0x09;
+    /**
+     * Raw payload bytes carried by this frame.
+     * @var string
+     */
     public $data;
     /**
      * Constructor to create a new ContinuationFrame object.
      * @param int $stream_id The stream ID for this frame.
      * @param string $data The continuation frame payload.
+     * @param array $kwargs flags passed through to the parent
+     *      Frame constructor
      */
     public function __construct($stream_id, $data = '', $kwargs = [])
     {
@@ -6202,18 +6568,39 @@ class ContinuationFrame extends Frame
         $this->payload_length = strlen($data);
     }
 }
-/*
- * Exception classes for exceptions thrown in all frame classes.
+/**
+ * Exception thrown when an HTTP/2 frame fails to parse or violates
+ * a structural invariant required by RFC 7540 (bad length, unknown
+ * frame type on a stream that doesn't accept it, etc.).
  */
 class InvalidFrameException extends \Exception {}
+/**
+ * Exception thrown when frame payload data fails to decode (e.g.
+ * a malformed SETTINGS payload, a CONTINUATION sequence that
+ * doesn't terminate, or any other data-level structural error).
+ */
 class InvalidDataException extends \Exception {}
+/**
+ * Exception thrown when a frame's PADDED flag is set but the
+ * declared pad length is inconsistent with the payload (i.e. the
+ * pad would extend beyond the payload bytes).
+ */
 class InvalidPaddingException extends \Exception {}
 /**
  * Represents a single flag with a name and bit value.
  */
 class Flag
 {
+    /**
+     * Symbolic name of this flag (e.g. "ACK", "END_STREAM").
+     * @var string
+     */
     public $name;
+    /**
+     * Bitmask of this flag within the frame-header flags
+     * byte (e.g. 0x01 for ACK).
+     * @var int
+     */
     public $bit;
     /**
      * Constructor for Flag.
@@ -6232,7 +6619,16 @@ class Flag
  */
 class Flags
 {
+    /**
+     * Whitelist of flag names this Flags instance accepts
+     * (from the owning frame type's $defined_flags).
+     * @var array
+     */
     private $valid_flags;
+    /**
+     * Currently active flag names (subset of valid_flags).
+     * @var array
+     */
     private $flags;
     /**
      * Constructor for Flags.
@@ -6246,6 +6642,10 @@ class Flags
     /**
      * Converts the Flags object to a string by sorting
      * and joining all active flags.
+     *
+     * @return string comma-separated list of active flag names in
+     *      sorted order (deterministic regardless of insertion
+     *      order)
      */
     public function __toString()
     {
@@ -6256,6 +6656,7 @@ class Flags
     /**
      * Checks if the specified flag is present.
      * @param string $flag The flag to check.
+     * @return bool true if $flag is in the active flags list
      */
     public function contains($flag)
     {
@@ -6305,11 +6706,16 @@ class Flags
         return $this->flags;
     }
 }
-/*
+/**
  * Trait for handling padding in HTTP/2 frames.
  */
 trait Padding
 {
+    /**
+     * Number of trailing pad bytes the PADDED flag is
+     * declaring per RFC 7540 §6.1.
+     * @var int
+     */
     protected $pad_length;
     /**
      * Constructor for Padding trait.
@@ -6357,12 +6763,19 @@ trait Padding
         return 0;
     }
 }
-/*
+/**
  * Handles HPack compression for HTTP/2, utilizing static and dynamic
  * tables with Huffman encoding. Supports encoding and decoding.
  */
 class HPack
 {
+    /**
+     * RFC 7541 Appendix A static table: the 61 fixed header
+     * name/value pairs every HPack endpoint shares before any
+     * dynamic-table state. Indexes 1..61, each entry [name,
+     * value] where value may be the empty string when only the
+     * name is canonical (e.g. ":authority").
+     */
     private const STATIC_TABLE = [
         1  => [':authority', ''],
         2  => [':method', 'GET'],
@@ -6441,6 +6854,12 @@ class HPack
      * @var array<string,int>
      */
     private static $static_name_value_index = null;
+    /**
+     * Lazy lookup map "name" => lowest static-table index
+     * carrying that name. Used by encode() to pick the
+     * most compact name reference.
+     * @var array<string,int>|null
+     */
     private static $static_name_index = null;
     /**
      * List of header names that have been encoded as
@@ -6951,6 +7370,10 @@ class HPack
      * If Huffman encoding is more efficient, the encoded string is returned;
      * otherwise, the original string is returned in hexadecimal format.
      * @param string $str The input string to encode.
+     * @return string HPACK-encoded string-literal bytes: a 7-bit
+     *      prefix integer length (with the Huffman bit set when
+     *      Huffman encoding was used) followed by the (possibly
+     *      Huffman-encoded) string data
      */
     private function encodeString($str)
     {
@@ -7083,6 +7506,15 @@ class HPack
         }
         return $decoded;
     }
+    /**
+     * RFC 7541 Appendix B canonical HPACK Huffman table.
+     * Map from bit-string ("0"/"1" characters) to ASCII
+     * code point. The bit-string form lets the decoder
+     * append candidate bits and isset()-check; the bits
+     * form a prefix code so the first match is the right
+     * one.
+     * @var array<string,int>
+     */
     private static $HUFFMAN_LOOKUP = [
         '010100' => 32,           '1111111000' => 33,       '1111111001' => 34,
         '111111111010' => 35,     '1111111111001' => 36,    '010101' => 37,

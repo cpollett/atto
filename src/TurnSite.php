@@ -98,6 +98,9 @@ class StaticTurnAuthenticator extends TurnAuthenticator
     {
         $this->users = $users;
     }
+    /**
+     * {@inheritDoc}
+     */
     public function lookupUser($username)
     {
         if (!isset($this->users[$username])) {
@@ -319,9 +322,19 @@ class TurnSite
      *      seconds old; older ones get a 438 stale-nonce.
      */
     protected $nonces = [];
+    /**
+     * Lifetime in seconds for nonces tracked in $nonces; requests
+     * arriving with a nonce older than this are rejected with a
+     * 438 stale-nonce error.
+     */
     const NONCE_TTL = 3600;
     /**
      * Sets the authenticator. Returns $this so calls chain.
+     *
+     * @param TurnAuthenticator $authenticator credential lookup
+     *      implementation used to validate USERNAME / MESSAGE-
+     *      INTEGRITY pairs on inbound requests
+     * @return $this for fluent chaining
      */
     public function auth($authenticator)
     {
@@ -330,6 +343,10 @@ class TurnSite
     }
     /**
      * Sets the realm. Returns $this so calls chain.
+     *
+     * @param string $realm authentication realm advertised in the
+     *      REALM attribute of 401 challenges (RFC 8656 sec 9.1)
+     * @return $this for fluent chaining
      */
     public function realm($realm)
     {
@@ -339,6 +356,10 @@ class TurnSite
     /**
      * Sets the SOFTWARE attribute. Returns $this so calls
      * chain.
+     *
+     * @param string $software UTF-8 free-form server description
+     *      added to outbound responses (RFC 5389 sec 15.10)
+     * @return $this for fluent chaining
      */
     public function software($software)
     {
@@ -348,6 +369,11 @@ class TurnSite
     /**
      * Sets the relay-port range. Returns $this so calls
      * chain.
+     *
+     * @param int $low inclusive lower bound of the UDP port range
+     *      from which relay sockets are allocated
+     * @param int $high inclusive upper bound of the same range
+     * @return $this for fluent chaining
      */
     public function relayPortRange($low, $high)
     {
@@ -361,6 +387,9 @@ class TurnSite
     /**
      * Returns true if the host string contains a colon, i.e.
      * looks like an IPv6 literal.
+     *
+     * @param string $host host string to test
+     * @return bool true when $host appears to be an IPv6 literal
      */
     protected function looksLikeIPv6($host)
     {
@@ -370,6 +399,10 @@ class TurnSite
      * Formats a (host, port) pair as a stream-socket-style
      * udp:// URL, bracket-wrapping IPv6 literals so PHP
      * parses them correctly.
+     *
+     * @param string $host bind address (may include brackets)
+     * @param int $port UDP port number
+     * @return string udp:// URL suitable for stream_socket_server
      */
     protected function formatBindAddress($host, $port)
     {
@@ -382,6 +415,11 @@ class TurnSite
     /**
      * Splits a "host:port" or "[host]:port" string into
      * [host, port]. Returns [false, 0] on parse error.
+     *
+     * @param string $peer peer address string from a STUN/TURN
+     *      message
+     * @return array two-element list [string|false $host,
+     *      int $port]; [false, 0] when the string can't be parsed
      */
     protected function splitHostPort($peer)
     {
@@ -429,6 +467,13 @@ class TurnSite
      *                 for cleaning up after dead clients
      *                 that never send Refresh(lifetime=0).
      *                 Default 900.
+     *
+     * @param array $config configuration overrides; see method
+     *      description above for recognised keys (BIND,
+     *      TURN_PORT, IDLE_TIMEOUT)
+     * @return void no return; the dispatch loop runs until
+     *      either a fatal listener error or the process is
+     *      killed
      */
     public function listen($config = [])
     {
@@ -529,6 +574,9 @@ class TurnSite
      * owning allocation, then delivers the payload to the
      * client either as a ChannelData frame (if a channel
      * is bound for the peer) or as a STUN Data indication.
+     *
+     * @param resource $sock UDP relay socket reported readable
+     *      by stream_select
      */
     protected function onRelayReadable($sock)
     {
@@ -572,6 +620,11 @@ class TurnSite
      * Builds a stable key string from a "host:port" form
      * (with or without IPv6 brackets) so we can index the
      * allocations and relay maps with normalized keys.
+     *
+     * @param string $endpoint endpoint string as returned by
+     *      stream_socket_get_name
+     * @return string canonical "host:port" key, or empty string
+     *      if $endpoint failed to parse
      */
     protected function relayKey($endpoint)
     {
@@ -620,6 +673,8 @@ class TurnSite
      * Tears down an allocation: closes the relay socket,
      * unregisters it from relay_index. Allocation removal
      * from the allocations map is the caller's job.
+     *
+     * @param TurnAllocation $alloc allocation to destroy
      */
     protected function destroyAllocation($alloc)
     {
@@ -660,6 +715,11 @@ class TurnSite
     /**
      * Combines a method (12-bit) and a class (one of the
      * CLASS_* constants) into a 16-bit message-type value.
+     *
+     * @param int $method 12-bit STUN method number
+     * @param int $class one of the CLASS_* constants (request,
+     *      indication, success, error)
+     * @return int 16-bit message-type field for the STUN header
      */
     protected function encodeMessageType($method, $class)
     {
@@ -673,6 +733,10 @@ class TurnSite
     }
     /**
      * Splits a 16-bit message-type into [method, class].
+     *
+     * @param int $type 16-bit message-type field as read from
+     *      a STUN header
+     * @return array two-element list [int $method, int $class]
      */
     protected function decodeMessageType($type)
     {
@@ -699,6 +763,10 @@ class TurnSite
      *     ]
      *
      * Returns false on parse failure.
+     *
+     * @param string $buf raw bytes of a STUN message
+     * @return array|false parsed message structure as described
+     *      above, or false if the buffer is malformed
      */
     protected function parseStun($buf)
     {
@@ -748,6 +816,11 @@ class TurnSite
     /**
      * Returns the value of the first attribute matching
      * the given type, or null if not present.
+     *
+     * @param array $msg parsed STUN message returned by parseStun
+     * @param int $type attribute type code (one of ATTR_*)
+     * @return string|null raw attribute value bytes, or null if
+     *      no matching attribute appears in the message
      */
     protected function findAttr($msg, $type)
     {
@@ -761,6 +834,11 @@ class TurnSite
     /**
      * Encodes a single attribute (type, length, value, with
      * 4-byte padding). Returns the attribute bytes.
+     *
+     * @param int $type attribute type code (one of ATTR_*)
+     * @param string $value raw attribute value bytes
+     * @return string TLV encoding of the attribute including
+     *      trailing zero padding to a 4-byte boundary
      */
     protected function encodeAttr($type, $value)
     {
@@ -778,6 +856,17 @@ class TurnSite
      * laid out. If $with_mi is non-empty, computes and
      * appends a MESSAGE-INTEGRITY attribute using $with_mi
      * as the HMAC-SHA1 key.
+     *
+     * @param int $method 12-bit STUN method
+     * @param int $class one of the CLASS_* constants
+     * @param string $tid 12-byte transaction id
+     * @param array $attr_blocks list of pre-encoded attribute
+     *      strings (as returned by encodeAttr) to include in
+     *      the message body
+     * @param string $with_mi HMAC-SHA1 key for the long-term
+     *      credential's MESSAGE-INTEGRITY, or empty string to
+     *      skip the MI attribute
+     * @return string full STUN message bytes ready to send
      */
     protected function buildStun($method, $class, $tid,
         $attr_blocks, $with_mi = '')
@@ -813,6 +902,13 @@ class TurnSite
      * XOR scheme: port XORed with high half of magic
      * cookie, address XORed with magic cookie (and TID
      * for IPv6).
+     *
+     * @param string $host IPv4 or IPv6 literal address
+     * @param int $port UDP port number to encode
+     * @param string $tid 12-byte STUN transaction id (used in
+     *      the IPv6 XOR mask)
+     * @return string raw attribute-value bytes for the
+     *      XOR-*-ADDRESS attribute
      */
     protected function encodeXorAddr($host, $port, $tid)
     {
@@ -833,6 +929,13 @@ class TurnSite
      * Decodes XOR-PEER-ADDRESS or similar. Returns
      * [host_string, port_int] or [false, 0] on parse
      * error.
+     *
+     * @param string $value raw attribute-value bytes from a
+     *      XOR-*-ADDRESS attribute
+     * @param string $tid 12-byte STUN transaction id (used to
+     *      reverse the IPv6 XOR mask)
+     * @return array two-element list [string|false $host,
+     *      int $port]; [false, 0] when $value can't be parsed
      */
     protected function decodeXorAddr($value, $tid)
     {
@@ -869,6 +972,11 @@ class TurnSite
      * where the first two zero bytes are reserved, the
      * third byte is the class (300..699 / 100), and the
      * fourth byte is the number modulo 100.
+     *
+     * @param int $code STUN error code (e.g. 401, 438, 500)
+     * @param string $reason UTF-8 human-readable reason phrase
+     * @return string raw attribute-value bytes for the
+     *      ERROR-CODE attribute
      */
     protected function encodeErrorCode($code, $reason)
     {
@@ -883,6 +991,10 @@ class TurnSite
     /**
      * Handles one parsed STUN message arriving on the
      * listener. Routes by method to a handler method.
+     *
+     * @param string $buf raw datagram bytes
+     * @param string $peer peer address as returned by
+     *      stream_socket_recvfrom
      */
     protected function handleStunMessage($buf, $peer)
     {
@@ -932,6 +1044,11 @@ class TurnSite
      * Handles a Binding request: returns the client's
      * reflexive address in XOR-MAPPED-ADDRESS. Bare STUN,
      * no authentication required.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes (kept for symmetry
+     *      with other handle* methods; not used here)
+     * @param string $peer client address that sent the request
      */
     protected function handleBinding($msg, $buf, $peer)
     {
@@ -966,6 +1083,17 @@ class TurnSite
      * carries USERNAME, REALM, NONCE, and MESSAGE-INTEGRITY.
      * If any are missing or fail, returns the diagnostic
      * needed to send a 401 / 438 / similar.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes (needed because
+     *      MESSAGE-INTEGRITY HMAC covers a header-rewritten
+     *      prefix of the message)
+     * @return array on success ['ok' => true, 'username' =>
+     *      string, 'key' => string]; on failure ['ok' => false,
+     *      'code' => int, 'reason' => string, 'extra' => array]
+     *      where the caller composes 'code' and 'reason' into
+     *      an ERROR-CODE attribute and the 'extra' attributes
+     *      (REALM, NONCE) into the error response
      */
     protected function checkCredentials($msg, $buf)
     {
@@ -1040,6 +1168,10 @@ class TurnSite
      * returns it. RFC 8489 sec 9.2 only requires the nonce
      * be unique and unguessable; we use 16 hex chars from
      * random_bytes which is more than sufficient.
+     *
+     * @return string 16-character hex nonce, already inserted
+     *      into the $nonces map so a follow-up request can be
+     *      validated against NONCE_TTL
      */
     protected function mintNonce()
     {
@@ -1050,6 +1182,17 @@ class TurnSite
     /**
      * Sends a STUN error response over the listener. The
      * 'extra' hash adds REALM/NONCE/USERNAME/etc.
+     *
+     * @param int $method STUN method of the request being
+     *      replied to
+     * @param array $msg parsed STUN message of the request
+     * @param string $peer client address to send the response to
+     * @param int $code STUN error code (e.g. 401, 438, 500)
+     * @param string $reason UTF-8 reason phrase
+     * @param array $extra optional extra attribute values keyed
+     *      by attribute name (REALM, NONCE, USERNAME, ...)
+     * @param string $key HMAC-SHA1 key for MESSAGE-INTEGRITY on
+     *      the response, or empty string to omit MI
      */
     protected function sendError($method, $msg, $peer, $code,
         $reason, $extra = [], $key = '')
@@ -1087,6 +1230,10 @@ class TurnSite
      * port on the same family the client used, and replies
      * with XOR-RELAYED-ADDRESS, XOR-MAPPED-ADDRESS, and
      * LIFETIME.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes
+     * @param string $peer client address that sent the request
      */
     protected function handleAllocate($msg, $buf, $peer)
     {
@@ -1189,6 +1336,12 @@ class TurnSite
      * binds a UDP socket on the same family as the client.
      * Returns [socket, host, port] on success or
      * [false, '', 0] on failure.
+     *
+     * @param string $client_host client IP literal, used to pick
+     *      a relay-side bind address on the same address family
+     * @return array three-element list [resource|false $socket,
+     *      string $host, int $port]; [false, '', 0] when no port
+     *      could be allocated in the configured range
      */
     protected function bindRelaySocket($client_host)
     {
@@ -1223,6 +1376,10 @@ class TurnSite
      * Handles a Refresh request. RFC 8656 sec 8. With
      * lifetime>0 it extends the allocation; with lifetime=0
      * it tears the allocation down.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes
+     * @param string $peer client address that sent the request
      */
     protected function handleRefresh($msg, $buf, $peer)
     {
@@ -1289,6 +1446,10 @@ class TurnSite
      * Handles a CreatePermission request. RFC 8656 sec 9.
      * Adds (or refreshes) one or more peer-IP entries in
      * the allocation's permission table.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes
+     * @param string $peer client address that sent the request
      */
     protected function handleCreatePermission($msg, $buf,
         $peer)
@@ -1349,6 +1510,10 @@ class TurnSite
      * (host, port) pair. Implicitly creates a permission
      * for the peer host. Refreshes the binding if it
      * already exists.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes
+     * @param string $peer client address that sent the request
      */
     protected function handleChannelBind($msg, $buf, $peer)
     {
@@ -1453,6 +1618,10 @@ class TurnSite
      * allocation itself is the credential. Forwards the
      * data to the peer over the relay socket if a
      * permission is held.
+     *
+     * @param array $msg parsed STUN message from parseStun
+     * @param string $buf raw datagram bytes
+     * @param string $peer client address that sent the request
      */
     protected function handleSend($msg, $buf, $peer)
     {
@@ -1501,6 +1670,9 @@ class TurnSite
      * a channel number (0x4000-0x4FFF) and a 16-bit
      * length; the rest is the payload. Looks up the
      * channel and forwards to the bound peer.
+     *
+     * @param string $buf raw ChannelData frame bytes
+     * @param string $peer client address that sent the frame
      */
     protected function handleChannelData($buf, $peer)
     {
@@ -1544,6 +1716,12 @@ class TurnSite
      * Sends a Data indication: wraps a peer-to-client
      * datagram in a STUN message with XOR-PEER-ADDRESS
      * and DATA attributes.
+     *
+     * @param TurnAllocation $alloc allocation whose client
+     *      should receive the indication
+     * @param string $peer_host source peer IP literal
+     * @param int $peer_port source peer UDP port
+     * @param string $payload bytes to relay to the client
      */
     protected function sendDataIndication($alloc,
         $peer_host, $peer_port, $payload)
@@ -1569,6 +1747,13 @@ class TurnSite
      * padded to 4 bytes for UDP (per RFC 8656 sec 12.4
      * the padding is required only for TCP/TLS but adding
      * it on UDP is harmless and clients tolerate it).
+     *
+     * @param TurnAllocation $alloc allocation whose client
+     *      should receive the frame
+     * @param int $chan_num channel number bound by the client
+     *      (0x4000..0x4FFF)
+     * @param string $payload bytes to wrap in the ChannelData
+     *      frame
      */
     protected function sendChannelData($alloc, $chan_num,
         $payload)

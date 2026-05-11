@@ -172,8 +172,8 @@ class WebSite
      *  that method
      * @var array
      */
-    protected $routes = ["CONNECT" => [], "DELETE"  => [], "ERROR"  => [],
-        "GET" => [], "HEAD" => [], "OPTIONS"  => [], "POST"  => [],
+    protected $routes = ["CONNECT" => [], "DELETE" => [], "ERROR" => [],
+        "GET" => [], "HEAD" => [], "OPTIONS" => [], "POST" => [],
         "PUT" => [], "TRACE" => [], "WS" => []];
     /**
      * Default values used to set up session variables
@@ -763,7 +763,7 @@ class WebSite
      */
     protected function writeStreamingHead_H1($chunk)
     {
-        if (substr($this->header_data, 0, 5) != "HTTP/") {
+        if (!str_starts_with($this->header_data, "HTTP/")) {
             $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
                 " 200 OK\x0D\x0A" . $this->header_data;
         }
@@ -819,7 +819,7 @@ class WebSite
             and must be kept.
          */
         if (!empty($header_lines[0])
-                && substr($header_lines[0], 0, 5) === "HTTP/") {
+                && str_starts_with($header_lines[0], "HTTP/")) {
             array_shift($header_lines);
         }
         foreach ($header_lines as $line) {
@@ -1118,7 +1118,7 @@ class WebSite
         $has_content_length = false;
         $header_lines = explode("\r\n", $pushed_header_data);
         if (!empty($header_lines[0])
-            && substr($header_lines[0], 0, 5) === 'HTTP/') {
+            && str_starts_with($header_lines[0], 'HTTP/')) {
             array_shift($header_lines);
         }
         foreach ($header_lines as $line) {
@@ -2056,11 +2056,11 @@ class WebSite
                 'host' => $localhost, 'port' => (string) $port];
         }
         $stripped = $address;
-        if (strpos($stripped, "://") !== false) {
+        if (str_contains($stripped, "://")) {
             $stripped = substr($stripped,
                 strpos($stripped, "://") + 3);
         }
-        if (substr($stripped, 0, 1) === "[") {
+        if (str_starts_with($stripped, "[")) {
             /*
                 Bracketed IPv6 form: [::1]:8080. The bracketed host
                 part is everything up to the closing bracket; the
@@ -2243,7 +2243,7 @@ class WebSite
             $this->sessions[$session_id]['DATA'] = $_SESSION;
         }
         $redirect = false;
-        if (substr($this->header_data, 0, 5) != "HTTP/") {
+        if (!str_starts_with($this->header_data, "HTTP/")) {
             if (stristr($this->header_data, "Location") != false) {
                 $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
                     " 301 Moved Permanently\x0D\x0A" .
@@ -3310,7 +3310,7 @@ class WebSite
             return false;
         }
         $connection_lc = strtolower($context['HTTP_CONNECTION']);
-        if (strpos($connection_lc, 'upgrade') === false) {
+        if (!str_contains($connection_lc, 'upgrade')) {
             return false;
         }
         /*
@@ -3744,7 +3744,7 @@ class WebSite
         if ($name === false || $name === null || $name === "") {
             return ["", ""];
         }
-        if (substr($name, 0, 1) === "[") {
+        if (str_starts_with($name, "[")) {
             $close = strpos($name, "]");
             if ($close === false) {
                 return [$name, ""];
@@ -3901,8 +3901,8 @@ class WebSite
             so relax spec for inputs. (Follow spec exactly for output)
         */
         if (!$context['REQUEST_HEAD_PARSED']) {
-            if (strpos($data, "\x0D\x0A\x0D\x0A") === false &&
-                strpos($data, "\x0D\x0D") === false) {
+            if (!str_contains($data, "\x0D\x0A\x0D\x0A") &&
+                !str_contains($data, "\x0D\x0D")) {
                 return false;
             }
             if (($end_head_pos = strpos($data, "$eol$eol")) === false) {
@@ -4023,7 +4023,7 @@ class WebSite
         $_FILES = [];
         if (!empty($context['CONTENT']) &&
             !empty($context['CONTENT_TYPE']) &&
-            strpos($context['CONTENT_TYPE'], "multipart/form-data") !== false) {
+            str_contains($context['CONTENT_TYPE'], "multipart/form-data")) {
             preg_match('/boundary=(.*)/', $context['CONTENT_TYPE'], $matches);
             $boundary = $matches[1];
             $raw_form_parts = preg_split("/-+$boundary/", $context['CONTENT']);
@@ -6777,15 +6777,15 @@ class HPack
      * name is canonical (e.g. ":authority").
      */
     private const STATIC_TABLE = [
-        1  => [':authority', ''],
-        2  => [':method', 'GET'],
-        3  => [':method', 'POST'],
-        4  => [':path', '/'],
-        5  => [':path', '/index.html'],
-        6  => [':scheme', 'http'],
-        7  => [':scheme', 'https'],
-        8  => [':status', '200'],
-        9  => [':status', '204'],
+        1 => [':authority', ''],
+        2 => [':method', 'GET'],
+        3 => [':method', 'POST'],
+        4 => [':path', '/'],
+        5 => [':path', '/index.html'],
+        6 => [':scheme', 'http'],
+        7 => [':scheme', 'https'],
+        8 => [':status', '200'],
+        9 => [':status', '204'],
         10 => [':status', '206'],
         11 => [':status', '304'],
         12 => [':status', '400'],

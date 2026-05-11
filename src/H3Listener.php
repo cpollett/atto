@@ -4155,19 +4155,19 @@ class QuicConnection
      * @var array level => packet_number => entry. Every packet
      *      emit() has encrypted and queued for sendto, until
      *      the peer ACKs it or we declare it lost. Entry shape:
-     *          'pn'            => int packet number
-     *          'time_sent'     => float microtime(true)
+     *          'pn' => int packet number
+     *          'time_sent' => float microtime(true)
      *          'ack_eliciting' => bool, whether the packet
      *                             carries any ack-eliciting
      *                             frames; non-eliciting packets
      *                             are tracked for congestion
      *                             accounting but do not advance
      *                             loss detection
-     *          'in_flight'     => bool, anything except pure
+     *          'in_flight' => bool, anything except pure
      *                             ACK frames (RFC 9002 A.1)
-     *          'sent_bytes'    => int wire length, summed into
+     *          'sent_bytes' => int wire length, summed into
      *                             bytes_in_flight
-     *          'frames'        => array of decoded frame dicts;
+     *          'frames' => array of decoded frame dicts;
      *                             walked when declaring a packet
      *                             lost to requeue underlying
      *                             CRYPTO / STREAM bytes
@@ -4433,13 +4433,13 @@ class QuicConnection
      *      inbound datagram arrives from a source address
      *      different from the one the H3Listener has recorded
      *      for this connection. Shape:
-     *        'address'      => string "ip:port" of the
+     *        'address' => string "ip:port" of the
      *                          alternative path
-     *        'challenge'    => string 8 random bytes that the
+     *        'challenge' => string 8 random bytes that the
      *                          peer must echo via PATH_-
      *                          RESPONSE on the alternative
      *                          path
-     *        'first_seen'   => float microtime when validation
+     *        'first_seen' => float microtime when validation
      *                          began (used for timeout)
      *        'response_received' => bool flipped true when
      *                          the matching PATH_RESPONSE
@@ -7857,7 +7857,7 @@ class H3Listener extends Listener
         $udp_address = preg_replace('/^tcp:\/\//', 'udp://',
             $bind_address);
         if ($udp_address === $bind_address &&
-            strpos($bind_address, '://') === false) {
+            !str_contains($bind_address, '://')) {
             $udp_address = 'udp://' . $bind_address;
         }
         $server = stream_socket_server($udp_address, $errno,
@@ -8794,7 +8794,7 @@ class H3Transport extends Transport
                         $st['authority'] = $v;
                     } else if ($n === ':scheme') {
                         $st['scheme'] = $v;
-                    } else if (substr($n, 0, 1) !== ':') {
+                    } else if (!str_starts_with($n, ':')) {
                         $st['headers'][$n] = $v;
                     }
                 }

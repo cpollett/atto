@@ -393,7 +393,7 @@ class TurnSite
      */
     protected function looksLikeIPv6($host)
     {
-        return strpos($host, ':') !== false;
+        return str_contains($host, ':');
     }
     /**
      * Formats a (host, port) pair as a stream-socket-style
@@ -754,9 +754,9 @@ class TurnSite
      *
      *     [
      *         'method' => int,
-     *         'class'  => int,
-     *         'tid'    => string (12 raw bytes),
-     *         'attrs'  => [ [type => int, value => string], ... ],
+     *         'class' => int,
+     *         'tid' => string (12 raw bytes),
+     *         'attrs' => [ [type => int, value => string], ... ],
      *         'mi_offset' => int|false  (byte offset of the
      *             MESSAGE-INTEGRITY attribute, for HMAC
      *             verification on a substring of the buffer),

@@ -576,7 +576,7 @@ abstract class MailStorage
     protected function normalizeFolder($folder)
     {
         $folder = (string) $folder;
-        if (strpos($folder, "\0") !== false) {
+        if (str_contains($folder, "\0")) {
             throw new \InvalidArgumentException(
                 "folder name contains NUL byte");
         }
@@ -765,7 +765,7 @@ class FileMailStorage extends MailStorage
         $user = ltrim($user, '._');
         if ($user === "" ||
             preg_match('/^[._]+$/', $user) ||
-            strpos($user, '..') !== false) {
+            str_contains($user, '..')) {
             $user = "_invalid_";
         }
         return $user;
@@ -1047,7 +1047,7 @@ class FileMailStorage extends MailStorage
             return [];
         }
         foreach ($entries as $entry) {
-            if (substr($entry, -4) !== ".eml") {
+            if (!str_ends_with($entry, ".eml")) {
                 continue;
             }
             $uid = (int) substr($entry, 0, -4);
@@ -1421,16 +1421,16 @@ class FileMailStorage extends MailStorage
  * Internal layout:
  *
  *      $this->users[$user] = [
- *          'uidnext'       => int,
- *          'uidvalidity'   => int,    // user-level fallback
- *          'subscribed'    => array,  // folder names
- *          'folders'       => [
+ *          'uidnext' => int,
+ *          'uidvalidity' => int,    // user-level fallback
+ *          'subscribed' => array,  // folder names
+ *          'folders' => [
  *              $folder_name => [
  *                  'uidvalidity' => int,
- *                  'messages'    => [
+ *                  'messages' => [
  *                      $uid => [
- *                          'bytes'         => string,
- *                          'flags'         => array,
+ *                          'bytes' => string,
+ *                          'flags' => array,
  *                          'internal_date' => int,
  *                      ],
  *                  ],
@@ -2380,7 +2380,7 @@ class SqlMailStorage extends MailStorage
     protected function insertIgnoreSql($insert_sql)
     {
         $insert_sql = ltrim($insert_sql);
-        if (substr($insert_sql, 0, 6) !== 'INSERT') {
+        if (!str_starts_with($insert_sql, 'INSERT')) {
             throw new \InvalidArgumentException(
                 "insertIgnoreSql expects an INSERT statement");
         }
@@ -4369,9 +4369,9 @@ class MailSite
                 without this the next processOne would see an
                 empty line and reply BAD.
              */
-            if (substr($buffer, 0, 2) === "\r\n") {
+            if (str_starts_with($buffer, "\r\n")) {
                 $buffer = substr($buffer, 2);
-            } else if (substr($buffer, 0, 1) === "\n") {
+            } else if (str_starts_with($buffer, "\n")) {
                 $buffer = substr($buffer, 1);
             }
             $this->continueImapLiteral($key, '', $context);
@@ -5747,7 +5747,7 @@ class MailSite
      */
     protected function imapSpecialUseAttr($folder)
     {
-        if (strpos($folder, '/') !== false) {
+        if (str_contains($folder, '/')) {
             return null;
         }
         $name = strtolower($folder);
@@ -6256,7 +6256,7 @@ class MailSite
             if ($piece === '') {
                 continue;
             }
-            if (strpos($piece, ':') === false) {
+            if (!str_contains($piece, ':')) {
                 $ranges[] = [$piece, $piece];
             } else {
                 $parts = explode(':', $piece, 2);
@@ -6469,7 +6469,7 @@ class MailSite
             return [];
         }
         if ($items_str[0] === '(' &&
-            substr($items_str, -1) === ')') {
+            str_ends_with($items_str, ')')) {
             $items_str = substr($items_str, 1, -1);
         }
         /*
@@ -6967,7 +6967,7 @@ class MailSite
      */
     protected function imapDecodeMimeHeader($value)
     {
-        if (strpos($value, '=?') === false) {
+        if (!str_contains($value, '=?')) {
             return $value;
         }
         $pattern = '/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/';
@@ -7263,11 +7263,11 @@ class MailSite
             /*
                 Eat the trailing CRLF after the boundary line.
              */
-            if (substr($remaining, 0, 2) === "\r\n") {
+            if (str_starts_with($remaining, "\r\n")) {
                 $remaining = substr($remaining, 2);
-            } else if (substr($remaining, 0, 1) === "\n") {
+            } else if (str_starts_with($remaining, "\n")) {
                 $remaining = substr($remaining, 1);
-            } else if (substr($remaining, 0, 2) === '--') {
+            } else if (str_starts_with($remaining, '--')) {
                 /* This was the closing delimiter; we are done. */
                 break;
             }
@@ -7299,7 +7299,7 @@ class MailSite
             $skip = ($remaining[$next] === "\r") ? 2 : 1;
             $remaining = substr($remaining,
                 $next + $skip + strlen($delim));
-            if (substr($remaining, 0, 2) === '--') {
+            if (str_starts_with($remaining, '--')) {
                 /* Closing delimiter: stop. */
                 break;
             }
@@ -7467,7 +7467,7 @@ class MailSite
         $operator = strtoupper($m[2]);
         $flags_str = trim($m[3]);
         if ($flags_str !== '' && $flags_str[0] === '(' &&
-            substr($flags_str, -1) === ')') {
+            str_ends_with($flags_str, ')')) {
             $flags_str = substr($flags_str, 1, -1);
         }
         $req_flags = [];
@@ -7477,7 +7477,7 @@ class MailSite
                 $req_flags[] = $flag;
             }
         }
-        $silent = (substr($operator, -7) === '.SILENT');
+        $silent = (str_ends_with($operator, '.SILENT'));
         $mode = $silent ? substr($operator, 0, -7) : $operator;
         $user = $context['AUTH_USER'];
         $folder = $context['SELECTED'];

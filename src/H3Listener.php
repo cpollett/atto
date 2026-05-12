@@ -3766,10 +3766,6 @@ class QuicStream
                              stop transmitting on this
                              stream */
     /**
-     * @var int 62-bit stream ID
-     */
-    public $id = 0;
-    /**
      * @var int the receive-side state flag
      */
     public $recv_state = self::RECV_OPEN;
@@ -3795,11 +3791,6 @@ class QuicStream
      *      equals the final size.
      */
     public $recv_seen_max = 0;
-    /**
-     * @var int receive-side flow-control window
-     *      (MAX_STREAM_DATA we've granted the peer).
-     */
-    public $recv_window = 1048576;
     /**
      * @var string send-side outgoing buffer. Append-only
      *      from the application side; the takeForFrame
@@ -3844,11 +3835,6 @@ class QuicStream
      */
     public $send_fin = false;
     /**
-     * @var int send-side flow-control window the peer
-     *      has granted us via MAX_STREAM_DATA.
-     */
-    public $send_window = 1048576;
-    /**
      * @var bool true once a STREAM frame with FIN has been
      *      transmitted by us. Used to skip retransmission
      *      of the FIN.
@@ -3859,16 +3845,16 @@ class QuicStream
      * receive flow-control window from the
      * initial_max_stream_data_* transport parameter the
      * QuicConnection passes through.
-     * @param mixed $id id parameter
-     * @param mixed $recv_window recv_window parameter
-     * @param mixed $send_window send_window parameter
+     *
+     * @param int $id 62-bit stream ID
+     * @param int $recv_window receive-side flow-control window
+     *      (MAX_STREAM_DATA we've granted the peer)
+     * @param int $send_window send-side flow-control window the peer
+     *      has granted us via MAX_STREAM_DATA
      */
-    public function __construct($id, $recv_window = 1048576,
-        $send_window = 1048576)
+    public function __construct(public $id = 0,
+        public $recv_window = 1048576, public $send_window = 1048576)
     {
-        $this->id = $id;
-        $this->recv_window = $recv_window;
-        $this->send_window = $send_window;
     }
     /**
      * Buffers incoming STREAM-frame bytes. RFC 9000
@@ -7599,20 +7585,6 @@ class QpackHuffman
 class H3Connection extends Connection
 {
     /**
-     * @var QuicConnection underlying QUIC connection
-     */
-    public $quic;
-    /**
-     * @var string hex-string view of the local CID, for
-     *      logging.
-     */
-    public $scid_hex = '';
-    /**
-     * @var string peer address in "ip:port" form, for
-     *      REMOTE_ADDR / REMOTE_PORT building.
-     */
-    public $peer_address = '';
-    /**
      * @var int|null QUIC stream ID of the server's
      *      uni control stream (allocated lazily on first
      *      flush).
@@ -7658,16 +7630,16 @@ class H3Connection extends Connection
     public $next_server_uni = 3;
     /**
      * Constructor: wraps a QuicConnection.
-     * @param mixed $quic quic parameter
-     * @param mixed $scid_hex scid_hex parameter
-     * @param mixed $peer_address peer_address parameter
+     *
+     * @param QuicConnection $quic underlying QUIC connection
+     * @param string $scid_hex hex-string view of the local CID, for
+     *      logging
+     * @param string $peer_address peer address in "ip:port" form, for
+     *      REMOTE_ADDR / REMOTE_PORT building
      */
-    public function __construct($quic, $scid_hex,
-        $peer_address)
+    public function __construct(public $quic, public $scid_hex = '',
+        public $peer_address = '')
     {
-        $this->quic = $quic;
-        $this->scid_hex = $scid_hex;
-        $this->peer_address = $peer_address;
         /*
             'h3' is a separate protocol code from 'h3'
             (which is reserved for H3Connection from the FFI

@@ -120,22 +120,17 @@ abstract class Authenticator
 class FileAuthenticator extends Authenticator
 {
     /**
-     * Path to the password file from which credentials are loaded.
-     * @var string
-     */
-    protected $path;
-    /**
      * Lazily-loaded credential map (username => password); null
      * until the file is first read.
      * @var array|null
      */
     protected $users;
     /**
-     * @param string $path path to the password file
+     * @param string $path path to the password file from which
+     *      credentials are loaded
      */
-    public function __construct($path)
+    public function __construct(protected $path)
     {
-        $this->path = $path;
         $this->users = null;
     }
     /**

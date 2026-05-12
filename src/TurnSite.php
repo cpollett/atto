@@ -88,15 +88,10 @@ abstract class TurnAuthenticator
 class StaticTurnAuthenticator extends TurnAuthenticator
 {
     /**
-     * @var array map username => password
+     * @param array $users map [username => password, ...]
      */
-    protected $users = [];
-    /**
-     * @param array $users [username => password, ...]
-     */
-    public function __construct($users)
+    public function __construct(protected $users = [])
     {
-        $this->users = $users;
     }
     /**
      * {@inheritDoc}

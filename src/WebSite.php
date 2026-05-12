@@ -4329,18 +4329,6 @@ class WebException extends \Exception
 class Connection
 {
     /**
-     * Underlying stream resource (TCP, possibly TLS-wrapped).
-     * @var resource
-     */
-    public $resource;
-    /**
-     * Whether this connection's transport is TLS-wrapped. Used by
-     * code paths that need to decide between cleartext and secure
-     * behavior independently of the listener that accepted it.
-     * @var bool
-     */
-    public $is_secure;
-    /**
      * Application protocol negotiated for this connection. One of
      * 'h1', 'h2', 'ws' for an upgraded WebSocket, or 'h3' once
      * QUIC support lands. Set by processServerRequest after
@@ -4445,14 +4433,15 @@ class Connection
     /**
      * Constructs a Connection wrapping a stream resource.
      *
-     * @param resource $resource open stream socket
-     * @param bool $is_secure whether the resource has had TLS
-     *      enabled via stream_socket_enable_crypto
+     * @param resource $resource underlying stream resource (TCP,
+     *      possibly TLS-wrapped)
+     * @param bool $is_secure whether this connection's transport is
+     *      TLS-wrapped; used by code paths that need to decide
+     *      between cleartext and secure behavior independently of
+     *      the listener that accepted it
      */
-    public function __construct($resource, $is_secure = false)
+    public function __construct(public $resource, public $is_secure = false)
     {
-        $this->resource = $resource;
-        $this->is_secure = $is_secure;
     }
     /**
      * Returns the underlying raw stream resource. Use this only
@@ -4594,41 +4583,22 @@ class Connection
 class ConnectionAcceptor
 {
     /**
-     * The 24-byte HTTP/2 client connection preface from RFC 7540
-     * section 3.5. Cached as a string for fast comparison rather
-     * than recomputed each accept.
-     * @var string
-     */
-    protected $h2_magic;
-    /**
-     * Optional callback invoked with an error message when TLS
-     * handshake fails. If null the message is written to stdout.
-     * @var callable|null
-     */
-    protected $error_handler;
-    /**
-     * Optional callback invoked after a successful TLS handshake
-     * to restore the WebSite's custom error handler that
-     * stream_socket_enable_crypto temporarily clears.
-     * @var callable|null
-     */
-    protected $post_tls_callback;
-    /**
      * Constructs a ConnectionAcceptor.
      *
-     * @param string $h2_magic the H2 client preface bytes
-     * @param callable|null $error_handler invoked with a string
-     *      error message on TLS failure
-     * @param callable|null $post_tls_callback invoked after a
-     *      successful TLS handshake to let the caller reinstall
-     *      its custom error handler
+     * @param string $h2_magic the 24-byte HTTP/2 client connection
+     *      preface from RFC 7540 section 3.5; cached as a string for
+     *      fast comparison rather than recomputed each accept
+     * @param callable|null $error_handler optional callback invoked
+     *      with an error message when TLS handshake fails; if null
+     *      the message is written to stdout
+     * @param callable|null $post_tls_callback optional callback
+     *      invoked after a successful TLS handshake to restore the
+     *      WebSite's custom error handler that
+     *      stream_socket_enable_crypto temporarily clears
      */
-    public function __construct($h2_magic,
-        $error_handler = null, $post_tls_callback = null)
+    public function __construct(protected $h2_magic,
+        protected $error_handler = null, protected $post_tls_callback = null)
     {
-        $this->h2_magic = $h2_magic;
-        $this->error_handler = $error_handler;
-        $this->post_tls_callback = $post_tls_callback;
     }
     /**
      * Accepts a new connection from the given listener entry,
@@ -4823,50 +4793,29 @@ class ConnectionAcceptor
 class Listener
 {
     /**
-     * Stream resource returned by stream_socket_server, or null
-     * if the bind failed (callers should check before adding to
-     * a select set).
-     * @var resource|null
-     */
-    public $server;
-    /**
-     * The bind address as understood by stream_socket_server,
-     * e.g. 'tcp://0.0.0.0:8080'. Used in startup logging and to
-     * recreate the same listener after a restart.
-     * @var string
-     */
-    public $address;
-    /**
-     * True if this listener was opened with a TLS context. The
-     * accept policy uses this to decide whether to run the TLS
-     * handshake on freshly accepted connections, and the dispatch
-     * code uses it to set HTTPS=on on the Connection.
-     * @var bool
-     */
-    public $is_secure;
-    /**
-     * Per-listener overrides for default_server_globals. Currently
-     * holds SERVER_NAME and SERVER_PORT so a multi-listener server
-     * can stamp the right host and port onto each accepted
-     * Connection regardless of which listener accepted it.
-     * @var array
-     */
-    public $globals;
-    /**
      * Constructs a Listener.
      *
-     * @param resource|null $server the server socket resource
-     * @param string $address bind address used by openListener
-     * @param bool $is_secure whether TLS is enabled
-     * @param array $globals per-listener server globals overrides
+     * @param resource|null $server stream resource returned by
+     *      stream_socket_server, or null if the bind failed
+     *      (callers should check before adding to a select set)
+     * @param string $address the bind address as understood by
+     *      stream_socket_server, e.g. 'tcp://0.0.0.0:8080'; used in
+     *      startup logging and to recreate the same listener after
+     *      a restart
+     * @param bool $is_secure true if this listener was opened with a
+     *      TLS context; the accept policy uses this to decide
+     *      whether to run the TLS handshake on freshly accepted
+     *      connections, and the dispatch code uses it to set
+     *      HTTPS=on on the Connection
+     * @param array $globals per-listener overrides for
+     *      default_server_globals; currently holds SERVER_NAME and
+     *      SERVER_PORT so a multi-listener server can stamp the
+     *      right host and port onto each accepted Connection
+     *      regardless of which listener accepted it
      */
-    public function __construct($server, $address,
-        $is_secure = false, $globals = [])
+    public function __construct(public $server, public $address,
+        public $is_secure = false, public $globals = [])
     {
-        $this->server = $server;
-        $this->address = $address;
-        $this->is_secure = $is_secure;
-        $this->globals = $globals;
     }
     /**
      * Returns the underlying server stream resource so the event
@@ -4919,20 +4868,14 @@ class Listener
 abstract class Transport
 {
     /**
-     * Back-reference to the WebSite the Transport is wired into.
-     * Used to call into the existing parsers and to access
-     * shared state (in_streams, default_server_globals).
-     * @var WebSite
-     */
-    protected $site;
-    /**
      * Constructs a Transport bound to the given WebSite.
      *
-     * @param WebSite $site site this Transport is part of
+     * @param WebSite $site back-reference to the WebSite the Transport is
+     *      wired into; used to call into the existing parsers and to
+     *      access shared state (in_streams, default_server_globals)
      */
-    public function __construct($site)
+    public function __construct(protected $site)
     {
-        $this->site = $site;
     }
     /**
      * Called by WebSite::processRequestStreams when stream_select
@@ -5189,23 +5132,6 @@ class WebSocketFrame
 class WebSocket
 {
     /**
-     * Underlying TCP (or TLS-wrapped) connection
-     * @var resource
-     */
-    public $connection;
-    /**
-     * Connection key used by the WebSite event loop to identify
-     * this connection in the in_streams arrays
-     * @var int
-     */
-    public $key;
-    /**
-     * Reference to the owning WebSite instance, used to enqueue
-     * outbound frames into its out_streams buffer
-     * @var WebSite
-     */
-    public $site;
-    /**
      * User-supplied handler called with each complete inbound text
      * or binary message
      * @var callable|null
@@ -5255,17 +5181,18 @@ class WebSocket
     /**
      * Constructs a WebSocket handle around an open connection.
      *
-     * @param resource $connection client socket already upgraded
-     *      from HTTP/1.1 to the WebSocket protocol
-     * @param int $key connection key used by the event loop
-     * @param WebSite $site owning WebSite instance used for
-     *      buffered outbound writes
+     * @param resource $connection underlying TCP (or TLS-wrapped)
+     *      client socket already upgraded from HTTP/1.1 to the
+     *      WebSocket protocol
+     * @param int $key connection key used by the WebSite event loop
+     *      to identify this connection in the in_streams arrays
+     * @param WebSite $site reference to the owning WebSite instance,
+     *      used to enqueue outbound frames into its out_streams
+     *      buffer
      */
-    public function __construct($connection, $key, $site)
+    public function __construct(public $connection, public $key,
+        public $site)
     {
-        $this->connection = $connection;
-        $this->key = $key;
-        $this->site = $site;
         $this->last_pong_time = time();
     }
     /**
@@ -5411,12 +5338,6 @@ class Frame
      */
     protected $payload_length;
     /**
-     * Stream identifier carried in the frame header (0 for
-     * connection-level frames).
-     * @var int
-     */
-    public $stream_id;
-    /**
      * Set of flag names currently active on this frame, drawn from
      * $defined_flags by parseFlags.
      * @var array
@@ -5454,13 +5375,12 @@ class Frame
     /**
      * reads the stream id and flags set for the frame
      *
-     * @param resource $stream_id the stream number with whom
-     * this frame is associated.
-     * @param resource $flags array of all flags in the frame
+     * @param int $stream_id stream identifier carried in the frame
+     *      header (0 for connection-level frames)
+     * @param array $flags array of all flags in the frame
      */
-    public function __construct($stream_id, $flags = [])
+    public function __construct(public $stream_id, $flags = [])
     {
-        $this->stream_id = $stream_id;
         $this->flags = new Flags($this->defined_flags);
         foreach ($flags as $flag) {
             $this->flags->add($flag);
@@ -5652,30 +5572,26 @@ class SettingsFrame extends Frame
         0x08 => 'ENABLE_CONNECT_PROTOCOL',
     ];
     /**
-     * Parsed settings dictionary (identifier => value) after a
-     * call to parseBody, and the input to serializeBody when
-     * sending. Public so callers (initH2Request, parseH2Request)
-     * can read the parsed values directly off the frame without
-     * needing a getter. Frames are always constructed inside this
-     * file so the broader class-encapsulation cost is nil.
-     * @var array
-     */
-    public $settings = [];
-    /**
      * Constructor to create a new SettingsFrame object.
-     * @param int $stream_id The stream ID for this frame
-     * (default is 0 since SETTINGS frames aren't tied to a stream).
-     * @param array $settings The settings to be included in the frame.
-     * @param array $flags Any flags associated with the frame (e.g., 'ACK').
+     *
+     * @param int $stream_id the stream ID for this frame (default is
+     *      0 since SETTINGS frames aren't tied to a stream)
+     * @param array $settings parsed settings dictionary (identifier
+     *      => value) after a call to parseBody, and the input to
+     *      serializeBody when sending; public so callers
+     *      (initH2Request, parseH2Request) can read the parsed
+     *      values directly off the frame without needing a getter
+     * @param array $flags any flags associated with the frame (e.g.
+     *      'ACK')
      */
-    public function __construct($stream_id = 0, $settings = [], $flags = [])
+    public function __construct($stream_id = 0,
+        public $settings = [], $flags = [])
     {
         parent::__construct($stream_id, $flags);
         if (!empty($settings) && in_array('ACK', $flags)) {
             throw new InvalidDataError(
                 "Settings must be empty if ACK flag is set.");
         }
-        $this->settings = $settings;
     }
     /**
      * Converts the settings into the format required for transmission.
@@ -5752,20 +5668,16 @@ class HeaderFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     /**
-     * Raw payload bytes carried by this frame.
-     * @var string
-     */
-    public $data;
-    /**
      * Constructor to create a new HeaderFrame object.
-     * @param int $stream_id The stream ID this frame belongs to.
-     * @param array $data The header data to include in the frame.
-     * @param array $flags Any flags associated with the frame.
+     *
+     * @param int $stream_id the stream ID this frame belongs to
+     * @param string $data raw payload bytes carried by this frame
+     * @param array $flags any flags associated with the frame
      */
-    public function __construct($stream_id = 0, $data = [], $flags = [])
+    public function __construct($stream_id = 0,
+        public $data = [], $flags = [])
     {
         parent::__construct($stream_id, $flags);
-        $this->data = $data;
     }
     /**
      * Serializes the header data into the format required for
@@ -5936,20 +5848,16 @@ class DataFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     /**
-     * Raw payload bytes carried by this frame.
-     * @var string
-     */
-    public $data;
-    /**
      * Constructor to create a new DataFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param string $data The data payload for the frame.
-     * @param array $flags Flags associated with the frame .
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param string $data raw payload bytes carried by this frame
+     * @param array $flags flags associated with the frame
      */
-    public function __construct($stream_id, $data = '', $flags = [])
+    public function __construct($stream_id,
+        public $data = '', $flags = [])
     {
         parent::__construct($stream_id, $flags);
-        $this->data = $data;
     }
     /**
      * Serializes the body of the frame into a binary string.
@@ -6108,24 +6016,18 @@ class RstStreamFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     /**
-     * RFC 7540 §7 error code (NO_ERROR=0,
-     * PROTOCOL_ERROR=1, INTERNAL_ERROR=2, etc.) being
-     * reported.
-     * @var int
-     */
-    protected $error_code;
-    /**
      * Constructor to create a new RstStreamFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param int $error_code The error code for the RST_STREAM frame.
-     * @param array $kwargs flags passed through to the parent
-     *      Frame constructor
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param int $error_code RFC 7540 §7 error code (NO_ERROR=0,
+     *      PROTOCOL_ERROR=1, INTERNAL_ERROR=2, etc.) being reported
+     * @param array $kwargs flags passed through to the parent Frame
+     *      constructor
      */
-    public function __construct($stream_id, $error_code = 0,
+    public function __construct($stream_id, protected $error_code = 0,
         array $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
-        $this->error_code = $error_code;
     }
     /**
      * Serializes the RST_STREAM frame body into binary format.
@@ -6183,30 +6085,21 @@ class PushPromiseFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_HAS_STREAM';
     /**
-     * Server-initiated stream id the server is promising
-     * to push a response on per RFC 7540 §6.6.
-     * @var int
-     */
-    protected $promised_stream_id;
-    /**
-     * Raw payload bytes carried by this frame.
-     * @var string
-     */
-    protected $data;
-    /**
      * Constructor to create a new PushPromiseFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param int $promised_stream_id The promised stream ID.
-     * @param string $data The data payload.
-     * @param array $kwargs flags passed through to the parent
-     *      Frame constructor
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param int $promised_stream_id server-initiated stream id the
+     *      server is promising to push a response on per RFC 7540
+     *      §6.6
+     * @param string $data raw payload bytes carried by this frame
+     * @param array $kwargs flags passed through to the parent Frame
+     *      constructor
      */
-    public function __construct($stream_id, $promised_stream_id = 0,
-        $data = '', $kwargs = [])
+    public function __construct($stream_id,
+        protected $promised_stream_id = 0,
+        protected $data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
-        $this->promised_stream_id = $promised_stream_id;
-        $this->data = $data;
     }
     /**
      * Serializes the PUSH_PROMISE frame body into binary format.
@@ -6289,24 +6182,18 @@ class PingFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
     /**
-     * 8 bytes of opaque round-trip-timing payload echoed
-     * back in the PING ACK per RFC 7540 §6.7.
-     * @var string
-     */
-    protected $opaque_data;
-    /**
      * Constructor to create a new PingFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param string $opaque_data The opaque data (8 bytes)
-     * associated with the PING frame.
-     * @param array $kwargs flags passed through to the parent
-     *      Frame constructor
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param string $opaque_data 8 bytes of opaque round-trip-timing
+     *      payload echoed back in the PING ACK per RFC 7540 §6.7
+     * @param array $kwargs flags passed through to the parent Frame
+     *      constructor
      */
-    public function __construct($stream_id = 0, $opaque_data = '',
-        $kwargs = [])
+    public function __construct($stream_id = 0,
+        protected $opaque_data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
-        $this->opaque_data = $opaque_data;
     }
     /**
      * Serializes the PING frame body into binary format.
@@ -6364,40 +6251,23 @@ class GoAwayFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_NO_STREAM';
     /**
-     * Highest stream id the sender will service before
-     * closing the connection per RFC 7540 §6.8.
-     * @var int
-     */
-    protected $last_stream_id;
-    /**
-     * RFC 7540 §7 error code (NO_ERROR=0,
-     * PROTOCOL_ERROR=1, INTERNAL_ERROR=2, etc.) being
-     * reported.
-     * @var int
-     */
-    protected $error_code;
-    /**
-     * Optional opaque debug data trailing the standard
-     * GOAWAY fields per RFC 7540 §6.8.
-     * @var string
-     */
-    protected $additional_data;
-    /**
      * Constructor to create a new GoAwayFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param int $last_stream_id last stream ID the sender will accept.
-     * @param int $error_code indicating the reason for shutting down.
-     * @param string $additional_data Additional debug data (optional).
-     * @param array $kwargs flags passed through to the parent
-     *      Frame constructor
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param int $last_stream_id highest stream id the sender will
+     *      service before closing the connection per RFC 7540 §6.8
+     * @param int $error_code RFC 7540 §7 error code (NO_ERROR=0,
+     *      PROTOCOL_ERROR=1, INTERNAL_ERROR=2, etc.) being reported
+     * @param string $additional_data optional opaque debug data
+     *      trailing the standard GOAWAY fields per RFC 7540 §6.8
+     * @param array $kwargs flags passed through to the parent Frame
+     *      constructor
      */
-    public function __construct($stream_id = 0, $last_stream_id = 0,
-        $error_code = 0, $additional_data = '', $kwargs = [])
+    public function __construct($stream_id = 0,
+        protected $last_stream_id = 0, protected $error_code = 0,
+        protected $additional_data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
-        $this->last_stream_id = $last_stream_id;
-        $this->error_code = $error_code;
-        $this->additional_data = $additional_data;
     }
     /**
      * Serializes the GOAWAY frame body into a binary format.
@@ -6455,23 +6325,18 @@ class WindowUpdateFrame extends Frame
      */
     protected $stream_association = '_STREAM_ASSOC_EITHER';
     /**
-     * 31-bit non-zero credit being added to the flow-
-     * control window per RFC 7540 §6.9.
-     * @var int
-     */
-    protected $window_increment;
-    /**
      * Constructor to create a new WindowUpdateFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param int $window_increment The increment to the window size.
-     * @param array $kwargs flags passed through to the parent
-     *      Frame constructor
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param int $window_increment 31-bit non-zero credit being added
+     *      to the flow-control window per RFC 7540 §6.9
+     * @param array $kwargs flags passed through to the parent Frame
+     *      constructor
      */
-    public function __construct($stream_id, $window_increment = 0,
-        $kwargs = [])
+    public function __construct($stream_id,
+        protected $window_increment = 0, $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
-        $this->window_increment = $window_increment;
     }
     /**
      * Serializes the WINDOW_UPDATE frame body into binary format.
@@ -6527,21 +6392,17 @@ class ContinuationFrame extends Frame
      */
     protected $type = 0x09;
     /**
-     * Raw payload bytes carried by this frame.
-     * @var string
-     */
-    public $data;
-    /**
      * Constructor to create a new ContinuationFrame object.
-     * @param int $stream_id The stream ID for this frame.
-     * @param string $data The continuation frame payload.
-     * @param array $kwargs flags passed through to the parent
-     *      Frame constructor
+     *
+     * @param int $stream_id the stream ID for this frame
+     * @param string $data raw payload bytes carried by this frame
+     * @param array $kwargs flags passed through to the parent Frame
+     *      constructor
      */
-    public function __construct($stream_id, $data = '', $kwargs = [])
+    public function __construct($stream_id,
+        public $data = '', $kwargs = [])
     {
         parent::__construct($stream_id, $kwargs);
-        $this->data = $data;
     }
     /**
      * Serializes the CONTINUATION frame body into binary format.
@@ -6592,25 +6453,15 @@ class InvalidPaddingException extends \Exception {}
 class Flag
 {
     /**
-     * Symbolic name of this flag (e.g. "ACK", "END_STREAM").
-     * @var string
-     */
-    public $name;
-    /**
-     * Bitmask of this flag within the frame-header flags
-     * byte (e.g. 0x01 for ACK).
-     * @var int
-     */
-    public $bit;
-    /**
      * Constructor for Flag.
-     * @param string $name The name of the flag.
-     * @param int $bit The bit value associated with the flag.
+     *
+     * @param string $name symbolic name of this flag (e.g. "ACK",
+     *      "END_STREAM")
+     * @param int $bit bitmask of this flag within the frame-header
+     *      flags byte (e.g. 0x01 for ACK)
      */
-    public function __construct($name, $bit)
+    public function __construct(public $name, public $bit)
     {
-        $this->name = $name;
-        $this->bit = $bit;
     }
 }
 /**
@@ -6704,63 +6555,6 @@ class Flags
     public function getFlags()
     {
         return $this->flags;
-    }
-}
-/**
- * Trait for handling padding in HTTP/2 frames.
- */
-trait Padding
-{
-    /**
-     * Number of trailing pad bytes the PADDED flag is
-     * declaring per RFC 7540 §6.1.
-     * @var int
-     */
-    protected $pad_length;
-    /**
-     * Constructor for Padding trait.
-     * @param int $stream_id The stream ID associated with the padding.
-     * @param int $pad_length The length of the padding (default: 0).
-     */
-    public function __construct($stream_id, $pad_length = 0)
-    {
-        $this->pad_length = $pad_length;
-    }
-    /**
-     * Serializes padding data into binary format. When the PADDED
-     * flag is set, this emits a single byte giving the pad length.
-     * When not set, it returns an empty string.
-     *
-     * @return string either a 1-byte pad length prefix or the empty
-     *      string depending on whether PADDED is set
-     */
-    public function serializePaddingData()
-    {
-        if (in_array('PADDED', $this->flags)) {
-            return pack('C', $this->pad_length);
-        }
-        return '';
-    }
-    /**
-     * Parses padding data from binary format. When the PADDED flag
-     * is set, reads the first byte of $data as the pad length.
-     *
-     * @param string $data binary payload whose first byte is the
-     *      pad length when PADDED is set
-     * @return int number of bytes consumed from the front of $data
-     *      (1 if PADDED is set, 0 otherwise)
-     */
-    public function parsePaddingData($data)
-    {
-        if (in_array('PADDED', $this->flags->getFlags())) {
-            if (strlen($data) < 1) {
-                throw new InvalidFrameError("Invalid Padding data");
-            }
-            $this->pad_length = unpack('C', $data[0])[1];
-            $data = substr($data, 1); // Remove the parsed byte from data
-            return 1;
-        }
-        return 0;
     }
 }
 /**

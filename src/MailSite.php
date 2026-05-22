@@ -362,6 +362,31 @@ abstract class MailStorage
     abstract public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0);
     /**
+     * Maximum bytes to read when fetching just the header block.
+     * Higher than any real-world RFC 5322 header set; sized so a
+     * file-backed storage can extract headers without slurping
+     * an entire message-with-attachments off disk.
+     */
+    const MAX_HEADER_BYTES = 65536;
+    /**
+     * Returns the raw RFC 5322 header block for a message
+     * (everything before the first blank line). Designed for
+     * inbox-listing UIs and other callers that need Subject /
+     * From / Date / Delivered-To without paying to read the
+     * full body. Backends may read up to MAX_HEADER_BYTES
+     * from the underlying message; if a message's header
+     * block somehow exceeds that cap, the returned prefix
+     * may not contain the terminator and downstream parsers
+     * should treat the result as a best-effort header view.
+     *
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder path with hierarchy (e.g. "Archive/2026")
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @return string|false the header block (no trailing CRLF
+     *      CRLF), or false if the message does not exist
+     */
+    abstract public function messageHeaderBytes($user, $folder, $uid);
+    /**
      * Returns the raw RFC 5322 bytes of a message, or false if
      * not found.
      *
@@ -619,6 +644,26 @@ abstract class MailStorage
         } catch (\InvalidArgumentException $e) {
             return false;
         }
+    }
+    /**
+     * Crops a message-bytes prefix to just the header block:
+     * everything before the first blank line. Accepts both
+     * CRLFCRLF (RFC-strict) and LFLF (lenient, since not all
+     * MTAs emit strict CRLF). When no terminator is found in
+     * the input, returns the input unchanged so callers always
+     * get a best-effort header view rather than empty.
+     *
+     * @param string $bytes a prefix of an RFC 5322 message;
+     *      typically the first MAX_HEADER_BYTES of the body
+     * @return string the header block without trailing blank line
+     */
+    protected function cropToHeaders($bytes)
+    {
+        $end = strpos($bytes, "\r\n\r\n");
+        if ($end === false) {
+            $end = strpos($bytes, "\n\n");
+        }
+        return ($end === false) ? $bytes : substr($bytes, 0, $end);
     }
 }
 /**
@@ -1024,6 +1069,33 @@ class FileMailStorage extends MailStorage
         }
         $bytes = @file_get_contents($eml);
         return ($bytes === false) ? false : $bytes;
+    }
+    /**
+     * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     */
+    public function messageHeaderBytes($user, $folder, $uid)
+    {
+        $uid = (int) $uid;
+        if ($uid < 1) {
+            return false;
+        }
+        $eml = $this->messagePath(
+            $this->folderDir($user, $folder), $uid, "eml");
+        if (!is_readable($eml)) {
+            return false;
+        }
+        $fh = fopen($eml, 'rb');
+        if ($fh === false) {
+            return false;
+        }
+        $chunk = fread($fh, self::MAX_HEADER_BYTES);
+        fclose($fh);
+        if ($chunk === false) {
+            return false;
+        }
+        return $this->cropToHeaders($chunk);
     }
     /**
      * @inheritdoc
@@ -1647,6 +1719,20 @@ class RamMailStorage extends MailStorage
         }
         return $this->users[$user]['folders'][$folder]
             ['messages'][$uid]['bytes'];
+    }
+    /**
+     * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     */
+    public function messageHeaderBytes($user, $folder, $uid)
+    {
+        $bytes = $this->fetchMessage($user, $folder, $uid);
+        if ($bytes === false) {
+            return false;
+        }
+        $prefix = substr($bytes, 0, self::MAX_HEADER_BYTES);
+        return $this->cropToHeaders($prefix);
     }
     /**
      * @inheritdoc
@@ -2686,6 +2772,34 @@ class SqlMailStorage extends MailStorage
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
      */
+    public function messageHeaderBytes($user, $folder, $uid)
+    {
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
+            return false;
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return false;
+        }
+        $stmt = $this->prepareStatement('message_by_uid');
+        $stmt->execute([$row['id'], (int) $uid]);
+        $msg = $stmt->fetch();
+        if ($msg === false) {
+            return false;
+        }
+        $prefix = $this->blobReadPrefix($msg['body_hash'],
+            self::MAX_HEADER_BYTES);
+        if ($prefix === false) {
+            return false;
+        }
+        return $this->cropToHeaders($prefix);
+    }
+    /**
+     * @inheritdoc
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     */
     public function listMessages($user, $folder)
     {
         $folder = $this->safeNormalizeFolder($folder);
@@ -3173,6 +3287,31 @@ class SqlMailStorage extends MailStorage
         }
         return @file_get_contents($eml_path);
     }
+    /**
+     * Reads up to $max bytes from the head of a content-
+     * addressed blob. Used by messageHeaderBytes to avoid
+     * reading the full body when the caller only needs the
+     * header block.
+     *
+     * @param string $hash content hash identifying the blob
+     * @param int $max maximum bytes to read from the head
+     * @return string|false the prefix bytes, or false on I/O
+     *      error or unknown hash
+     */
+    protected function blobReadPrefix($hash, $max)
+    {
+        $eml_path = $this->blobPath($hash);
+        if (!is_readable($eml_path)) {
+            return false;
+        }
+        $fh = fopen($eml_path, 'rb');
+        if ($fh === false) {
+            return false;
+        }
+        $chunk = fread($fh, $max);
+        fclose($fh);
+        return $chunk;
+    }
 }
 /**
  * The mail server itself. Single instance per process; binds one
@@ -3494,6 +3633,9 @@ class MailSite
                 $flags = $verdict['flags'];
             }
         }
+        if ($to !== '') {
+            $bytes = "Delivered-To: $to\r\n" . $bytes;
+        }
         $this->mail_storage->ensureUser($local);
         $uid = $this->mail_storage->appendMessage($local, $folder,
             $bytes, $flags);
@@ -3590,6 +3732,24 @@ class MailSite
     {
         return $this->mail_storage->fetchMessage($user, $folder,
             $uid);
+    }
+    /**
+     * Returns the raw RFC 5322 header block of a message,
+     * stopping at the first blank line. Faster than fetchMessage
+     * for callers that need only Subject / From / Date /
+     * Delivered-To; the backend may read up to
+     * MailStorage::MAX_HEADER_BYTES to find the terminator,
+     * which is well above any real-world header size.
+     *
+     * @param string $user username (no @domain)
+     * @param string $folder full folder path
+     * @param int $uid persistent IMAP UID
+     * @return string|false header block, or false if not found
+     */
+    public function messageHeaderBytes($user, $folder, $uid)
+    {
+        return $this->mail_storage->messageHeaderBytes($user,
+            $folder, $uid);
     }
     /**
      * Returns metadata describing where the body bytes for

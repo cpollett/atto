@@ -138,12 +138,6 @@ class WebSite
      */
     public $immortal_stream_keys = [];
     /**
-     * Used to determine portion of path to ignore
-     * when checking if a route matches against the current request.
-     * @var string
-     */
-    public $base_path;
-    /**
      * Check if the current run of the website is after a restart
      * @var boolean
      */
@@ -367,24 +361,23 @@ class WebSite
      * precision for timed events and sets up timer heap and other
      * field variables
      *
-     * @param string $base_path used to determine portion of path to ignore
-     *      when checking if a route matches against the current request.
-     *      If it is left blank, then a base path will be computed using
-     *      the $_SERVER script name variable.
+     * @param string $base_path used to determine portion of path to
+     *      ignore when checking if a route matches against the
+     *      current request. If left blank, a base path will be
+     *      computed using the $_SERVER script name variable.
      */
-    public function __construct($base_path = "")
+    public function __construct(public $base_path = "")
     {
         $this->default_server_globals = ["MAX_CACHE_FILESIZE" => 2000000];
         $this->http_methods = array_keys($this->routes);
-        if (empty($base_path)) {
+        if (empty($this->base_path)) {
             $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
-            $base_path = $pathinfo["dirname"];
+            $this->base_path = $pathinfo["dirname"];
         }
-        if ($base_path == ".") {
-            $base_path = "";
+        if ($this->base_path == ".") {
+            $this->base_path = "";
         }
         $this->is_cli = (php_sapi_name() == 'cli');
-        $this->base_path = $base_path;
         $this->stop = false;
         $this->restart = false;
         ini_set('precision', 16);
@@ -2430,7 +2423,7 @@ class WebSite
                 missing state and cleans up.
              */
             $conn = $this->connection($key);
-            $proto = $conn !== null ? $conn->protocol : 'h1';
+            $proto = $conn?->protocol ?? 'h1';
             if (!isset($this->transports[$proto])) {
                 $proto = 'h1';
             }
@@ -3111,10 +3104,8 @@ class WebSite
         $stream_id, $context)
     {
         $conn = $this->connection($key);
-        $hpack_encode = $conn !== null
-            ? ($conn->protocol_state['hpack_encode']
-                ?? new HPack())
-            : new HPack();
+        $hpack_encode = $conn?->protocol_state['hpack_encode']
+            ?? new HPack();
         $_SESSION = [];
         $this->setGlobals($context, $conn);
         /*
@@ -3588,9 +3579,9 @@ class WebSite
         $frame = WebSocketFrame::read($connection);
         stream_set_blocking($connection, false);
         $conn = $this->connection($key);
-        $ws = $conn !== null ? $conn->ws : null;
+        $ws = $conn?->ws;
         if ($frame === null) {
-            if ($ws !== null && $ws->on_close !== null) {
+            if ($ws?->on_close !== null) {
                 ($ws->on_close)($ws);
             }
             $this->shutdownHttpStream($key);
@@ -3821,8 +3812,8 @@ class WebSite
             if ($remaining_bytes == 0) {
                 $context = $this->out_streams[self::CONTEXT][$key];
                 $conn_obj = $this->connection($key);
-                $is_ws = $conn_obj !== null && $conn_obj->is_websocket;
-                $is_h2 = $conn_obj !== null && $conn_obj->protocol === 'h2';
+                $is_ws = $conn_obj?->is_websocket;
+                $is_h2 = $conn_obj?->protocol === 'h2';
                 if ($is_ws) {
                     /*
                         WebSocket: drain complete, but the
@@ -3840,7 +3831,7 @@ class WebSite
                         $this->out_streams[self::DATA_OFFSET][$key],
                         $this->out_streams[self::CONTEXT][$key],
                         $this->out_streams[self::MODIFIED_TIME][$key]);
-                    if ($ws !== null && $ws->closed) {
+                    if ($ws?->closed) {
                         $this->shutdownHttpStream($key);
                     }
                 } else if ($is_h2) {
@@ -4201,7 +4192,7 @@ class WebSite
             $meta = stream_get_meta_data(
                 $this->in_streams[self::CONNECTION][$key]);
             $conn_obj = $this->connection($key);
-            if ($conn_obj !== null && $conn_obj->is_websocket) {
+            if ($conn_obj?->is_websocket) {
                 /*
                     WebSockets have their own keepalive timer in
                     wsKeepalivePass; do not close them based on

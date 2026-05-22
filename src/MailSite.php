@@ -5296,9 +5296,7 @@ class MailSite
         }
         $context['AUTH_USER'] = strtolower($user);
         $context['STATE'] = 'AUTH';
-        if ($this->mail_storage !== null) {
-            $this->mail_storage->ensureUser($context['AUTH_USER']);
-        }
+        $this->mail_storage?->ensureUser($context['AUTH_USER']);
         $this->queueWrite($key,
             "$tag OK [CAPABILITY IMAP4rev1 IDLE] LOGIN " .
             "completed\r\n");

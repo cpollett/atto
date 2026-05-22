@@ -3727,6 +3727,31 @@ class QuicFrame
     }
 }
 /**
+ * Receive-side stream state per RFC 9000 sec 3.2.
+ * Substates that differ only in whether a STREAM frame with FIN has
+ * been buffered vs. delivered are collapsed.
+ */
+enum RecvState: int
+{
+    case Open = 0;
+    case SizeKnown = 1; // FIN seen, more bytes may still arrive
+    case Done = 2;      // FIN seen and all bytes delivered to app
+    case Reset = 3;     // peer sent RESET_STREAM; no more bytes expected
+}
+/**
+ * Send-side stream state per RFC 9000 sec 3.1.
+ * Substates that differ only in whether a STREAM frame with FIN has
+ * been buffered vs. transmitted are collapsed.
+ */
+enum SendState: int
+{
+    case Ready = 0;
+    case Data = 1;
+    case DataSent = 2;
+    case Done = 3;
+    case Reset = 4;     // peer sent STOP_SENDING; we stop transmitting
+}
+/**
  * Per-stream state for one QUIC stream. Streams are
  * identified by a 62-bit stream ID; bits 0-1 of the ID
  * encode the stream's initiator (client / server) and
@@ -3745,34 +3770,14 @@ class QuicFrame
  */
 class QuicStream
 {
-    /*
-        Stream-side state flags. Names mirror RFC 9000
-        sec 3.1 / 3.2 but we collapse the substates that
-        differ only in whether a STREAM frame with FIN
-        has been buffered vs. delivered.
-     */
-    const RECV_OPEN = 0;
-    const RECV_SIZE_KNOWN = 1; /* FIN seen, more bytes
-                                  may still arrive */
-    const RECV_DONE = 2; /* FIN seen and all bytes
-                            delivered to app */
-    const RECV_RESET = 3; /* peer sent RESET_STREAM; no
-                             more bytes expected */
-    const SEND_READY = 0;
-    const SEND_DATA = 1;
-    const SEND_DATA_SENT = 2;
-    const SEND_DONE = 3;
-    const SEND_RESET = 4; /* peer sent STOP_SENDING; we
-                             stop transmitting on this
-                             stream */
     /**
-     * @var int the receive-side state flag
+     * @var RecvState the receive-side state flag
      */
-    public $recv_state = self::RECV_OPEN;
+    public RecvState $recv_state = RecvState::Open;
     /**
-     * @var int the send-side state flag
+     * @var SendState the send-side state flag
      */
-    public $send_state = self::SEND_READY;
+    public SendState $send_state = SendState::Ready;
     /**
      * @var array offset => bytes, for out-of-order
      *      reassembly. Cleared as in-order data is
@@ -3881,7 +3886,7 @@ class QuicStream
             $this->recv_chunks[$offset] = $data;
         }
         if ($fin) {
-            $this->recv_state = self::RECV_SIZE_KNOWN;
+            $this->recv_state = RecvState::SizeKnown;
         }
         return true;
     }
@@ -3919,9 +3924,9 @@ class QuicStream
                 $this->recv_chunks[$next] = $tail;
             }
         }
-        if ($this->recv_state === self::RECV_SIZE_KNOWN &&
+        if ($this->recv_state === RecvState::SizeKnown &&
             $next >= $this->recv_seen_max) {
-            $this->recv_state = self::RECV_DONE;
+            $this->recv_state = RecvState::Done;
         }
         return $out;
     }
@@ -3933,8 +3938,8 @@ class QuicStream
      */
     public function isReceiveDone()
     {
-        return $this->recv_state === self::RECV_DONE ||
-            $this->recv_state === self::RECV_RESET;
+        return $this->recv_state === RecvState::Done ||
+            $this->recv_state === RecvState::Reset;
     }
     /**
      * Appends bytes to the send buffer. The
@@ -3947,8 +3952,8 @@ class QuicStream
     public function write($bytes)
     {
         $this->send_buf .= (string) $bytes;
-        if ($this->send_state === self::SEND_READY) {
-            $this->send_state = self::SEND_DATA;
+        if ($this->send_state === SendState::Ready) {
+            $this->send_state = SendState::Data;
         }
     }
     /**
@@ -3959,8 +3964,8 @@ class QuicStream
     {
         $this->send_fin = true;
         if ($this->bufferedLength() === 0 &&
-            $this->send_state === self::SEND_READY) {
-            $this->send_state = self::SEND_DATA_SENT;
+            $this->send_state === SendState::Ready) {
+            $this->send_state = SendState::DataSent;
         }
     }
     /**
@@ -3987,7 +3992,7 @@ class QuicStream
      */
     public function takeForFrame($max_bytes)
     {
-        if ($this->send_state === self::SEND_RESET) {
+        if ($this->send_state === SendState::Reset) {
             return null;
         }
         $buffered = $this->bufferedLength();
@@ -4028,7 +4033,7 @@ class QuicStream
             $this->bufferedLength() === 0);
         if ($fin) {
             $this->send_fin_sent = true;
-            $this->send_state = self::SEND_DATA_SENT;
+            $this->send_state = SendState::DataSent;
         }
         return [$offset, $data, $fin];
     }
@@ -4043,7 +4048,7 @@ class QuicStream
      */
     public function hasPendingSend()
     {
-        if ($this->send_state === self::SEND_RESET) {
+        if ($this->send_state === SendState::Reset) {
             return false;
         }
         if ($this->bufferedLength() > 0) {

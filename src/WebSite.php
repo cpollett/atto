@@ -109,6 +109,12 @@ class WebSite
         announcing huge frames.
      */
     const H2_MAX_FRAME_SIZE = 16384;
+    /**
+     * Maximum bytes read from an HTTP/2 connection in one readable
+     * event before parsing buffered frames. Bounds the work done
+     * per event; remaining bytes are read on the next event.
+     */
+    const H2_READ_CHUNK_SIZE = 65536;
     /*
         Magic GUID concatenated with the client-supplied
         Sec-WebSocket-Key during the WebSocket handshake to compute
@@ -132,6 +138,13 @@ class WebSite
         closed with status 1009 (message too big).
      */
     const WS_MAX_MESSAGE_SIZE = 1048576;
+    /**
+     * Maximum bytes read from a WebSocket connection in one
+     * readable event before parsing buffered frames. Bounds the
+     * work done per event so one busy connection cannot monopolize
+     * the loop; remaining bytes are read on the next event.
+     */
+    const WS_READ_CHUNK_SIZE = 65536;
     /**
      * Keys of stream that won't disappear (for example the server socket)
      * @var array
@@ -1397,8 +1410,9 @@ class WebSite
                 'MAX_CACHE_FILESIZE']) {
                 if (count($this->file_cache['MARKED']) +
                     ($num_unmarked = count($this->file_cache['UNMARKED'])) >=
-                    $this->default_server_globals['MAX_CACHE_FILES']) {
-                    $eject = mt_rand(0, $num_unmarked - 1);
+                    $this->default_server_globals['MAX_CACHE_FILES'] &&
+                    $num_unmarked > 0) {
+                    $eject = random_int(0, $num_unmarked - 1);
                     $unmarked_paths = array_keys($this->file_cache['UNMARKED']);
                     unset(
                         $this->file_cache['UNMARKED'][$unmarked_paths[$eject]]);
@@ -1821,6 +1835,7 @@ class WebSite
             'h1' => new H1Transport($this),
             'h2' => new H2Transport($this),
             'ws' => new WsTransport($this),
+            'handshake' => new HandshakeTransport($this),
         ];
         if (class_exists('\seekquarry\atto\H3Transport', false)) {
             $this->transports['h3'] = new H3Transport($this);
@@ -1868,6 +1883,24 @@ class WebSite
                 $timeout = floor($pre_timeout);
                 $micro_timeout = intval(($timeout - floor($pre_timeout))
                     * 1000000);
+            }
+            /*
+                Bound the wait by the soonest pending TLS-handshake
+                deadline so a peer that opens a connection and
+                stalls is reaped on time even when no other socket
+                has activity to wake the loop (otherwise select
+                with a null timeout would block until unrelated
+                traffic arrived).
+             */
+            $handshake_deadline = $this->nextHandshakeDeadline();
+            if ($handshake_deadline !== null) {
+                $until = max(0, $handshake_deadline - microtime(true));
+                if ($timeout === null ||
+                    $until < $timeout + $micro_timeout / 1000000.0) {
+                    $timeout = (int) floor($until);
+                    $micro_timeout =
+                        (int) (($until - floor($until)) * 1000000);
+                }
             }
             /*
                 Clamp the stream_select wake-up by the next
@@ -2406,7 +2439,7 @@ class WebSite
                 $this->shutdownHttpStream($key);
                 continue;
             }
-            $len = strlen($this->in_streams[self::DATA][$key]);
+            $len = strlen($this->in_streams[self::DATA][$key] ?? '');
             $max_len = $this->default_server_globals['MAX_REQUEST_LEN'];
             $too_long = $len >= $max_len;
             if (!empty(
@@ -2563,6 +2596,33 @@ class WebSite
         $key = (int) $resource;
         $this->in_streams[self::CONNECTION][$key] = $resource;
         $client_http = $additional_context["CLIENT_HTTP"];
+        if ($client_http === 'handshake') {
+            /*
+                TLS handshake not yet done. Persist the connection
+                with its listener attributes and peer addresses so
+                the handshake transport can finish protocol setup
+                once stepCrypto completes, and return to the event
+                loop, which will wake on this socket's I/O and step
+                the handshake. Nothing protocol-specific is set up
+                yet because the protocol is unknown until the
+                decrypted first bytes are read after the handshake.
+             */
+            $connection->listener_port =
+                $listener->globals['SERVER_PORT'] ?? '';
+            $connection->listener_name =
+                $listener->globals['SERVER_NAME'] ?? '';
+            $connection->https = 'on';
+            $remote_name = stream_socket_get_name($resource, true);
+            $server_name = stream_socket_get_name($resource, false);
+            list($connection->remote_addr,
+                $connection->remote_port) =
+                $this->splitAddressPort($remote_name);
+            list($connection->server_addr,
+                $connection->server_port) =
+                $this->splitAddressPort($server_name);
+            $this->connections[$key] = $connection;
+            return;
+        }
         /*
             Persist the Connection object for this stream key.
             The Connection holds the I/O resource handle, the
@@ -2574,11 +2634,6 @@ class WebSite
             $this->connection($key) and reads these fields
             without indexing the untyped in_streams[CONTEXT].
          */
-        if ($client_http == "HTTP/2.0" || $client_http == "h2c") {
-            $connection->protocol = 'h2';
-        } else {
-            $connection->protocol = 'h1';
-        }
         $connection->client_http = $client_http;
         $connection->listener_port =
             $listener->globals['SERVER_PORT'] ?? '';
@@ -2609,6 +2664,37 @@ class WebSite
         list($connection->server_addr, $connection->server_port) =
             $this->splitAddressPort($server_name);
         $this->connections[$key] = $connection;
+        $this->promoteConnection($key, $connection, $client_http,
+            $additional_context);
+    }
+    /**
+     * Finishes setting up an accepted connection once its protocol
+     * is known: records the protocol, runs the per-protocol init
+     * (HTTP/2 SETTINGS and HPACK state, or the HTTP/1 request
+     * stream) and seeds any leftover bytes from protocol detection.
+     * Called for a plaintext connection straight from accept, and
+     * for a TLS connection by the handshake transport once the
+     * handshake has completed and the decrypted first bytes have
+     * been read. Reads listener attributes from the Connection,
+     * which both callers have already populated.
+     *
+     * @param int $key stream key of the connection
+     * @param Connection $connection the connection being promoted
+     * @param string $client_http detected client protocol string
+     * @param array $additional_context detection context, may carry
+     *      a LEFTOVER of already-read bytes
+     * @return void
+     */
+    protected function promoteConnection($key, $connection,
+        $client_http, $additional_context)
+    {
+        $resource = $connection->resource();
+        if ($client_http == "HTTP/2.0" || $client_http == "h2c") {
+            $connection->protocol = 'h2';
+        } else {
+            $connection->protocol = 'h1';
+        }
+        $connection->client_http = $client_http;
         if ($client_http == "HTTP/2.0") {
             try {
                 /*
@@ -2690,6 +2776,118 @@ class WebSite
                     $additional_context["LEFTOVER"];
             }
         }
+    }
+    /**
+     * Advances a connection still in the TLS-handshake-pending
+     * state by one non-blocking step, called from the event loop
+     * when the socket is readable. On the first contact it peeks
+     * the first byte to auto-detect plaintext on a TLS port (a TLS
+     * ClientHello starts with 0x16 per RFC 8446 sec 5.1; anything
+     * else is treated as cleartext and bypasses TLS, the same
+     * behavior the old inline accept had, so local utilities can
+     * still speak HTTP to a TLS port). It then steps the handshake:
+     * on completion the protocol is detected and the connection
+     * promoted; while more I/O is needed it is left pending; on
+     * failure or once the handshake deadline passes it is closed.
+     *
+     * @param int $key stream key of the pending connection
+     * @param Connection|null $conn the pending connection
+     * @return void
+     */
+    public function stepHandshake($key, $conn)
+    {
+        if ($conn === null) {
+            $this->shutdownHttpStream($key);
+            return;
+        }
+        $deadline =
+            $conn->protocol_state['handshake_deadline'] ?? 0;
+        if ($deadline > 0 && microtime(true) > $deadline) {
+            $this->shutdownHttpStream($key);
+            return;
+        }
+        $acceptor = $this->getConnectionAcceptor();
+        if (empty($conn->protocol_state['handshake_peeked'])) {
+            $peek = @stream_socket_recvfrom($conn->resource(), 1,
+                STREAM_PEEK);
+            if ($peek === false || $peek === '') {
+                return;
+            }
+            $conn->protocol_state['handshake_peeked'] = true;
+            if ($peek[0] !== "\x16") {
+                /*
+                    Cleartext on the TLS port: skip the handshake,
+                    detect the plaintext protocol, and promote.
+                 */
+                $conn->is_secure = false;
+                $conn->https = '';
+                $additional_context =
+                    $acceptor->detectProtocol($conn);
+                $conn->protocol_state = [];
+                $this->promoteConnection($key, $conn,
+                    $additional_context['CLIENT_HTTP'],
+                    $additional_context);
+                return;
+            }
+        }
+        if (empty($conn->protocol_state['handshake_done'])) {
+            $handshake_error = '';
+            $result = $acceptor->stepCrypto($conn, $handshake_error);
+            if ($result === 0) {
+                return;
+            }
+            if ($result === false) {
+                /*
+                    Close silently on a failed handshake. A peer
+                    that aborts mid-handshake is common and routine
+                    under load; logging each one floods the log
+                    (the SSL error storm the blocking handshake
+                    produced) with no useful diagnostic.
+                 */
+                $this->shutdownHttpStream($key);
+                return;
+            }
+            $conn->protocol_state['handshake_done'] = true;
+            $conn->protocol_state['detect_buffer'] = '';
+        }
+        /*
+            Handshake done: read the first decrypted bytes
+            non-blocking and decide HTTP/2 versus HTTP/1.1 from
+            them. PHP does not expose the ALPN result, and TLS
+            bytes cannot be peeked (STREAM_PEEK works on the raw
+            socket, not the decrypted stream), so the bytes are
+            consumed into a buffer and handed back to the parser:
+            an H2 client sends the 24-byte preface, an H1 client a
+            request line. The protocol is decided as soon as the
+            buffer is unambiguous; until then more reads are
+            awaited, bounded by the same handshake deadline so a
+            client that completes TLS but sends nothing is reaped
+            rather than blocking.
+         */
+        $magic_len = strlen(self::H2_CLIENT_MAGIC);
+        $remaining = $magic_len -
+            strlen($conn->protocol_state['detect_buffer']);
+        if ($remaining > 0) {
+            $chunk = $conn->read($remaining);
+            if ($chunk !== false && $chunk !== '') {
+                $conn->protocol_state['detect_buffer'] .= $chunk;
+            }
+        }
+        $buffer = $conn->protocol_state['detect_buffer'];
+        $classification = $acceptor->classifySecureFirstBytes(
+            $buffer);
+        if ($classification === null) {
+            return;
+        }
+        if ($classification === 'h2') {
+            $additional_context = ["CLIENT_HTTP" => "HTTP/2.0"];
+        } else {
+            $additional_context = ["CLIENT_HTTP" => "HTTP/1.1",
+                "LEFTOVER" => $buffer];
+        }
+        $conn->protocol_state = [];
+        $this->promoteConnection($key, $conn,
+            $additional_context['CLIENT_HTTP'], $additional_context);
     }
     /**
      * Lazily constructs the ConnectionAcceptor used by
@@ -2851,10 +3049,8 @@ class WebSite
         /*
             Per-connection H2 state lives on the Connection object
             (HPACK encoder/decoder, last-seen stream id, half-open
-            streams awaiting END_STREAM). Pre-fetch it here so the
-            rest of this method reads from the typed
-            protocol_state array rather than indexing the untyped
-            in_streams[CONTEXT]. The Connection is created by
+            streams awaiting END_STREAM, and the inbound byte
+            buffer). The Connection is created by
             processServerRequest right after accept; if it is
             missing here, we are processing a frame for a stream
             that has already been torn down and should bail.
@@ -2865,48 +3061,99 @@ class WebSite
             return false;
         }
         $state = &$conn->protocol_state;
-        stream_set_blocking($connection, true);
-        try {
-            $hdr = $this->readExactly($connection,
-                self::H2_FRAME_HEADER_LEN);
-        } catch (\Exception $e) {
-            stream_set_blocking($connection, false);
+        /*
+            Read whatever is available without blocking and append
+            it to the inbound buffer. Reading frames from this
+            buffer rather than with blocking reads means a client
+            that sends a partial frame and stalls leaves its bytes
+            buffered and does not hold the single event loop.
+         */
+        $chunk = @fread($connection, self::H2_READ_CHUNK_SIZE);
+        if ($chunk === false ||
+            ($chunk === "" && feof($connection))) {
             $this->shutdownHttpStream($key);
             return false;
         }
-        [$frame, $payload_len] = Frame::parseFrameHeader($hdr);
-        if ($payload_len > self::H2_MAX_FRAME_SIZE) {
-            /*
-                RFC 7540 sec 4.2: a frame size error is a connection
-                error. Send GOAWAY with FRAME_SIZE_ERROR (0x6) and
-                tear down before allocating the oversized payload.
-                We do not drain the announced payload because the
-                connection is being closed anyway and reading it
-                would defeat the purpose of the size check.
-             */
-            $goaway = new GoAwayFrame(0, 0, 0x6, "");
-            @fwrite($connection, $goaway->serialize());
-            stream_set_blocking($connection, false);
-            $this->shutdownHttpStream($key);
-            return false;
+        if (!isset($state['input_buffer'])) {
+            $state['input_buffer'] = "";
         }
-        $payload = "";
-        if ($payload_len > 0) {
-            try {
-                $payload = $this->readExactly($connection, $payload_len);
-            } catch (\Exception $e) {
+        $state['input_buffer'] .= $chunk;
+        /*
+            Drain every complete frame now buffered. A frame is
+            complete once the 9-byte header plus its declared
+            payload are present; otherwise the partial bytes stay
+            buffered for the next readable event. A single read may
+            carry several frames, so loop until the buffer holds
+            less than a whole frame.
+         */
+        while (true) {
+            $buffer = $state['input_buffer'];
+            if (strlen($buffer) < self::H2_FRAME_HEADER_LEN) {
+                return false;
+            }
+            $hdr = substr($buffer, 0, self::H2_FRAME_HEADER_LEN);
+            [$frame, $payload_len] = Frame::parseFrameHeader($hdr);
+            if ($payload_len > self::H2_MAX_FRAME_SIZE) {
                 /*
-                    Peer closed connection between the frame header
-                    and its payload. Match the cleanup pattern of
-                    the header read above: drop the stream and
-                    return without touching the half-read frame.
+                    RFC 7540 sec 4.2: a frame size error is a
+                    connection error. Send GOAWAY with FRAME_SIZE_
+                    ERROR (0x6) and tear down before allocating the
+                    oversized payload. The announced payload is not
+                    drained because the connection is being closed.
                  */
-                stream_set_blocking($connection, false);
+                $goaway = new GoAwayFrame(0, 0, 0x6, "");
+                @fwrite($connection, $goaway->serialize());
                 $this->shutdownHttpStream($key);
                 return false;
             }
+            $frame_len = self::H2_FRAME_HEADER_LEN + $payload_len;
+            if (strlen($buffer) < $frame_len) {
+                return false;
+            }
+            $payload = $payload_len > 0
+                ? substr($buffer, self::H2_FRAME_HEADER_LEN,
+                    $payload_len)
+                : "";
+            $state['input_buffer'] = substr($buffer, $frame_len);
+            $result = $this->processH2Frame($key, $connection,
+                $conn, $frame, $payload, $payload_len);
+            if ($result !== false) {
+                return $result;
+            }
+            /*
+                processH2Frame returns false both for a routine
+                control frame (keep draining the buffer) and after
+                tearing the connection down. Stop draining once the
+                connection is gone so we do not touch freed state.
+             */
+            if ($this->connection($key) === null) {
+                return false;
+            }
         }
-        stream_set_blocking($connection, false);
+    }
+    /**
+     * Processes one fully-acquired HTTP/2 frame. The frame header
+     * and payload have already been read (non-blocking) and parsed
+     * by parseH2Request; this method handles the frame according to
+     * its type: control frames (GOAWAY, PING, SETTINGS, WINDOW_
+     * UPDATE, RST_STREAM), and HEADERS/CONTINUATION/DATA that make
+     * up a request. Returns false when the connection was torn down
+     * or no request is ready, or the result of dispatchH2Request
+     * when a complete request has been assembled.
+     *
+     * @param int $key connection key in $this->in_streams
+     * @param resource $connection client socket
+     * @param Connection $conn the persistent connection object
+     * @param Frame $frame the parsed frame (type-specific subclass)
+     * @param string $payload the frame's decoded payload bytes
+     * @param int $payload_len the frame payload length
+     * @return bool processing result; true only when a response was
+     *      dispatched, false otherwise
+     */
+    protected function processH2Frame($key, $connection, $conn,
+        $frame, $payload, $payload_len)
+    {
+        $state = &$conn->protocol_state;
         if ($frame instanceof GoAwayFrame) {
             $this->shutdownHttpStream($key);
             return false;
@@ -2962,8 +3209,9 @@ class WebSite
                     one already dispatched. RFC 7540 sec 5.1: DATA
                     on a stream not in open/half-closed(local) is
                     a STREAM_ERROR. We tear down the connection —
-                    Atto's H2 path is synchronous so concurrent-
-                    stream loss is acceptable.
+                    Atto does not track per-stream error recovery,
+                    so dropping the whole connection on a misbehaving
+                    stream is an accepted simplification.
                  */
                 $goaway = new GoAwayFrame(0,
                     $state['last_stream_id'] ?? 0, 0x1, "");
@@ -3190,7 +3438,7 @@ class WebSite
             Empty bodies still emit one frame so END_STREAM has a
             place to live. Outbound flow control (sec 5.2) is not
             enforced: real clients grant huge windows eagerly so
-            it never bottlenecks Atto's synchronous model.
+            it never bottlenecks Atto's single-process event loop.
          */
         $body_len = strlen($body);
         $max = self::H2_MAX_FRAME_SIZE;
@@ -3246,6 +3494,14 @@ class WebSite
      * Reads exactly $length bytes from $connection, blocking until
      * all bytes are available. Returns the binary string, or throws
      * if the connection closes before enough data arrives.
+     *
+     * This is the only remaining blocking reader on the connection
+     * path; it is used solely by initH2Request to read the client's
+     * initial SETTINGS frame at HTTP/2 establishment. The accept,
+     * TLS handshake, protocol-detection, WebSocket, and per-request
+     * HTTP/2 frame paths are all non-blocking (buffered across event
+     * loop wakes). Converting the establishment read too would mean
+     * deferring it across wakes the way the handshake step does.
      *
      * @param resource $connection client connection to read from;
      *      must be in blocking mode so fread won't return early
@@ -3575,33 +3831,74 @@ class WebSite
      */
     public function parseWsRequest($key, $connection)
     {
-        stream_set_blocking($connection, true);
-        $frame = WebSocketFrame::read($connection);
-        stream_set_blocking($connection, false);
         $conn = $this->connection($key);
         $ws = $conn?->ws;
-        if ($frame === null) {
-            if ($ws?->on_close !== null) {
+        if ($ws === null) {
+            $this->shutdownHttpStream($key);
+            return;
+        }
+        $chunk = @fread($connection, self::WS_READ_CHUNK_SIZE);
+        if ($chunk === false || ($chunk === '' && feof($connection))) {
+            if ($ws->on_close !== null) {
                 ($ws->on_close)($ws);
             }
             $this->shutdownHttpStream($key);
             return;
         }
-        if ($ws === null) {
-            $this->shutdownHttpStream($key);
+        if ($chunk === '') {
             return;
         }
+        $ws->input_buffer .= $chunk;
         /*
-            Any frame from the client counts as proof of life
-            for the keepalive timer, not just PONG frames.
+            Any bytes from the client count as proof of life for
+            the keepalive timer, not just PONG frames.
          */
         $ws->last_pong_time = time();
+        /*
+            Parse every complete frame now buffered. A single
+            readable event may carry several frames, and a frame
+            may span several events; parseBuffer returns null when
+            the buffer does not yet hold a whole frame, leaving the
+            partial bytes for the next event.
+         */
+        while (true) {
+            $parsed = WebSocketFrame::parseBuffer($ws->input_buffer);
+            if ($parsed === null) {
+                break;
+            }
+            $ws->input_buffer = substr($ws->input_buffer,
+                $parsed['consumed']);
+            $keep_open = $this->dispatchWsFrame($key, $ws,
+                $parsed['frame']);
+            if (!$keep_open) {
+                break;
+            }
+        }
+    }
+    /**
+     * Handles one fully parsed inbound WebSocket frame: enforces
+     * the masking and size rules, answers control frames (close,
+     * ping), and assembles text and binary messages across
+     * continuation frames, invoking the registered onMessage
+     * callback when a message is complete. Returns whether the
+     * connection should stay open for further frames; a close,
+     * protocol error, or oversize message returns false so the
+     * caller stops parsing the buffer.
+     *
+     * @param int $key stream key of the connection
+     * @param WebSocket $ws the per-connection WebSocket handle
+     * @param array $frame parsed frame from parseBuffer
+     * @return bool true to keep processing further frames, false to
+     *      stop (the connection was closed or failed)
+     */
+    protected function dispatchWsFrame($key, $ws, $frame)
+    {
         if (!empty($frame['too_large'])) {
             if ($ws->on_error !== null) {
                 ($ws->on_error)("Message exceeds maximum size", $ws);
             }
             $ws->close(1009, "Message too big");
-            return;
+            return false;
         }
         if (!$frame['masked']) {
             /*
@@ -3610,7 +3907,7 @@ class WebSite
                 error and the connection must be closed.
              */
             $ws->close(1002, "Unmasked client frame");
-            return;
+            return false;
         }
         $opcode = $frame['opcode'];
         if ($opcode === self::WS_OPCODE_CLOSE) {
@@ -3623,16 +3920,16 @@ class WebSite
             if ($ws->on_close !== null) {
                 ($ws->on_close)($ws);
             }
-            return;
+            return false;
         }
         if ($opcode === self::WS_OPCODE_PING) {
             $this->wsEnqueueWrite($key,
                 WebSocketFrame::build(self::WS_OPCODE_PONG,
                     $frame['payload']));
-            return;
+            return true;
         }
         if ($opcode === self::WS_OPCODE_PONG) {
-            return;
+            return true;
         }
         if ($opcode === self::WS_OPCODE_TEXT
             || $opcode === self::WS_OPCODE_BINARY) {
@@ -3642,7 +3939,7 @@ class WebSite
             if (strlen($ws->fragment_buffer) + $frame['length']
                 > self::WS_MAX_MESSAGE_SIZE) {
                 $ws->close(1009, "Message too big");
-                return;
+                return false;
             }
             $ws->fragment_buffer .= $frame['payload'];
         } else {
@@ -3651,7 +3948,7 @@ class WebSite
                 must fail the connection.
              */
             $ws->close(1002, "Unknown opcode");
-            return;
+            return false;
         }
         if ($frame['fin']) {
             $message = $ws->fragment_buffer;
@@ -3666,6 +3963,7 @@ class WebSite
                 }
             }
         }
+        return true;
     }
     /**
      * Gets info about an incoming request stream and uses this to set up
@@ -4172,6 +4470,32 @@ class WebSite
              'PRE_BAD_RESPONSE' => true]);
     }
     /**
+     * Returns the soonest pending TLS-handshake deadline across
+     * all live connections, or null when none are mid-handshake.
+     * The main loop uses this to bound its select wait so a
+     * stalled handshake is reaped on time even when no other
+     * socket has activity to wake the loop.
+     *
+     * @return float|null soonest handshake deadline as a
+     *      microtime value, or null if no handshakes are pending
+     */
+    protected function nextHandshakeDeadline()
+    {
+        $soonest = null;
+        foreach ($this->connections as $conn) {
+            if ($conn->protocol !== 'handshake') {
+                continue;
+            }
+            $deadline =
+                $conn->protocol_state['handshake_deadline'] ?? 0;
+            if ($deadline > 0 &&
+                ($soonest === null || $deadline < $soonest)) {
+                $soonest = $deadline;
+            }
+        }
+        return $soonest;
+    }
+    /**
      * Used to close connections and remove from stream arrays streams that
      * have not had traffic in the last CONNECTION_TIMEOUT seconds. The
      * stream socket server is exempt from being culled, as are any streams
@@ -4200,6 +4524,23 @@ class WebSite
                     applies so dead TCP connections are reaped.
                  */
                 if ($meta['eof']) {
+                    $this->shutdownHttpStream($key);
+                }
+                continue;
+            }
+            if ($conn_obj?->protocol === 'handshake') {
+                /*
+                    A connection still completing its TLS handshake
+                    has no request modified-time yet, so the generic
+                    idle timeout would reap it immediately. Reap it
+                    only on EOF or once its handshake deadline has
+                    passed, matching stepHandshake.
+                 */
+                $deadline =
+                    $conn_obj->protocol_state['handshake_deadline']
+                    ?? 0;
+                if ($meta['eof'] ||
+                    ($deadline > 0 && microtime(true) > $deadline)) {
                     $this->shutdownHttpStream($key);
                 }
                 continue;
@@ -4574,6 +4915,13 @@ class Connection
 class ConnectionAcceptor
 {
     /**
+     * Seconds a connection may remain in the TLS-handshake-pending
+     * state before the event loop reaps it, so a peer that opens a
+     * connection and then stalls without completing the handshake
+     * cannot hold a slot indefinitely.
+     */
+    const HANDSHAKE_TIMEOUT = 30;
+    /**
      * Constructs a ConnectionAcceptor.
      *
      * @param string $h2_magic the 24-byte HTTP/2 client connection
@@ -4618,91 +4966,90 @@ class ConnectionAcceptor
             stream_set_blocking($server, false);
         }
         if (!$resource) {
-            echo "No connection accepted or timed out.\n";
             return [null, null];
         }
-        if ($is_secure) {
-            /*
-                Peek first byte to auto-detect plaintext on a TLS
-                port. A TLS ClientHello starts with 0x16 (RFC 8446
-                sec 5.1 ContentType=Handshake); anything else is
-                cleartext and bypasses TLS. Lets local utilities
-                (yioop's Fetcher, sidecars, health checks) speak
-                HTTP to a TLS-configured port — same behavior as
-                nginx and Caddy.
-             */
-            $peek = @stream_socket_recvfrom($resource, 1, STREAM_PEEK);
-            if ($peek === false || $peek === '') {
-                @fclose($resource);
-                return [null, null];
-            }
-            if ($peek[0] !== "\x16") {
-                $is_secure = false;
-            }
+        /*
+            Put the accepted socket in non-blocking mode at once so
+            no later step can block the single accept-and-serve
+            loop on one slow or stalled client. A plaintext-port
+            connection is detected and returned ready as before. A
+            secure-port connection is returned in a handshake
+            pending state: the byte peek that auto-detects
+            plaintext on a TLS port and the TLS handshake itself
+            are driven a step at a time from the event loop by the
+            handshake transport, rather than run inline here where
+            a peer that connects and then stalls would freeze every
+            other connection.
+         */
+        stream_set_blocking($resource, false);
+        if (!$is_secure) {
+            $connection = new Connection($resource, false);
+            $additional_context = $this->detectProtocol($connection);
+            return [$connection, $additional_context];
         }
-        $connection = new Connection($resource, $is_secure);
-        if ($is_secure) {
-            if (!$this->enableTls($connection)) {
-                $connection->close();
-                return [null, null];
-            }
-        }
-        $additional_context = $this->detectProtocol($connection);
-        return [$connection, $additional_context];
+        $connection = new Connection($resource, true);
+        $connection->protocol = 'handshake';
+        $connection->protocol_state['handshake_deadline'] =
+            microtime(true) + self::HANDSHAKE_TIMEOUT;
+        return [$connection, ['CLIENT_HTTP' => 'handshake']];
     }
     /**
-     * Wraps a freshly accepted connection in TLS by calling
-     * stream_socket_enable_crypto. Returns true if the TLS
-     * handshake succeeded, false otherwise; on failure the
-     * error message captured from the underlying call is
-     * reported via the configured error_handler or, if none is
-     * set, echoed to standard output.
+     * The TLS crypto method bitmask the server offers: the generic
+     * TLS server method plus the 1.2 and 1.3 variants when the
+     * build defines them.
      *
-     * Failures with no PHP-level error message attached (the
-     * common case when a peer simply closes the TCP connection
-     * mid-handshake) are silent: there is no useful diagnostic
-     * to report and emitting "SSL Error: unknown" once per
-     * aborted connection floods the log under load.
-     *
-     * @param Connection $connection freshly accepted connection
-     *      to wrap with TLS
-     * @return bool true on success, false if the handshake failed
+     * @return int crypto method flags for stream_socket_enable_crypto
      */
-    protected function enableTls($connection)
+    protected function cryptoMethod()
     {
-        $connection->setBlocking(true);
-        $captured = '';
-        set_error_handler(function ($errno, $errstr) use (&$captured) {
-            $captured = $errstr;
-            return true;
-        });
-        $ok = @stream_socket_enable_crypto(
-            $connection->resource(), true,
-            STREAM_CRYPTO_METHOD_TLS_SERVER);
+        $method = STREAM_CRYPTO_METHOD_TLS_SERVER;
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_SERVER')) {
+            $method |= STREAM_CRYPTO_METHOD_TLSv1_2_SERVER;
+        }
+        if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')) {
+            $method |= STREAM_CRYPTO_METHOD_TLSv1_3_SERVER;
+        }
+        return $method;
+    }
+    /**
+     * Runs one non-blocking step of the server-side TLS handshake
+     * on a connection. The socket is non-blocking so the call
+     * returns at once: true when the handshake has completed,
+     * false when it has failed, and 0 when it needs more socket
+     * I/O and should be retried on a later select wake. The error
+     * handler is scoped to this call so any SSL error text is
+     * attributed to this step rather than read from the unreliable
+     * process-wide last error.
+     *
+     * @param Connection $connection connection whose handshake to step
+     * @param string $handshake_error set to the SSL error text on failure
+     * @return bool|int true done, false failed, 0 needs more I/O
+     */
+    public function stepCrypto($connection, &$handshake_error = '')
+    {
+        $handshake_error = '';
+        $error = null;
+        set_error_handler(
+            function ($errno, $errstr) use (&$error) {
+                $error = $errstr;
+                return true;
+            });
+        $result = @stream_socket_enable_crypto(
+            $connection->resource(), true, $this->cryptoMethod());
         restore_error_handler();
-        if (!$ok) {
-            if ($captured === '') {
-                /*
-                    No PHP-level error attached: peer most likely
-                    closed the TCP connection mid-handshake. Stay
-                    silent rather than emit a meaningless "SSL
-                    Error: unknown" line for every aborted
-                    connection.
-                 */
-                return false;
+        if ($result === true) {
+            if ($this->post_tls_callback) {
+                ($this->post_tls_callback)();
             }
-            $message = "\n\nSSL Error: " . $captured;
-            if ($this->error_handler) {
-                ($this->error_handler)($message);
-            } else {
-                echo $message;
-            }
-            return false;
+            return true;
         }
-        if ($this->post_tls_callback) {
-            ($this->post_tls_callback)();
+        if ($result === 0) {
+            return 0;
         }
-        return true;
+        if ($error !== null) {
+            $handshake_error = $error;
+        }
+        return false;
     }
     /**
      * Inspects the first bytes of a connection to decide which
@@ -4718,27 +5065,15 @@ class ConnectionAcceptor
      * @return array context with CLIENT_HTTP and possibly
      *      LEFTOVER keys
      */
-    protected function detectProtocol($connection)
+    public function detectProtocol($connection)
     {
-        if ($connection->is_secure) {
-            /*
-                PHP does not expose the ALPN-negotiated protocol
-                so after the TLS handshake we read the decrypted
-                bytes while still in blocking mode. An H2 client
-                always sends the 24-byte magic string as its
-                first data.
-             */
-            $magic_len = strlen($this->h2_magic);
-            $stream_start = $connection->read($magic_len);
-            $connection->setBlocking(false);
-            if ($stream_start === $this->h2_magic) {
-                return ["CLIENT_HTTP" => "HTTP/2.0"];
-            }
-            return ["CLIENT_HTTP" => "HTTP/1.1",
-                "LEFTOVER" => $stream_start];
-        }
         /*
-            Cleartext: safe to peek since there is no TLS wrapping
+            Reached only for cleartext connections: a plaintext
+            listener, or cleartext detected on a TLS port. Secure
+            connections are classified from their first decrypted
+            bytes by classifySecureFirstBytes. Cleartext is safe to
+            peek since there is no TLS wrapping, so the bytes stay
+            in the receive buffer for the request parser.
          */
         $stream_start = @stream_socket_recvfrom(
             $connection->resource(), 512, STREAM_PEEK);
@@ -4755,6 +5090,35 @@ class ConnectionAcceptor
             return ["CLIENT_HTTP" => "HTTP/1.1"];
         }
         return ["CLIENT_HTTP" => "unknown"];
+    }
+    /**
+     * Classifies the first decrypted bytes of a TLS connection as
+     * HTTP/2 or HTTP/1.1. Returns 'h2' when the bytes are the full
+     * 24-byte HTTP/2 client connection preface, 'h1' when they have
+     * already diverged from that preface, and null when more bytes
+     * are still needed to decide (the buffer so far is a proper
+     * prefix of the preface). Lets the caller stop reading as soon
+     * as the protocol is unambiguous rather than always waiting for
+     * 24 bytes.
+     *
+     * @param string $buffer decrypted bytes read so far
+     * @return string|null 'h2', 'h1', or null if undecided
+     */
+    public function classifySecureFirstBytes($buffer)
+    {
+        $magic = $this->h2_magic;
+        $magic_len = strlen($magic);
+        $have = strlen($buffer);
+        if ($have >= $magic_len) {
+            if (strncmp($buffer, $magic, $magic_len) === 0) {
+                return 'h2';
+            }
+            return 'h1';
+        }
+        if (strncmp($buffer, $magic, $have) === 0) {
+            return null;
+        }
+        return 'h1';
     }
 }
 /**
@@ -4901,6 +5265,26 @@ class H1Transport extends Transport
     }
 }
 /**
+ * Transport for connections still completing their TLS handshake.
+ * Each readable event advances the non-blocking handshake one
+ * step; when it completes the connection is promoted to its real
+ * HTTP protocol, and when it fails or the handshake deadline
+ * passes the connection is closed. Routing the handshake through a
+ * transport lets the existing event loop drive it with no special
+ * casing in the select loop, so a peer that stalls mid-handshake
+ * no longer blocks any other connection.
+ */
+class HandshakeTransport extends Transport
+{
+    /**
+     * {@inheritDoc}
+     */
+    public function onReadable($key, $conn, $in_stream, $too_long)
+    {
+        $this->site->stepHandshake($key, $conn);
+    }
+}
+/**
  * Transport for HTTP/2 connections. H2 bypasses the chunk-read +
  * out_streams async write path because H2 framing handles its own
  * flow control: parseH2Request does its own blocking frame read
@@ -4950,72 +5334,87 @@ class WsTransport extends Transport
 class WebSocketFrame
 {
     /**
-     * Reads one complete WebSocket frame from a connection,
-     * blocking until all bytes are available. Unmasks the payload
-     * if the mask bit is set. Returns an associative array with
-     * the parsed fields, or null if the connection closes mid-frame.
+     * Parses one complete WebSocket frame out of an in-memory
+     * byte buffer without doing any socket I/O. Returns an array
+     * with the parsed frame and the number of bytes it consumed
+     * from the front of the buffer, or null when the buffer does
+     * not yet hold a whole frame and more bytes must be read. This
+     * lets the event loop accumulate inbound bytes non-blocking
+     * and parse frames as they complete, so a slow client that
+     * dribbles a partial frame cannot block the loop. When the
+     * declared payload length exceeds the maximum the frame is
+     * reported as too_large once its header has arrived, since the
+     * oversized payload itself need not be buffered to reject it.
      *
-     * @param resource $connection client socket to read from
-     * @return array|null array with keys 'fin' (bool),
-     *      'opcode' (int), 'masked' (bool), 'payload' (string),
-     *      and 'length' (int) on success; null on EOF
+     * @param string $buffer raw inbound bytes accumulated so far
+     * @return array|null ['frame' => array, 'consumed' => int] when
+     *      a whole frame is available, or null if more bytes are
+     *      needed. The frame array has keys 'fin' (bool), 'opcode'
+     *      (int), 'masked' (bool), 'payload' (string), 'length'
+     *      (int), and 'too_large' (bool).
      */
-    public static function read($connection)
+    public static function parseBuffer($buffer)
     {
-        $hdr = self::readExactly($connection, 2);
-        if ($hdr === null) {
+        $have = strlen($buffer);
+        if ($have < 2) {
             return null;
         }
-        $byte1 = ord($hdr[0]);
-        $byte2 = ord($hdr[1]);
+        $byte1 = ord($buffer[0]);
+        $byte2 = ord($buffer[1]);
         $fin = (bool)($byte1 & 0x80);
         $opcode = $byte1 & 0x0F;
         $masked = (bool)($byte2 & 0x80);
         $length = $byte2 & 0x7F;
+        $offset = 2;
         if ($length === 126) {
-            $ext = self::readExactly($connection, 2);
-            if ($ext === null) {
+            if ($have < $offset + 2) {
                 return null;
             }
-            $length = unpack('n', $ext)[1];
+            $length = unpack('n', substr($buffer, $offset, 2))[1];
+            $offset += 2;
         } else if ($length === 127) {
-            $ext = self::readExactly($connection, 8);
-            if ($ext === null) {
+            if ($have < $offset + 8) {
                 return null;
             }
             /*
                 64-bit length: PHP integers are signed 64-bit on
-                most builds; clamp the high bit to avoid negative
-                values. Practically we limit message size below.
+                most builds; combine the two 32-bit halves. The
+                maximum message size below bounds the value well
+                under the sign bit in practice.
              */
-            $unpacked = unpack('Nhi/Nlo', $ext);
+            $unpacked = unpack('Nhi/Nlo', substr($buffer, $offset, 8));
             $length = ($unpacked['hi'] << 32) | $unpacked['lo'];
+            $offset += 8;
         }
         if ($length > WebSite::WS_MAX_MESSAGE_SIZE) {
-            return ['fin' => $fin, 'opcode' => $opcode,
+            return ['frame' => ['fin' => $fin, 'opcode' => $opcode,
                 'masked' => $masked, 'payload' => '',
-                'length' => $length, 'too_large' => true];
+                'length' => $length, 'too_large' => true],
+                'consumed' => $offset];
         }
         $mask_key = '';
         if ($masked) {
-            $mask_key = self::readExactly($connection, 4);
-            if ($mask_key === null) {
+            if ($have < $offset + 4) {
                 return null;
             }
+            $mask_key = substr($buffer, $offset, 4);
+            $offset += 4;
+        }
+        if ($have < $offset + $length) {
+            return null;
         }
         $payload = '';
         if ($length > 0) {
-            $payload = self::readExactly($connection, $length);
-            if ($payload === null) {
-                return null;
-            }
+            $payload = substr($buffer, $offset, $length);
             if ($masked) {
                 $payload = self::unmask($payload, $mask_key);
             }
+            $offset += $length;
         }
-        return ['fin' => $fin, 'opcode' => $opcode,
+        return ['frame' => ['fin' => $fin, 'opcode' => $opcode,
             'masked' => $masked, 'payload' => $payload,
-            'length' => $length, 'too_large' => false];
+            'length' => $length, 'too_large' => false],
+            'consumed' => $offset];
     }
     /**
      * Builds the binary representation of an outbound (server to
@@ -5057,59 +5456,6 @@ class WebSocketFrame
         $key = str_repeat($mask_key, intdiv($length, 4) + 1);
         return $payload ^ substr($key, 0, $length);
     }
-    /**
-     * Reads exactly $count bytes from a connection. Returns the
-     * bytes on success, or null if the connection closed or the
-     * read deadline expired without enough data arriving.
-     *
-     * Uses stream_select with a 1-second slice when fread returns
-     * no data so a stalled client does not spin a CPU core. If no
-     * data arrives within $deadline_seconds total wall time the
-     * read aborts and the caller closes the connection.
-     *
-     * @param resource $connection client socket to read from
-     * @param int $count number of bytes to read
-     * @param int $deadline_seconds maximum wall-clock seconds to
-     *      wait for the full count to arrive before giving up
-     * @return string|null binary data of length $count, or null
-     *      on EOF or timeout
-     */
-    private static function readExactly($connection, $count,
-        $deadline_seconds = 30)
-    {
-        $data = '';
-        $remaining = $count;
-        $deadline = time() + $deadline_seconds;
-        while ($remaining > 0) {
-            $chunk = @fread($connection, $remaining);
-            if ($chunk === false) {
-                return null;
-            }
-            if ($chunk === '') {
-                if (feof($connection)) {
-                    return null;
-                }
-                if (time() >= $deadline) {
-                    return null;
-                }
-                /*
-                    Park on stream_select with a short timeout
-                    rather than busy-looping on fread. This pegs
-                    CPU usage at 0% on a stalled client instead
-                    of 100%. Bare list assignment with by-ref
-                    parameters is required by stream_select.
-                 */
-                $read = [$connection];
-                $write = null;
-                $except = null;
-                @stream_select($read, $write, $except, 1);
-                continue;
-            }
-            $data .= $chunk;
-            $remaining -= strlen($chunk);
-        }
-        return $data;
-    }
 }
 /**
  * Per-connection WebSocket handle passed to the user route handler.
@@ -5144,6 +5490,15 @@ class WebSocket
      * @var string
      */
     public $fragment_buffer = "";
+    /**
+     * Buffer of raw inbound bytes read from the socket but not yet
+     * forming a complete frame. The event loop appends whatever is
+     * available on each readable event and parseBuffer consumes
+     * whole frames from the front, so a slow client that sends a
+     * frame in pieces does not block the loop.
+     * @var string
+     */
+    public $input_buffer = "";
     /**
      * Opcode of the first frame in a fragmented message; used to
      * remember whether the assembled message is text or binary

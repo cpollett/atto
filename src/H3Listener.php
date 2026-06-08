@@ -1958,7 +1958,8 @@ class Tls13Engine
      *
      * This is the standalone-test path. QUIC will not call it.
      * @param resource $sock open UDP socket resource
-     * @return bool true on successful handshake; provided for test harnesses that proxy QUIC over TCP
+     * @return bool true on successful handshake; provided for
+     *      tests that proxy QUIC over TCP
      */
     public function runHandshakeOverTcp($sock)
     {

@@ -263,6 +263,46 @@ class AnonAuthenticator extends Authenticator
     protected $cached_hash = null;
 }
 /**
+ * Shared vocabulary of magic-string values used across the mail
+ * storage engines and the IMAP/SMTP server: the RFC 3501 system
+ * flag atoms, the canonical INBOX folder name, and the filename
+ * extension for a stored raw message. Centralizing them gives each
+ * value a single definition that every implementing class reaches
+ * through self::, so changing a value (or checking for a typo)
+ * happens in exactly one place.
+ */
+interface MailVocabulary
+{
+    /** RFC 3501 system flag marking a message as read. */
+    const FLAG_SEEN = '\Seen';
+    /** RFC 3501 system flag marking a message as answered. */
+    const FLAG_ANSWERED = '\Answered';
+    /** RFC 3501 system flag marking a message as flagged. */
+    const FLAG_FLAGGED = '\Flagged';
+    /** RFC 3501 system flag marking a message for expunge. */
+    const FLAG_DELETED = '\Deleted';
+    /** RFC 3501 system flag marking a message as a draft. */
+    const FLAG_DRAFT = '\Draft';
+    /** RFC 3501 session-only system flag for recent arrival. */
+    const FLAG_RECENT = '\Recent';
+    /** Canonical name of the always-present base folder. */
+    const FOLDER_INBOX = 'INBOX';
+    /** Canonical Sent folder (RFC 6154 \Sent special-use). */
+    const FOLDER_SENT = 'Sent';
+    /** Canonical Drafts folder (RFC 6154 \Drafts special-use). */
+    const FOLDER_DRAFTS = 'Drafts';
+    /** Canonical Junk folder (RFC 6154 \Junk special-use). */
+    const FOLDER_JUNK = 'Junk';
+    /** Canonical Trash folder (RFC 6154 \Trash special-use). */
+    const FOLDER_TRASH = 'Trash';
+    /**
+     * Filename extension (without the leading dot) for a stored
+     * raw RFC822 message, shared by the file backend's per-message
+     * files and the SQL backend's blob store.
+     */
+    const MESSAGE_FILE_EXTENSION = 'eml';
+}
+/**
  * Abstract storage backend for mail folders and messages.
  *
  * The interface is shaped around what IMAP4rev1 needs but is
@@ -288,7 +328,7 @@ class AnonAuthenticator extends Authenticator
  * assume the IMAP/SMTP command parser is the only caller and
  * accepts the latency.
  */
-abstract class MailStorage
+abstract class MailStorage implements MailVocabulary
 {
     /**
      * Provision storage for a user, creating the user's INBOX
@@ -317,6 +357,111 @@ abstract class MailStorage
      * @return bool true on success
      */
     abstract public function createFolder($user, $folder);
+    /**
+     * Provisions the standard RFC 6154 special-use folders
+     * (Sent, Drafts, Junk, Trash) for a user and consolidates
+     * onto them. For each role the canonical folder is created
+     * if missing; then any other existing folder that maps to
+     * the same role by a conventional alias (e.g. "Deleted
+     * Messages" for Trash, "Sent Messages" for Sent) has its
+     * messages moved into the canonical folder and is removed.
+     * This converges an account on one folder per role so
+     * clients such as Apple Mail stop creating duplicates. Safe
+     * to call on every login: when an account is already clean
+     * the alias scan finds nothing and it is a no-op aside from
+     * the idempotent createFolder calls.
+     *
+     * @param string $user username (no @domain) identifying the mail account
+     * @return array list of consolidations performed; each entry
+     *      has 'from' (the non-canonical folder), 'into' (the
+     *      canonical folder), 'moved' (messages copied), 'failed'
+     *      (messages that could not be copied), and 'deleted'
+     *      (whether the source folder was removed; false when any
+     *      message failed so the source is kept for a retry).
+     *      Empty when nothing needed consolidating.
+     */
+    public function ensureStandardFolders($user)
+    {
+        /*
+            Each canonical special-use folder, paired with the
+            other conventional names clients use for the same
+            role. When a non-canonical role-equivalent exists we
+            move its messages into the canonical folder and remove
+            the emptied original so an account converges on one
+            folder per role. The match is case-insensitive.
+         */
+        $roles = [
+            self::FOLDER_SENT => ['sent items', 'sent messages'],
+            self::FOLDER_DRAFTS => ['draft'],
+            self::FOLDER_JUNK => ['spam'],
+            self::FOLDER_TRASH => ['deleted', 'deleted items',
+                'deleted messages'],
+        ];
+        $consolidations = [];
+        foreach ($roles as $canonical => $aliases) {
+            $this->createFolder($user, $canonical);
+            $canonical_lower = strtolower($canonical);
+            foreach ($this->listFolders($user) as $existing) {
+                $existing_lower = strtolower($existing);
+                if ($existing_lower === $canonical_lower) {
+                    continue;
+                }
+                if (!in_array($existing_lower, $aliases, true)) {
+                    continue;
+                }
+                $moved = 0;
+                $failed = 0;
+                $copied_uids = [];
+                foreach ($this->listMessages($user, $existing)
+                    as $meta) {
+                    $body = $this->fetchMessage($user, $existing,
+                        $meta['uid']);
+                    if ($body === false) {
+                        $failed++;
+                        continue;
+                    }
+                    $new_uid = $this->appendMessage($user,
+                        $canonical, $body, $meta['flags'],
+                        $meta['internal_date']);
+                    if ($new_uid === false) {
+                        $failed++;
+                        continue;
+                    }
+                    $moved++;
+                    $copied_uids[] = (int) $meta['uid'];
+                }
+                /*
+                    Remove from the source only the messages that
+                    were actually copied into the canonical folder.
+                    A message whose fetch or append failed stays in
+                    the source so its mail is never lost, and
+                    because the copied ones are removed here a retry
+                    on the next login re-copies only the failures
+                    rather than duplicating what already moved.
+                 */
+                foreach ($copied_uids as $copied_uid) {
+                    $this->setFlags($user, $existing, $copied_uid,
+                        [self::FLAG_DELETED]);
+                }
+                if (!empty($copied_uids)) {
+                    $this->expunge($user, $existing, $copied_uids);
+                }
+                /*
+                    Drop the now-empty source only when every
+                    message moved; otherwise keep it holding the
+                    failures for the next attempt.
+                 */
+                $deleted = false;
+                if ($failed === 0) {
+                    $deleted = $this->deleteFolder($user, $existing);
+                }
+                $consolidations[] = ['from' => $existing,
+                    'into' => $canonical, 'moved' => $moved,
+                    'failed' => $failed, 'deleted' => $deleted];
+            }
+        }
+        return $consolidations;
+    }
     /**
      * Deletes a folder and all messages in it. Refuses to
      * delete INBOX and refuses to delete a folder that has
@@ -408,6 +553,22 @@ abstract class MailStorage
      */
     abstract public function listMessages($user, $folder);
     /**
+     * Returns the uids of the messages in a folder whose subject,
+     * from, or to header contains the given query string,
+     * case-insensitive. Each storage implements this with whatever
+     * index is natural to it (a flat per-folder search file, a SQL
+     * column with LIKE, an in-memory scan), so a message-list
+     * filter does not have to open and parse every message. An
+     * empty query returns an empty list.
+     *
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $query substring to match against subject/from/to
+     * @return array list of matching uids that are present in the folder
+     */
+    abstract public function searchMessages($user, $folder,
+        $query);
+    /**
      * Returns metadata for one message: same shape as one entry
      * of listMessages, or false if not found.
      *
@@ -434,9 +595,14 @@ abstract class MailStorage
      *
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param array $uid_restriction when non-null, only deleted
+     *      messages whose UID is in this list are removed (the
+     *      UID EXPUNGE case, RFC 4315); when null every deleted
+     *      message is removed (plain EXPUNGE)
      * @return array list of expunged UIDs
      */
-    abstract public function expunge($user, $folder);
+    abstract public function expunge($user, $folder,
+        $uid_restriction = null);
     /**
      * Moves a message from one folder to another. The UID is
      * preserved (UIDs are per-user, not per-folder).
@@ -606,10 +772,10 @@ abstract class MailStorage
         }
         $folder = trim($folder, "/");
         if ($folder === "") {
-            return "INBOX";
+            return self::FOLDER_INBOX;
         }
-        if (strcasecmp($folder, "INBOX") === 0) {
-            return "INBOX";
+        if (strcasecmp($folder, self::FOLDER_INBOX) === 0) {
+            return self::FOLDER_INBOX;
         }
         $parts = preg_split('#/+#', $folder);
         $clean = [];
@@ -665,6 +831,56 @@ abstract class MailStorage
         }
         return ($end === false) ? $bytes : substr($bytes, 0, $end);
     }
+    /**
+     * Extracts the value of a single header from a header block,
+     * unfolding continuation lines. Self-contained (no dependency
+     * on the Yioop library) because this class is shared with the
+     * standalone atto project. Case-insensitive on the field name.
+     * @param string $header_block the message header text
+     * @param string $name header field name, e.g. "Subject"
+     * @return string the header value with folding removed, or ""
+     */
+    protected function headerValue($header_block, $name)
+    {
+        $lines = preg_split("/\r\n|\n/", $header_block);
+        $needle = strtolower($name) . ":";
+        $value = "";
+        $capturing = false;
+        foreach ($lines as $line) {
+            if ($capturing) {
+                if ($line !== "" &&
+                    ($line[0] === " " || $line[0] === "\t")) {
+                    $value .= " " . trim($line);
+                    continue;
+                }
+                break;
+            }
+            if (strlen($line) >= strlen($needle) &&
+                strtolower(substr($line, 0, strlen($needle))) ===
+                $needle) {
+                $value = trim(substr($line, strlen($needle)));
+                $capturing = true;
+            }
+        }
+        return $value;
+    }
+    /**
+     * Builds the lowercased search haystack (subject, from, to)
+     * for a message from its raw bytes. Shared by every storage's
+     * search index so the matched text is identical regardless of
+     * backend.
+     * @param string $bytes the raw message bytes (or header block)
+     * @return string lowercased "subject from to" text
+     */
+    protected function searchHaystackFromBytes($bytes)
+    {
+        $header_block = $this->cropToHeaders($bytes);
+        $haystack = $this->headerValue($header_block, "Subject") .
+            " " . $this->headerValue($header_block, "From") .
+            " " . $this->headerValue($header_block, "To");
+        $haystack = preg_replace("/\s+/", " ", $haystack);
+        return strtolower(trim($haystack));
+    }
 }
 /**
  * Filesystem-backed MailStorage. Directory layout under the
@@ -678,8 +894,6 @@ abstract class MailStorage
  *                  subscribed.txt   (one folder name per line)
  *                  INBOX/
  *                      <uid>.eml
- *                      <uid>.flags    (one flag per line)
- *                      <uid>.date     (single integer unix ts)
  *                  <folder1>/
  *                  <folder2>/...
  *
@@ -703,6 +917,39 @@ class FileMailStorage extends MailStorage
      */
     const FOLDER_UIDVALIDITY_FILE = "uidvalidity.txt";
     /**
+     * Per-folder file holding this mailbox's UIDNEXT high-water
+     * value: one greater than the largest UID ever assigned in
+     * this folder. RFC 3501 sec 2.3.1.1 makes UIDNEXT a per-
+     * mailbox value, so it is tracked per folder here even though
+     * UIDs are drawn from a single monotonic per-user allocator.
+     * Bumped on append and never decreased, so it stays valid
+     * even after the highest-UID message is removed. Absent for
+     * folders created before this file existed; uidNext then
+     * derives the value from the index and writes it once.
+     */
+    const FOLDER_UIDNEXT_FILE = "foldernext.txt";
+    /**
+     * Per-folder file holding the durable flag state as one
+     * "uid<TAB>space-joined-flags" line per message. The index is
+     * the live flag store; this snapshot is refreshed whenever the
+     * index is rebuilt (compaction) and is read only to recover
+     * flags when the index is rebuilt from disk, so flags survive
+     * an index that is lost or edited directly. Flags set after
+     * the last compaction are not in the snapshot.
+     */
+    const FOLDER_FLAGS_SNAPSHOT_FILE = "flags.snapshot";
+    /**
+     * Per-folder journal written before a UID renumber touches any
+     * message file. It records the planned old-to-new UID mapping
+     * (with each message's size, date, and flags) and the new
+     * UIDVALIDITY, so a renumber interrupted by a crash can be
+     * resumed: its presence means a renumber is in progress, and
+     * it is deleted only once the folder's index, snapshot, and
+     * UID files have been written. Every rename step is idempotent
+     * against the journal, so resuming repeats no completed work.
+     */
+    const FOLDER_REUID_JOURNAL_FILE = "reuid.journal";
+    /**
      * Per-user file holding a single integer counter for the
      * next UID to assign. Bumped under flock so concurrent
      * appends never hand out the same UID.
@@ -714,6 +961,72 @@ class FileMailStorage extends MailStorage
      */
     const USER_SUBSCRIBED_FILE = "subscribed.txt";
     /**
+     * Per-folder append-only metadata index. Each line records one
+     * mutation: "+ uid size date flag..." for an appended or
+     * moved-in message, "f uid flag..." for a flag change, and
+     * "- uid" for a removed message. listMessages replays the log
+     * into a uid map so a folder listing costs one sequential read
+     * instead of opening and parsing every message file. The
+     * .eml files stay the source of truth: a missing or unparseable
+     * index is rebuilt from the message files (plus the folder's
+     * flags snapshot for flag state) on demand, and message
+     * presence is taken from the directory itself so a stale index
+     * can neither hide nor invent a message. The name is visible
+     * (no leading dot) by project convention, and does not end in
+     * .eml so the listing scan skips it.
+     */
+    const MESSAGE_INDEX_FILE = "messages.index";
+    /**
+     * Per-folder search index. Each line is "uid\tHAYSTACK" where
+     * HAYSTACK is the lowercased subject, from, and to header text
+     * of the message joined by spaces. It lets a substring filter
+     * scan one sequential file instead of opening and parsing the
+     * header block of every message in the folder, which is the
+     * difference between a sub-second and a many-second filter on a
+     * folder with tens of thousands of messages. Append-only and
+     * written alongside the metadata index when a message arrives;
+     * a missing index is rebuilt lazily on the next search. Like
+     * the metadata index it is advisory: message presence is taken
+     * from the directory, so a stale line for a removed uid is
+     * intersected away rather than trusted. The name has no leading
+     * dot (project convention) and does not end in .eml so the
+     * folder listing scan skips it.
+     */
+    const MESSAGE_SEARCH_FILE = "messages.search";
+    /**
+     * Filename extension (without the leading dot) for a
+     * per-message flags file. These files are no longer written —
+     * flags live in the folder index, with the flags snapshot as
+     * the rebuild fallback. The constant is retained so the
+     * cleanup tool can recognize and remove orphaned <uid>.flags
+     * files left by the earlier storage format, and so directory
+     * scans skip them.
+     */
+    const FLAGS_FILE_EXTENSION = "flags";
+    /**
+     * Filename extension (without the leading dot) for a
+     * per-message internal-date file. No longer written —
+     * internal_date is recovered from the message Date header (then
+     * file mtime). Retained for the same orphan-cleanup and
+     * scan-skipping reason as the flags extension.
+     */
+    const DATE_FILE_EXTENSION = "date";
+    /**
+     * Leading character of an index record describing a present
+     * message ("+ uid size date flag...").
+     */
+    const INDEX_PRESENT_MARKER = "+";
+    /**
+     * Leading character of an index record describing a flag
+     * change on an existing message ("f uid flag...").
+     */
+    const INDEX_FLAG_MARKER = "f";
+    /**
+     * Leading character of an index record describing a removed
+     * message ("- uid").
+     */
+    const INDEX_REMOVE_MARKER = "-";
+    /**
      * Filesystem directory under which the per-user storage
      * tree is created. Set once by the constructor and never
      * changed.
@@ -721,12 +1034,25 @@ class FileMailStorage extends MailStorage
      */
     protected $base;
     /**
+     * In-memory cache of parsed folder indexes, keyed by
+     * "user\0folder". A single IMAP command sequence reads a
+     * folder's index several times (SELECT for stats, then FETCH
+     * or STORE to match the set), so serving the parsed map from
+     * memory avoids re-streaming the whole index file each time.
+     * Invalidated whenever the folder's index is written, rebuilt,
+     * or the folder is removed or renamed, so it never serves a
+     * stale view.
+     * @var array
+     */
+    protected $index_cache = [];
+    /**
      * @param string $base directory under which the "users/"
      *      subtree is created
      */
     public function __construct($base)
     {
         $this->base = rtrim($base, "/\\");
+        $this->index_cache = [];
     }
     /**
      * Returns the absolute directory path for a user's account.
@@ -736,8 +1062,7 @@ class FileMailStorage extends MailStorage
      */
     protected function userDir($user)
     {
-        return $this->base . DIRECTORY_SEPARATOR . "users" .
-            DIRECTORY_SEPARATOR . $this->safeName($user);
+        return $this->base . "/users/" . $this->safeName($user);
     }
     /**
      * Returns the absolute directory path for a folder. Folder
@@ -755,8 +1080,13 @@ class FileMailStorage extends MailStorage
         $folder = $this->normalizeFolder($folder);
         $reserved = [
             self::FOLDER_UIDVALIDITY_FILE,
+            self::FOLDER_UIDNEXT_FILE,
+            self::FOLDER_FLAGS_SNAPSHOT_FILE,
+            self::FOLDER_REUID_JOURNAL_FILE,
             self::USER_UIDNEXT_FILE,
             self::USER_SUBSCRIBED_FILE,
+            self::MESSAGE_INDEX_FILE,
+            self::MESSAGE_SEARCH_FILE,
         ];
         foreach (explode("/", $folder) as $part) {
             if (in_array($part, $reserved, true)) {
@@ -764,16 +1094,25 @@ class FileMailStorage extends MailStorage
                     "folder name '$part' is reserved");
             }
         }
-        $encoded = rawurlencode($folder);
-        return $this->userDir($user) . DIRECTORY_SEPARATOR .
-            $encoded;
+        /*
+            Folders are stored as real nested directories with
+            their literal names (a space stays a space, "a/b"
+            becomes the directory "a" with child "b"), matching
+            the layout a dovecot administrator expects on the
+            command line. normalizeFolder has already rejected
+            empty, "." and ".." components and control bytes, so
+            joining the parts onto the user directory cannot walk
+            outside it.
+         */
+        return $this->userDir($user) . "/" . $folder;
     }
     /**
-     * Returns the path of a per-message file. Each message
-     * has three sibling files inside its folder directory:
-     * <uid>.eml (raw bytes), <uid>.flags (flag list), and
-     * <uid>.date (internal-date timestamp). Callers pass the
-     * extension as a string without the leading dot.
+     * Returns the path of a per-message file. The live file is
+     * <uid>.eml (raw bytes); the <uid>.flags and <uid>.date
+     * extensions are no longer written and are passed here only by
+     * the cleanup path that removes orphaned files left by the
+     * earlier storage format. Callers pass the extension as a
+     * string without the leading dot.
      * @param string $folder_dir absolute folder directory path
      * @param int $uid persistent IMAP unique identifier of the message
      * @param string $ext filename extension without leading dot
@@ -781,7 +1120,7 @@ class FileMailStorage extends MailStorage
      */
     protected function messagePath($folder_dir, $uid, $ext)
     {
-        return $folder_dir . DIRECTORY_SEPARATOR .
+        return $folder_dir . "/" .
             $uid . "." . $ext;
     }
     /**
@@ -820,7 +1159,7 @@ class FileMailStorage extends MailStorage
         if (!is_dir($dir) && !@mkdir($dir, 0700, true)) {
             return false;
         }
-        $uidvalidity_file = $dir . DIRECTORY_SEPARATOR .
+        $uidvalidity_file = $dir . "/" .
             self::FOLDER_UIDVALIDITY_FILE;
         if (!is_file($uidvalidity_file)) {
             /*
@@ -830,12 +1169,12 @@ class FileMailStorage extends MailStorage
             file_put_contents($uidvalidity_file,
                 (string) $this->nextUidValidity());
         }
-        $uidnext_file = $dir . DIRECTORY_SEPARATOR .
+        $uidnext_file = $dir . "/" .
             self::USER_UIDNEXT_FILE;
         if (!is_file($uidnext_file)) {
             file_put_contents($uidnext_file, "1");
         }
-        $this->createFolder($user, "INBOX");
+        $this->createFolder($user, self::FOLDER_INBOX);
         return true;
     }
     /**
@@ -844,33 +1183,106 @@ class FileMailStorage extends MailStorage
      */
     public function listFolders($user)
     {
-        $dir = $this->userDir($user);
-        if (!is_dir($dir)) {
+        $base = $this->userDir($user);
+        if (!is_dir($base)) {
             return [];
         }
         $folders = [];
-        $entries = @scandir($dir);
-        if ($entries === false) {
-            return [];
+        $this->collectFolderTree($base, "", $folders);
+        sort($folders);
+        return $folders;
+    }
+    /**
+     * Recursively gathers folder paths under a directory. Folders
+     * are stored as real nested directories, so every
+     * subdirectory of a folder directory is a child folder; the
+     * per-message <uid>.eml files (and any orphaned <uid>.flags or
+     * <uid>.date files from the earlier storage format) and the
+     * per-folder metadata files (messages.index, messages.search,
+     * uidvalidity.txt) are plain files and are skipped by the
+     * is_dir test, as are the user-level metadata files
+     * (uidnext.txt, subscribed.txt) that sit only at the top.
+     *
+     * @param string $dir absolute directory to scan
+     * @param string $prefix slash-terminated folder path of $dir,
+     *      empty at the user root
+     * @param array $folders accumulator of folder path strings,
+     *      passed by reference
+     * @return void
+     */
+    protected function collectFolderTree($dir, $prefix, &$folders)
+    {
+        $handle = @opendir($dir);
+        if ($handle === false) {
+            return;
         }
-        foreach ($entries as $entry) {
+        /*
+            A folder directory holds one <uid>.eml file per message
+            plus a little per-folder metadata (and possibly orphaned
+            <uid>.flags/.date files from the earlier storage format),
+            so on a large mailbox almost every entry is a message
+            file. scandir would pull all of those hundreds of
+            thousands of names into one array (and sort it) on every
+            listing, which is what made folder listing and the
+            create/delete/rename paths that check for child folders
+            take tens of seconds. Streaming with readdir examines one
+            name at a time and keeps nothing but the few real child
+            folders. Message and metadata files are recognized by
+            name and skipped before any is_dir, so the only stats are
+            for child-folder candidates. The .flags/.date suffixes
+            stay in the skip-list so any such orphans are not
+            mistaken for child folders.
+         */
+        $message_suffixes = [
+            "." . self::MESSAGE_FILE_EXTENSION,
+            "." . self::FLAGS_FILE_EXTENSION,
+            "." . self::DATE_FILE_EXTENSION,
+        ];
+        $metadata_files = [
+            self::MESSAGE_INDEX_FILE,
+            self::MESSAGE_SEARCH_FILE,
+            self::FOLDER_UIDVALIDITY_FILE,
+            self::FOLDER_UIDNEXT_FILE,
+            self::FOLDER_FLAGS_SNAPSHOT_FILE,
+            self::FOLDER_REUID_JOURNAL_FILE,
+            self::USER_UIDNEXT_FILE,
+            self::USER_SUBSCRIBED_FILE,
+        ];
+        $children = [];
+        while (($entry = readdir($handle)) !== false) {
             if ($entry === "." || $entry === "..") {
                 continue;
             }
-            $sub = $dir . DIRECTORY_SEPARATOR . $entry;
-            if (is_dir($sub)) {
-                /*
-                    Sibling metadata files (uidvalidity.txt,
-                    uidnext.txt, subscribed.txt) live in the
-                    same directory as the folder
-                    subdirectories; the is_dir filter excludes
-                    them from the listing automatically.
-                 */
-                $folders[] = rawurldecode($entry);
+            if (in_array($entry, $metadata_files, true)) {
+                continue;
             }
+            $is_message_file = false;
+            foreach ($message_suffixes as $suffix) {
+                if (str_ends_with($entry, $suffix)) {
+                    $is_message_file = true;
+                    break;
+                }
+            }
+            if ($is_message_file) {
+                continue;
+            }
+            $sub = $dir . "/" . $entry;
+            if (!is_dir($sub)) {
+                continue;
+            }
+            $name = $prefix . $entry;
+            $folders[] = $name;
+            $children[] = [$sub, $name . "/"];
         }
-        sort($folders);
-        return $folders;
+        closedir($handle);
+        /*
+            Recurse only after the directory handle is closed so a
+            deep tree does not hold one open handle per level.
+         */
+        foreach ($children as $child) {
+            $this->collectFolderTree($child[0], $child[1],
+                $folders);
+        }
     }
     /**
      * @inheritdoc
@@ -905,7 +1317,7 @@ class FileMailStorage extends MailStorage
             recreate cycles in the same wall-clock second.
          */
         @file_put_contents(
-            $path . DIRECTORY_SEPARATOR .
+            $path . "/" .
                 self::FOLDER_UIDVALIDITY_FILE,
             (string) $this->nextUidValidity());
         return true;
@@ -918,28 +1330,48 @@ class FileMailStorage extends MailStorage
     public function deleteFolder($user, $folder)
     {
         $folder = $this->normalizeFolder($folder);
-        if ($folder === "INBOX") {
+        if ($folder === self::FOLDER_INBOX) {
             return false;
         }
         $path = $this->folderDir($user, $folder);
         if (!is_dir($path)) {
             return false;
         }
-        $prefix = $folder . "/";
-        foreach ($this->listFolders($user) as $other_folder) {
-            if (strpos($other_folder, $prefix) === 0) {
-                return false;
-            }
+        /*
+            A folder has children only if its own directory holds a
+            subdirectory, so check that directly rather than
+            listing the whole account tree (which would walk every
+            folder, INBOX included). Stream the directory with
+            readdir and unlink the message and metadata files as we
+            go, so a folder holding hundreds of thousands of files
+            is never pulled into one scandir array. The directory
+            handle is closed before rmdir.
+         */
+        $handle = @opendir($path);
+        if ($handle === false) {
+            return false;
         }
-        $entries = @scandir($path);
-        if ($entries !== false) {
-            foreach ($entries as $entry) {
-                if ($entry === "." || $entry === "..") {
-                    continue;
-                }
-                @unlink($path . DIRECTORY_SEPARATOR . $entry);
+        $to_unlink = [];
+        $has_child = false;
+        while (($entry = readdir($handle)) !== false) {
+            if ($entry === "." || $entry === "..") {
+                continue;
             }
+            $entry_path = $path . "/" . $entry;
+            if (is_dir($entry_path)) {
+                $has_child = true;
+                break;
+            }
+            $to_unlink[] = $entry_path;
         }
+        closedir($handle);
+        if ($has_child) {
+            return false;
+        }
+        foreach ($to_unlink as $entry_path) {
+            @unlink($entry_path);
+        }
+        $this->invalidateIndexCache($user, $folder);
         return @rmdir($path);
     }
     /**
@@ -952,7 +1384,7 @@ class FileMailStorage extends MailStorage
     {
         $old = $this->normalizeFolder($old);
         $new = $this->normalizeFolder($new);
-        if ($old === "INBOX" || $new === "INBOX") {
+        if ($old === self::FOLDER_INBOX || $new === self::FOLDER_INBOX) {
             return false;
         }
         $old_path = $this->folderDir($user, $old);
@@ -960,6 +1392,8 @@ class FileMailStorage extends MailStorage
         if (!is_dir($old_path) || is_dir($new_path)) {
             return false;
         }
+        $this->invalidateIndexCache($user, $old);
+        $this->invalidateIndexCache($user, $new);
         return @rename($old_path, $new_path);
     }
     /**
@@ -984,7 +1418,7 @@ class FileMailStorage extends MailStorage
      */
     protected function allocUid($user)
     {
-        $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
+        $file = $this->userDir($user) . "/" .
             self::USER_UIDNEXT_FILE;
         $file_handle = @fopen($file, "c+");
         if ($file_handle === false) {
@@ -1033,21 +1467,33 @@ class FileMailStorage extends MailStorage
             $internal_date = time();
         }
         $dir = $this->folderDir($user, $folder);
-        $eml = $this->messagePath($dir, $uid, "eml");
-        $temp_path = $eml . ".tmp";
-        if (file_put_contents($temp_path, $bytes) === false) {
+        $eml = $this->messagePath($dir, $uid, self::MESSAGE_FILE_EXTENSION);
+        /* Direct write instead of write-temp-then-rename: the
+           UID just allocated is unique to this writer (allocUid
+           is single-process), so there is no concurrent reader
+           who could see a half-written .eml. A mid-write crash
+           leaves a partial file at the new UID, but the UID has
+           not yet been observed by any reader and the caller
+           has not yet recorded delivery, so a retry that
+           re-issues appendMessage simply overwrites it. Cutting
+           the rename removes one filesystem barrier per append.
+           */
+        if (file_put_contents($eml, $bytes) === false) {
             return false;
         }
-        if (!@rename($temp_path, $eml)) {
-            @unlink($temp_path);
-            return false;
-        }
-        file_put_contents(
-            $this->messagePath($dir, $uid, "flags"),
-            implode("\n", $flags));
-        file_put_contents(
-            $this->messagePath($dir, $uid, "date"),
-            (string) $internal_date);
+        /*
+            No per-message flag or date file is written: the index
+            record below carries flags, size, and internal_date as
+            the live store, the flags snapshot (refreshed on
+            compaction) is the durable flag fallback, and the
+            message Date header recovers internal_date on a rebuild.
+         */
+        $this->appendIndexRecord($user, $folder,
+            $this->formatPresentRecord($uid, strlen($bytes),
+            $internal_date, $flags));
+        $this->appendSearchRecord($user, $folder, $uid,
+            $this->searchHaystackFromBytes($bytes));
+        $this->bumpFolderUidNext($user, $folder, $uid + 1);
         return $uid;
     }
     /**
@@ -1063,7 +1509,8 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $eml = $this->messagePath(
-            $this->folderDir($user, $folder), $uid, "eml");
+            $this->folderDir($user, $folder), $uid,
+            self::MESSAGE_FILE_EXTENSION);
         if (!is_file($eml)) {
             return false;
         }
@@ -1082,7 +1529,8 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $eml = $this->messagePath(
-            $this->folderDir($user, $folder), $uid, "eml");
+            $this->folderDir($user, $folder), $uid,
+            self::MESSAGE_FILE_EXTENSION);
         if (!is_readable($eml)) {
             return false;
         }
@@ -1108,27 +1556,39 @@ class FileMailStorage extends MailStorage
         if (!is_dir($dir)) {
             return [];
         }
-        $messages = [];
-        $entries = @scandir($dir);
-        if ($entries === false) {
-            return [];
+        $line_count = 0;
+        $records =
+            $this->readFolderIndex($user, $folder, $line_count);
+        if ($records === null) {
+            return $this->rebuildFolderIndex($user, $folder);
         }
-        foreach ($entries as $entry) {
-            if (!str_ends_with($entry, ".eml")) {
-                continue;
-            }
-            $uid = (int) substr($entry, 0, -4);
-            if ($uid < 1) {
-                continue;
-            }
-            $meta = $this->messageMeta($user, $folder, $uid);
-            if ($meta !== false) {
-                $messages[] = $meta;
-            }
-        }
-        usort($messages, function ($a, $b) {
-            return $a['uid'] - $b['uid'];
+        /*
+            Trust the index as the live set rather than scanning the
+            folder directory first. The directory holds one message
+            file per message, so the old scan walked hundreds of
+            thousands of entries and built a second large array on
+            every list; on a big mailbox that was both the slow path
+            and a doubled memory footprint. appendMessage writes the
+            message file and then the index line, and removals are
+            logged too, so the index reflects what is live. A file
+            left on disk without its index line is a crash artifact
+            healed by the compaction rebuild below.
+         */
+        $messages = array_values($records);
+        $live_count = count($messages);
+        unset($records);
+        usort($messages, function ($first, $second) {
+            return $first['uid'] <=> $second['uid'];
         });
+        /*
+            Compact a log that has grown well past the live set (its
+            append-only flag and remove lines accumulate over time).
+            rebuildFolderIndex rescans the directory to write a
+            fresh snapshot, which also reconciles any drift.
+         */
+        if ($line_count > 2 * $live_count && $live_count > 0) {
+            $this->rebuildFolderIndex($user, $folder);
+        }
         return $messages;
     }
     /**
@@ -1144,35 +1604,909 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $dir = $this->folderDir($user, $folder);
-        $eml = $this->messagePath($dir, $uid, "eml");
+        $eml = $this->messagePath($dir, $uid, self::MESSAGE_FILE_EXTENSION);
         if (!is_file($eml)) {
             return false;
         }
         $size = (int) @filesize($eml);
-        $flags_file = $this->messagePath($dir, $uid, "flags");
-        $flags = [];
-        if (is_file($flags_file)) {
-            $contents = (string) @file_get_contents($flags_file);
-            foreach (preg_split('/\r\n|\r|\n/', $contents)
-                as $flag) {
-                $flag = trim($flag);
-                if ($flag !== "") {
-                    $flags[] = $flag;
-                }
-            }
-        }
-        $date_file = $this->messagePath($dir, $uid, "date");
-        $date = is_file($date_file) ?
-            (int) @file_get_contents($date_file) : 0;
+        /*
+            internal_date is recovered from the message's own Date
+            header (then the file mtime) rather than a per-message
+            companion file. Flags are not read here: the index is
+            the live flag store, and the folder's flags snapshot is
+            the rebuild fallback, layered on by scanFolderMessages.
+         */
+        $date = $this->internalDateFromHeaders($user, $folder,
+            $uid);
         if ($date <= 0) {
             $date = (int) @filemtime($eml);
         }
         return [
             'uid' => $uid,
             'size' => $size,
-            'flags' => $flags,
+            'flags' => [],
             'internal_date' => $date,
         ];
+    }
+    /**
+     * Recovers a message's internal date from its Date header,
+     * used when rebuilding the index from disk. Returns 0 when no
+     * parsable Date header is present so the caller can fall back
+     * to the file mtime.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid persistent IMAP unique identifier of the message
+     * @return int unix timestamp, or 0 when no Date header parses
+     */
+    protected function internalDateFromHeaders($user, $folder, $uid)
+    {
+        $header_bytes = $this->messageHeaderBytes($user, $folder,
+            $uid);
+        if ($header_bytes === false) {
+            return 0;
+        }
+        if (!preg_match('/^Date:[ \t]*(.+?)\r?$/im', $header_bytes,
+            $matches)) {
+            return 0;
+        }
+        $parsed = strtotime(trim($matches[1]));
+        if ($parsed === false || $parsed <= 0) {
+            return 0;
+        }
+        return $parsed;
+    }
+    /**
+     * Absolute path to a folder's metadata index file.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return string absolute path to the folder's messages.index
+     */
+    protected function messageIndexPath($user, $folder)
+    {
+        return $this->folderDir($user, $folder) .
+            "/" . self::MESSAGE_INDEX_FILE;
+    }
+    /**
+     * Absolute path to a folder's UIDNEXT high-water file.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return string absolute path to the folder's foldernext.txt
+     */
+    protected function folderUidNextPath($user, $folder)
+    {
+        return $this->folderDir($user, $folder) .
+            "/" . self::FOLDER_UIDNEXT_FILE;
+    }
+    /**
+     * Absolute path to a folder's flags snapshot file.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return string absolute path to the folder's flags.snapshot
+     */
+    protected function flagsSnapshotPath($user, $folder)
+    {
+        return $this->folderDir($user, $folder) .
+            "/" . self::FOLDER_FLAGS_SNAPSHOT_FILE;
+    }
+    /**
+     * Absolute path to a folder's reuid journal file.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return string absolute path to the folder's reuid.journal
+     */
+    protected function reuidJournalPath($user, $folder)
+    {
+        return $this->folderDir($user, $folder) .
+            "/" . self::FOLDER_REUID_JOURNAL_FILE;
+    }
+    /**
+     * Staging path for a message mid-renumber: the target UID with
+     * a suffix that the message-file scan ignores, so a partially
+     * renamed folder never exposes a staged file as a live message
+     * and a resumed run can tell staged from finished files.
+     * @param string $dir folder directory
+     * @param int $new_uid target UID being staged
+     * @return string staging file path
+     */
+    protected function reuidStagePath($dir, $new_uid)
+    {
+        return $this->messagePath($dir, $new_uid,
+            self::MESSAGE_FILE_EXTENSION) . ".reuid";
+    }
+    /**
+     * Atomically writes the reuid journal: a first line with the
+     * new UIDVALIDITY, then one tab-separated line per message of
+     * old UID, new UID, size, internal date, and flags. Written to
+     * a temporary file and renamed into place so the journal is
+     * never observed half-written.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param array $plan list of ['old','new','size','date','flags']
+     * @param int $uidvalidity new UIDVALIDITY to apply on completion
+     * @return bool whether the journal was written
+     */
+    protected function writeReuidJournal($user, $folder, $plan,
+        $uidvalidity)
+    {
+        $buffer = "uidvalidity\t" . (int) $uidvalidity . "\n";
+        foreach ($plan as $entry) {
+            $buffer .= (int) $entry['old'] . "\t" .
+                (int) $entry['new'] . "\t" . (int) $entry['size'] .
+                "\t" . (int) $entry['date'] . "\t" .
+                implode(" ", $entry['flags']) . "\n";
+        }
+        $path = $this->reuidJournalPath($user, $folder);
+        $temp = $path . ".tmp";
+        if (@file_put_contents($temp, $buffer, LOCK_EX) === false) {
+            return false;
+        }
+        return @rename($temp, $path);
+    }
+    /**
+     * Reads a folder's reuid journal into the planned UIDVALIDITY
+     * and per-message mapping, or null when no journal is present.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return array|null ['uidvalidity'=>int, 'plan'=>array] or null
+     */
+    protected function readReuidJournal($user, $folder)
+    {
+        $path = $this->reuidJournalPath($user, $folder);
+        if (!is_file($path)) {
+            return null;
+        }
+        $handle = @fopen($path, "rb");
+        if ($handle === false) {
+            return null;
+        }
+        @flock($handle, LOCK_SH);
+        $uidvalidity = 0;
+        $plan = [];
+        while (($line = fgets($handle)) !== false) {
+            $line = rtrim($line, "\r\n");
+            if ($line === "") {
+                continue;
+            }
+            $parts = explode("\t", $line);
+            if ($parts[0] === "uidvalidity") {
+                $uidvalidity = (int) ($parts[1] ?? 0);
+                continue;
+            }
+            if (count($parts) < 4) {
+                continue;
+            }
+            $flags = [];
+            if (isset($parts[4]) && $parts[4] !== "") {
+                foreach (explode(" ", $parts[4]) as $flag) {
+                    if ($flag !== "") {
+                        $flags[] = $flag;
+                    }
+                }
+            }
+            $plan[] = [
+                'old' => (int) $parts[0],
+                'new' => (int) $parts[1],
+                'size' => (int) $parts[2],
+                'date' => (int) $parts[3],
+                'flags' => $flags,
+            ];
+        }
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+        return ['uidvalidity' => $uidvalidity, 'plan' => $plan];
+    }
+    /**
+     * Writes a folder's flags snapshot from its current index, so
+     * the rebuild fallback exists without waiting for the next
+     * compaction. Used after an import populates a folder. A
+     * folder with no index is left without a snapshot, which reads
+     * as "no flags" on a later rebuild.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return void
+     */
+    public function refreshFlagsSnapshot($user, $folder)
+    {
+        $line_count = 0;
+        $records = $this->readFolderIndex($user, $folder,
+            $line_count);
+        if ($records === null) {
+            return;
+        }
+        $this->writeFlagsSnapshot($user, $folder, $records);
+    }
+    /**
+     * Rewrites a folder's flags snapshot from a uid-keyed records
+     * map, one "uid<TAB>space-joined-flags" line per message that
+     * has any flags. Messages with no flags are omitted to keep
+     * the file small; their absence on read means no flags.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param array $records uid-keyed metadata records
+     * @return void
+     */
+    protected function writeFlagsSnapshot($user, $folder, $records)
+    {        $buffer = "";
+        foreach ($records as $uid => $record) {
+            if (empty($record['flags'])) {
+                continue;
+            }
+            $buffer .= (int) $uid . "\t" .
+                implode(" ", $record['flags']) . "\n";
+        }
+        @file_put_contents(
+            $this->flagsSnapshotPath($user, $folder), $buffer,
+            LOCK_EX);
+    }
+    /**
+     * Reads a folder's flags snapshot into a uid-keyed map of flag
+     * lists, used to recover flags when rebuilding the index from
+     * disk. Returns an empty map when the snapshot is absent.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return array uid-keyed map of flag-string lists
+     */
+    protected function readFlagsSnapshot($user, $folder)
+    {
+        $path = $this->flagsSnapshotPath($user, $folder);
+        $flags_by_uid = [];
+        if (!is_file($path)) {
+            return $flags_by_uid;
+        }
+        $handle = @fopen($path, "rb");
+        if ($handle === false) {
+            return $flags_by_uid;
+        }
+        @flock($handle, LOCK_SH);
+        while (($line = fgets($handle)) !== false) {
+            $line = rtrim($line, "\r\n");
+            if ($line === "") {
+                continue;
+            }
+            $tab = strpos($line, "\t");
+            if ($tab === false) {
+                continue;
+            }
+            $uid = (int) substr($line, 0, $tab);
+            if ($uid < 1) {
+                continue;
+            }
+            $flags = [];
+            foreach (explode(" ", substr($line, $tab + 1))
+                as $flag) {
+                if ($flag !== "") {
+                    $flags[] = $flag;
+                }
+            }
+            $flags_by_uid[$uid] = $flags;
+        }
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+        return $flags_by_uid;
+    }
+    /**
+     * Raises a folder's UIDNEXT high-water to at least the given
+     * value, never lowering it. Held under an exclusive lock so
+     * concurrent appends converge on the maximum.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param int $candidate proposed next-uid value
+     * @return void
+     */
+    protected function bumpFolderUidNext($user, $folder, $candidate)
+    {
+        $path = $this->folderUidNextPath($user, $folder);
+        $file_handle = @fopen($path, "c+");
+        if ($file_handle === false) {
+            return;
+        }
+        if (!flock($file_handle, LOCK_EX)) {
+            fclose($file_handle);
+            return;
+        }
+        rewind($file_handle);
+        $current = (int) trim((string) stream_get_contents(
+            $file_handle));
+        if ($candidate > $current) {
+            ftruncate($file_handle, 0);
+            rewind($file_handle);
+            fwrite($file_handle, (string) $candidate);
+            fflush($file_handle);
+        }
+        flock($file_handle, LOCK_UN);
+        fclose($file_handle);
+    }
+    /**
+     * Renders a flag list as a space-prefixed suffix for an index
+     * line. IMAP flag atoms contain no spaces, so the joined
+     * suffix parses back unambiguously by splitting on spaces.
+     * @param array $flags list of IMAP flag strings
+     * @return string a leading-space-per-flag suffix, or "" if none
+     */
+    protected function indexFlagSuffix($flags)
+    {
+        $suffix = "";
+        foreach ($flags as $flag) {
+            $flag = trim((string) $flag);
+            if ($flag !== "") {
+                $suffix .= " " . $flag;
+            }
+        }
+        return $suffix;
+    }
+    /**
+     * Builds one newline-terminated index line for a present
+     * message ("+ uid size date flag...").
+     * @param int $uid message unique identifier
+     * @param int $size message size in bytes
+     * @param int $internal_date Unix timestamp of the internal date
+     * @param array $flags list of IMAP flag strings
+     * @return string the formatted, newline-terminated line
+     */
+    protected function formatPresentRecord($uid, $size,
+        $internal_date, $flags)
+    {
+        return self::INDEX_PRESENT_MARKER . " " . (int) $uid .
+            " " . (int) $size . " " . (int) $internal_date .
+            $this->indexFlagSuffix($flags) . "\n";
+    }
+    /**
+     * Appends one line to a folder's index, creating the index
+     * file if absent. The append is exclusive-locked so a writer
+     * in the clone process and a reader in the web process cannot
+     * interleave. On any write failure the index is removed so the
+     * next read rebuilds it from the message files rather than
+     * trusting a partial log.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param string $line one or more newline-terminated records
+     */
+    protected function appendIndexRecord($user, $folder, $line)
+    {
+        $path = $this->messageIndexPath($user, $folder);
+        $written = @file_put_contents($path, $line,
+            FILE_APPEND | LOCK_EX);
+        if ($written === false) {
+            @unlink($path);
+        }
+        $this->invalidateIndexCache($user, $folder);
+    }
+    /**
+     * Drops a folder's cached parsed index so the next read
+     * re-parses from disk. Called from every path that changes a
+     * folder's index or removes the folder, which keeps the cache
+     * from ever serving a view that disagrees with the file.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return void
+     */
+    protected function invalidateIndexCache($user, $folder)
+    {
+        unset($this->index_cache[$user . "\0" . $folder]);
+    }
+    /**
+     * Absolute path to a folder's search index file.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return string absolute path to the folder's messages.search
+     */
+    protected function messageSearchPath($user, $folder)
+    {
+        return $this->folderDir($user, $folder) .
+            "/" . self::MESSAGE_SEARCH_FILE;
+    }
+    /**
+     * Appends one "uid\tHAYSTACK" line to a folder's search index,
+     * creating the file if absent. On write failure the index is
+     * removed so the next search rebuilds it from the messages
+     * rather than trusting a partial log.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param int $uid message unique identifier
+     * @param string $haystack the lowercased search text
+     */
+    protected function appendSearchRecord($user, $folder, $uid,
+        $haystack)
+    {
+        $path = $this->messageSearchPath($user, $folder);
+        $haystack = str_replace(["\t", "\n", "\r"], " ",
+            $haystack);
+        $line = (int) $uid . "\t" . $haystack . "\n";
+        $written = @file_put_contents($path, $line,
+            FILE_APPEND | LOCK_EX);
+        if ($written === false) {
+            @unlink($path);
+        }
+    }
+    /**
+     * Rebuilds a folder's search index from the messages on disk.
+     * Reads each present message's header block once, extracts the
+     * search haystack, and writes the whole index in a single
+     * locked write. Used the first time a folder that predates the
+     * search index is filtered, or after a write failure left the
+     * index missing.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return array map of present uid => haystack just written
+     */
+    protected function rebuildSearchIndex($user, $folder)
+    {
+        $dir = $this->folderDir($user, $folder);
+        $uids = $this->folderMessageUids($dir);
+        $map = [];
+        $buffer = "";
+        foreach ($uids as $uid) {
+            $header_bytes = $this->messageHeaderBytes($user,
+                $folder, $uid);
+            if ($header_bytes === false) {
+                continue;
+            }
+            $haystack = $this->searchHaystackFromBytes(
+                $header_bytes);
+            $haystack = str_replace(["\t", "\n", "\r"], " ",
+                $haystack);
+            $map[(int) $uid] = $haystack;
+            $buffer .= (int) $uid . "\t" . $haystack . "\n";
+        }
+        $path = $this->messageSearchPath($user, $folder);
+        $written = @file_put_contents($path, $buffer, LOCK_EX);
+        if ($written === false) {
+            @unlink($path);
+        }
+        return $map;
+    }
+    /**
+     * Reads a folder's search index into a uid => haystack map,
+     * rebuilding it from the messages when the file is missing.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return array map of uid => lowercased haystack
+     */
+    protected function loadSearchIndex($user, $folder)
+    {
+        $path = $this->messageSearchPath($user, $folder);
+        if (!is_readable($path)) {
+            return $this->rebuildSearchIndex($user, $folder);
+        }
+        $handle = @fopen($path, "rb");
+        if ($handle === false) {
+            return $this->rebuildSearchIndex($user, $folder);
+        }
+        $map = [];
+        while (($line = fgets($handle)) !== false) {
+            $tab = strpos($line, "\t");
+            if ($tab === false) {
+                continue;
+            }
+            $uid = (int) substr($line, 0, $tab);
+            if ($uid < 1) {
+                continue;
+            }
+            $map[$uid] = rtrim(substr($line, $tab + 1), "\r\n");
+        }
+        fclose($handle);
+        return $map;
+    }
+    /**
+     * Returns the uids in a folder whose subject, from, or to
+     * header contains the query string (case-insensitive),
+     * intersected with the messages actually present on disk so a
+     * stale index line for a removed message cannot match. Uses
+     * the per-folder search index for a single sequential read
+     * instead of opening every message; the index is rebuilt
+     * lazily when missing.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param string $query substring to match
+     * @return array list of matching present uids
+     */
+    public function searchMessages($user, $folder, $query)
+    {
+        $needle = strtolower(trim((string) $query));
+        if ($needle === "") {
+            return [];
+        }
+        $map = $this->loadSearchIndex($user, $folder);
+        if (empty($map)) {
+            return [];
+        }
+        $present = array_flip(
+            $this->folderMessageUids($this->folderDir($user,
+            $folder)));
+        $hits = [];
+        foreach ($map as $uid => $haystack) {
+            if (!isset($present[$uid])) {
+                continue;
+            }
+            if (strpos($haystack, $needle) !== false) {
+                $hits[] = $uid;
+            }
+        }
+        return $hits;
+    }
+    /**
+     * Lists the integer uids of the .eml files in a folder
+     * directory. One directory read with no per-message stat,
+     * used as the authoritative set of present messages so the
+     * metadata index is never trusted to invent or hide a message.
+     * @param string $dir absolute folder directory path
+     * @return array list of integer uids present on disk
+     */
+    protected function folderMessageUids($dir)
+    {
+        $entries = @scandir($dir);
+        if ($entries === false) {
+            return [];
+        }
+        $uids = [];
+        $suffix = "." . self::MESSAGE_FILE_EXTENSION;
+        $suffix_length = strlen($suffix);
+        foreach ($entries as $entry) {
+            if (!str_ends_with($entry, $suffix)) {
+                continue;
+            }
+            $uid = (int) substr($entry, 0, -$suffix_length);
+            if ($uid > 0) {
+                $uids[] = $uid;
+            }
+        }
+        return $uids;
+    }
+    /**
+     * Directory scan that reads every message's metadata from the
+     * message file (size and date) and the folder's flags snapshot
+     * (flag state), and sorts by ascending uid. This is the
+     * pre-index code path, retained as the rebuild and cache-miss
+     * source of truth.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return array list of metadata records sorted by ascending uid
+     */
+    protected function scanFolderMessages($user, $folder)
+    {
+        $dir = $this->folderDir($user, $folder);
+        if (!is_dir($dir)) {
+            return [];
+        }
+        /*
+            messageMeta recovers size and date from the message
+            file but returns no flags, so layer flags in from the
+            folder's snapshot (the durable flag store consulted
+            only on a disk rebuild). A uid absent from the snapshot
+            has no flags.
+         */
+        $snapshot_flags = $this->readFlagsSnapshot($user, $folder);
+        $messages = [];
+        foreach ($this->folderMessageUids($dir) as $uid) {
+            $meta = $this->messageMeta($user, $folder, $uid);
+            if ($meta !== false) {
+                if (isset($snapshot_flags[(int) $uid])) {
+                    $meta['flags'] = $snapshot_flags[(int) $uid];
+                }
+                $messages[] = $meta;
+            }
+        }
+        usort($messages, function ($left, $right) {
+            return $left['uid'] - $right['uid'];
+        });
+        return $messages;
+    }
+    /**
+     * Streams a folder's index log and returns the set of live
+     * uids as a uid-keyed boolean map. Unlike readFolderIndex this
+     * keeps no per-message metadata record, so counting a folder
+     * with tens of thousands of messages costs one small integer
+     * key per live message rather than a full record map. Returns
+     * null when the index is absent so the caller can fall back to
+     * a directory scan.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return array|null uid-keyed map of present messages, null if absent
+     */
+    protected function liveUidsFromIndex($user, $folder)
+    {
+        $cache_key = $user . "\0" . $folder;
+        if (isset($this->index_cache[$cache_key])) {
+            $live = [];
+            foreach ($this->index_cache[$cache_key]['records']
+                as $uid => $record) {
+                $live[$uid] = true;
+            }
+            return $live;
+        }
+        $path = $this->messageIndexPath($user, $folder);
+        if (!is_file($path)) {
+            return null;
+        }
+        $handle = @fopen($path, "rb");
+        if ($handle === false) {
+            return null;
+        }
+        @flock($handle, LOCK_SH);
+        $live = [];
+        while (($line = fgets($handle)) !== false) {
+            $line = rtrim($line, "\r\n");
+            if ($line === "") {
+                continue;
+            }
+            $space = strpos($line, " ");
+            if ($space === false) {
+                continue;
+            }
+            $operation = substr($line, 0, $space);
+            $rest = substr($line, $space + 1);
+            $next = strpos($rest, " ");
+            $uid = (int) ($next === false ? $rest :
+                substr($rest, 0, $next));
+            if ($uid < 1) {
+                continue;
+            }
+            if ($operation === self::INDEX_PRESENT_MARKER) {
+                $live[$uid] = true;
+            } else if ($operation === self::INDEX_REMOVE_MARKER) {
+                unset($live[$uid]);
+            }
+        }
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+        return $live;
+    }
+    /**
+     * Reads and replays a folder's index log into a uid-keyed map
+     * of metadata records. Returns null when the index is absent
+     * so the caller can rebuild it. A trailing partial line (a
+     * reader racing a concurrent append) is dropped. The shared
+     * lock blocks only during the brief exclusive window of an
+     * append or compaction.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param int &$line_count set to the number of records replayed
+     * @return array|null map of uid => metadata record, null if absent
+     */
+    protected function readFolderIndex($user, $folder,
+        &$line_count)
+    {
+        $line_count = 0;
+        $cache_key = $user . "\0" . $folder;
+        if (isset($this->index_cache[$cache_key])) {
+            $line_count =
+                $this->index_cache[$cache_key]['line_count'];
+            return $this->index_cache[$cache_key]['records'];
+        }
+        $path = $this->messageIndexPath($user, $folder);
+        if (!is_file($path)) {
+            return null;
+        }
+        $handle = @fopen($path, "rb");
+        if ($handle === false) {
+            return null;
+        }
+        @flock($handle, LOCK_SH);
+        /*
+            Read the log one line at a time rather than slurping
+            the whole file and exploding it. A busy folder's
+            append-only index can hold many tens of thousands of
+            present/flag/remove lines; keeping the full file
+            string, the exploded line array, and the records map
+            all resident at once was enough to exhaust memory on a
+            large mailbox. Streaming keeps only the records map and
+            a single line live.
+         */
+        $records = [];
+        while (($line = fgets($handle)) !== false) {
+            $line = rtrim($line, "\r\n");
+            if ($line === "") {
+                continue;
+            }
+            $parts = explode(" ", $line);
+            $operation = $parts[0];
+            $uid = (int) ($parts[1] ?? 0);
+            if ($uid < 1) {
+                continue;
+            }
+            $line_count++;
+            if ($operation === self::INDEX_PRESENT_MARKER) {
+                $records[$uid] = [
+                    'uid' => $uid,
+                    'size' => (int) ($parts[2] ?? 0),
+                    'flags' => array_slice($parts, 4),
+                    'internal_date' => (int) ($parts[3] ?? 0),
+                ];
+            } else if ($operation === self::INDEX_FLAG_MARKER) {
+                if (isset($records[$uid])) {
+                    $records[$uid]['flags'] =
+                        array_slice($parts, 2);
+                }
+            } else if ($operation === self::INDEX_REMOVE_MARKER) {
+                unset($records[$uid]);
+            }
+        }
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+        $this->index_cache[$cache_key] = [
+            'records' => $records,
+            'line_count' => $line_count,
+        ];
+        return $records;
+    }
+    /**
+     * Rebuilds a folder's index from the message files and
+     * writes a fresh snapshot (one present-record per live
+     * message). Used when the index is absent, has drifted from
+     * the directory, or has grown long enough to warrant
+     * compaction. The directory scan here is the slow path the
+     * index exists to avoid; it runs once, then later listings
+     * read the snapshot.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @return array list of metadata records for the live messages
+     */
+    protected function rebuildFolderIndex($user, $folder)
+    {
+        $records = $this->scanFolderMessages($user, $folder);
+        /*
+            scanFolderMessages takes flags from the snapshot, which
+            is the right source when the index was lost. When the
+            index is still readable (the compaction case) it holds
+            fresher flags than the last snapshot, so prefer those
+            and let the refreshed snapshot below capture them.
+         */
+        $line_count = 0;
+        $current = $this->readFolderIndex($user, $folder,
+            $line_count);
+        if ($current !== null) {
+            foreach ($records as $position => $record) {
+                $uid = (int) $record['uid'];
+                if (isset($current[$uid])) {
+                    $records[$position]['flags'] =
+                        $current[$uid]['flags'];
+                }
+            }
+        }
+        $snapshot = "";
+        foreach ($records as $record) {
+            $snapshot .= $this->formatPresentRecord(
+                $record['uid'], $record['size'],
+                $record['internal_date'], $record['flags']);
+        }
+        @file_put_contents(
+            $this->messageIndexPath($user, $folder),
+            $snapshot, LOCK_EX);
+        $by_uid = [];
+        foreach ($records as $record) {
+            $by_uid[(int) $record['uid']] = $record;
+        }
+        $this->writeFlagsSnapshot($user, $folder, $by_uid);
+        $this->invalidateIndexCache($user, $folder);
+        return $records;
+    }
+    /**
+     * Renumbers a folder's messages to sequential per-folder UIDs
+     * starting at 1, preserving message order by ascending current
+     * UID. Used to repair folders whose messages were assigned
+     * from the old global allocator and so carry large UIDs that
+     * clients render as a message count. A journal recording the
+     * full old-to-new mapping is written before any message file
+     * moves, so a run interrupted by a crash resumes from the
+     * journal on the next call; each message is staged to a
+     * target-UID file the message scan ignores and then finalized,
+     * and every step is idempotent, so no message is lost or moved
+     * twice. A fresh UIDVALIDITY is written because the UIDs
+     * change, which tells clients to discard cached per-UID state
+     * and re-sync (RFC 3501 sec 2.3.1.1). The per-folder high-water
+     * is reset and both indexes are rebuilt; the journal is removed
+     * only once all of that has been written.
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path
+     * @param callable $progress optional callback invoked with
+     *      (done, total, phase) during long runs
+     * @return int the number of messages renumbered
+     */
+    public function renumberFolderUids($user, $folder,
+        $progress = null)
+    {
+        $folder = $this->normalizeFolder($folder);
+        $dir = $this->folderDir($user, $folder);
+        if (!is_dir($dir)) {
+            return 0;
+        }
+        /*
+            Resume an interrupted renumber from its journal, or plan
+            a fresh one. The journal records the full old-to-new
+            mapping and is written (atomically) before any message
+            file is touched, so its presence means a renumber is in
+            progress and every step below can be safely repeated.
+         */
+        $journal = $this->readReuidJournal($user, $folder);
+        if ($journal === null) {
+            $messages = $this->listMessages($user, $folder);
+            $plan = [];
+            $sequence = 0;
+            foreach ($messages as $message) {
+                $sequence++;
+                $plan[] = [
+                    'old' => (int) $message['uid'],
+                    'new' => $sequence,
+                    'size' => (int) $message['size'],
+                    'date' => (int) $message['internal_date'],
+                    'flags' => $message['flags'],
+                ];
+            }
+            $uidvalidity = $this->nextUidValidity();
+            if (!$this->writeReuidJournal($user, $folder, $plan,
+                $uidvalidity)) {
+                return 0;
+            }
+        } else {
+            $plan = $journal['plan'];
+            $uidvalidity = $journal['uidvalidity'];
+        }
+        $total = count($plan);
+        $done = 0;
+        foreach ($plan as $entry) {
+            $final = $this->messagePath($dir, $entry['new'],
+                self::MESSAGE_FILE_EXTENSION);
+            $stage = $this->reuidStagePath($dir, $entry['new']);
+            $source = $this->messagePath($dir, $entry['old'],
+                self::MESSAGE_FILE_EXTENSION);
+            if (!is_file($final) && !is_file($stage) &&
+                is_file($source)) {
+                @rename($source, $stage);
+            }
+            $done++;
+            if ($progress !== null && $done % 1000 === 0) {
+                call_user_func($progress, $done, $total, "staged");
+            }
+        }
+        $done = 0;
+        foreach ($plan as $entry) {
+            $final = $this->messagePath($dir, $entry['new'],
+                self::MESSAGE_FILE_EXTENSION);
+            $stage = $this->reuidStagePath($dir, $entry['new']);
+            if (is_file($stage) && !is_file($final)) {
+                @rename($stage, $final);
+            }
+            $done++;
+            if ($progress !== null && $done % 1000 === 0) {
+                call_user_func($progress, $done, $total, "finalized");
+            }
+        }
+        /*
+            Write the index and snapshot from the journal plan
+            mapped to the new uids, then the per-folder UID files,
+            and only then remove the journal so an interrupted run
+            re-runs the whole finalize. The flags came from the
+            journal, so this does not depend on a disk scan.
+         */
+        $renumbered = [];
+        $index_text = "";
+        foreach ($plan as $entry) {
+            $record = [
+                'uid' => $entry['new'],
+                'size' => $entry['size'],
+                'flags' => $entry['flags'],
+                'internal_date' => $entry['date'],
+            ];
+            $renumbered[$entry['new']] = $record;
+            $index_text .= $this->formatPresentRecord(
+                $record['uid'], $record['size'],
+                $record['internal_date'], $record['flags']);
+        }
+        @file_put_contents($this->messageIndexPath($user, $folder),
+            $index_text, LOCK_EX);
+        $this->writeFlagsSnapshot($user, $folder, $renumbered);
+        @file_put_contents($this->folderUidNextPath($user, $folder),
+            (string) ($total + 1), LOCK_EX);
+        @file_put_contents(
+            $dir . "/" . self::FOLDER_UIDVALIDITY_FILE,
+            (string) $uidvalidity, LOCK_EX);
+        $this->invalidateIndexCache($user, $folder);
+        $this->rebuildSearchIndex($user, $folder);
+        @unlink($this->reuidJournalPath($user, $folder));
+        if ($progress !== null) {
+            call_user_func($progress, $total, $total, "done");
+        }
+        return $total;
     }
     /**
      * @inheritdoc
@@ -1188,7 +2522,7 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $dir = $this->folderDir($user, $folder);
-        $eml = $this->messagePath($dir, $uid, "eml");
+        $eml = $this->messagePath($dir, $uid, self::MESSAGE_FILE_EXTENSION);
         if (!is_file($eml)) {
             return false;
         }
@@ -1199,30 +2533,39 @@ class FileMailStorage extends MailStorage
                 $clean[] = $flag;
             }
         }
-        $written = @file_put_contents(
-            $this->messagePath($dir, $uid, "flags"),
-            implode("\n", $clean));
-        return $written !== false;
+        $this->appendIndexRecord($user, $folder,
+            self::INDEX_FLAG_MARKER . " " . (int) $uid .
+            $this->indexFlagSuffix($clean) . "\n");
+        return true;
     }
     /**
      * @inheritdoc
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
      */
-    public function expunge($user, $folder)
+    public function expunge($user, $folder, $uid_restriction = null)
     {
         $expunged = [];
         foreach ($this->listMessages($user, $folder) as $meta) {
-            if (in_array('\Deleted', $meta['flags'])) {
+            if (in_array(self::FLAG_DELETED, $meta['flags'])) {
+                if ($uid_restriction !== null &&
+                    !in_array((int) $meta['uid'], $uid_restriction,
+                    true)) {
+                    continue;
+                }
                 $dir = $this->folderDir($user, $folder);
-                @unlink($dir . DIRECTORY_SEPARATOR .
-                    $meta['uid'] . ".eml");
-                @unlink($dir . DIRECTORY_SEPARATOR .
-                    $meta['uid'] . ".flags");
-                @unlink($dir . DIRECTORY_SEPARATOR .
-                    $meta['uid'] . ".date");
+                @unlink($this->messagePath($dir, $meta['uid'],
+                    self::MESSAGE_FILE_EXTENSION));
                 $expunged[] = $meta['uid'];
             }
+        }
+        if (!empty($expunged)) {
+            $removals = "";
+            foreach ($expunged as $expunged_uid) {
+                $removals .= self::INDEX_REMOVE_MARKER . " " .
+                    (int) $expunged_uid . "\n";
+            }
+            $this->appendIndexRecord($user, $folder, $removals);
         }
         return $expunged;
     }
@@ -1250,11 +2593,41 @@ class FileMailStorage extends MailStorage
             }
             $to_dir = $this->folderDir($user, $to);
         }
-        foreach (['eml', 'flags', 'date'] as $ext) {
+        /*
+            Capture the source flags from the index before moving,
+            since flags no longer travel in a per-message file and
+            messageMeta in the destination would report none until
+            the next rebuild.
+         */
+        $source_flags = [];
+        foreach ($this->listMessages($user, $from) as $source_meta) {
+            if ((int) $source_meta['uid'] === $uid) {
+                $source_flags = $source_meta['flags'];
+                break;
+            }
+        }
+        foreach ([self::MESSAGE_FILE_EXTENSION]
+            as $ext) {
             $src = $this->messagePath($from_dir, $uid, $ext);
             $dst = $this->messagePath($to_dir, $uid, $ext);
             if (is_file($src) && !@rename($src, $dst)) {
                 return false;
+            }
+        }
+        $this->appendIndexRecord($user, $from,
+            self::INDEX_REMOVE_MARKER . " " . (int) $uid . "\n");
+        $moved_meta = $this->messageMeta($user, $to, $uid);
+        if ($moved_meta !== false) {
+            $this->appendIndexRecord($user, $to,
+                $this->formatPresentRecord($moved_meta['uid'],
+                $moved_meta['size'], $moved_meta['internal_date'],
+                $source_flags));
+            $moved_header = $this->messageHeaderBytes($user, $to,
+                $uid);
+            if ($moved_header !== false) {
+                $this->appendSearchRecord($user, $to, $uid,
+                    $this->searchHaystackFromBytes(
+                    $moved_header));
             }
         }
         return true;
@@ -1266,7 +2639,24 @@ class FileMailStorage extends MailStorage
      */
     public function messageCount($user, $folder)
     {
-        return count($this->listMessages($user, $folder));
+        $dir = $this->folderDir($user, $folder);
+        if (!is_dir($dir)) {
+            return 0;
+        }
+        /*
+            The index already records every live message, so count
+            from it rather than scanning the folder directory. On a
+            large mailbox that directory holds one file per message,
+            so the old scandir-and-count walked hundreds of
+            thousands of entries on every SELECT. When the index
+            is absent (a folder that predates it) fall back to the
+            scan, which also primes a rebuild on the next list.
+         */
+        $live = $this->liveUidsFromIndex($user, $folder);
+        if ($live !== null) {
+            return count($live);
+        }
+        return count($this->folderMessageUids($dir));
     }
     /**
      * @inheritdoc
@@ -1284,7 +2674,7 @@ class FileMailStorage extends MailStorage
     public function uidValidity($user, $folder)
     {
         $folder_file = $this->folderDir($user, $folder) .
-            DIRECTORY_SEPARATOR . self::FOLDER_UIDVALIDITY_FILE;
+            "/" . self::FOLDER_UIDVALIDITY_FILE;
         if (is_file($folder_file)) {
             $value = (int) trim((string)
                 @file_get_contents($folder_file));
@@ -1292,7 +2682,7 @@ class FileMailStorage extends MailStorage
                 return $value;
             }
         }
-        $user_file = $this->userDir($user) . DIRECTORY_SEPARATOR .
+        $user_file = $this->userDir($user) . "/" .
             self::FOLDER_UIDVALIDITY_FILE;
         if (!is_file($user_file)) {
             $this->ensureUser($user);
@@ -1306,12 +2696,31 @@ class FileMailStorage extends MailStorage
      */
     public function uidNext($user, $folder)
     {
-        $file = $this->userDir($user) . DIRECTORY_SEPARATOR .
-            self::USER_UIDNEXT_FILE;
-        if (!is_file($file)) {
-            $this->ensureUser($user);
+        $path = $this->folderUidNextPath($user, $folder);
+        if (is_file($path)) {
+            $stored = (int) trim((string) @file_get_contents(
+                $path));
+            if ($stored >= 1) {
+                return $stored;
+            }
         }
-        return (int) trim((string) @file_get_contents($file));
+        /*
+            A folder created before the per-folder high-water file
+            existed has no foldernext.txt yet. Derive UIDNEXT from
+            the largest live UID in the index (UIDs only ever
+            increase, so max live uid + 1 is a valid next value),
+            then persist it so later reads skip the index scan. An
+            empty folder reports 1.
+         */
+        $next = 1;
+        $live = $this->liveUidsFromIndex($user, $folder);
+        if (!empty($live)) {
+            $next = max(array_keys($live)) + 1;
+        }
+        if (is_dir($this->folderDir($user, $folder))) {
+            $this->bumpFolderUidNext($user, $folder, $next);
+        }
+        return $next;
     }
     /**
      * Returns the absolute path to the per-user subscription
@@ -1322,7 +2731,7 @@ class FileMailStorage extends MailStorage
      */
     protected function subscriptionFile($user)
     {
-        return $this->userDir($user) . DIRECTORY_SEPARATOR .
+        return $this->userDir($user) . "/" .
             self::USER_SUBSCRIBED_FILE;
     }
     /**
@@ -1337,7 +2746,7 @@ class FileMailStorage extends MailStorage
     protected function readSubscriptions($user)
     {
         $file = $this->subscriptionFile($user);
-        $names = ['INBOX'];
+        $names = [self::FOLDER_INBOX];
         if (is_file($file)) {
             $lines = @file($file, FILE_IGNORE_NEW_LINES |
                 FILE_SKIP_EMPTY_LINES);
@@ -1410,7 +2819,7 @@ class FileMailStorage extends MailStorage
      */
     public function unsubscribe($user, $folder)
     {
-        if (strcasecmp($folder, 'INBOX') === 0) {
+        if (strcasecmp($folder, self::FOLDER_INBOX) === 0) {
             /*
                 INBOX cannot be unsubscribed (it is implicitly
                 in every result); we accept the request and
@@ -1461,7 +2870,8 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $eml = $this->messagePath(
-            $this->folderDir($user, $folder), $uid, "eml");
+            $this->folderDir($user, $folder), $uid,
+            self::MESSAGE_FILE_EXTENSION);
         if (!is_file($eml)) {
             return false;
         }
@@ -1534,9 +2944,9 @@ class RamMailStorage extends MailStorage
             $this->users[$user] = [
                 'uidnext' => 1,
                 'uidvalidity' => $this->nextUidValidity(),
-                'subscribed' => ['INBOX'],
+                'subscribed' => [self::FOLDER_INBOX],
                 'folders' => [
-                    'INBOX' => [
+                    self::FOLDER_INBOX => [
                         'uidvalidity' => $this->nextUidValidity(),
                         'messages' => [],
                     ],
@@ -1579,13 +2989,23 @@ class RamMailStorage extends MailStorage
             return false;
         }
         $u = & $this->userRef($user);
-        if (isset($u['folders'][$folder])) {
-            return true;
+        /*
+            Create each ancestor along the path as well, matching
+            the on-disk backend whose recursive mkdir materializes
+            intermediate parents (so "Archive/2026" yields both
+            "Archive" and "Archive/2026").
+         */
+        $parts = explode("/", $folder);
+        $path = "";
+        foreach ($parts as $part) {
+            $path = ($path === "") ? $part : $path . "/" . $part;
+            if (!isset($u['folders'][$path])) {
+                $u['folders'][$path] = [
+                    'uidvalidity' => $this->nextUidValidity(),
+                    'messages' => [],
+                ];
+            }
         }
-        $u['folders'][$folder] = [
-            'uidvalidity' => $this->nextUidValidity(),
-            'messages' => [],
-        ];
         return true;
     }
     /**
@@ -1599,7 +3019,7 @@ class RamMailStorage extends MailStorage
         if ($folder === false) {
             return false;
         }
-        if ($folder === "INBOX") {
+        if ($folder === self::FOLDER_INBOX) {
             return false;
         }
         if (!isset($this->users[$user]['folders'][$folder])) {
@@ -1633,7 +3053,7 @@ class RamMailStorage extends MailStorage
         if ($old === false || $new === false) {
             return false;
         }
-        if ($old === "INBOX" || $new === "INBOX") {
+        if ($old === self::FOLDER_INBOX || $new === self::FOLDER_INBOX) {
             return false;
         }
         if (!isset($this->users[$user]['folders'][$old])) {
@@ -1764,6 +3184,41 @@ class RamMailStorage extends MailStorage
     }
     /**
      * @inheritdoc
+     * In-memory backend: scans the folder's records directly,
+     * building each haystack on the fly. No persistent index is
+     * needed because the store is process-local and ephemeral.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param string $query substring to match against subject/from/to
+     */
+    public function searchMessages($user, $folder, $query)
+    {
+        $needle = strtolower(trim((string) $query));
+        if ($needle === "") {
+            return [];
+        }
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
+            return [];
+        }
+        if (!isset($this->users[$user]['folders'][$folder])) {
+            return [];
+        }
+        $messages = $this->users[$user]['folders'][$folder]
+            ['messages'];
+        ksort($messages);
+        $hits = [];
+        foreach ($messages as $uid => $record) {
+            $haystack = $this->searchHaystackFromBytes(
+                $record['bytes']);
+            if (strpos($haystack, $needle) !== false) {
+                $hits[] = (int) $uid;
+            }
+        }
+        return $hits;
+    }
+    /**
+     * @inheritdoc
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
      * @param int $uid persistent IMAP unique identifier of the message
@@ -1825,7 +3280,7 @@ class RamMailStorage extends MailStorage
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
      */
-    public function expunge($user, $folder)
+    public function expunge($user, $folder, $uid_restriction = null)
     {
         $folder = $this->safeNormalizeFolder($folder);
         if ($folder === false) {
@@ -1839,8 +3294,12 @@ class RamMailStorage extends MailStorage
             ['messages'];
         ksort($messages);
         foreach ($messages as $uid => $record) {
-            if (in_array('\\Deleted', $record['flags'],
+            if (in_array(self::FLAG_DELETED, $record['flags'],
                 true)) {
+                if ($uid_restriction !== null &&
+                    !in_array((int) $uid, $uid_restriction, true)) {
+                    continue;
+                }
                 $expunged[] = (int) $uid;
                 unset($messages[$uid]);
             }
@@ -1936,7 +3395,7 @@ class RamMailStorage extends MailStorage
         if ($folder === false) {
             return false;
         }
-        if ($folder === "INBOX") {
+        if ($folder === self::FOLDER_INBOX) {
             return true;
         }
         if (!isset($this->users[$user])) {
@@ -1991,7 +3450,7 @@ class RamMailStorage extends MailStorage
      */
     public function listSubscribed($user)
     {
-        $names = ['INBOX'];
+        $names = [self::FOLDER_INBOX];
         if (isset($this->users[$user])) {
             foreach ($this->users[$user]['subscribed']
                 as $name) {
@@ -2291,6 +3750,7 @@ class SqlMailStorage extends MailStorage
                 internal_date $big NOT NULL,
                 size $big NOT NULL,
                 body_hash CHAR(64) NOT NULL,
+                search_text $text,
                 CONSTRAINT mail_messages_unique
                     UNIQUE (folder_id, uid)
             )",
@@ -2309,6 +3769,19 @@ class SqlMailStorage extends MailStorage
         ];
         foreach ($statements as $sql) {
             $this->pdo->exec($sql);
+        }
+        /* Older installs created mail_messages before the
+           search_text column existed; add it if missing. The
+           ALTER is wrapped because a second run (column already
+           present) raises on every supported driver, and there is
+           no portable IF NOT EXISTS for ADD COLUMN across SQLite,
+           MySQL, Postgres, Oracle, and DB2. */
+        try {
+            $this->pdo->exec("ALTER TABLE mail_messages " .
+                "ADD COLUMN search_text $text");
+        } catch (\Throwable $already_present) {
+            /* column already exists; nothing to do */
+            $already_present = null;
         }
     }
     /**
@@ -2354,13 +3827,28 @@ class SqlMailStorage extends MailStorage
             'messages_by_folder' =>
                 "SELECT * FROM mail_messages " .
                 "WHERE folder_id = ? ORDER BY uid",
+            'message_meta_by_folder' =>
+                "SELECT uid, size, flags, internal_date " .
+                "FROM mail_messages " .
+                "WHERE folder_id = ? ORDER BY uid",
             'message_count' =>
                 "SELECT COUNT(*) AS c FROM mail_messages " .
                 "WHERE folder_id = ?",
             'message_insert' =>
                 "INSERT INTO mail_messages (folder_id, uid, " .
-                "flags, internal_date, size, body_hash) " .
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "flags, internal_date, size, body_hash, " .
+                "search_text) " .
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            'message_search' =>
+                "SELECT uid FROM mail_messages " .
+                "WHERE folder_id = ? AND search_text LIKE ? " .
+                "ESCAPE '\\' ORDER BY uid",
+            'messages_missing_search' =>
+                "SELECT id, uid, body_hash FROM mail_messages " .
+                "WHERE folder_id = ? AND search_text IS NULL",
+            'message_set_search' =>
+                "UPDATE mail_messages SET search_text = ? " .
+                "WHERE id = ?",
             'message_delete' =>
                 "DELETE FROM mail_messages WHERE id = ?",
             'message_update_flags' =>
@@ -2498,7 +3986,7 @@ class SqlMailStorage extends MailStorage
         $user_id = (int) $this->pdo->lastInsertId();
         $inbox_uv = $this->nextUidValidity();
         $this->prepareStatement('folder_insert')->execute(
-            [$user_id, 'INBOX', $inbox_uv, $now]);
+            [$user_id, self::FOLDER_INBOX, $inbox_uv, $now]);
         return [
             'id' => $user_id,
             'username' => $user,
@@ -2593,7 +4081,7 @@ class SqlMailStorage extends MailStorage
         if ($folder === false) {
             return false;
         }
-        if ($folder === "INBOX") {
+        if ($folder === self::FOLDER_INBOX) {
             return false;
         }
         $row = $this->folderRow($user, $folder);
@@ -2646,7 +4134,7 @@ class SqlMailStorage extends MailStorage
         if ($old === false || $new === false) {
             return false;
         }
-        if ($old === "INBOX" || $new === "INBOX") {
+        if ($old === self::FOLDER_INBOX || $new === self::FOLDER_INBOX) {
             return false;
         }
         $row = $this->folderRow($user, $old);
@@ -2734,7 +4222,8 @@ class SqlMailStorage extends MailStorage
                 [$uid + 1, $u['id']]);
             $this->prepareStatement('message_insert')->execute([
                 $row['id'], $uid, implode(' ', $clean),
-                (int) $internal_date, strlen($bytes), $hash
+                (int) $internal_date, strlen($bytes), $hash,
+                $this->searchHaystackFromBytes($bytes)
             ]);
             $this->pdo->commit();
         } catch (\Throwable $e) {
@@ -2810,13 +4299,67 @@ class SqlMailStorage extends MailStorage
         if ($row === false) {
             return [];
         }
-        $stmt = $this->prepareStatement('messages_by_folder');
+        $stmt = $this->prepareStatement('message_meta_by_folder');
         $stmt->execute([$row['id']]);
         $output = [];
         while ($msg = $stmt->fetch()) {
             $output[] = $this->messageRecord($msg);
         }
         return $output;
+    }
+    /**
+     * @inheritdoc
+     * SQL backend: matches on the indexed search_text column with
+     * LIKE for messages that have it populated, and lazily
+     * backfills rows that predate the column (search_text IS NULL)
+     * by reading the body once, matching in PHP, and writing the
+     * computed search_text back so later searches are fast.
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param string $query substring to match against subject/from/to
+     */
+    public function searchMessages($user, $folder, $query)
+    {
+        $needle = strtolower(trim((string) $query));
+        if ($needle === "") {
+            return [];
+        }
+        $folder = $this->safeNormalizeFolder($folder);
+        if ($folder === false) {
+            return [];
+        }
+        $row = $this->folderRow($user, $folder);
+        if ($row === false) {
+            return [];
+        }
+        $hits = [];
+        $like = "%" . $this->escapeLike($needle) . "%";
+        $stmt = $this->prepareStatement('message_search');
+        $stmt->execute([$row['id'], $like]);
+        while ($found = $stmt->fetch()) {
+            $hits[(int) $found['uid']] = true;
+        }
+        $stale = $this->prepareStatement(
+            'messages_missing_search');
+        $stale->execute([$row['id']]);
+        $pending = [];
+        while ($msg = $stale->fetch()) {
+            $pending[] = $msg;
+        }
+        foreach ($pending as $msg) {
+            $bytes = $this->blobRead($msg['body_hash']);
+            $haystack = ($bytes === false) ? "" :
+                $this->searchHaystackFromBytes($bytes);
+            $this->prepareStatement('message_set_search')->execute(
+                [$haystack, $msg['id']]);
+            if ($haystack !== "" &&
+                strpos($haystack, $needle) !== false) {
+                $hits[(int) $msg['uid']] = true;
+            }
+        }
+        $uids = array_keys($hits);
+        sort($uids);
+        return $uids;
     }
     /**
      * @inheritdoc
@@ -2841,6 +4384,23 @@ class SqlMailStorage extends MailStorage
             return false;
         }
         return $this->messageRecord($msg);
+    }
+    /**
+     * Escapes the LIKE wildcards in a user-supplied search term so
+     * they match literally rather than as wildcards. The backslash
+     * escape character is itself escaped first; the search query
+     * pairs this with an explicit ESCAPE '\' clause, which is
+     * standard SQL honored by every backend Yioop targets.
+     * @param string $term raw search term
+     * @return string term with backslash, percent, and underscore
+     *      escaped
+     */
+    protected function escapeLike($term)
+    {
+        return str_replace(
+            ["\\", "%", "_"],
+            ["\\\\", "\\%", "\\_"],
+            (string) $term);
     }
     /**
      * Shapes a raw mail_messages row into the public record
@@ -2903,7 +4463,7 @@ class SqlMailStorage extends MailStorage
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
      */
-    public function expunge($user, $folder)
+    public function expunge($user, $folder, $uid_restriction = null)
     {
         $folder = $this->safeNormalizeFolder($folder);
         if ($folder === false) {
@@ -2920,7 +4480,12 @@ class SqlMailStorage extends MailStorage
         while ($msg = $stmt->fetch()) {
             $flags = preg_split('/\s+/',
                 trim((string) $msg['flags']));
-            if (!in_array('\\Deleted', $flags, true)) {
+            if (!in_array(self::FLAG_DELETED, $flags, true)) {
+                continue;
+            }
+            if ($uid_restriction !== null &&
+                !in_array((int) $msg['uid'], $uid_restriction,
+                true)) {
                 continue;
             }
             $expunged[] = (int) $msg['uid'];
@@ -3060,7 +4625,7 @@ class SqlMailStorage extends MailStorage
         if ($folder === false) {
             return false;
         }
-        if ($folder === "INBOX") {
+        if ($folder === self::FOLDER_INBOX) {
             return true;
         }
         $stmt = $this->prepareStatement('user_by_name');
@@ -3121,7 +4686,7 @@ class SqlMailStorage extends MailStorage
      */
     public function listSubscribed($user)
     {
-        $names = ['INBOX'];
+        $names = [self::FOLDER_INBOX];
         $stmt = $this->prepareStatement('user_by_name');
         $stmt->execute([$user]);
         $user_row = $stmt->fetch();
@@ -3199,7 +4764,7 @@ class SqlMailStorage extends MailStorage
         return $this->blobs_dir . '/' .
             substr($hash, 0, 2) . '/' .
             substr($hash, 2, 2) . '/' .
-            $hash . '.eml';
+            $hash . '.' . self::MESSAGE_FILE_EXTENSION;
     }
     /**
      * Increments the refcount for $hash, creating the blob
@@ -3364,22 +4929,65 @@ class SqlMailStorage extends MailStorage
  * fetchMessage, listMessages, setFlags, expunge, moveMessage,
  * messageCount.
  */
-class MailSite
+class MailSite implements MailVocabulary
 {
     /* indices into the in_streams / out_streams parallel arrays */
     const CONNECTION = 0;
     const DATA = 1;
     const MODIFIED_TIME = 2;
+    /**
+     * Maximum nesting depth for recursive MIME multipart parsing.
+     * A well-formed message nests a few levels at most (for
+     * example multipart/mixed wrapping multipart/alternative
+     * wrapping text and html); this bound still stops a malformed
+     * or hostile message whose parts keep declaring themselves
+     * multipart from recursing without limit and exhausting
+     * memory.
+     */
+    const MAX_MIME_DEPTH = 20;
+    /**
+     * Largest body, in bytes, that is split into its multipart
+     * parts for BODYSTRUCTURE. A multipart body larger than this
+     * (typically a message dominated by a big base64 attachment)
+     * is left as a single part rather than parsed apart, because
+     * the string-copying parser would peak at several times the
+     * body size and could exhaust memory on a large message. A
+     * client fetching BODYSTRUCTURE then sees a single-part
+     * structure, which is acceptable, and can still fetch the
+     * whole body; the cap is well above ordinary mail.
+     */
+    const MAX_STRUCTURE_PARSE_BYTES = 8388608;
+    /**
+     * When a FETCH response loop has queued at least this many
+     * bytes for a connection, the loop drains the write buffer to
+     * the socket before fetching the next message. Without this a
+     * range fetch (e.g. "1:* BODY[]") over a large mailbox would
+     * buffer every message at once and exhaust memory; the flush
+     * bounds resident memory to roughly one message plus this
+     * threshold. The unit is bytes.
+     */
+    const FETCH_FLUSH_THRESHOLD = 4194304;
     const CONTEXT = 3;
     /** @var Authenticator */
     protected $authenticator;
+    /**
+     * Optional callback that maps an alias local-part to the
+     * username of the Yioop user who owns it, or returns an empty
+     * string when the local-part is not a registered alias. It is
+     * injected (rather than the atto-namespace MailSite reaching
+     * into a Yioop model directly) so this server stays usable in
+     * the standalone atto project where mail aliases do not exist.
+     * @var callable|null
+     */
+    protected $alias_resolver;
     /** @var MailStorage */
     protected $mail_storage;
     /** @var array hook callbacks keyed by stage */
     protected $hooks = [
         'banner' => [], 'connect' => [], 'helo' => [],
         'mailfrom' => [], 'rcptto' => [], 'header' => [],
-        'message' => [],
+        'message' => [], 'secure' => [], 'outbound' => [],
+        'log' => [],
     ];
     /** @var array list of locally hosted domains */
     protected $local_domains = ['localhost'];
@@ -3389,6 +4997,19 @@ class MailSite
     protected $immortal_stream_keys = [];
     /** @var array */
     protected $in_streams = [];
+    /**
+     * In-progress non-blocking TLS handshakes, keyed by stream
+     * key. Each entry is an array with 'mode'
+     * ('implicit'|'starttls'), 'protocol', 'remote_addr',
+     * 'remote_port', 'listener' (the accept listener record, for
+     * implicit handshakes that still need their banner once TLS is
+     * up), and 'deadline' (a microtime float after which a stalled
+     * handshake is abandoned). A key present here is mid-handshake
+     * and is driven a step at a time by driveHandshake on each
+     * select wake rather than blocking the loop.
+     * @var array
+     */
+    protected $handshakes = [];
     /** @var array */
     protected $out_streams = [];
     /** @var \SplPriorityQueue|null */
@@ -3431,6 +5052,22 @@ class MailSite
     public function auth(Authenticator $authenticator)
     {
         $this->authenticator = $authenticator;
+        return $this;
+    }
+    /**
+     * Sets the callback that resolves an alias local-part to the
+     * owning user's mailbox username. The callback receives the
+     * lowercased local-part and should return the owner's username
+     * (a non-empty string) or an empty string when the local-part
+     * is not a registered alias. When no resolver is installed,
+     * aliases are simply not recognized, matching the behavior of
+     * the standalone atto project.
+     * @param callable $alias_resolver alias-to-owner lookup
+     * @return MailSite this instance, for chaining
+     */
+    public function aliasResolver(callable $alias_resolver)
+    {
+        $this->alias_resolver = $alias_resolver;
         return $this;
     }
     /**
@@ -3547,6 +5184,74 @@ class MailSite
         return $this;
     }
     /**
+     * Registers the callback that receives MailSite log events.
+     * The callback is passed a single already-formatted message
+     * string. Multiple callbacks may be registered; each is
+     * invoked in registration order for every event. Embedding
+     * daemons use this to forward events into their own logging
+     * without MailSite reaching across namespaces to call a
+     * logger directly.
+     *
+     * @param callable $callback receives one string argument
+     * @return self this, for chaining
+     */
+    public function onLog(callable $callback)
+    {
+        $this->hooks['log'][] = $callback;
+        return $this;
+    }
+    /**
+     * Sends a message to every registered log callback; a no-op
+     * when none are registered. MailSite uses this rather than
+     * any external logger so the atto-namespace class stays free
+     * of Yioop-specific code.
+     *
+     * @param string $message the text to log
+     * @return void
+     */
+    protected function emitLog($message)
+    {
+        foreach ($this->hooks['log'] as $callback) {
+            $callback($message);
+        }
+    }
+    /**
+     * Registers a callback invoked at the end of a DATA command
+     * for each recipient that is remote (not a local mailbox) on
+     * an authenticated session whose envelope sender is a local
+     * domain. $info has 'from' (envelope MAIL FROM), 'recipients'
+     * (a list of the remote recipient addresses), and 'bytes' (the
+     * complete RFC 5322 message). The callback is expected to queue
+     * the message for background outbound delivery; its return
+     * value is ignored. Outbound delivery is not done inside the
+     * server itself because the atto-namespace MailSite must stay
+     * free of Yioop-specific delivery and DNS code, which lives in
+     * the factory that registers this callback.
+     * @param callable $callback callback to invoke
+     * @return object this MailSite, for chaining
+     */
+    public function onOutbound(callable $callback)
+    {
+        $this->hooks['outbound'][] = $callback;
+        return $this;
+    }
+    /**
+     * Registers a callback to run after a TLS handshake attempt,
+     * for either an implicit-TLS connection or a STARTTLS upgrade.
+     * $info has 'remote_addr', 'remote_port', 'protocol'
+     * ('SMTP'|'IMAP'), 'mode' ('implicit'|'starttls'), 'ok'
+     * (bool), and 'error' (string, the handshake error when ok is
+     * false, otherwise ''). Purely observational: the return value
+     * is ignored, so a logging hook cannot disturb the session.
+     * @param callable $callback callback to invoke
+     * @return object this MailSite, for chaining
+     */
+    public function onSecure(callable $callback)
+    {
+        $this->hooks['secure'][] = $callback;
+        return $this;
+    }
+    /**
      * Runs all hooks for $stage in registration order. Returns
      * the first non-null verdict, or null if every hook returned
      * null/true. Hooks that throw are caught and treated as if
@@ -3617,8 +5322,8 @@ class MailSite
         if ($local === false) {
             return false;
         }
-        $folder = "INBOX";
-        $flags = ['\Recent'];
+        $folder = self::FOLDER_INBOX;
+        $flags = [self::FLAG_RECENT];
         $info = ['from' => $from, 'to' => $to, 'bytes' => $bytes];
         $verdict = $this->runHooks('message', $info, $context);
         if ($verdict === false || $verdict === 'reject') {
@@ -3636,6 +5341,16 @@ class MailSite
         if ($to !== '') {
             $bytes = "Delivered-To: $to\r\n" . $bytes;
         }
+        /* Record the envelope sender (the SMTP MAIL FROM reverse
+           path) as a Return-Path header, as the final delivery
+           server is meant to under RFC 5321 section 4.4. An empty
+           reverse path (a bounce or DSN) is written as <> per the
+           standard. This preserves who actually sent the message,
+           which the From header need not match, so later features
+           such as trusting a sender act on the real envelope
+           address the spam routing keyed on. */
+        $return_path = ($from === "") ? "<>" : "<$from>";
+        $bytes = "Return-Path: $return_path\r\n" . $bytes;
         $this->mail_storage->ensureUser($local);
         $uid = $this->mail_storage->appendMessage($local, $folder,
             $bytes, $flags);
@@ -3782,6 +5497,21 @@ class MailSite
         return $this->mail_storage->listMessages($user, $folder);
     }
     /**
+     * Returns the uids in a folder whose subject, from, or to
+     * header contains the query string (case-insensitive),
+     * delegating to the configured storage's search index.
+     *
+     * @param string $user username (no @domain) identifying the mail account
+     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $query substring to match against subject/from/to
+     * @return array list of matching uids present in the folder
+     */
+    public function searchMessages($user, $folder, $query)
+    {
+        return $this->mail_storage->searchMessages($user, $folder,
+            $query);
+    }
+    /**
      * Returns the metadata record for a single message, with
      * the same shape as one entry of listMessages.
      *
@@ -3821,11 +5551,16 @@ class MailSite
      *
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param array $uid_restriction when non-null, only deleted
+     *      messages whose UID is in this list are removed (UID
+     *      EXPUNGE, RFC 4315); when null every deleted message is
+     *      removed (plain EXPUNGE)
      * @return array list of expunged UIDs
      */
-    public function expunge($user, $folder)
+    public function expunge($user, $folder, $uid_restriction = null)
     {
-        $removed = $this->mail_storage->expunge($user, $folder);
+        $removed = $this->mail_storage->expunge($user, $folder,
+            $uid_restriction);
         if (!empty($removed)) {
             $this->bumpMailboxChange($user, $folder);
         }
@@ -3972,6 +5707,13 @@ class MailSite
      * Resolves a recipient address to a local username, or false
      * if the recipient is not local. The local part is returned
      * in its lowercased form because storage is case-insensitive.
+     * A local-part that is not itself a user but is a registered
+     * alias resolves to the alias owner's mailbox username, so a
+     * message to chris@domain lands in cpollett's mailbox when
+     * "chris" is an alias owned by cpollett. The original
+     * recipient address is preserved by deliverMail in the
+     * Delivered-To header, so a reply can still default to the
+     * alias the sender used.
      * @param string $address address
      * @return string|false local username if the address resolves to a local mailbox, false otherwise
      */
@@ -3991,10 +5733,17 @@ class MailSite
             return false;
         }
         $local_lc = strtolower($local);
-        if (!$this->authenticator->userExists($local_lc)) {
-            return false;
+        if ($this->authenticator->userExists($local_lc)) {
+            return $local_lc;
         }
-        return $local_lc;
+        if ($this->alias_resolver !== null) {
+            $owner = (string) call_user_func($this->alias_resolver,
+                $local_lc, $domain);
+            if ($owner !== '') {
+                return strtolower($owner);
+            }
+        }
+        return false;
     }
     /**
      * Schedules a callable to fire after $time seconds. If
@@ -4046,6 +5795,7 @@ class MailSite
     {
         $defaults = [
             'SMTP_PORT' => 2525,
+            'SUBMISSION_PORT' => 0,
             'IMAP_PORT' => 1143,
             'SMTPS_PORT' => 0,
             'IMAPS_PORT' => 0,
@@ -4053,6 +5803,7 @@ class MailSite
             'SERVER_NAME' => 'localhost',
             'SERVER_SOFTWARE' => 'AttoMail',
             'CONNECTION_TIMEOUT' => 30 * 60,
+            'TLS_HANDSHAKE_TIMEOUT' => 10,
             'MAX_COMMAND_LEN' => 2048,
             'MAX_MESSAGE_LEN' => 25 * 1024 * 1024,
             /*
@@ -4120,6 +5871,12 @@ class MailSite
             fclose($smtp);
             return false;
         }
+        /* submission (conventionally 587) is an optional second
+           plaintext SMTP listener that upgrades with STARTTLS; it
+           shares the SMTP handling and the plaintext-auth gate, so
+           a client must STARTTLS before AUTH unless plaintext auth
+           is allowed. */
+        $bindOne('SUBMISSION_PORT', 'SMTP', false, 'SUBMISSION');
         /* implicit-TLS sockets are optional and require ssl */
         if ($tls_available) {
             $bindOne('SMTPS_PORT', 'SMTP', true, 'SMTPS');
@@ -4147,6 +5904,19 @@ class MailSite
             $reads = $this->in_streams[self::CONNECTION];
             $writes = $this->out_streams[self::CONNECTION];
             /*
+                A socket mid TLS handshake must be watched for both
+                read and write readiness, since the handshake can
+                block on either direction, so add it to the write
+                set too (it is already in the read set via
+                in_streams).
+             */
+            foreach ($this->handshakes as $hs_key => $hs_info) {
+                if (isset($this->in_streams[self::CONNECTION][$hs_key])) {
+                    $writes[$hs_key] =
+                        $this->in_streams[self::CONNECTION][$hs_key];
+                }
+            }
+            /*
                 Cap select timeout at 5s so the loop wakes
                 regularly. IDLE pushes happen post-select, so
                 a long sleep would delay "* N EXISTS"
@@ -4169,8 +5939,27 @@ class MailSite
                 $timeout, $microtimeout);
             $this->processTimers();
             if ($n > 0) {
+                $driven = [];
                 foreach ($reads as $stream) {
                     $key = (int) $stream;
+                    if (isset($this->handshakes[$key])) {
+                        $driven[$key] = true;
+                    }
+                }
+                foreach ($writes as $stream) {
+                    $key = (int) $stream;
+                    if (isset($this->handshakes[$key])) {
+                        $driven[$key] = true;
+                    }
+                }
+                foreach (array_keys($driven) as $key) {
+                    $this->driveHandshake($key);
+                }
+                foreach ($reads as $stream) {
+                    $key = (int) $stream;
+                    if (isset($driven[$key])) {
+                        continue;
+                    }
                     if (isset($listeners[$key])) {
                         $this->acceptConnection($stream,
                             $listeners[$key]);
@@ -4179,6 +5968,10 @@ class MailSite
                     }
                 }
                 foreach ($writes as $stream) {
+                    $key = (int) $stream;
+                    if (isset($driven[$key])) {
+                        continue;
+                    }
                     $this->writeClient($stream);
                 }
             }
@@ -4215,20 +6008,41 @@ class MailSite
         $remote_port = ($colon === false) ? 0 :
             (int) substr($remote, $colon + 1);
         $protocol = $listener['protocol'];
-        $tls_active = false;
         if (!empty($listener['tls_implicit'])) {
             /*
-                Implicit TLS: negotiate the handshake before
-                queueing any banner. We MUST NOT send a
-                plaintext fallback banner because the client
-                is waiting for a TLS ServerHello.
+                Implicit TLS: the client is waiting for a TLS
+                ServerHello, so we MUST NOT queue a plaintext
+                banner. Start the handshake non-blocking and let
+                the select loop drive it; completeAccept runs once
+                TLS is up. A plaintext fallback banner is never
+                sent on these ports.
              */
-            if (!$this->upgradeToTls($connection)) {
-                @fclose($connection);
-                return;
-            }
-            $tls_active = true;
+            $this->beginHandshake($connection, $key, 'implicit',
+                $protocol, $remote_addr, $remote_port, $listener);
+            return;
         }
+        $this->completeAccept($connection, $key, $protocol,
+            $remote_addr, $remote_port, false);
+    }
+    /**
+     * Finishes setting up an accepted connection once it is ready
+     * for protocol traffic: registers it in the stream tables,
+     * builds its session context, fires the connect and banner
+     * hooks, and queues the greeting banner. Reached directly for
+     * a plaintext accept, or from the handshake driver once an
+     * implicit-TLS connection has completed its handshake.
+     * @param resource $connection open connection resource
+     * @param int $key stream key for $connection
+     * @param string $protocol 'SMTP' or 'IMAP'
+     * @param string $remote_addr client address
+     * @param int $remote_port client port
+     * @param bool $tls_active whether the connection is already
+     *      wrapped in TLS
+     * @return void
+     */
+    protected function completeAccept($connection, $key, $protocol,
+        $remote_addr, $remote_port, $tls_active)
+    {
         $this->in_streams[self::CONNECTION][$key] = $connection;
         $this->in_streams[self::DATA][$key] = "";
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
@@ -4243,6 +6057,7 @@ class MailSite
             'TLS_ACTIVE' => $tls_active,
             'AUTH_USERNAME' => null,
             'PENDING_STARTTLS' => false,
+            'HELO' => null,
         ];
         $ctx_ref = & $this->in_streams[self::CONTEXT][$key];
         $connect_info = [
@@ -4332,18 +6147,21 @@ class MailSite
         return implode(' ', $parts);
     }
     /**
-     * Performs the server-side TLS handshake on an accepted
-     * client socket. Wraps stream_socket_enable_crypto in a
-     * scoped error handler so the actual SSL error message can
-     * be attributed to this call (using error_get_last alone is
-     * unreliable because that buffer is process-wide). Returns
-     * true on success, false on failure (caller closes socket).
+     * Prepares a just-accepted (or STARTTLS-upgrading) socket for
+     * a non-blocking TLS handshake: copies the configured SSL
+     * context options onto the stream. The handshake itself is
+     * driven in steps by stepCrypto from the select loop, so this
+     * never blocks. Returns false (and sets the error) when no
+     * certificate is configured.
      * @param resource $connection open connection resource
-     * @return bool true on successful TLS handshake
+     * @param string $handshake_error set to the reason on failure
+     * @return bool true if crypto options were applied
      */
-    protected function upgradeToTls($connection)
+    protected function prepareCrypto($connection, &$handshake_error = '')
     {
+        $handshake_error = '';
         if (empty($this->server_context_array['ssl'])) {
+            $handshake_error = 'no server certificate configured';
             return false;
         }
         foreach ($this->server_context_array['ssl']
@@ -4351,13 +6169,16 @@ class MailSite
             stream_context_set_option($connection, 'ssl',
                 $option_name, $option_value);
         }
-        $error = null;
-        set_error_handler(
-            function ($errno, $errstr) use (&$error) {
-                $error = $errstr;
-                return true;
-            });
-        stream_set_blocking($connection, 1);
+        return true;
+    }
+    /**
+     * The TLS crypto method bitmask the server offers: the generic
+     * TLS server method plus the 1.2 and 1.3 variants when the
+     * build defines them.
+     * @return int crypto method flags for stream_socket_enable_crypto
+     */
+    protected function cryptoMethod()
+    {
         $method = STREAM_CRYPTO_METHOD_TLS_SERVER;
         if (defined('STREAM_CRYPTO_METHOD_TLSv1_2_SERVER')) {
             $method |= STREAM_CRYPTO_METHOD_TLSv1_2_SERVER;
@@ -4365,17 +6186,180 @@ class MailSite
         if (defined('STREAM_CRYPTO_METHOD_TLSv1_3_SERVER')) {
             $method |= STREAM_CRYPTO_METHOD_TLSv1_3_SERVER;
         }
-        $ok = @stream_socket_enable_crypto($connection, true,
-            $method);
-        stream_set_blocking($connection, 0);
+        return $method;
+    }
+    /**
+     * Runs one non-blocking step of the server-side TLS handshake.
+     * The socket stays non-blocking so the call returns at once:
+     * true when the handshake has completed, false when it has
+     * failed, and 0 when it needs more socket I/O and should be
+     * retried on a later select wake. Wraps the call in a scoped
+     * error handler so the SSL error text can be attributed to
+     * this step (error_get_last alone is process-wide and
+     * unreliable).
+     * @param resource $connection open connection resource
+     * @param string $handshake_error set to the SSL error text
+     *      when the step fails
+     * @return bool|int true done, false failed, 0 needs more I/O
+     */
+    protected function stepCrypto($connection, &$handshake_error = '')
+    {
+        $handshake_error = '';
+        $error = null;
+        set_error_handler(
+            function ($errno, $errstr) use (&$error) {
+                $error = $errstr;
+                return true;
+            });
+        $result = @stream_socket_enable_crypto($connection, true,
+            $this->cryptoMethod());
         restore_error_handler();
-        if ($ok === true) {
+        if ($result === true) {
             return true;
         }
+        if ($result === 0) {
+            return 0;
+        }
         if ($error !== null) {
-            echo "TLS handshake failed: $error\n";
+            $handshake_error = $error;
+        } else {
+            $handshake_error = 'handshake failed';
         }
         return false;
+    }
+    /**
+     * Starts a non-blocking TLS handshake on a socket and registers
+     * it in the handshakes table so the select loop can drive it a
+     * step at a time. Used for both an implicit-TLS accept (the
+     * $listener record is carried so completeAccept can queue the
+     * banner once TLS is up) and a STARTTLS upgrade (no listener;
+     * the session context already exists). Attempts the first
+     * crypto step immediately; if that already resolves the
+     * handshake, finishes right away rather than waiting for the
+     * next wake.
+     * @param resource $connection open connection resource
+     * @param int $key stream key for $connection
+     * @param string $mode 'implicit' or 'starttls'
+     * @param string $protocol 'SMTP' or 'IMAP'
+     * @param string $remote_addr client address
+     * @param int $remote_port client port
+     * @param array|null $listener accept listener record for an
+     *      implicit handshake, or null for a STARTTLS upgrade
+     * @return void
+     */
+    protected function beginHandshake($connection, $key, $mode,
+        $protocol, $remote_addr, $remote_port, $listener = null)
+    {
+        $handshake_error = '';
+        if (!$this->prepareCrypto($connection, $handshake_error)) {
+            $this->runHooks('secure', [
+                'remote_addr' => $remote_addr,
+                'remote_port' => $remote_port,
+                'protocol' => $protocol,
+                'mode' => $mode,
+                'ok' => false,
+                'error' => $handshake_error,
+            ], []);
+            if ($mode === 'starttls') {
+                $this->shutdownStream($key);
+            } else {
+                @fclose($connection);
+            }
+            return;
+        }
+        $timeout = (int) ($this->default_server_globals[
+            'TLS_HANDSHAKE_TIMEOUT'] ?? 10);
+        if ($timeout < 1) {
+            $timeout = 1;
+        }
+        $this->handshakes[$key] = [
+            'mode' => $mode,
+            'protocol' => $protocol,
+            'remote_addr' => $remote_addr,
+            'remote_port' => $remote_port,
+            'listener' => $listener,
+            'deadline' => microtime(true) + $timeout,
+        ];
+        /*
+            An implicit-TLS socket is not yet in the stream tables
+            (completeAccept adds it once TLS is up), but it must be
+            selectable so the loop wakes to drive the handshake, so
+            register its connection slot now. A STARTTLS socket is
+            already registered from its plaintext phase.
+         */
+        if ($mode === 'implicit') {
+            $this->in_streams[self::CONNECTION][$key] = $connection;
+            $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        }
+        $this->driveHandshake($key);
+    }
+    /**
+     * Drives one step of an in-progress TLS handshake for the
+     * given stream key, then dispatches on the outcome: a
+     * completed handshake finishes the connection (queues the
+     * banner for an implicit accept, or resets an upgraded session
+     * to its post-STARTTLS INIT state), a failed handshake logs
+     * and tears down, and a handshake that needs more I/O is left
+     * registered for the next select wake. Called from the select
+     * loop whenever a handshaking socket is readable or writable.
+     * @param int $key stream key of the handshaking socket
+     * @return void
+     */
+    protected function driveHandshake($key)
+    {
+        if (!isset($this->handshakes[$key]) ||
+            !isset($this->in_streams[self::CONNECTION][$key])) {
+            unset($this->handshakes[$key]);
+            return;
+        }
+        $connection = $this->in_streams[self::CONNECTION][$key];
+        $handshake_error = '';
+        $result = $this->stepCrypto($connection, $handshake_error);
+        if ($result === 0) {
+            $this->in_streams[self::MODIFIED_TIME][$key] = time();
+            return;
+        }
+        $info = $this->handshakes[$key];
+        $secure_info = [
+            'remote_addr' => $info['remote_addr'],
+            'remote_port' => $info['remote_port'],
+            'protocol' => $info['protocol'],
+            'mode' => $info['mode'],
+            'ok' => ($result === true),
+            'error' => ($result === true) ? '' : $handshake_error,
+        ];
+        unset($this->handshakes[$key]);
+        if ($result !== true) {
+            if ($info['mode'] === 'starttls') {
+                $this->runHooks('secure', $secure_info,
+                    $this->in_streams[self::CONTEXT][$key] ?? []);
+                $this->shutdownStream($key);
+            } else {
+                $this->runHooks('secure', $secure_info, []);
+                @fclose($connection);
+                unset($this->in_streams[self::CONNECTION][$key]);
+                unset($this->in_streams[self::MODIFIED_TIME][$key]);
+            }
+            return;
+        }
+        if ($info['mode'] === 'implicit') {
+            $this->runHooks('secure', $secure_info, []);
+            $this->completeAccept($connection, $key,
+                $info['protocol'], $info['remote_addr'],
+                $info['remote_port'], true);
+            return;
+        }
+        /* STARTTLS success: reset the existing session per RFC
+           3207 sec 4.2 (client must re-EHLO; same for IMAP). */
+        $context = & $this->in_streams[self::CONTEXT][$key];
+        $context['TLS_ACTIVE'] = true;
+        $context['STATE'] = 'INIT';
+        $context['MAILFROM'] = null;
+        $context['RCPTTO'] = [];
+        $context['AUTH_USER'] = null;
+        $context['AUTH_USERNAME'] = null;
+        $this->in_streams[self::DATA][$key] = "";
+        $this->runHooks('secure', $secure_info, $context);
     }
     /**
      * Appends bytes to the outbound write buffer. Allocates
@@ -4588,6 +6572,7 @@ class MailSite
                 return;
             }
             $context['STATE'] = 'READY';
+            $context['HELO'] = $domain;
             $name = $this->default_server_globals['SERVER_NAME'];
             $response = "250-$name Hello\r\n";
             $allow_plain = $this->allowsPlaintextAuth();
@@ -4927,13 +6912,23 @@ class MailSite
                 return;
             }
             /*
-                Authenticated submission to a non-local
-                recipient would be outbound relay; no outbound
-                queue is implemented, so reject. A smarthost
-                or queue could be added here.
+                Authenticated submission to a non-local recipient
+                is outbound relay. We permit it only when the
+                envelope sender is one of our own domains (a local
+                user sending out); we never relay on behalf of an
+                external sender. Accepted remote recipients are
+                tagged so DATA queues them for background MX
+                delivery rather than local mailbox delivery.
              */
-            $this->queueWrite($key,
-                "550 5.7.1 Outbound relay not configured\r\n");
+            if (!$this->senderDomainIsLocal($context['MAILFROM'])) {
+                $this->queueWrite($key,
+                    "550 5.7.1 Sender not local; relay denied\r\n");
+                return;
+            }
+            $context['RCPTTO'][] = ['addr' => $addr,
+                'user' => false, 'remote' => true];
+            $context['STATE'] = 'RCPT';
+            $this->queueWrite($key, "250 2.1.5 Ok\r\n");
             return;
         }
         $verdict = $this->runHooks('rcptto',
@@ -4943,9 +6938,30 @@ class MailSite
                 "550 5.7.1 Recipient rejected\r\n");
             return;
         }
-        $context['RCPTTO'][] = ['addr' => $addr, 'user' => $local_user];
+        $context['RCPTTO'][] = ['addr' => $addr,
+            'user' => $local_user, 'remote' => false];
         $context['STATE'] = 'RCPT';
         $this->queueWrite($key, "250 2.1.5 Ok\r\n");
+    }
+    /**
+     * True when an envelope sender address belongs to one of the
+     * server's own local domains. Used to gate outbound relay:
+     * an authenticated session may relay to remote recipients
+     * only when its MAIL FROM is local, so the server never
+     * relays on behalf of an external sender. A missing or
+     * malformed sender is treated as not local.
+     * @param string|null $address envelope MAIL FROM address
+     * @return bool true when the sender's domain is local
+     */
+    protected function senderDomainIsLocal($address)
+    {
+        $address = trim((string) $address, "<> \t\r\n");
+        $at = strrpos($address, '@');
+        if ($at === false) {
+            return false;
+        }
+        $domain = strtolower(substr($address, $at + 1));
+        return in_array($domain, $this->local_domains);
     }
     /**
      * Drains DATA bytes from the input buffer until it sees the
@@ -5012,12 +7028,33 @@ class MailSite
         }
         $message = $this->prependReceivedHeader($message, $context);
         $delivered_any = false;
-        foreach ($context['RCPTTO'] as $r) {
-            $uid = $this->deliverMail($context['MAILFROM'], $r['addr'],
-                $message, $context);
+        $remote_recipients = [];
+        foreach ($context['RCPTTO'] as $recipient) {
+            if (!empty($recipient['remote'])) {
+                $remote_recipients[] = $recipient['addr'];
+                continue;
+            }
+            $uid = $this->deliverMail($context['MAILFROM'],
+                $recipient['addr'], $message, $context);
             if ($uid !== false) {
                 $delivered_any = true;
             }
+        }
+        if (!empty($remote_recipients)) {
+            /*
+                Hand remote recipients to the outbound hook, which
+                queues the message for background direct-MX
+                delivery. Queueing succeeds locally and at once, so
+                this counts as delivered for the client's reply;
+                actual remote delivery (and any bounce on permanent
+                failure) happens off the event loop.
+             */
+            $this->runHooks('outbound', [
+                'from' => $context['MAILFROM'],
+                'recipients' => $remote_recipients,
+                'bytes' => $message,
+            ], $context);
+            $delivered_any = true;
         }
         $context['STATE'] = 'READY';
         $context['MAILFROM'] = null;
@@ -5091,8 +7128,9 @@ class MailSite
      * Mail clients use this header to render the routing path
      * and SpamAssassin-class tools rely on it to reconstruct
      * the delivery chain. We include the remote address, our
-     * server name, the protocol (ESMTPA when authenticated),
-     * and the receipt timestamp.
+     * server name, the RFC 3848 with-protocol keyword (the S
+     * suffix when the hop used TLS, the A suffix when it was
+     * authenticated), and the receipt timestamp.
      * @param string $message raw RFC 5322 message bytes
      * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
      * @return string message with a Received: header prepended
@@ -5102,8 +7140,18 @@ class MailSite
         $name = $this->default_server_globals['SERVER_NAME'];
         $server_software =
             $this->default_server_globals['SERVER_SOFTWARE'];
-        $with = empty($context['AUTH_USER']) ?
-            'ESMTP' : 'ESMTPA';
+        /* RFC 3848 with-protocol keyword: the S suffix marks a
+           TLS-protected hop and the A suffix marks an
+           authenticated one, so a reader (and Yioop's own
+           insecure-arrival notice) can tell from the trace header
+           whether this hop used TLS. */
+        $secure = !empty($context['TLS_ACTIVE']);
+        $authed = !empty($context['AUTH_USER']);
+        if ($secure) {
+            $with = $authed ? 'ESMTPSA' : 'ESMTPS';
+        } else {
+            $with = $authed ? 'ESMTPA' : 'ESMTP';
+        }
         $now = gmdate("D, d M Y H:i:s") . " +0000";
         /*
             Defense in depth: scrub CR and LF from every
@@ -5457,6 +7505,19 @@ class MailSite
         $context['AUTH_USER'] = strtolower($user);
         $context['STATE'] = 'AUTH';
         $this->mail_storage?->ensureUser($context['AUTH_USER']);
+        $consolidations = $this->mail_storage?->ensureStandardFolders(
+            $context['AUTH_USER']) ?? [];
+        foreach ($consolidations as $consolidation) {
+            $outcome = $consolidation['deleted'] ?
+                "and removed \"" . $consolidation['from'] . "\"" :
+                "but kept \"" . $consolidation['from'] . "\" (" .
+                $consolidation['failed'] . " could not be copied)";
+            $this->emitLog("MailSite consolidated " .
+                $consolidation['moved'] . " message(s) from \"" .
+                $consolidation['from'] . "\" into \"" .
+                $consolidation['into'] . "\" " . $outcome .
+                " for user " . $context['AUTH_USER']);
+        }
         $this->queueWrite($key,
             "$tag OK [CAPABILITY IMAP4rev1 IDLE] LOGIN " .
             "completed\r\n");
@@ -5822,8 +7883,8 @@ class MailSite
             storage has not provisioned its directory yet
             (some clients LIST before any message has arrived).
          */
-        if (!in_array('INBOX', $folders, true)) {
-            $folders[] = 'INBOX';
+        if (!in_array(self::FOLDER_INBOX, $folders, true)) {
+            $folders[] = self::FOLDER_INBOX;
             sort($folders);
         }
         if ($is_lsub) {
@@ -6084,14 +8145,16 @@ class MailSite
         $recent = 0;
         $unseen_uid = 0;
         $first_unseen_seq = 0;
-        foreach ($messages as $index => $m) {
-            if (in_array('\Recent', $m['flags'], true)) {
+        foreach ($messages as $index => $message) {
+            if (in_array(self::FLAG_RECENT, $message['flags'],
+                true)) {
                 $recent++;
             }
             if ($first_unseen_seq === 0 &&
-                !in_array('\Seen', $m['flags'], true)) {
+                !in_array(self::FLAG_SEEN, $message['flags'],
+                true)) {
                 $first_unseen_seq = $index + 1;
-                $unseen_uid = $m['uid'];
+                $unseen_uid = $message['uid'];
             }
         }
         return [
@@ -6168,11 +8231,22 @@ class MailSite
             return;
         }
         $user = $context['AUTH_USER'];
+        /*
+            A DELETE for a folder that is already gone leaves the
+            mailbox in exactly the state the client asked for, so
+            we answer OK rather than NO. This lets a client clear
+            a stale folder from its local cache (e.g. Apple Mail
+            removing a phantom "Deleted Messages") without the
+            server reporting a hard error for a no-op.
+         */
         if (!$this->mail_storage->folderExists($user, $name)) {
-            $this->imapResp($key, $tag, "NO", "Mailbox does not exist");
+            $this->imapOk($key, $tag, "DELETE");
             return;
         }
         if (!$this->mail_storage->deleteFolder($user, $name)) {
+            $this->emitLog("MailSite refused DELETE of folder \"" .
+                $name . "\" for user " . $user .
+                " (INBOX, has subfolders, or I/O error)");
             $this->queueWrite($key,
                 "$tag NO Cannot delete (INBOX, " .
                 "non-empty parent, or I/O error)\r\n");
@@ -6291,7 +8365,9 @@ class MailSite
             return;
         }
         $stat = $this->imapFolderStats($user, $folder);
-        $flags = '\Answered \Flagged \Deleted \Seen \Draft';
+        $flags = self::FLAG_ANSWERED . " " .
+            self::FLAG_FLAGGED . " " . self::FLAG_DELETED . " " .
+            self::FLAG_SEEN . " " . self::FLAG_DRAFT;
         $this->queueWrite($key,
             "* " . $stat['messages'] . " EXISTS\r\n");
         $this->queueWrite($key,
@@ -6345,11 +8421,14 @@ class MailSite
     }
     /**
      * Handles UID-prefixed variants of FETCH, STORE, COPY,
-     * MOVE, and SEARCH. RFC 3501 sec 6.4.8: same argument
-     * syntax as non-UID, but the message-set numbers are
-     * interpreted as UIDs. We dispatch to the same handlers
-     * with a by-uid flag, and the FETCH responses always
-     * include the UID data item per the RFC.
+     * MOVE, SEARCH, and EXPUNGE. RFC 3501 sec 6.4.8 and RFC
+     * 4315: same argument syntax as the non-UID forms, but the
+     * message-set numbers are interpreted as UIDs. We dispatch
+     * to the same handlers with a by-uid flag, and the FETCH
+     * responses always include the UID data item per the RFC.
+     * UID EXPUNGE (RFC 4315) expunges only the deleted messages
+     * whose UID is in the given set, which is how UIDPLUS
+     * clients such as iOS Mail delete a single message.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
      * @param string $arguments arguments substring following the IMAP command verb
@@ -6386,6 +8465,18 @@ class MailSite
         }
         if ($V === 'SEARCH') {
             $this->imapCmdSearch($key, $tag, $sub_args, $context, true);
+            return;
+        }
+        if ($V === 'EXPUNGE') {
+            $user = $context['AUTH_USER'];
+            $folder = $context['SELECTED'];
+            $matched = $this->imapMatchSet($user, $folder,
+                trim($sub_args), true);
+            $restrict_uids = [];
+            foreach ($matched as $entry) {
+                $restrict_uids[] = (int) $entry[1]['uid'];
+            }
+            $this->imapCmdExpunge($key, $tag, $context, $restrict_uids);
             return;
         }
         $this->imapResp($key, $tag, "BAD", "UID $V not supported");
@@ -6558,6 +8649,29 @@ class MailSite
             "+ Ready for $count octets\r\n");
     }
     /**
+     * Reports whether any requested FETCH item needs the message
+     * body bytes. UID, FLAGS, INTERNALDATE and RFC822.SIZE all
+     * answer from the metadata record alone, so a client sync that
+     * asks only for those (as Apple Mail does) can be served
+     * without reading the message file off disk. Reading every
+     * message body for a metadata-only fetch made an initial sync
+     * of a large folder read tens of thousands of files.
+     * @param array $items parsed FETCH item descriptions
+     * @return bool true if at least one item requires the body
+     */
+    protected function fetchItemsNeedBody($items)
+    {
+        $body_kinds = ['RFC822', 'RFC822.HEADER', 'RFC822.TEXT',
+            'ENVELOPE', 'BODY', 'BODYSTRUCTURE'];
+        foreach ($items as $item) {
+            if (in_array(strtoupper($item['kind']), $body_kinds,
+                true)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /**
      * Sends a single FETCH response line for one message,
      * formatting the requested items in the order the client
      * asked for them. The $items_str is the raw paren-list
@@ -6593,16 +8707,32 @@ class MailSite
                     'section' => null, 'fields' => []];
             }
         }
-        $parts = [];
+        /*
+            Queue the response pieces directly rather than
+            collecting them into an array and imploding. A
+            BODY[]/RFC822 item can be the whole message (tens of
+            megabytes); holding it in a parts array and then
+            imploding would keep two extra full-size copies of it
+            alive at once, which is what exhausted memory on large
+            fetches. Appending each piece straight to the write
+            buffer keeps only the single queued copy.
+         */
+        $this->queueWrite($key, "* $sequence_number FETCH (");
+        $first = true;
         foreach ($items as $item) {
             $rendered = $this->imapRenderFetchItem($item, $meta,
                 $body, $mark_seen);
-            if ($rendered !== null) {
-                $parts[] = $rendered;
+            if ($rendered === null) {
+                continue;
             }
+            if (!$first) {
+                $this->queueWrite($key, " ");
+            }
+            $this->queueWrite($key, $rendered);
+            $first = false;
+            unset($rendered);
         }
-        $this->queueWrite($key,
-            "* $sequence_number FETCH (" . implode(' ', $parts) . ")\r\n");
+        $this->queueWrite($key, ")\r\n");
     }
     /**
      * Parses the items list of a FETCH command. Accepts both
@@ -6767,8 +8897,7 @@ class MailSite
             return "RFC822.SIZE " . $meta['size'];
         }
         if ($kind === 'RFC822') {
-            return "RFC822 " . $this->imapLiteralOf($body) .
-                ($item ? '' : '');
+            return "RFC822 " . $this->imapLiteralOf($body);
         }
         if ($kind === 'RFC822.HEADER') {
             $header_value = $this->imapHeaderBlock($body);
@@ -7315,24 +9444,43 @@ class MailSite
      *   lines             -- number of body lines (text only)
      *   parts             -- list of child entities (multipart
      *                        only; empty for leaves)
-     * @param int $bytes number of bytes
+     * @param string $bytes the entity bytes (header block plus
+     *      body)
+     * @param int $depth current nesting depth, used to bound
+     *      recursion on pathologically nested multipart messages
      * @return array parsed MIME entity (headers + body or multipart parts)
      */
-    protected function imapParseEntity($bytes)
+    protected function imapParseEntity($bytes, $depth = 0)
     {
         $sep_pos = strpos($bytes, "\r\n\r\n");
         if ($sep_pos === false) {
             $alternative = strpos($bytes, "\n\n");
             if ($alternative === false) {
                 $header_block = $bytes;
-                $body = '';
+                $body_offset = strlen($bytes);
             } else {
                 $header_block = substr($bytes, 0, $alternative + 2);
-                $body = substr($bytes, $alternative + 2);
+                $body_offset = $alternative + 2;
             }
         } else {
             $header_block = substr($bytes, 0, $sep_pos + 4);
-            $body = substr($bytes, $sep_pos + 4);
+            $body_offset = $sep_pos + 4;
+        }
+        $body_size = strlen($bytes) - $body_offset;
+        /* Only materialize the body as its own string when it is
+           small enough to be split into parts (see the cap below).
+           For a large body -- typically a big base64 attachment --
+           copying it out again would roughly double the memory
+           already held for $bytes and risk exhausting the limit on
+           a single large message; the size and line count needed
+           for BODYSTRUCTURE are computed from the original bytes
+           instead, and the body string is left empty. */
+        if ($body_size <= self::MAX_STRUCTURE_PARSE_BYTES) {
+            $body = substr($bytes, $body_offset);
+            $lines = substr_count($body, "\n");
+        } else {
+            $body = '';
+            $lines = substr_count($bytes, "\n", $body_offset);
         }
         $headers = $this->imapParseHeaders($header_block);
         $content_type = isset($headers['content-type']) ?
@@ -7375,14 +9523,19 @@ class MailSite
                 $headers['content-disposition'] : null,
             'header_block' => $header_block,
             'body' => $body,
-            'size' => strlen($body),
-            'lines' => substr_count($body, "\n"),
+            'size' => $body_size,
+            'lines' => $lines,
             'parts' => [],
         ];
         if ($type === 'multipart' &&
             isset($params['boundary'])) {
-            $entity['parts'] = $this->imapSplitMultipart($body,
-                $params['boundary']);
+            $boundary = (string) $params['boundary'];
+            if (trim($boundary) !== '' &&
+                $depth < self::MAX_MIME_DEPTH &&
+                $body_size <= self::MAX_STRUCTURE_PARSE_BYTES) {
+                $entity['parts'] = $this->imapSplitMultipart($body,
+                    $boundary, $depth + 1);
+            }
         }
         return $entity;
     }
@@ -7399,37 +9552,46 @@ class MailSite
      * RFC. Each part is recursively parsed via imapParseEntity.
      * @param string $body message body bytes
      * @param mixed $boundary boundary parameter
+     * @param int $depth current nesting depth, propagated to the
+     *      recursive parse of each part
      * @return array list of MIME part bodies split at the boundary
      */
-    protected function imapSplitMultipart($body, $boundary)
+    protected function imapSplitMultipart($body, $boundary, $depth = 0)
     {
         $delim = '--' . $boundary;
-        $close = '--' . $boundary . '--';
+        $delim_len = strlen($delim);
         $parts = [];
-        $remaining = $body;
-        $first = strpos($remaining, $delim);
+        /* Scan with a moving cursor into $body rather than
+           repeatedly slicing the remaining tail. Each substr of the
+           whole tail would allocate a fresh copy of everything left,
+           so a large message (a big attachment) would peak at many
+           simultaneous multi-megabyte copies and exhaust memory.
+           With an offset cursor only the individual part bytes are
+           copied out, one at a time, so peak memory is proportional
+           to the largest single part, not the message size times
+           the part count. */
+        $first = strpos($body, $delim);
         if ($first === false) {
             return [];
         }
-        $remaining = substr($remaining, $first + strlen($delim));
-        while (true) {
-            /*
-                Eat the trailing CRLF after the boundary line.
-             */
-            if (str_starts_with($remaining, "\r\n")) {
-                $remaining = substr($remaining, 2);
-            } else if (str_starts_with($remaining, "\n")) {
-                $remaining = substr($remaining, 1);
-            } else if (str_starts_with($remaining, '--')) {
-                /* This was the closing delimiter; we are done. */
+        $pos = $first + $delim_len;
+        $length = strlen($body);
+        while ($pos < $length) {
+            /* Eat the trailing CRLF (or bare LF) after the boundary
+               line; a leading "--" here marks the closing delimiter,
+               so stop. */
+            if (substr_compare($body, "\r\n", $pos, 2) === 0) {
+                $pos += 2;
+            } else if (substr_compare($body, "\n", $pos, 1) === 0) {
+                $pos += 1;
+            } else if (substr_compare($body, '--', $pos, 2) === 0) {
                 break;
             }
-            /*
-                Find the next boundary. We search for both the
-                CRLF-prefixed and LF-prefixed forms.
-             */
-            $next_crlf = strpos($remaining, "\r\n--" . $boundary);
-            $next_lf = strpos($remaining, "\n--" . $boundary);
+            /* Find the next boundary from the cursor, trying both
+               the CRLF- and LF-prefixed forms and taking the
+               earlier. */
+            $next_crlf = strpos($body, "\r\n" . $delim, $pos);
+            $next_lf = strpos($body, "\n" . $delim, $pos);
             $next = false;
             if ($next_crlf !== false && $next_lf !== false) {
                 $next = min($next_crlf, $next_lf);
@@ -7441,19 +9603,14 @@ class MailSite
             if ($next === false) {
                 break;
             }
-            $part_bytes = substr($remaining, 0, $next);
-            $parts[] = $this->imapParseEntity($part_bytes);
-            /*
-                Advance past the CRLF + delimiter. The
-                delimiter itself is consumed; the next-line
-                eat at the top of the loop handles the trailing
-                CRLF.
-             */
-            $skip = ($remaining[$next] === "\r") ? 2 : 1;
-            $remaining = substr($remaining,
-                $next + $skip + strlen($delim));
-            if (str_starts_with($remaining, '--')) {
-                /* Closing delimiter: stop. */
+            $part_bytes = substr($body, $pos, $next - $pos);
+            $parts[] = $this->imapParseEntity($part_bytes, $depth);
+            /* Advance past the line ending plus the delimiter; the
+               trailing-CRLF eat at the top of the loop handles the
+               line ending after this delimiter. */
+            $skip = ($body[$next] === "\r") ? 2 : 1;
+            $pos = $next + $skip + $delim_len;
+            if (substr_compare($body, '--', $pos, 2) === 0) {
                 break;
             }
         }
@@ -7571,21 +9728,41 @@ class MailSite
         $matched = $this->imapMatchSet($user, $folder, $set,
             $by_uid);
         $verb = $by_uid ? 'UID FETCH' : 'FETCH';
+        $needs_body = $this->fetchItemsNeedBody(
+            $this->imapParseFetchItems($items_str));
         foreach ($matched as $entry) {
             list($sequence_number, $meta) = $entry;
-            $body = $this->mail_storage->fetchMessage($user,
-                $folder, $meta['uid']);
-            if ($body === false) {
-                continue;
+            /*
+                Only read the message file when a requested item
+                actually needs its bytes. A metadata-only fetch
+                (FLAGS/UID/INTERNALDATE/RFC822.SIZE), which is what
+                a client issues to sync a folder, is answered from
+                the index record alone, so syncing a large folder
+                no longer reads every message off disk.
+             */
+            if ($needs_body) {
+                $body = $this->mail_storage->fetchMessage($user,
+                    $folder, $meta['uid']);
+                if ($body === false) {
+                    continue;
+                }
+            } else {
+                $body = "";
             }
             $mark_seen = false;
             $this->imapEmitFetch($key, $sequence_number, $meta, $body,
                 $items_str, $by_uid, $mark_seen);
+            unset($body);
+            if (isset($this->out_streams[self::DATA][$key]) &&
+                strlen($this->out_streams[self::DATA][$key]) >=
+                self::FETCH_FLUSH_THRESHOLD) {
+                $this->drainWriteBuffer($key);
+            }
             if ($mark_seen &&
                 empty($context['SELECTED_READONLY']) &&
-                !in_array('\Seen', $meta['flags'], true)) {
+                !in_array(self::FLAG_SEEN, $meta['flags'], true)) {
                 $new_flags = $meta['flags'];
-                $new_flags[] = '\Seen';
+                $new_flags[] = self::FLAG_SEEN;
                 $this->mail_storage->setFlags($user, $folder,
                     $meta['uid'], $new_flags);
                 $this->bumpMailboxChange($user, $folder);
@@ -7819,13 +9996,20 @@ class MailSite
      * in descending sequence order so the client's running
      * count stays consistent as each removal shifts higher
      * sequences down. Not allowed on read-only mailboxes
-     * (EXAMINE).
+     * (EXAMINE). When a UID restriction is supplied (the UID
+     * EXPUNGE case, RFC 4315) only deleted messages whose UID
+     * is in that list are removed, which is how a UIDPLUS
+     * client deletes a single message.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
      * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $restrict_uids when non-null, only deleted
+     *      messages whose UID is in this list are expunged; when
+     *      null every deleted message in the folder is expunged
      * @return void no return; the response is queued for the client
      */
-    protected function imapCmdExpunge($key, $tag, &$context)
+    protected function imapCmdExpunge($key, $tag, &$context,
+        $restrict_uids = null)
     {
         if (!empty($context['SELECTED_READONLY'])) {
             $this->imapResp($key, $tag, "NO", "Mailbox is read-only");
@@ -7837,11 +10021,15 @@ class MailSite
             $folder);
         $seqs_removed = [];
         foreach ($messages as $index => $meta) {
-            if (in_array('\Deleted', $meta['flags'], true)) {
+            if (in_array(self::FLAG_DELETED, $meta['flags'], true)) {
+                if ($restrict_uids !== null &&
+                    !in_array((int) $meta['uid'], $restrict_uids, true)) {
+                    continue;
+                }
                 $seqs_removed[] = $index + 1;
             }
         }
-        $this->mail_storage->expunge($user, $folder);
+        $this->mail_storage->expunge($user, $folder, $restrict_uids);
         if (!empty($seqs_removed)) {
             $this->bumpMailboxChange($user, $folder);
         }
@@ -8017,19 +10205,19 @@ class MailSite
                 two flag/expected-presence pairs.
              */
             static $flag_keywords = [
-                'NEW' => ['\Recent', true, '\Seen', false],
-                'OLD' => ['\Recent', false],
-                'RECENT' => ['\Recent', true],
-                'SEEN' => ['\Seen', true],
-                'UNSEEN' => ['\Seen', false],
-                'FLAGGED' => ['\Flagged', true],
-                'UNFLAGGED' => ['\Flagged', false],
-                'DELETED' => ['\Deleted', true],
-                'UNDELETED' => ['\Deleted', false],
-                'ANSWERED' => ['\Answered', true],
-                'UNANSWERED' => ['\Answered', false],
-                'DRAFT' => ['\Draft', true],
-                'UNDRAFT' => ['\Draft', false],
+                'NEW' => [self::FLAG_RECENT, true, self::FLAG_SEEN, false],
+                'OLD' => [self::FLAG_RECENT, false],
+                'RECENT' => [self::FLAG_RECENT, true],
+                'SEEN' => [self::FLAG_SEEN, true],
+                'UNSEEN' => [self::FLAG_SEEN, false],
+                'FLAGGED' => [self::FLAG_FLAGGED, true],
+                'UNFLAGGED' => [self::FLAG_FLAGGED, false],
+                'DELETED' => [self::FLAG_DELETED, true],
+                'UNDELETED' => [self::FLAG_DELETED, false],
+                'ANSWERED' => [self::FLAG_ANSWERED, true],
+                'UNANSWERED' => [self::FLAG_ANSWERED, false],
+                'DRAFT' => [self::FLAG_DRAFT, true],
+                'UNDRAFT' => [self::FLAG_DRAFT, false],
             ];
             if ($keyword === 'ALL') {
                 return true;
@@ -8246,6 +10434,38 @@ class MailSite
             "$tag OK Begin TLS negotiation now\r\n");
     }
     /**
+     * Best-effort partial write of a connection's outbound buffer,
+     * used to relieve memory pressure in the middle of a long
+     * response loop (FETCH over a large message range) without
+     * waiting for the select loop. Writes once in non-blocking
+     * mode and keeps any unwritten tail queued for the normal
+     * writeClient path. Unlike writeClient it never calls
+     * finishWrite, so it does not fire deferred actions (STARTTLS,
+     * QUIT close) that must only run once the buffer is fully and
+     * intentionally drained at end of command.
+     * @param int $key connection key in the in_streams map
+     * @return void no return; the outbound buffer is shortened by
+     *      however many bytes the socket accepted
+     */
+    protected function drainWriteBuffer($key)
+    {
+        if (empty($this->out_streams[self::DATA][$key])) {
+            return;
+        }
+        $stream = $this->out_streams[self::CONNECTION][$key] ??
+            ($this->in_streams[self::CONNECTION][$key] ?? null);
+        if (!is_resource($stream)) {
+            return;
+        }
+        $written = @fwrite($stream,
+            $this->out_streams[self::DATA][$key]);
+        if ($written !== false && $written > 0) {
+            $this->out_streams[self::DATA][$key] =
+                substr($this->out_streams[self::DATA][$key], $written);
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        }
+    }
+    /**
      * Drains pending bytes from a connection's outbound
      * buffer to its socket, called when the select loop
      * reports the socket writable. Tolerates partial writes:
@@ -8304,30 +10524,21 @@ class MailSite
         if (!empty($context['PENDING_STARTTLS'])) {
             /*
                 The 220 reply (or IMAP "OK Begin TLS negotiation
-                now") has been fully flushed. Negotiate the TLS
-                handshake on the same socket; on success, reset
-                the protocol state to INIT (RFC 3207 sec 4.2: the
-                client must re-EHLO after TLS comes up; same idea
-                for IMAP CAPABILITY).
+                now") has been fully flushed. Start the TLS
+                handshake non-blocking and let the select loop
+                drive it; driveHandshake resets the session to its
+                post-STARTTLS INIT state on success (RFC 3207 sec
+                4.2: the client must re-EHLO after TLS comes up;
+                same idea for IMAP CAPABILITY) and drops the
+                connection on failure (RFC 3207 sec 4.1).
              */
             $context['PENDING_STARTTLS'] = false;
             $connection = $this->in_streams[self::CONNECTION][$key];
-            if ($this->upgradeToTls($connection)) {
-                $context['TLS_ACTIVE'] = true;
-                $context['STATE'] = 'INIT';
-                $context['MAILFROM'] = null;
-                $context['RCPTTO'] = [];
-                $context['AUTH_USER'] = null;
-                $context['AUTH_USERNAME'] = null;
-                $this->in_streams[self::DATA][$key] = "";
-            } else {
-                /*
-                    Handshake failure mid-session is unrecoverable
-                    per RFC 3207 sec 4.1: drop the connection.
-                 */
-                $this->shutdownStream($key);
-                return;
-            }
+            $this->beginHandshake($connection, $key, 'starttls',
+                $context['PROTOCOL'] ?? '',
+                $context['REMOTE_ADDR'] ?? '',
+                $context['REMOTE_PORT'] ?? 0);
+            return;
         }
         if ($context && isset($context['STATE']) &&
             $context['STATE'] === 'QUIT') {
@@ -8372,6 +10583,30 @@ class MailSite
      */
     protected function cullDeadStreams()
     {
+        $now_float = microtime(true);
+        foreach ($this->handshakes as $key => $info) {
+            if ($now_float <= $info['deadline']) {
+                continue;
+            }
+            $this->runHooks('secure', [
+                'remote_addr' => $info['remote_addr'],
+                'remote_port' => $info['remote_port'],
+                'protocol' => $info['protocol'],
+                'mode' => $info['mode'],
+                'ok' => false,
+                'error' => 'handshake timed out',
+            ], $this->in_streams[self::CONTEXT][$key] ?? []);
+            unset($this->handshakes[$key]);
+            if ($info['mode'] === 'starttls') {
+                $this->shutdownStream($key);
+            } else {
+                if (isset($this->in_streams[self::CONNECTION][$key])) {
+                    @fclose($this->in_streams[self::CONNECTION][$key]);
+                }
+                unset($this->in_streams[self::CONNECTION][$key]);
+                unset($this->in_streams[self::MODIFIED_TIME][$key]);
+            }
+        }
         $timeout =
             $this->default_server_globals['CONNECTION_TIMEOUT'];
         $now = time();

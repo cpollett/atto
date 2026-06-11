@@ -84,6 +84,20 @@ class WebSite
      * connection.
      */
     const OUT_DATA_COMPACT_THRESHOLD = 65536;
+    /**
+     * Number of times openListener retries a failed bind before
+     * giving up. A restart spawns the replacement process while the
+     * exiting one may still hold the privileged port for a short
+     * teardown window, so the first bind can fail transiently; the
+     * retries let the replacement wait that window out rather than
+     * coming up with a dead listener.
+     */
+    const BIND_ATTEMPTS = 10;
+    /**
+     * Milliseconds the bind retry waits between attempts. Total
+     * worst-case wait is BIND_ATTEMPTS times this value.
+     */
+    const BIND_RETRY_WAIT = 250;
     /*
       CONNECT OPTIONS and the longest named HTTP method. It has length 7
      */
@@ -109,6 +123,34 @@ class WebSite
         announcing huge frames.
      */
     const H2_MAX_FRAME_SIZE = 16384;
+    /**
+     * Initial HTTP/2 flow-control window in bytes for a connection
+     * and for each new stream, per RFC 7540 sec 6.9.2, before any
+     * SETTINGS_INITIAL_WINDOW_SIZE or WINDOW_UPDATE adjustments
+     * from the peer.
+     */
+    const H2_DEFAULT_WINDOW = 65535;
+    /**
+     * Most bytes of one stream's pending response body queued per
+     * pump call, in bytes. Responses bigger than this go out in
+     * slices interleaved with other streams' frames as the
+     * connection's outbound buffer drains, so one large response
+     * (a video range, say) does not delay every other response
+     * multiplexed on the same connection (a page of thumbnails)
+     * by its full length.
+     */
+    const H2_PUMP_SLICE = 262144;
+    /**
+     * RFC 7540 sec 7 PROTOCOL_ERROR code, sent in GOAWAY frames
+     * when tearing a connection down over a malformed frame.
+     */
+    const H2_ERROR_PROTOCOL = 0x1;
+    /**
+     * RFC 7540 sec 6.5.2 SETTINGS_INITIAL_WINDOW_SIZE identifier:
+     * the per-stream flow-control window the peer's SETTINGS
+     * frame advertises.
+     */
+    const H2_SETTING_INITIAL_WINDOW = 0x04;
     /**
      * Maximum bytes read from an HTTP/2 connection in one readable
      * event before parsing buffered frames. Bounds the work done
@@ -295,6 +337,14 @@ class WebSite
      * @var array
      */
     protected $streaming_context = [];
+    /**
+     * Whether a write on the current streaming response failed
+     * (client gone or stalled past the connection timeout). Once
+     * set, further flushes are no-ops returning false so the
+     * route can stop producing output; reset by endStreaming.
+     * @var bool
+     */
+    protected $streaming_failed = false;
     /**
      * Used to cache in RAM files which have been read or written by the
      * fileGetContents or filePutContents
@@ -733,27 +783,133 @@ class WebSite
                 || empty($this->streaming_context)) {
             return false;
         }
+        $protocol = $this->streaming_context['protocol'] ?? null;
+        if ($protocol !== 'h1') {
+            /* only H1 chunked streaming is supported: sending H2
+               DATA frames ahead of the peer's flow-control window
+               makes clients reset the stream once their window
+               (10 MiB for curl) is exceeded, and honoring the
+               window would require processing WINDOW_UPDATE
+               frames mid-dispatch. H2 and H3 responses buffer and
+               go out whole through the normal response path, so
+               the output buffer must be left untouched here. */
+            return false;
+        }
         $chunk = ob_get_clean();
         ob_start();
-        $protocol = $this->streaming_context['protocol'] ?? null;
+        if ($this->streaming_failed) {
+            /* the client is gone or stalled out; discard the
+               buffered output and tell the route so it can stop */
+            return false;
+        }
         if (!$this->is_streaming) {
             $this->is_streaming = true;
-            if ($protocol === 'h1') {
-                $this->writeStreamingHead_H1($chunk);
-            } else if ($protocol === 'h2') {
-                $this->writeStreamingHead_H2($chunk);
-            } else {
-                return false;
-            }
-            return true;
+            $this->writeStreamingHead_H1($chunk);
+            return !$this->streaming_failed;
         }
         if ($chunk === '' || $chunk === false) {
             return true;
         }
-        if ($protocol === 'h1') {
-            $this->writeStreamingChunk_H1($chunk);
-        } else if ($protocol === 'h2') {
-            $this->writeStreamingChunk_H2($chunk);
+        $this->writeStreamingChunk_H1($chunk);
+        return !$this->streaming_failed;
+    }
+    /**
+     * Tells whether a write on the current streaming response has
+     * failed (client disconnected or stalled past the connection
+     * timeout). A route streaming through flush() can use this to
+     * distinguish a dead client (stop producing output) from
+     * streaming being unavailable (buffer output as usual).
+     *
+     * @return bool whether the current streaming response failed
+     */
+    public function streamingFailed()
+    {
+        return $this->streaming_failed;
+    }
+    /**
+     * Tells whether the current response can be streamed block by
+     * block (chunked HTTP/1.1) rather than buffered and sent whole.
+     * Only HTTP/1.1 supports incremental flush() here; HTTP/2 and
+     * HTTP/3 responses accumulate in the output buffer and go out
+     * together when the route returns. A route serving a large body
+     * can use this to keep one buffered response bounded (for
+     * example capping a byte range) while still serving the full
+     * body when real streaming is available.
+     *
+     * @return bool whether incremental streaming is available for
+     *      the current response
+     */
+    public function streamingAvailable()
+    {
+        if (!$this->isCli() || $this->streaming_socket === null) {
+            return false;
+        }
+        return ($this->streaming_context['protocol'] ?? null) === 'h1';
+    }
+    /**
+     * Writes $data completely to the streaming socket, looping on
+     * the partial writes a non-blocking socket gives when the
+     * kernel send buffer is full. Between attempts it waits for
+     * the socket to become writable for up to the connection
+     * timeout. On a write error, a stalled-out wait, or no
+     * progress after a writable wait (a half-closed peer), it
+     * marks the streaming response failed and gives up; the
+     * remaining transfer is abandoned rather than silently
+     * dropping bytes mid-frame, which corrupts the chunked or
+     * DATA framing.
+     *
+     * @param string $data bytes to write in full
+     * @return bool whether all bytes were written
+     */
+    protected function writeAll($data)
+    {
+        if ($this->streaming_failed) {
+            return false;
+        }
+        $socket = $this->streaming_socket;
+        $total = strlen($data);
+        $written = 0;
+        $zero_writes = 0;
+        $stall_limit =
+            $this->default_server_globals['CONNECTION_TIMEOUT'];
+        $custom_error_handler =
+            $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
+            null;
+        while ($written < $total) {
+            set_error_handler(null);
+            $num_written = fwrite($socket, ($written == 0) ? $data :
+                substr($data, $written));
+            set_error_handler($custom_error_handler);
+            if ($num_written === false || feof($socket)) {
+                $this->streaming_failed = true;
+                return false;
+            }
+            $written += $num_written;
+            if ($written >= $total) {
+                break;
+            }
+            if ($num_written == 0) {
+                $zero_writes++;
+                if ($zero_writes > 1) {
+                    /* writable per select below yet nothing
+                       accepted twice running: peer is gone */
+                    $this->streaming_failed = true;
+                    return false;
+                }
+                $read_streams = [];
+                $write_streams = [$socket];
+                $except_streams = [];
+                set_error_handler(null);
+                $ready = stream_select($read_streams,
+                    $write_streams, $except_streams, $stall_limit);
+                set_error_handler($custom_error_handler);
+                if (empty($ready)) {
+                    $this->streaming_failed = true;
+                    return false;
+                }
+            } else {
+                $zero_writes = 0;
+            }
         }
         return true;
     }
@@ -776,9 +932,15 @@ class WebSite
         if (!$this->content_type) {
             $this->header_data .= "Content-Type: text/html\x0D\x0A";
         }
+        /* A streamed body has unknown length, so it is sent chunked;
+           strip any Content-Length the route set or the response
+           would carry both Content-Length and Transfer-Encoding. */
+        $this->header_data = preg_replace(
+            '/^Content-Length:[^\r\n]*\r\n/im', '',
+            $this->header_data);
         $this->header_data .= "Transfer-Encoding: chunked\x0D\x0A";
         $head = $this->header_data . "\x0D\x0A";
-        @fwrite($this->streaming_socket, $head);
+        $this->writeAll($head);
         if ($chunk !== '' && $chunk !== false) {
             $this->writeStreamingChunk_H1($chunk);
         }
@@ -791,94 +953,8 @@ class WebSite
      */
     protected function writeStreamingChunk_H1($chunk)
     {
-        @fwrite($this->streaming_socket,
+        $this->writeAll(
             dechex(strlen($chunk)) . "\x0D\x0A" . $chunk . "\x0D\x0A");
-    }
-    /**
-     * Composes and writes the H2 HEADERS frame (without
-     * END_STREAM) plus first DATA frame for a streaming response.
-     * Subsequent flushes are pure DATA frames. The terminating
-     * empty DATA with END_STREAM is sent by getResponseData.
-     *
-     * @param string $chunk first chunk of body to send with the
-     *      HEADERS frame; may be the empty string
-     */
-    protected function writeStreamingHead_H2($chunk)
-    {
-        $stream_id = $this->streaming_context['stream_id'];
-        $hpack_encode = $this->streaming_context['hpack_encode'];
-        $status = "200";
-        if (preg_match("/HTTP\/[\d.]+ (\d+)/",
-                $this->header_data, $matches)) {
-            $status = $matches[1];
-        }
-        $resp_headers_data = [[":status", $status]];
-        $forbidden = ["connection", "keep-alive", "proxy-connection",
-            "transfer-encoding", "upgrade", "content-length"];
-        $has_content_type = false;
-        $header_lines = explode("\r\n", $this->header_data);
-        /*
-            If header_data starts with an HTTP status line, drop
-            it (we already encoded :status above). In streaming
-            mode the route may not have sent a status line yet —
-            in that case the first entry is already a real header
-            and must be kept.
-         */
-        if (!empty($header_lines[0])
-                && str_starts_with($header_lines[0], "HTTP/")) {
-            array_shift($header_lines);
-        }
-        foreach ($header_lines as $line) {
-            $colon = strpos($line, ":");
-            if ($colon === false) {
-                continue;
-            }
-            $name = strtolower(trim(substr($line, 0, $colon)));
-            $value = trim(substr($line, $colon + 1));
-            if ($name === "" || $name[0] === ":"
-                || in_array($name, $forbidden)) {
-                continue;
-            }
-            if ($name === "content-type") {
-                $has_content_type = true;
-            }
-            $resp_headers_data[] = [$name, $value];
-        }
-        if (!$has_content_type) {
-            $resp_headers_data[] =
-                ["content-type", "text/html; charset=utf-8"];
-        }
-        $resp_headers = new HeaderFrame($stream_id, $resp_headers_data);
-        $resp_headers->flags->add("END_HEADERS");
-        @fwrite($this->streaming_socket,
-            $resp_headers->serialize($hpack_encode));
-        if ($chunk !== '' && $chunk !== false) {
-            $this->writeStreamingChunk_H2($chunk);
-        }
-    }
-    /**
-     * Writes one or more H2 DATA frames for a streaming chunk,
-     * splitting at H2_MAX_FRAME_SIZE per RFC 7540 sec 4.2.
-     * No END_STREAM is set; the terminator comes later.
-     *
-     * @param string $chunk body bytes for this chunk; will be
-     *      split across multiple DATA frames if longer than
-     *      H2_MAX_FRAME_SIZE
-     */
-    protected function writeStreamingChunk_H2($chunk)
-    {
-        $stream_id = $this->streaming_context['stream_id'];
-        $body_len = strlen($chunk);
-        $max = self::H2_MAX_FRAME_SIZE;
-        $offset = 0;
-        $out = "";
-        while ($offset < $body_len) {
-            $piece = substr($chunk, $offset, $max);
-            $offset += strlen($piece);
-            $frame = new DataFrame($stream_id, $piece);
-            $out .= $frame->serialize();
-        }
-        @fwrite($this->streaming_socket, $out);
     }
     /**
      * Closes a streaming response by sending the terminating
@@ -890,15 +966,11 @@ class WebSite
     protected function endStreaming()
     {
         $protocol = $this->streaming_context['protocol'] ?? null;
-        if ($protocol === 'h1') {
-            @fwrite($this->streaming_socket, "0\x0D\x0A\x0D\x0A");
-        } else if ($protocol === 'h2') {
-            $stream_id = $this->streaming_context['stream_id'];
-            $end = new DataFrame($stream_id, "");
-            $end->flags->add("END_STREAM");
-            @fwrite($this->streaming_socket, $end->serialize());
+        if (!$this->streaming_failed && $protocol === 'h1') {
+            $this->writeAll("0\x0D\x0A\x0D\x0A");
         }
         $this->is_streaming = false;
+        $this->streaming_failed = false;
         $this->streaming_socket = null;
         $this->streaming_context = [];
     }
@@ -1073,6 +1145,7 @@ class WebSite
             'streaming_socket' => $this->streaming_socket,
             'streaming_context' => $this->streaming_context,
             'is_streaming' => $this->is_streaming,
+            'streaming_failed' => $this->streaming_failed,
             'request_script' => $this->request_script,
         ];
         $context = [
@@ -1088,6 +1161,7 @@ class WebSite
         $this->streaming_socket = null;
         $this->streaming_context = [];
         $this->is_streaming = false;
+        $this->streaming_failed = false;
         $this->setGlobals($context, $conn);
         $body = $this->getResponseData(false);
         $pushed_header_data = $this->header_data;
@@ -1104,6 +1178,7 @@ class WebSite
         $this->streaming_socket = $saved['streaming_socket'];
         $this->streaming_context = $saved['streaming_context'];
         $this->is_streaming = $saved['is_streaming'];
+        $this->streaming_failed = $saved['streaming_failed'];
         $this->request_script = $saved['request_script'];
         /*
             Compose response HEADERS for the promised stream
@@ -1158,41 +1233,17 @@ class WebSite
             $resp_headers_data);
         $resp_headers->flags->add('END_HEADERS');
         $out .= $resp_headers->serialize($hpack_encode);
-        $body_len = strlen($body);
-        $max = self::H2_MAX_FRAME_SIZE;
-        if ($body_len === 0) {
-            $resp_data = new DataFrame($promised_id, '');
-            $resp_data->flags->add('END_STREAM');
-            $out .= $resp_data->serialize();
-        } else {
-            $offset = 0;
-            while ($offset < $body_len) {
-                $chunk = substr($body, $offset, $max);
-                $offset += strlen($chunk);
-                $frame = new DataFrame($promised_id, $chunk);
-                if ($offset >= $body_len) {
-                    $frame->flags->add('END_STREAM');
-                }
-                $out .= $frame->serialize();
-            }
-        }
         /*
-            Queue on the same out_streams entry as the parent
-            response so all PUSH_PROMISE / HEADERS / DATA frames
-            share one async-drain buffer. Wire order matches
-            HPACK encoding order which is critical for HPACK's
-            stateful dynamic table; if frames were reordered the
-            client's decoder would get wrong header values.
+            Queue the PUSH_PROMISE and HEADERS frames on the same
+            out_streams entry as the parent response so wire order
+            matches HPACK encoding order (the dynamic table is
+            stateful; reordered frames give the client's decoder
+            wrong header values), then hand the pushed body to the
+            outbound flow-control engine on the promised stream.
          */
-        if (!empty($this->out_streams[self::CONNECTION][$key])) {
-            $this->out_streams[self::DATA][$key] .= $out;
-        } else {
-            $this->out_streams[self::CONNECTION][$key] = $socket;
-            $this->out_streams[self::DATA][$key] = $out;
-            $this->out_streams[self::DATA_OFFSET][$key] = 0;
-            $this->out_streams[self::CONTEXT][$key] = [];
-        }
-        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        $this->queueResponseData($key, $socket, $out);
+        $this->sendH2Body($key, $socket, $conn, $promised_id,
+            $body);
         return true;
     }
     /**
@@ -1638,6 +1689,46 @@ class WebSite
         return $this->listeners;
     }
     /**
+     * Refreshes the certificate served by every secure listener by
+     * re-setting the certificate and key options on each listener's
+     * stream context. The accepted-socket TLS handshake reads the
+     * listening socket's context at handshake time, so new
+     * connections pick up the certificate currently on disk while
+     * connections already established finish on the one they began
+     * with. This lets a renewed certificate take effect without
+     * rebinding the privileged ports or restarting the server, so
+     * an external renewer (the AcmeRenew media job runs in the
+     * MediaUpdater process, not this one) need only write the new
+     * files. H3 listeners manage their own TLS and are left for a
+     * restart to pick up.
+     *
+     * @param string $cert_file path to the certificate to serve
+     *      (PEM, full chain)
+     * @param string $key_file path to the private key (PEM) paired
+     *      with $cert_file
+     * @return int the number of secure listeners refreshed
+     */
+    public function reloadSecureCertificate($cert_file, $key_file)
+    {
+        $refreshed = 0;
+        foreach ($this->listeners as $listener) {
+            if (!($listener instanceof Listener) ||
+                empty($listener->is_secure)) {
+                continue;
+            }
+            $server = $listener->resource();
+            if (!is_resource($server)) {
+                continue;
+            }
+            stream_context_set_option($server, "ssl", "local_cert",
+                $cert_file);
+            stream_context_set_option($server, "ssl", "local_pk",
+                $key_file);
+            $refreshed++;
+        }
+        return $refreshed;
+    }
+    /**
      * Starts an Atto Web Server listening on one or more addresses,
      * then runs the event loop. Streams are non-blocking and traffic
      * detection uses stream_select (portable Unix select wrapper).
@@ -1789,8 +1880,23 @@ class WebSite
                 }
                 continue;
             }
-            $opened[] = $this->openListener($spec_address,
+            $listener = $this->openListener($spec_address,
                 $merged_context);
+            if (empty($listener->server)) {
+                /* the bind ultimately failed even after retries;
+                   refuse to start rather than run with a listener
+                   that accepts no connections, which would look
+                   alive but serve nothing */
+                echo "Could not bind $spec_address; server " .
+                    "stopping\n";
+                foreach ($opened as $already) {
+                    if (!empty($already->server)) {
+                        $already->close();
+                    }
+                }
+                exit();
+            }
+            $opened[] = $listener;
         }
         if (empty($opened)) {
             echo "No listeners opened, server stopping\n";
@@ -1975,9 +2081,24 @@ class WebSite
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
             $session_path = substr($this->restart, strlen('restart') + 1);
             $php_path = $this->default_server_globals["PHP_PATH"] ?? "";
-            $php = (empty($_ENV['HHVM'])) ? "$php_path/php" : "$php_path/hhvm";
-            $restart_arg = is_array($original_address)
-                ? "multi" : $original_address;
+            $binary = empty($_ENV['HHVM']) ? "php" : "hhvm";
+            /* prepend the configured interpreter directory only when
+               one was supplied; with none, the bare name resolves
+               through PATH. Building "$php_path/php" unconditionally
+               would yield "/php" when no directory is set, which is
+               not a real path and leaves the restart with nothing to
+               exec. */
+            $php = ($php_path === "") ? $binary :
+                $php_path . "/" . $binary;
+            /* a launcher can name the address the re-spawned
+               process should be started with (for instance a marker
+               that selects a multi-port bind), supplied as a server
+               global so this Yioop-agnostic server need not know
+               what the marker means; fall back to the address this
+               process was launched with otherwise */
+            $restart_arg = $this->default_server_globals[
+                "RESTART_ADDRESS"] ?? (is_array($original_address)
+                ? "multi" : $original_address);
             /*
                 Escape every command-line argument so a route handler
                 that passes attacker-influenced strings into
@@ -2048,8 +2169,23 @@ class WebSite
         $context["socket"]["backlog"] = empty($context["socket"]["backlog"])
             ? 200 : $context["socket"]["backlog"];
         $server_context = stream_context_create($context);
-        $server = stream_socket_server($bind_address, $errno, $errstr,
-            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN, $server_context);
+        $server = false;
+        $errstr = "";
+        for ($attempt = 0; $attempt < self::BIND_ATTEMPTS;
+            $attempt++) {
+            $server = stream_socket_server($bind_address, $errno,
+                $errstr,
+                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN,
+                $server_context);
+            if ($server) {
+                break;
+            }
+            /* the exiting process may still hold the port for a
+               short teardown window after a restart; wait and try
+               again before giving up so the replacement does not
+               come up deaf */
+            usleep(self::BIND_RETRY_WAIT * 1000);
+        }
         if (!$server) {
             echo "Failed to bind address $bind_address: $errstr\n";
             return new Listener(null, $bind_address, $is_secure, []);
@@ -2159,6 +2295,23 @@ class WebSite
         if (!empty($_SERVER['HTTP_COOKIE'])) {
             $context['HTTP_COOKIE'] = $_SERVER['HTTP_COOKIE'];
         }
+        /*
+            Carry the scheme and authority of the in-flight request
+            into the synthetic one. Without an HTTPS flag the secure
+            server's http->https guard in configureRewrites treats an
+            internal request as plain HTTP and answers it with a 301
+            to https://<host>/ instead of running it, so the machine
+            self-calls (statuses/update/log) never execute. Copying
+            the host and port as well keeps any absolute URL the
+            internal request builds pointed at the real authority
+            rather than the 0.0.0.0 bind address.
+         */
+        foreach (['HTTPS', 'HTTP_HOST', 'SERVER_NAME', 'SERVER_PORT']
+            as $inherited) {
+            if (!empty($_SERVER[$inherited])) {
+                $context[$inherited] = $_SERVER[$inherited];
+            }
+        }
         $context['SCRIPT_FILENAME'] =
             $this->default_server_globals['DOCUMENT_ROOT'] .
             $context['PHP_SELF'];
@@ -2244,12 +2397,9 @@ class WebSite
                 doesn't try to send the same response again.
              */
             if ($out_data !== '' && $out_data !== false) {
-                $protocol = $this->streaming_context['protocol'] ?? null;
-                if ($protocol === 'h1') {
-                    $this->writeStreamingChunk_H1($out_data);
-                } else if ($protocol === 'h2') {
-                    $this->writeStreamingChunk_H2($out_data);
-                }
+                /* streaming is h1-only (see flush()); is_streaming
+                   can only be set on an h1 request */
+                $this->writeStreamingChunk_H1($out_data);
             }
             $this->endStreaming();
             return "";
@@ -2304,6 +2454,12 @@ class WebSite
                 . "\x0D\x0A";
         }
         if ($include_headers) {
+            /* the computed length is authoritative; drop any
+               Content-Length the route set itself (resource range
+               replies do) so the response carries exactly one */
+            $this->header_data = preg_replace(
+                '/^Content-Length:[^\r\n]*\r\n/im', '',
+                $this->header_data);
             $out_data = $this->header_data .
                     "Content-Length: ". strlen($out_data) .
                     "\x0D\x0A\x0D\x0A" .  $out_data;
@@ -2460,8 +2616,23 @@ class WebSite
             if (!isset($this->transports[$proto])) {
                 $proto = 'h1';
             }
-            $this->transports[$proto]->onReadable($key, $conn,
-                $in_stream, $too_long);
+            try {
+                $this->transports[$proto]->onReadable($key, $conn,
+                    $in_stream, $too_long);
+            } catch (\Throwable $throwable) {
+                /* one request must never take the whole
+                   single-process server down with it (for years a
+                   header value a frame encoder could not handle
+                   was fatal to the site); log the failure and
+                   tear down only the offending connection */
+                error_log("Uncaught " . get_class($throwable) .
+                    " processing connection $key: " .
+                    $throwable->getMessage() . " at " .
+                    $throwable->getFile() . ":" .
+                    $throwable->getLine());
+                $this->shutdownHttpStream($key);
+                continue;
+            }
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
         }
     }
@@ -2707,6 +2878,8 @@ class WebSite
                     = new HPack();
                 $connection->protocol_state['hpack_encode']
                     = new HPack();
+                $this->initH2SendWindows($connection,
+                    $client_settings);
                 /*
                     Server push state. enable_push starts true
                     (RFC 7540 sec 6.5.2 default for SETTINGS_
@@ -2750,6 +2923,8 @@ class WebSite
                     = new HPack();
                 $connection->protocol_state['hpack_encode']
                     = new HPack();
+                $this->initH2SendWindows($connection,
+                    $client_settings);
                 $enable_push = true;
                 if (isset($client_settings[0x02])) {
                     $enable_push = ($client_settings[0x02] === 1);
@@ -3186,6 +3361,32 @@ class WebSite
                 $state['enable_push'] =
                     ($frame->settings[0x02] === 1);
             }
+            if (isset($frame->settings[
+                self::H2_SETTING_INITIAL_WINDOW])) {
+                /*
+                    RFC 7540 sec 6.9.2: a changed
+                    SETTINGS_INITIAL_WINDOW_SIZE adjusts every
+                    open stream's send window by the delta (which
+                    can drive a window negative; the pump treats
+                    non-positive credit as none) and sets the
+                    window new streams start with.
+                 */
+                $new_initial = $frame->settings[
+                    self::H2_SETTING_INITIAL_WINDOW];
+                $delta = $new_initial -
+                    ($state['peer_initial_window'] ??
+                    self::H2_DEFAULT_WINDOW);
+                $state['peer_initial_window'] = $new_initial;
+                foreach (($state['stream_send_windows'] ?? [])
+                    as $open_id => $window) {
+                    $state['stream_send_windows'][$open_id] =
+                        $window + $delta;
+                }
+                if ($delta > 0) {
+                    $this->pumpH2AllPendingSend($key, $connection,
+                        $conn);
+                }
+            }
             $ack = new SettingsFrame(0, []);
             $ack->flags->add('ACK');
             @fwrite($connection, $ack->serialize());
@@ -3265,6 +3466,57 @@ class WebSite
             $state['pending_streams'][$stream_id] = $pending;
             return false;
         }
+        if ($frame instanceof WindowUpdateFrame) {
+            /*
+                RFC 7540 sec 6.9: the client returns send credit.
+                Stream id 0 credits the connection-level window,
+                otherwise the named stream's window. After
+                crediting, queue any pending response bytes the
+                new credit allows. A malformed increment tears the
+                connection down like other malformed frames.
+             */
+            try {
+                $frame->parseBody($payload);
+            } catch (\Exception $exception) {
+                $goaway = new GoAwayFrame(0,
+                    $state['last_stream_id'] ?? 0,
+                    self::H2_ERROR_PROTOCOL, "");
+                $custom_error_handler =
+                    $this->default_server_globals[
+                    "CUSTOM_ERROR_HANDLER"] ?? null;
+                set_error_handler(null);
+                fwrite($connection, $goaway->serialize());
+                set_error_handler($custom_error_handler);
+                $this->shutdownHttpStream($key);
+                return false;
+            }
+            $increment = $frame->windowIncrement();
+            if ($frame->stream_id == 0) {
+                $state['send_window'] = ($state['send_window'] ??
+                    self::H2_DEFAULT_WINDOW) + $increment;
+                $this->pumpH2AllPendingSend($key, $connection,
+                    $conn);
+            } else if (isset($state['stream_send_windows'][
+                $frame->stream_id])) {
+                $state['stream_send_windows'][$frame->stream_id]
+                    += $increment;
+                $this->pumpH2PendingSend($key, $connection, $conn,
+                    $frame->stream_id);
+            }
+            return false;
+        }
+        if ($frame instanceof RstStreamFrame) {
+            /*
+                RFC 7540 sec 6.4: the client no longer wants this
+                stream; drop any response bytes still waiting on
+                send credit so they neither hold memory nor get
+                sent to a reset stream.
+             */
+            unset($state['pending_send'][$frame->stream_id]);
+            unset($state['stream_send_windows'][
+                $frame->stream_id]);
+            return false;
+        }
         if (!($frame instanceof HeaderFrame)) {
             return false;
         }
@@ -3330,6 +3582,196 @@ class WebSite
         }
         return $this->dispatchH2Request($key, $connection,
             $client_stream_id, $context);
+    }
+    /**
+     * Seeds the outbound HTTP/2 flow-control bookkeeping for a
+     * freshly established connection: the connection-level send
+     * window, the initial window each new stream starts with
+     * (from the client's SETTINGS_INITIAL_WINDOW_SIZE when sent),
+     * and the empty per-stream window and pending-body maps.
+     *
+     * @param object $connection the Connection whose
+     *      protocol_state to seed
+     * @param array $client_settings the client's initial SETTINGS
+     *      dictionary (identifier => value)
+     */
+    protected function initH2SendWindows($connection,
+        $client_settings)
+    {
+        $connection->protocol_state['send_window'] =
+            self::H2_DEFAULT_WINDOW;
+        $connection->protocol_state['peer_initial_window'] =
+            $client_settings[self::H2_SETTING_INITIAL_WINDOW]
+            ?? self::H2_DEFAULT_WINDOW;
+        $connection->protocol_state['stream_send_windows'] = [];
+        $connection->protocol_state['pending_send'] = [];
+    }
+    /**
+     * Appends serialized response bytes for connection $key to its
+     * out_streams entry (creating the entry when this is the first
+     * queued data) so processResponseStreams drains them
+     * asynchronously across event-loop iterations. Appending rather
+     * than overwriting keeps concurrent streams' frames in dispatch
+     * order in one outbound buffer, which also preserves HPACK
+     * dynamic-table encoding order.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the bytes go out on
+     * @param string $out serialized frame bytes to queue
+     */
+    protected function queueResponseData($key, $connection, $out)
+    {
+        if (!empty($this->out_streams[self::CONNECTION][$key])) {
+            $this->out_streams[self::DATA][$key] .= $out;
+        } else {
+            $this->out_streams[self::CONNECTION][$key] = $connection;
+            $this->out_streams[self::DATA][$key] = $out;
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
+            $this->out_streams[self::CONTEXT][$key] = [];
+        }
+        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+    }
+    /**
+     * Starts sending an HTTP/2 response body on stream $stream_id,
+     * honoring outbound flow control (RFC 7540 sec 5.2): the
+     * stream gets a send window equal to the client's advertised
+     * initial window, the body is recorded as pending, and as many
+     * DATA frames as current credit allows are queued right away.
+     * The remainder goes out from pumpH2PendingSend as the client
+     * returns credit with WINDOW_UPDATE frames.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the frames go out on
+     * @param object $conn Connection holding protocol_state
+     * @param int $stream_id stream the body belongs to
+     * @param string $body response body bytes
+     */
+    protected function sendH2Body($key, $connection, $conn,
+        $stream_id, $body)
+    {
+        $state = &$conn->protocol_state;
+        if (!isset($state['send_window'])) {
+            $this->initH2SendWindows($conn, []);
+        }
+        $state['stream_send_windows'][$stream_id] =
+            $state['peer_initial_window'];
+        $state['pending_send'][$stream_id] =
+            ['data' => $body, 'offset' => 0];
+        $this->pumpH2PendingSend($key, $connection, $conn,
+            $stream_id);
+    }
+    /**
+     * Pumps connection $key's streams with pending response
+     * bodies, starting from a per-connection rotating cursor so
+     * that, combined with the pump's one-slice outbound-buffer
+     * cap, every pending stream gets its turn across successive
+     * drain events and concurrent responses interleave on the
+     * wire. Called when the connection's outbound buffer drains
+     * and when the peer returns connection-level credit; safe to
+     * call when nothing is pending or the connection is gone.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the frames go out on
+     * @param object $conn Connection holding protocol_state, or
+     *      null when the connection is already torn down
+     */
+    protected function pumpH2AllPendingSend($key, $connection,
+        $conn)
+    {
+        if ($conn === null ||
+            empty($conn->protocol_state['pending_send'])) {
+            return;
+        }
+        $pending_ids =
+            array_keys($conn->protocol_state['pending_send']);
+        $num_pending = count($pending_ids);
+        $cursor = $conn->protocol_state['pending_send_cursor'] ?? 0;
+        for ($i = 0; $i < $num_pending; $i++) {
+            $pending_id =
+                $pending_ids[($cursor + $i) % $num_pending];
+            $this->pumpH2PendingSend($key, $connection, $conn,
+                $pending_id);
+        }
+        $conn->protocol_state['pending_send_cursor'] = $cursor + 1;
+    }
+    /**
+     * Queues as many DATA frames for stream $stream_id as the
+     * connection-level and stream-level send windows allow, at
+     * most H2_PUMP_SLICE bytes per call so concurrent responses
+     * on one connection interleave, consuming credit per payload
+     * byte. END_STREAM rides the frame carrying the body's final
+     * byte (or an empty frame for an empty body, which costs no
+     * credit). When the body is fully queued the stream's pending
+     * entry and window are dropped. Called when a response
+     * starts, when the connection's outbound buffer drains, and
+     * whenever the client returns credit.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the frames go out on
+     * @param object $conn Connection holding protocol_state
+     * @param int $stream_id stream to emit pending body bytes for
+     */
+    protected function pumpH2PendingSend($key, $connection, $conn,
+        $stream_id)
+    {
+        $state = &$conn->protocol_state;
+        if (!isset($state['pending_send'][$stream_id])) {
+            return;
+        }
+        $queued_unsent = strlen($this->out_streams[self::DATA][$key]
+            ?? "") - ($this->out_streams[self::DATA_OFFSET][$key]
+            ?? 0);
+        if ($queued_unsent >= self::H2_PUMP_SLICE) {
+            /*
+                Backpressure: the connection's outbound buffer
+                already holds a full slice the peer has not taken
+                yet. Queueing more would let frequent
+                WINDOW_UPDATE frames from a slowly consuming peer
+                grow the buffer without bound (a multi-hundred-MB
+                video response could balloon to the full body and
+                exhaust process memory). The next drain that
+                brings the buffer under one slice pumps again.
+             */
+            return;
+        }
+        $pending = &$state['pending_send'][$stream_id];
+        $total = strlen($pending['data']);
+        $out = "";
+        $sliced = 0;
+        while ($pending['offset'] < $total &&
+            $sliced < self::H2_PUMP_SLICE) {
+            $credit = min($state['send_window'],
+                $state['stream_send_windows'][$stream_id]);
+            if ($credit <= 0) {
+                break;
+            }
+            $piece = substr($pending['data'], $pending['offset'],
+                min(self::H2_MAX_FRAME_SIZE, $credit,
+                self::H2_PUMP_SLICE - $sliced,
+                $total - $pending['offset']));
+            $piece_len = strlen($piece);
+            $sliced += $piece_len;
+            $pending['offset'] += $piece_len;
+            $state['send_window'] -= $piece_len;
+            $state['stream_send_windows'][$stream_id] -= $piece_len;
+            $frame = new DataFrame($stream_id, $piece);
+            if ($pending['offset'] >= $total) {
+                $frame->flags->add("END_STREAM");
+            }
+            $out .= $frame->serialize();
+        }
+        if ($total == 0) {
+            $end_frame = new DataFrame($stream_id, "");
+            $end_frame->flags->add("END_STREAM");
+            $out .= $end_frame->serialize();
+        }
+        if ($pending['offset'] >= $total) {
+            unset($state['pending_send'][$stream_id]);
+            unset($state['stream_send_windows'][$stream_id]);
+        }
+        if ($out !== "") {
+            $this->queueResponseData($key, $connection, $out);
+        }
     }
     /**
      * Dispatches a fully-assembled HTTP/2 request to the user
@@ -3431,63 +3873,23 @@ class WebSite
         $resp_headers->flags->add("END_HEADERS");
         $out = $resp_headers->serialize($hpack_encode);
         /*
-            Split body into DATA frames of at most H2_MAX_FRAME_SIZE
-            bytes per RFC 7540 sec 4.2 (oversized frames are
-            FRAME_SIZE_ERROR and curl/browsers drop the response).
-            Default MAX_FRAME_SIZE is 16384; most clients keep it.
-            Empty bodies still emit one frame so END_STREAM has a
-            place to live. Outbound flow control (sec 5.2) is not
-            enforced: real clients grant huge windows eagerly so
-            it never bottlenecks Atto's single-process event loop.
+            Queue the HEADERS frame, then hand the body to the
+            outbound flow-control engine: DATA frames are split at
+            H2_MAX_FRAME_SIZE per RFC 7540 sec 4.2 and emitted only
+            as far as the connection-level and stream-level send
+            windows allow (sec 5.2); the remainder follows as the
+            client returns credit with WINDOW_UPDATE frames. All
+            frame bytes go through out_streams so
+            processResponseStreams drains them asynchronously across
+            event-loop iterations (a single non-blocking fwrite of a
+            large buffer is only partially accepted once the kernel
+            TCP send buffer fills). Finishing one response never
+            closes the connection: processResponseStreams' is_h2
+            branch clears only the out_streams entry.
          */
-        $body_len = strlen($body);
-        $max = self::H2_MAX_FRAME_SIZE;
-        if ($body_len === 0) {
-            $resp_data = new DataFrame($stream_id, "");
-            $resp_data->flags->add("END_STREAM");
-            $out .= $resp_data->serialize();
-        } else {
-            $offset = 0;
-            while ($offset < $body_len) {
-                $chunk = substr($body, $offset, $max);
-                $offset += strlen($chunk);
-                $frame = new DataFrame($stream_id, $chunk);
-                if ($offset >= $body_len) {
-                    $frame->flags->add("END_STREAM");
-                }
-                $out .= $frame->serialize();
-            }
-        }
-        /*
-            Queue the response on out_streams so processResponseStreams
-            drains it asynchronously, looping fwrite across event-loop
-            iterations until the full buffer is delivered. A single
-            non-blocking fwrite of a multi-megabyte response can be
-            partially accepted by the kernel TCP send buffer (~1 MiB
-            on Linux, smaller under load) — the rest is silently
-            dropped, the client sees a truncated response. Using the
-            same async-drain path as H1 fixes truncation while keeping
-            H2's flow-control semantics: a single H2 connection
-            multiplexes many streams, so finishing one response never
-            closes the connection. processResponseStreams' is_h2
-            branch recognizes that and clears only the out_streams
-            entry, leaving the connection in_streams for the next
-            frame.
-
-            Append rather than overwrite so concurrent streams on the
-            same connection (parallel ASSET requests) get their
-            HEADERS+DATA frames serialized in dispatch order into the
-            same outbound buffer.
-         */
-        if (!empty($this->out_streams[self::CONNECTION][$key])) {
-            $this->out_streams[self::DATA][$key] .= $out;
-        } else {
-            $this->out_streams[self::CONNECTION][$key] = $connection;
-            $this->out_streams[self::DATA][$key] = $out;
-            $this->out_streams[self::DATA_OFFSET][$key] = 0;
-            $this->out_streams[self::CONTEXT][$key] = [];
-        }
-        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        $this->queueResponseData($key, $connection, $out);
+        $this->sendH2Body($key, $connection, $conn, $stream_id,
+            $body);
         return true;
     }
     /**
@@ -4062,6 +4464,17 @@ class WebSite
     {
         foreach ($out_streams_with_data as $out_stream) {
             $key = (int)$out_stream;
+            if (!isset($this->out_streams[self::DATA][$key])) {
+                /*
+                    The select snapshot was taken before this
+                    iteration; request-side processing in the same
+                    event-loop tick can tear a connection down
+                    (peer hung up, malformed frame) after select
+                    reported it writable. Nothing to send for a
+                    dismantled entry.
+                 */
+                continue;
+            }
             $data = $this->out_streams[self::DATA][$key];
             $offset =
                 $this->out_streams[self::DATA_OFFSET][$key] ?? 0;
@@ -4108,7 +4521,8 @@ class WebSite
                 $this->out_streams[self::MODIFIED_TIME][$key] = time();
             }
             if ($remaining_bytes == 0) {
-                $context = $this->out_streams[self::CONTEXT][$key];
+                $context = $this->out_streams[self::CONTEXT][$key]
+                    ?? [];
                 $conn_obj = $this->connection($key);
                 $is_ws = $conn_obj?->is_websocket;
                 $is_h2 = $conn_obj?->protocol === 'h2';
@@ -4136,11 +4550,34 @@ class WebSite
                     /*
                         H2: a single connection multiplexes many
                         streams, so finishing one response never
-                        means closing the connection. Clear the
-                        out_streams entry; in_streams keeps the
-                        connection alive for the next frame.
+                        means closing the connection. The drained
+                        buffer may also just be the latest slice of
+                        bigger responses still pending on this
+                        connection: queue each pending stream's next
+                        slice (round robin, so a large response and
+                        a page of small ones interleave), and only
+                        clear the out_streams entry once nothing is
+                        left to queue. in_streams keeps the
+                        connection alive for the next frame either
+                        way.
                      */
-                    $this->shutdownHttpWriteStream($key);
+                    $this->pumpH2AllPendingSend($key, $out_stream,
+                        $conn_obj);
+                    if ((strlen($this->out_streams[self::DATA][$key]
+                        ?? "") - ($this->out_streams[
+                        self::DATA_OFFSET][$key] ?? 0)) <= 0) {
+                        /*
+                            Nothing unsent after pumping (the DATA
+                            string may still hold a fully consumed
+                            prefix; what matters is bytes past the
+                            head pointer). Clear the entry so the
+                            connection stops selecting writable;
+                            otherwise an idle kept-alive connection
+                            spins the event loop at full speed
+                            until the peer hangs up.
+                         */
+                        $this->shutdownHttpWriteStream($key);
+                    }
                 } else if ((!empty($context['HTTP_CONNECTION']) &&
                     strtolower($context['HTTP_CONNECTION']) == 'close') ||
                     empty($context['SERVER_PROTOCOL']) ||
@@ -4391,16 +4828,27 @@ class WebSite
                  */
                 $tmp_token = "atto-mem-upload-"
                     . bin2hex(random_bytes(8));
+                /*
+                    full_path mirrors the key mod_php has set on
+                    every $_FILES entry since PHP 8.1: for a normal
+                    file upload it equals the client filename (only
+                    a webkitdirectory upload differs, carrying a
+                    relative path). Handlers such as
+                    SocialComponent::handleResourceUploads require
+                    it, so emit it here or every upload through the
+                    Atto server fails its presence check.
+                 */
                 $file_array = ['name' => $file_name,
                     'tmp_name' => $tmp_token,
                     'type' => $content_type, 'error' => 0,
                     'data' => $content,
-                    'size' => strlen($content)];
+                    'size' => strlen($content),
+                    'full_path' => $file_name];
                 if (empty($_FILES[$name])) {
                     $_FILES[$name] = $file_array;
                 } else {
                     foreach (['name', 'tmp_name', 'type', 'error', 'data',
-                        'size'] as $field) {
+                        'size', 'full_path'] as $field) {
                         if (!is_array($_FILES[$name][$field])) {
                             $_FILES[$name][$field] = [$_FILES[$name][$field]];
                         }
@@ -6698,6 +7146,17 @@ class WindowUpdateFrame extends Frame
         return pack('N', $this->window_increment & 0x7FFFFFFF);
     }
     /**
+     * Returns the credit this frame adds to the peer's view of a
+     * flow-control window (connection-level when the frame's
+     * stream id is 0, otherwise for that stream).
+     *
+     * @return int 31-bit window size increment
+     */
+    public function windowIncrement()
+    {
+        return $this->window_increment;
+    }
+    /**
      * Parses the binary body of a WINDOW_UPDATE frame.
      *
      * @param string $data binary payload, must be exactly 4 bytes
@@ -7506,9 +7965,9 @@ class HPack
         return $encoded;
     }
     /**
-     * Encodes a given string using Huffman Encoding if it provides compression.
-     * If Huffman encoding is more efficient, the encoded string is returned;
-     * otherwise, the original string is returned in hexadecimal format.
+     * Encodes a given string using Huffman Encoding if it provides compression
+     * and every byte of the string is in the Huffman table. Otherwise the
+     * string is sent as a raw HPACK string literal.
      * @param string $str The input string to encode.
      * @return string HPACK-encoded string-literal bytes: a 7-bit
      *      prefix integer length (with the Huffman bit set when
@@ -7518,7 +7977,7 @@ class HPack
     private function encodeString($str)
     {
         $huffman = $this->huffmanEncode($str);
-        if (strlen($huffman) < strlen($str)) {
+        if ($huffman !== false && strlen($huffman) < strlen($str)) {
             /*
                 Length is a 7-bit prefix integer with the high
                 "Huffman" bit (0x80) set. Multi-byte if length
@@ -7556,7 +8015,9 @@ class HPack
      * 1-bits per the EOS symbol (all-ones).
      *
      * @param string $input ASCII string to encode
-     * @return string binary Huffman-encoded byte string
+     * @return mixed binary Huffman-encoded byte string, or false
+     *      when the input contains a byte outside the Huffman
+     *      table (the caller then sends the raw string literal)
      */
     public function huffmanEncode($input)
     {
@@ -7576,8 +8037,12 @@ class HPack
         for ($i = 0; $i < $len; $i++) {
             $ascii = ord($input[$i]);
             if (!isset($codes[$ascii])) {
-                throw new \Exception(
-                    "Character not in Huffman table: " . $input[$i]);
+                /* the table covers printable ASCII only; a value
+                   with any other byte (a UTF-8 file name in a
+                   Content-Disposition header, say) is sent as a
+                   raw string literal instead, which RFC 7541 sec
+                   5.2 always permits */
+                return false;
             }
             [$code_int, $code_len] = $codes[$ascii];
             $cur = ($cur << $code_len) | $code_int;

@@ -1981,7 +1981,20 @@ class Tls13Engine
         if ($flight === false) {
             return false;
         }
-        @fwrite($sock, $flight);
+        $flight_len = strlen($flight);
+        $written = 0;
+        while ($written < $flight_len) {
+            set_error_handler(null);
+            $num_written = fwrite($sock, ($written == 0) ?
+                $flight : substr($flight, $written));
+            restore_error_handler();
+            if ($num_written === false || $num_written === 0) {
+                $this->fail(
+                    "short write sending server flight");
+                return false;
+            }
+            $written += $num_written;
+        }
         /*
             Step 2: read the client's response. Modern
             clients send a (now-ignored) ChangeCipherSpec
@@ -3804,7 +3817,7 @@ class QuicStream
      *      mutating the buffer. Without that the buffer
      *      shift was O(n) per drained frame and the
      *      cumulative cost of draining a single 1 MiB
-     *      response in 1100-byte STREAM frames was
+     *      response in MAX_STREAM_FRAME_BYTES STREAM frames was
      *      O(n^2) -- about 47 ms of pure substr-shift
      *      cost per request observed in profiling. The
      *      buffer is compacted in place when send_buf_off
@@ -4596,14 +4609,20 @@ class QuicConnection
      *      until the peer grants more via MAX_DATA. Default
      *      until the peer's TPs are parsed is large enough
      *      to handle a 1 MiB response without immediate
-     *      stall. This field is currently informational; we
-     *      don't yet enforce a connection-level send cap
-     *      (Phase 9b will). Per-stream caps below are the
-     *      enforced ones for now, since real clients
-     *      typically advertise per-stream caps that match
-     *      or exceed the connection cap.
+     *      stall. Raised when the peer sends MAX_DATA
+     *      frames; flushStreams enforces it against
+     *      $conn_data_sent so the connection never sends
+     *      stream bytes past the granted credit.
      */
     public $peer_initial_max_data = 16777216;
+    /**
+     * @var int total new stream-payload bytes sent on this
+     *      connection across all streams, the quantity RFC
+     *      9000 sec 4.1 counts against the peer's MAX_DATA
+     *      credit. Retransmissions re-send recorded frames
+     *      and do not count again.
+     */
+    public $conn_data_sent = 0;
     /**
      * @var int peer's initial_max_stream_data_bidi_local
      *      (TP id 0x05, RFC 9000 sec 18.2): the receive cap
@@ -6616,9 +6635,9 @@ class QuicConnection
     }
     /**
      * Drains every writable stream into 1-RTT STREAM
-     * frames. One STREAM frame body is bounded at 1100
-     * bytes so multiple frames fit comfortably in a single
-     * ~1200-byte UDP datagram.
+     * frames. One STREAM frame body is bounded at
+     * MAX_STREAM_FRAME_BYTES so multiple frames fit
+     * comfortably in a single max-size UDP datagram.
      */
     /**
      * Default per-tick byte budget for flushStreams. Caps how
@@ -6633,6 +6652,16 @@ class QuicConnection
      * controlled pacing per RFC 9002.
      */
     const DEFAULT_FLUSH_BUDGET = 32768;
+    /**
+     * Largest STREAM-frame payload, in bytes, flushStreams emits
+     * per frame. Held below CC_MAX_DATAGRAM_BYTES (1200) so the
+     * frame plus its QUIC/UDP framing overhead still fits in one
+     * datagram without fragmentation; the 100-byte margin covers
+     * the short and long header, packet number, frame type,
+     * stream id, offset, and length fields.
+     */
+    const MAX_STREAM_FRAME_BYTES =
+        self::CC_MAX_DATAGRAM_BYTES - 100;
     /**
      * Drains pending stream-send buffers into 1-RTT STREAM
      * frames, queued for emit(). Caps total bytes pushed per
@@ -6675,11 +6704,17 @@ class QuicConnection
             $stream = $this->streams[$sid];
             while ($sent < $budget) {
                 $remaining = $budget - $sent;
-                /* Cap each STREAM frame at the smaller of
-                   1100 bytes (leaves UDP/QUIC headroom under
-                   the 1200-byte default max datagram) and
-                   what's left of this tick's budget. */
-                $chunk = min(1100, $remaining);
+                /* Cap each STREAM frame at the smallest of
+                   MAX_STREAM_FRAME_BYTES (leaves UDP/QUIC
+                   headroom under the max datagram), what's left
+                   of this tick's budget, and the peer's
+                   remaining connection-level MAX_DATA credit
+                   (RFC 9000 sec 4.1; a zero cap still lets an
+                   empty FIN-only frame through, which costs no
+                   credit). */
+                $chunk = min(self::MAX_STREAM_FRAME_BYTES,
+                    $remaining, max(0, $this->peer_initial_max_data
+                    - $this->conn_data_sent));
                 $tup = $stream->takeForFrame($chunk);
                 if ($tup === null) {
                     break;
@@ -6688,6 +6723,7 @@ class QuicConnection
                 if ($data === '' && !$fin) {
                     break;
                 }
+                $this->conn_data_sent += strlen($data);
                 $stream_frame = [
                     'type' => QuicFrame::F_STREAM_BASE,
                     'stream_id' => $sid,

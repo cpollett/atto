@@ -8691,6 +8691,20 @@ class H3Transport extends Transport
             $this->handleBidiStream($listener, $conn, $sid,
                 $stream, $bytes);
         }
+        /* Top up any streamed responses before draining, so
+           the buffer stays fed on this inbound-driven flush
+           (an ACK opening flow-control credit) rather than
+           waiting for the next timer tick. Without this a
+           streamed body only refills on the periodic tick and
+           its throughput collapses to one refill per tick. */
+        if (!empty($conn->h3_streams)) {
+            foreach ($conn->h3_streams as $sid => $st) {
+                if (!empty($st['streaming_gen'])) {
+                    $this->advanceH3StreamingGenerator($conn,
+                        $sid);
+                }
+            }
+        }
         /* Drain anything our handlers wrote into the
            stream-send buffers, then flush the resulting
            1-RTT packets to the wire. */

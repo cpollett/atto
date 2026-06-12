@@ -517,6 +517,36 @@ $test->get('/big', function () use ($test) {
     $block = str_repeat("X", 1024);
     echo str_repeat($block, 1024);
 });
+$test->get('/stream', function () use ($test) {
+    /*
+        1 MiB response, same size as /big, but produced through
+        $site->stream() instead of a single echo. The route hands
+        Atto a generator and returns; Atto pulls one block at a
+        time from its event loop as the client takes bytes, so the
+        body is never assembled in memory whole and, over HTTP/2,
+        the send is paced by the peer's flow-control window.
+        Benchmarking this against /big shows the overhead (if any)
+        of generator-paced delivery versus a buffered body of the
+        same size. Content-Length is set up front so the transfer
+        is determinate.
+     */
+    $total_length = 1024 * 1024;
+    $block_length = 256 * 1024;
+    $test->header("Content-Type: application/octet-stream");
+    $test->header("Content-Length: " . $total_length);
+    $test->stream(function () use ($total_length, $block_length) {
+        $block = str_repeat("X", $block_length);
+        $sent = 0;
+        while ($sent < $total_length) {
+            $remaining = $total_length - $sent;
+            if ($remaining < $block_length) {
+                $block = str_repeat("X", $remaining);
+            }
+            yield $block;
+            $sent += strlen($block);
+        }
+    });
+});
 $test->get('/asset/{n}', function () use ($test) {
     /*
         Tiny per-asset response. The runner fetches many of

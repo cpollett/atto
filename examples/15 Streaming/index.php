@@ -10,7 +10,7 @@ if (!defined("seekquarry\\atto\\RUN")) {
 $test = new WebSite();
 
 /*
-    A streaming-response demo for Atto. Shows three patterns:
+    A streaming-response demo for Atto. Shows five patterns:
 
     1. /         A landing page with two live demos: an SSE event
                  stream and a "send chunks as you compute them"
@@ -36,6 +36,18 @@ $test = new WebSite();
                     you want the browser to start receiving and
                     saving rows immediately rather than waiting
                     for the whole file to assemble in memory.
+
+    5. /download.bin  Large download produced through
+                    $site->stream($generator) rather than flush().
+                    The route returns immediately and Atto pulls
+                    body chunks from the generator in its event
+                    loop as the client takes bytes, so the body is
+                    never held in memory whole and, over HTTP/2, is
+                    paced by the peer's flow-control window. Use
+                    stream() for a large or lazily produced body;
+                    use flush() (the routes above) to push a
+                    bounded series of small chunks as you compute
+                    them.
 
     After commenting the exit() line above, you can run this
     example by typing:
@@ -98,9 +110,13 @@ $test->get('/', function () use ($test) {
     </head>
     <body>
         <h1>Atto Streaming Responses</h1>
-        <p>Three demos of <code>$site-&gt;flush()</code>. Each
-        pushes data to the browser incrementally rather than
-        buffering the whole response.</p>
+        <p>The first three demos use <code>$site-&gt;flush()</code>,
+        which pushes buffered output to the browser incrementally.
+        The fourth uses <code>$site-&gt;stream()</code>, which hands
+        Atto a generator and lets the event loop pull body chunks as
+        the client takes them &mdash; so a large response stays
+        memory-bounded and, over HTTP/2, is paced by the peer's
+        flow-control window while other requests keep being served.</p>
 
         <h2>1. Server-Sent Events (<code>/events</code>)</h2>
         <p class="meta">Uses the browser's
@@ -123,6 +139,20 @@ $test->get('/', function () use ($test) {
         download as soon as the first chunk arrives, even though
         the server is still generating rows. Useful for large or
         slow-to-compute exports.</p>
+
+        <h2>4. Generator-Streamed Download
+            (<a href="/download.bin">/download.bin</a>)</h2>
+        <p class="meta">Serves an 8&nbsp;MiB body through
+        <code>$site-&gt;stream($generator)</code>. The route returns
+        right away; Atto advances the generator from its event loop
+        as the client takes bytes, so the whole body is never held
+        in memory at once. Over HTTP/2 the send is paced by the
+        peer's flow-control window, which keeps one large download
+        from monopolizing the connection. Use <code>stream()</code>
+        when the body is large or produced lazily and you want it
+        sent without buffering it whole; use <code>flush()</code>
+        (demos 1&ndash;3) when you are emitting a bounded series of
+        small chunks and want each pushed out as you compute it.</p>
 
         <script>
             var sse_log = document.getElementById('sse_log');
@@ -249,6 +279,44 @@ $test->get('/export.csv', function () use ($test) {
             usleep(50000);
         }
     }
+});
+$test->get('/download.bin', function () use ($test) {
+    /*
+        Generator-streamed download. Unlike the flush() demos
+        above, this route does not echo a body and call flush();
+        it hands $site->stream() a generator and returns. Atto
+        then advances the generator from its event loop, pulling
+        one chunk at a time as the client takes the previous
+        bytes. The body is therefore never assembled in memory
+        whole, and over HTTP/2 it is paced by the peer's
+        flow-control window, so a large download neither balloons
+        the server's memory nor monopolizes the connection while
+        other streams wait.
+
+        Content-Length is set ahead of the stream so the browser
+        shows a determinate download. The body here is generated
+        deterministically (an 8 MiB run of a repeating block) but
+        a real route would read from a file or other source the
+        same way, yielding a block per iteration.
+     */
+    $total_length = 8 * 1024 * 1024;
+    $block_length = 256 * 1024;
+    $test->header("Content-Type: application/octet-stream");
+    $test->header("Content-Length: " . $total_length);
+    $test->header(
+        "Content-Disposition: attachment; filename=\"download.bin\"");
+    $test->stream(function () use ($total_length, $block_length) {
+        $block = str_repeat("X", $block_length);
+        $sent = 0;
+        while ($sent < $total_length) {
+            $remaining = $total_length - $sent;
+            if ($remaining < $block_length) {
+                $block = str_repeat("X", $remaining);
+            }
+            yield $block;
+            $sent += strlen($block);
+        }
+    });
 });
 if ($test->isCli()) {
     $test->listen(8080);

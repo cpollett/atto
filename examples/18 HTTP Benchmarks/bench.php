@@ -488,6 +488,12 @@ $cases['big'] = function ($t) use ($iterations) {
         max(10, intdiv($iterations, 10)),
         'sustained throughput, 1 MiB body');
 };
+$cases['stream'] = function ($t) use ($iterations) {
+    $url = ($t['endpoint'])('/stream');
+    return singleShot($url, $t['curl_opts'],
+        max(10, intdiv($iterations, 10)),
+        'same 1 MiB body via generator stream()');
+};
 $cases['asset'] = function ($t) use ($concurrency) {
     /*
         Parallel-fetch test. With H2 multiplexing all

@@ -807,7 +807,7 @@ class WebSite
             return true;
         }
         $protocol = $this->streaming_context['protocol'] ?? null;
-        if ($this->isCli() && $protocol === 'h2') {
+        if ($this->isCli() && ($protocol === 'h2' || $protocol === 'h3')) {
             $this->streaming_producer = $generator;
         } else if ($this->isCli() && $protocol === 'h1') {
             /* H1 streams incrementally: echo each chunk and flush it
@@ -833,6 +833,41 @@ class WebSite
             }
         }
         return true;
+    }
+    /**
+     * Returns the streaming generator a route parked via stream()
+     * and clears it, so a listener can take ownership and advance
+     * it from its own event loop. Returns null when the route did
+     * not stream. Used by listeners (such as the H3 listener) that
+     * drive a parked generator outside WebSite's own H2 send path.
+     *
+     * @return \Generator|null the parked generator, or null if the
+     *      route produced an ordinary buffered body
+     */
+    public function takeStreamingProducer()
+    {
+        $producer = $this->streaming_producer;
+        $this->streaming_producer = null;
+        return $producer;
+    }
+    /**
+     * Sets, or with an empty string clears, the streaming protocol
+     * a listener is serving the current request over, so that a
+     * route calling stream() parks its generator for that protocol
+     * rather than buffering the whole body. Used by a listener (the
+     * H3 listener) that drives streaming itself, before it invokes
+     * getResponseData and after it has taken the parked generator.
+     *
+     * @param string $protocol protocol token such as 'h3', or the
+     *      empty string to clear the streaming context
+     */
+    public function setStreamingProtocol($protocol)
+    {
+        if ($protocol === '') {
+            $this->streaming_context = [];
+        } else {
+            $this->streaming_context = ['protocol' => $protocol];
+        }
     }
     /**
      * Streams the buffered output to the client immediately

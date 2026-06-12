@@ -6634,6 +6634,22 @@ class QuicConnection
         }
     }
     /**
+     * Number of bytes queued but not yet framed on stream $sid's
+     * send side, or 0 if the stream does not exist yet. Lets a
+     * caller pacing its own producer (the H3 streaming path) see
+     * how much is still waiting to go out before queuing more.
+     *
+     * @param int $sid stream id to inspect
+     * @return int bytes still buffered awaiting send on that stream
+     */
+    public function bufferedLength($sid)
+    {
+        if (!isset($this->streams[$sid])) {
+            return 0;
+        }
+        return $this->streams[$sid]->bufferedLength();
+    }
+    /**
      * Drains every writable stream into 1-RTT STREAM
      * frames. One STREAM frame body is bounded at
      * MAX_STREAM_FRAME_BYTES so multiple frames fit
@@ -8467,6 +8483,30 @@ class H3Listener extends Listener
                 every event-loop iteration even if no new
                 packets arrive from the peer.
              */
+            /*
+                Top up any streamed responses on this
+                connection before draining. For each stream
+                with a parked generator, pull more chunks
+                while its send buffer sits below the refill
+                threshold, so flushStreams has data to emit
+                this tick without the whole body being held
+                in memory. Production is paced by how fast
+                the QUIC layer drains earlier chunks, which
+                in turn follows the peer's flow-control
+                window. The transport owns the generator
+                bookkeeping, so the advance runs there.
+             */
+            if ($this->site !== null &&
+                isset($this->site->transports['h3']) &&
+                !empty($h3->h3_streams)) {
+                $transport = $this->site->transports['h3'];
+                foreach ($h3->h3_streams as $sid => $st) {
+                    if (!empty($st['streaming_gen'])) {
+                        $transport->advanceH3StreamingGenerator(
+                            $h3, $sid);
+                    }
+                }
+            }
             $h3->quic->flushStreams();
             foreach ($h3->quic->emit() as $datagram) {
                 @stream_socket_sendto($this->server,
@@ -8591,6 +8631,17 @@ class H3Listener extends Listener
  */
 class H3Transport extends Transport
 {
+    /**
+     * Buffered-byte threshold below which advanceH3StreamingGenerator
+     * pulls more from a parked generator. Keeping a little more than
+     * one flush budget queued means flushStreams always has data to
+     * send each tick without the whole body being buffered at once,
+     * so a streamed response stays memory-bounded while still filling
+     * the per-tick send budget. Producing past this only wastes
+     * memory, since the QUIC layer drains no faster than the peer's
+     * flow-control window allows.
+     */
+    const H3_STREAM_REFILL_BYTES = 65536;
     /**
      * No-op for H3: per-connection readable events are
      * driven by H3Listener::accept reading the shared UDP
@@ -8842,12 +8893,25 @@ class H3Transport extends Transport
         $context = $this->buildContext($listener, $conn,
             $st);
         $this->site->setGlobals($context, $conn);
+        /*
+            Tell WebSite this request is served over H3 so a route
+            that calls $site->stream($generator) parks the generator
+            instead of draining it into a buffered body. After
+            getResponseData the parked generator (if any) is taken
+            and advanced from the QUIC event loop, so a large or
+            lazily produced body is sent in bounded chunks rather
+            than assembled in memory whole.
+         */
+        $this->site->setStreamingProtocol('h3');
         try {
             $body = $this->site->getResponseData(false);
         } catch (\Throwable $e) {
+            $this->site->setStreamingProtocol('');
             $this->sendErrorResponse($conn, $sid, 500);
             return;
         }
+        $producer = $this->site->takeStreamingProducer();
+        $this->site->setStreamingProtocol('');
         $status = 200;
         if (preg_match('/HTTP\/[\d.]+ (\d+)/',
             $this->site->header_data, $m)) {
@@ -8861,6 +8925,13 @@ class H3Transport extends Transport
                 continue;
             }
             $headers[] = $line;
+        }
+        if ($producer !== null) {
+            $this->sendResponseHeaders($conn, $sid, $status,
+                $headers);
+            $st['streaming_gen'] = $producer;
+            $this->advanceH3StreamingGenerator($conn, $sid);
+            return;
         }
         $this->sendResponse($conn, $sid, $status, $headers,
             $body);
@@ -8954,6 +9025,32 @@ class H3Transport extends Transport
     protected function sendResponse($conn, $sid, $status,
         $header_lines, $body)
     {
+        $this->sendResponseHeaders($conn, $sid, $status,
+            $header_lines);
+        if ($body !== '') {
+            $data_frame = H3FrameCodec::encode(
+                H3FrameCodec::H3_DATA, $body);
+            $conn->quic->sendStreamData($sid, $data_frame,
+                true);
+        } else {
+            $conn->quic->sendStreamData($sid, '', true);
+        }
+    }
+    /**
+     * Emits the QPACK-encoded HEADERS frame for a response on
+     * stream $sid without finishing the stream, so a body (one
+     * or more DATA frames) can follow. Shared by sendResponse
+     * and the generator-streaming path.
+     *
+     * @param QuicConnection $conn live QUIC connection
+     * @param int $sid bidirectional request stream id
+     * @param int $status HTTP response status code
+     * @param array $header_lines response header lines, each a
+     *      "Name: value" string from the app's header_data
+     */
+    protected function sendResponseHeaders($conn, $sid, $status,
+        $header_lines)
+    {
         $h3_headers = [
             [':status', (string) $status],
         ];
@@ -8985,13 +9082,48 @@ class H3Transport extends Transport
             H3FrameCodec::H3_HEADERS, $headers_body);
         $conn->quic->sendStreamData($sid, $headers_frame,
             false);
-        if ($body !== '') {
+    }
+    /**
+     * Advances a parked streaming generator for stream $sid,
+     * keeping the QUIC send buffer topped up without assembling
+     * the whole body in memory. While the stream's buffered
+     * (not-yet-framed) bytes sit below H3_STREAM_REFILL_BYTES
+     * and the generator has more to give, pulls the next chunk
+     * and writes it as its own DATA frame. When the generator
+     * is exhausted, finishes the stream with an empty FIN write
+     * and unparks it. Called once when the response is first
+     * dispatched and again from the connection tick as the
+     * QUIC layer drains earlier chunks, so production is paced
+     * by the peer's per-stream flow-control window rather than
+     * running ahead of it.
+     *
+     * @param QuicConnection $conn live QUIC connection
+     * @param int $sid bidirectional request stream id whose
+     *      generator is being advanced
+     */
+    public function advanceH3StreamingGenerator($conn, $sid)
+    {
+        if (empty($conn->h3_streams[$sid]['streaming_gen'])) {
+            return;
+        }
+        $generator = $conn->h3_streams[$sid]['streaming_gen'];
+        $buffered = $conn->quic->bufferedLength($sid);
+        while ($buffered < self::H3_STREAM_REFILL_BYTES) {
+            if (!$generator->valid()) {
+                $conn->quic->sendStreamData($sid, '', true);
+                unset($conn->h3_streams[$sid]['streaming_gen']);
+                return;
+            }
+            $chunk = $generator->current();
+            $generator->next();
+            if ($chunk === null || $chunk === '') {
+                continue;
+            }
             $data_frame = H3FrameCodec::encode(
-                H3FrameCodec::H3_DATA, $body);
+                H3FrameCodec::H3_DATA, $chunk);
             $conn->quic->sendStreamData($sid, $data_frame,
-                true);
-        } else {
-            $conn->quic->sendStreamData($sid, '', true);
+                false);
+            $buffered += strlen($data_frame);
         }
     }
     /**

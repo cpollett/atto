@@ -146,6 +146,28 @@ class WebSite
      */
     const H2_ERROR_PROTOCOL = 0x1;
     /**
+     * RFC 7540 sec 7 NO_ERROR code: used on a RST_STREAM that ends a
+     * stream cleanly rather than because of a fault. Sent when the
+     * server gives up on a streamed response that has made no send
+     * progress for STREAM_STALL_TIMEOUT seconds because the peer
+     * stopped extending the stream's flow-control window (a media
+     * player that seeked to bytes it cannot decode and so never
+     * drains its receive buffer). Ending the stream lets the player
+     * re-request promptly instead of waiting out its own timeout.
+     */
+    const H2_ERROR_NO_ERROR = 0x0;
+    /**
+     * Seconds a streamed response may sit blocked with bytes it owes
+     * but cannot send (the stream's flow-control window is exhausted
+     * and the peer has sent no WINDOW_UPDATE) before the server ends
+     * the stream with a NO_ERROR RST_STREAM. Chosen below a browser's
+     * own stalled-stream timeout so a seek that wedges the window
+     * recovers in a few seconds rather than twenty-odd. A response
+     * that is merely draining slowly keeps making progress and so
+     * never reaches this bound.
+     */
+    const STREAM_STALL_TIMEOUT = 4;
+    /**
      * RFC 7540 sec 6.5.2 SETTINGS_INITIAL_WINDOW_SIZE identifier:
      * the per-stream flow-control window the peer's SETTINGS
      * frame advertises.
@@ -321,6 +343,15 @@ class WebSite
      * @var bool
      */
     protected $is_streaming = false;
+    /**
+     * Generator a route registers via stream() to produce an H2
+     * response body lazily, one yielded chunk at a time, instead of
+     * echoing the whole body. Picked up by dispatchH2Request, which
+     * parks it and resumes it from the event loop as the peer takes
+     * data. Null outside a streaming route.
+     * @var \Generator|null
+     */
+    protected $streaming_producer = null;
     /**
      * Connection resource for the in-flight request, set by
      * processRequestStreams (H1) or dispatchH2Request (H2)
@@ -752,6 +783,58 @@ class WebSite
         return true;
     }
     /**
+     * Registers a generator that produces the response body lazily,
+     * one yielded string chunk at a time, for the in-flight request.
+     * Over HTTP/2 the body is then produced and sent incrementally,
+     * paced by the peer's flow-control window, so an arbitrarily
+     * large response (a full video range, say) never has to be held
+     * in memory at once and other streams on the connection keep
+     * being served. A route calls this and returns immediately; it
+     * must not also echo a body. Headers set before the call (status,
+     * content-type, content-length, content-range) are sent as the
+     * response HEADERS. Outside CLI HTTP/2 there is no incremental
+     * path, so the generator is drained into the normal buffered
+     * response instead, which still produces the correct body.
+     *
+     * @param callable|\Generator $producer a generator, or a
+     *      callable returning one, that yields body chunks
+     * @return bool true (the request is considered handled)
+     */
+    public function stream($producer)
+    {
+        $generator = is_callable($producer) ? $producer() : $producer;
+        if (!($generator instanceof \Generator)) {
+            return true;
+        }
+        $protocol = $this->streaming_context['protocol'] ?? null;
+        if ($this->isCli() && $protocol === 'h2') {
+            $this->streaming_producer = $generator;
+        } else if ($this->isCli() && $protocol === 'h1') {
+            /* H1 streams incrementally: echo each chunk and flush it
+               as a chunked-transfer block, stopping if the peer goes
+               away (a seek aborting the request), the same contract
+               as a route that echoes and calls flush() itself */
+            foreach ($generator as $chunk) {
+                if ($chunk !== null && $chunk !== "") {
+                    echo $chunk;
+                }
+                if (!$this->flush() && $this->streamingFailed()) {
+                    break;
+                }
+            }
+        } else {
+            /* no incremental path here (SAPI and H3 buffer whole);
+               produce the body now so the result is still correct,
+               just not memory-bounded */
+            foreach ($generator as $chunk) {
+                if ($chunk !== null && $chunk !== "") {
+                    echo $chunk;
+                }
+            }
+        }
+        return true;
+    }
+    /**
      * Streams the buffered output to the client immediately
      * instead of buffering until the route returns. Use to push
      * Server-Sent Events, deliver large dynamic responses
@@ -825,26 +908,6 @@ class WebSite
     public function streamingFailed()
     {
         return $this->streaming_failed;
-    }
-    /**
-     * Tells whether the current response can be streamed block by
-     * block (chunked HTTP/1.1) rather than buffered and sent whole.
-     * Only HTTP/1.1 supports incremental flush() here; HTTP/2 and
-     * HTTP/3 responses accumulate in the output buffer and go out
-     * together when the route returns. A route serving a large body
-     * can use this to keep one buffered response bounded (for
-     * example capping a byte range) while still serving the full
-     * body when real streaming is available.
-     *
-     * @return bool whether incremental streaming is available for
-     *      the current response
-     */
-    public function streamingAvailable()
-    {
-        if (!$this->isCli() || $this->streaming_socket === null) {
-            return false;
-        }
-        return ($this->streaming_context['protocol'] ?? null) === 'h1';
     }
     /**
      * Writes $data completely to the streaming socket, looping on
@@ -2076,6 +2139,7 @@ class WebSite
                     $in_streams_with_data);
                 $this->processResponseStreams($out_streams_with_data);
             }
+            $this->refillStreamingGenerators();
             $this->cullDeadStreams();
         }
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
@@ -3500,6 +3564,8 @@ class WebSite
                 $frame->stream_id])) {
                 $state['stream_send_windows'][$frame->stream_id]
                     += $increment;
+                $state['stream_progress_time'][$frame->stream_id] =
+                    microtime(true);
                 $this->pumpH2PendingSend($key, $connection, $conn,
                     $frame->stream_id);
             }
@@ -3510,11 +3576,14 @@ class WebSite
                 RFC 7540 sec 6.4: the client no longer wants this
                 stream; drop any response bytes still waiting on
                 send credit so they neither hold memory nor get
-                sent to a reset stream.
+                sent to a reset stream. Discarding a parked
+                streaming generator lets its finally block run,
+                releasing any file handle it held.
              */
             unset($state['pending_send'][$frame->stream_id]);
             unset($state['stream_send_windows'][
                 $frame->stream_id]);
+            unset($state['streaming_gen'][$frame->stream_id]);
             return false;
         }
         if (!($frame instanceof HeaderFrame)) {
@@ -3656,9 +3725,239 @@ class WebSite
         $state['stream_send_windows'][$stream_id] =
             $state['peer_initial_window'];
         $state['pending_send'][$stream_id] =
-            ['data' => $body, 'offset' => 0];
+            ['data' => $body, 'offset' => 0, 'complete' => true];
         $this->pumpH2PendingSend($key, $connection, $conn,
             $stream_id);
+    }
+    /**
+     * Appends another chunk of a streamed response body to a
+     * stream's pending send buffer and pumps what the flow-control
+     * windows allow. Unlike sendH2Body, which takes a whole body at
+     * once, this is called repeatedly as a streaming producer yields
+     * chunks across event-loop turns, so the whole body is never
+     * held in memory at once. The already-sent prefix is dropped
+     * from the buffer on each call so a long response stays bounded
+     * by roughly one pump slice. END_STREAM is withheld until $last
+     * is true, which marks the entry complete so pumpH2PendingSend
+     * closes the stream once the final bytes drain.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the frames go out on
+     * @param object $conn Connection holding protocol_state
+     * @param int $stream_id H2 stream id being streamed
+     * @param string $chunk next body bytes to queue, possibly empty
+     * @param bool $last whether this is the final chunk of the body
+     */
+    protected function appendH2Body($key, $connection, $conn,
+        $stream_id, $chunk, $last)
+    {
+        $state = &$conn->protocol_state;
+        if (!isset($state['send_window'])) {
+            $this->initH2SendWindows($conn, []);
+        }
+        if (!isset($state['pending_send'][$stream_id])) {
+            $state['stream_send_windows'][$stream_id] =
+                $state['peer_initial_window'];
+            $state['pending_send'][$stream_id] =
+                ['data' => "", 'offset' => 0, 'complete' => false];
+        }
+        $pending = &$state['pending_send'][$stream_id];
+        /* drop the already-sent prefix so the buffer stays bounded */
+        if ($pending['offset'] > 0) {
+            $pending['data'] = substr($pending['data'],
+                $pending['offset']);
+            $pending['offset'] = 0;
+        }
+        $pending['data'] .= $chunk;
+        if ($last) {
+            $pending['complete'] = true;
+        }
+        unset($pending);
+        $this->pumpH2PendingSend($key, $connection, $conn,
+            $stream_id);
+    }
+    /**
+     * Advances every parked streaming-response generator whose
+     * stream's outbound buffer has drained below one pump slice,
+     * pulling the next body chunk from the generator and appending
+     * it. Run once per event-loop iteration so a streamed response
+     * is produced lazily, paced by how fast the peer takes data and
+     * returns flow-control credit, while other streams on the same
+     * connection keep being served (the generator is parked between
+     * iterations rather than blocking the route). A generator that
+     * has finished is removed and its stream's final chunk marked,
+     * letting pumpH2PendingSend close the stream once it drains.
+     */
+    protected function refillStreamingGenerators()
+    {
+        foreach ($this->connections as $key => $conn) {
+            if (empty($conn->protocol_state['streaming_gen'])) {
+                continue;
+            }
+            $connection = $this->in_streams[self::CONNECTION][$key]
+                ?? null;
+            if ($connection === null) {
+                unset($conn->protocol_state['streaming_gen']);
+                continue;
+            }
+            foreach ($conn->protocol_state['streaming_gen']
+                as $stream_id => $generator) {
+                /*
+                    Only draw from a generator when this stream has
+                    less than a pump slice already buffered and
+                    unsent. Without this guard the refill pulls and
+                    pumps another small chunk on every event-loop
+                    iteration, which keeps the connection perpetually
+                    in the writable set so stream_select never blocks
+                    and the loop spins at high CPU, starving other
+                    work during a burst of requests (a scrub). With
+                    it, once a slice is queued the generator is left
+                    alone until that slice drains, so the loop sleeps
+                    between drains instead of spinning.
+                 */
+                $state = &$conn->protocol_state;
+                $pending_unsent = 0;
+                if (isset($state['pending_send'][$stream_id])) {
+                    $pending_unsent = strlen(
+                        $state['pending_send'][$stream_id]['data'])
+                        - $state['pending_send'][$stream_id]['offset'];
+                }
+                $queued_unsent =
+                    strlen($this->out_streams[self::DATA][$key] ?? "")
+                    - ($this->out_streams[self::DATA_OFFSET][$key]
+                    ?? 0);
+                /*
+                    End a streamed response that has been unable to
+                    make progress for too long. When the stream's
+                    flow-control window is exhausted and the peer has
+                    sent no WINDOW_UPDATE, the server holds bytes it
+                    cannot send. A media player that seeks to an
+                    offset whose bytes it cannot decode never drains
+                    its receive buffer, so it never extends the
+                    window, and the response would sit wedged until
+                    the player's own timeout (twenty-odd seconds)
+                    fired. Ending the stream with a NO_ERROR
+                    RST_STREAM after a short bound lets the player
+                    re-request right away. A response that is merely
+                    draining slowly, or a paused player that resumes,
+                    keeps advancing stream_progress_time and so never
+                    trips this. The file handle is released when the
+                    discarded generator's finally block runs.
+                 */
+                $stream_window =
+                    $state['stream_send_windows'][$stream_id] ?? 0;
+                $progress_time =
+                    $state['stream_progress_time'][$stream_id] ?? 0;
+                $stalled = $pending_unsent > 0 && $stream_window <= 0
+                    && $progress_time > 0
+                    && microtime(true) - $progress_time
+                    >= self::STREAM_STALL_TIMEOUT;
+                unset($state);
+                if ($stalled) {
+                    $this->endStalledStream($key, $connection, $conn,
+                        $stream_id);
+                    continue;
+                }
+                if ($pending_unsent + $queued_unsent
+                    >= self::H2_PUMP_SLICE) {
+                    continue;
+                }
+                $this->refillOneStreamingGenerator($key, $connection,
+                    $conn, $stream_id, $generator);
+            }
+        }
+    }
+    /**
+     * Ends a streamed response that has stalled with bytes it cannot
+     * send because the peer stopped extending the stream's
+     * flow-control window. Sends a NO_ERROR RST_STREAM and discards
+     * the stream's parked generator and pending state so the file
+     * handle is released and the peer is free to re-request. Used
+     * only after STREAM_STALL_TIMEOUT seconds of no send progress.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the frame goes out on
+     * @param object $conn Connection holding protocol_state
+     * @param int $stream_id H2 stream id to reset
+     */
+    protected function endStalledStream($key, $connection, $conn,
+        $stream_id)
+    {
+        $state = &$conn->protocol_state;
+        $reset = new RstStreamFrame($stream_id,
+            self::H2_ERROR_NO_ERROR);
+        $custom_error_handler = $this->default_server_globals[
+            "CUSTOM_ERROR_HANDLER"] ?? null;
+        set_error_handler(null);
+        fwrite($connection, $reset->serialize());
+        set_error_handler($custom_error_handler);
+        unset($state['pending_send'][$stream_id]);
+        unset($state['stream_send_windows'][$stream_id]);
+        unset($state['stream_progress_time'][$stream_id]);
+        unset($state['streaming_gen'][$stream_id]);
+    }
+    /**
+     * Refills a single parked streaming generator for one stream:
+     * while its outbound buffer holds less than a pump slice and the
+     * generator has more to give, pulls the next chunk and appends
+     * it; when the generator is exhausted, appends a final empty
+     * chunk marking the body complete and unparks it. Keeping the
+     * refill bounded by one slice caps the memory a streamed
+     * response holds and lets the loop move on to other work.
+     *
+     * @param int $key connection identifier
+     * @param resource $connection socket the frames go out on
+     * @param object $conn Connection holding protocol_state
+     * @param int $stream_id H2 stream id being streamed
+     * @param \Generator $generator the parked response producer
+     */
+    protected function refillOneStreamingGenerator($key, $connection,
+        $conn, $stream_id, $generator)
+    {
+        $state = &$conn->protocol_state;
+        while ($generator->valid()) {
+            /*
+                Stop pulling from the generator once a slice's worth
+                of body is already buffered and unsent for this
+                stream (either still in pending_send or queued in the
+                connection's outbound buffer). This caps the memory a
+                streamed response holds to about one slice regardless
+                of how fast the generator can produce, while leaving
+                enough queued that the pump always has data to send.
+             */
+            $pending_unsent = 0;
+            if (isset($state['pending_send'][$stream_id])) {
+                $pending_unsent =
+                    strlen($state['pending_send'][$stream_id]['data'])
+                    - $state['pending_send'][$stream_id]['offset'];
+            }
+            $queued_unsent =
+                strlen($this->out_streams[self::DATA][$key] ?? "")
+                - ($this->out_streams[self::DATA_OFFSET][$key] ?? 0);
+            if ($pending_unsent + $queued_unsent
+                >= self::H2_PUMP_SLICE) {
+                return;
+            }
+            $chunk = $generator->current();
+            $generator->next();
+            $last = !$generator->valid();
+            if ($chunk === null) {
+                $chunk = "";
+            }
+            $this->appendH2Body($key, $connection, $conn, $stream_id,
+                $chunk, $last);
+        }
+        if (!$generator->valid()) {
+            /* generator produced nothing new but is done; ensure the
+               stream is marked complete so it can close */
+            if (isset($state['pending_send'][$stream_id])
+                && empty($state['pending_send'][$stream_id][
+                'complete'])) {
+                $this->appendH2Body($key, $connection, $conn,
+                    $stream_id, "", true);
+            }
+            unset($conn->protocol_state['streaming_gen'][$stream_id]);
+        }
     }
     /**
      * Pumps connection $key's streams with pending response
@@ -3736,6 +4035,17 @@ class WebSite
         }
         $pending = &$state['pending_send'][$stream_id];
         $total = strlen($pending['data']);
+        /*
+            A streaming body is appended to over several event-loop
+            turns, so "offset reached the current data length" does
+            not by itself mean the body is finished. The producer
+            marks the entry complete only once the final chunk has
+            been appended; until then END_STREAM is withheld and the
+            stream is kept pending so later appends can be pumped.
+            Bodies sent whole through sendH2Body are complete from
+            the start, preserving the previous behavior.
+         */
+        $complete = $pending['complete'] ?? true;
         $out = "";
         $sliced = 0;
         while ($pending['offset'] < $total &&
@@ -3754,18 +4064,20 @@ class WebSite
             $pending['offset'] += $piece_len;
             $state['send_window'] -= $piece_len;
             $state['stream_send_windows'][$stream_id] -= $piece_len;
+            $state['stream_progress_time'][$stream_id] =
+                microtime(true);
             $frame = new DataFrame($stream_id, $piece);
-            if ($pending['offset'] >= $total) {
+            if ($complete && $pending['offset'] >= $total) {
                 $frame->flags->add("END_STREAM");
             }
             $out .= $frame->serialize();
         }
-        if ($total == 0) {
+        if ($total == 0 && $complete) {
             $end_frame = new DataFrame($stream_id, "");
             $end_frame->flags->add("END_STREAM");
             $out .= $end_frame->serialize();
         }
-        if ($pending['offset'] >= $total) {
+        if ($complete && $pending['offset'] >= $total) {
             unset($state['pending_send'][$stream_id]);
             unset($state['stream_send_windows'][$stream_id]);
         }
@@ -3813,6 +4125,8 @@ class WebSite
         ];
         $body = $this->getResponseData(false);
         $was_streaming = ($body === "" && $this->streaming_socket === null);
+        $streaming_producer = $this->streaming_producer;
+        $this->streaming_producer = null;
         $this->streaming_socket = null;
         $this->streaming_context = [];
         if ($was_streaming) {
@@ -3888,6 +4202,20 @@ class WebSite
             branch clears only the out_streams entry.
          */
         $this->queueResponseData($key, $connection, $out);
+        if ($streaming_producer !== null) {
+            /*
+                Streaming response: park the generator on the
+                connection and prime it. refillStreamingGenerators
+                advances it from the event loop as the peer takes
+                data, so the body is produced incrementally and
+                bounded in memory rather than sent all at once.
+             */
+            $conn->protocol_state['streaming_gen'][$stream_id] =
+                $streaming_producer;
+            $this->refillOneStreamingGenerator($key, $connection,
+                $conn, $stream_id, $streaming_producer);
+            return true;
+        }
         $this->sendH2Body($key, $connection, $conn, $stream_id,
             $body);
         return true;

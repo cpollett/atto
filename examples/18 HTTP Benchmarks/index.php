@@ -50,6 +50,7 @@ $test = new WebSite();
     or H2 per request based on ALPN):
         /small        2-byte response — per-request overhead
         /big          1 MiB response — sustained throughput
+        /stream       1 MiB response via generator stream()
         /asset/{n}    indexed small response — parallel-fetch
         /headers      100 custom headers — HPACK / QPACK vs plain
         /echo-post    echoes POST body — request-body round-trip
@@ -175,6 +176,7 @@ $test->get('/', function () {
             included via the checkbox below.</li>
         <li><a href="/small" target="_blank">/small</a>,
             <a href="/big" target="_blank">/big</a>,
+            <a href="/stream" target="_blank">/stream</a>,
             <a href="/headers" target="_blank">/headers</a>,
             <a href="/asset/1" target="_blank">/asset/{n}</a>
             &mdash; the bench test endpoints. Hit them
@@ -231,6 +233,7 @@ $test->get('/', function () {
 var KNOWN_CASES = [
     {key: 'SMALL',     label: '/small (per-request overhead)'},
     {key: 'BIG',       label: '/big (1 MiB throughput)'},
+    {key: 'STREAM',    label: '/stream (1 MiB via generator)'},
     {key: 'ASSET',     label: '/asset (parallel multiplex)'},
     {key: 'HEADERS',   label: '/headers (HPACK/QPACK vs plain)'},
     {key: 'KEEPALIVE', label: '/small over one connection'},

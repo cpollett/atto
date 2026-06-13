@@ -92,7 +92,7 @@ class WebSite
      * retries let the replacement wait that window out rather than
      * coming up with a dead listener.
      */
-    const BIND_ATTEMPTS = 10;
+    const BIND_ATTEMPTS = 40;
     /**
      * Milliseconds the bind retry waits between attempts. Total
      * worst-case wait is BIND_ATTEMPTS times this value.
@@ -145,28 +145,6 @@ class WebSite
      * when tearing a connection down over a malformed frame.
      */
     const H2_ERROR_PROTOCOL = 0x1;
-    /**
-     * RFC 7540 sec 7 NO_ERROR code: used on a RST_STREAM that ends a
-     * stream cleanly rather than because of a fault. Sent when the
-     * server gives up on a streamed response that has made no send
-     * progress for STREAM_STALL_TIMEOUT seconds because the peer
-     * stopped extending the stream's flow-control window (a media
-     * player that seeked to bytes it cannot decode and so never
-     * drains its receive buffer). Ending the stream lets the player
-     * re-request promptly instead of waiting out its own timeout.
-     */
-    const H2_ERROR_NO_ERROR = 0x0;
-    /**
-     * Seconds a streamed response may sit blocked with bytes it owes
-     * but cannot send (the stream's flow-control window is exhausted
-     * and the peer has sent no WINDOW_UPDATE) before the server ends
-     * the stream with a NO_ERROR RST_STREAM. Chosen below a browser's
-     * own stalled-stream timeout so a seek that wedges the window
-     * recovers in a few seconds rather than twenty-odd. A response
-     * that is merely draining slowly keeps making progress and so
-     * never reaches this bound.
-     */
-    const STREAM_STALL_TIMEOUT = 4;
     /**
      * RFC 7540 sec 6.5.2 SETTINGS_INITIAL_WINDOW_SIZE identifier:
      * the per-stream flow-control window the peer's SETTINGS
@@ -807,7 +785,7 @@ class WebSite
             return true;
         }
         $protocol = $this->streaming_context['protocol'] ?? null;
-        if ($this->isCli() && ($protocol === 'h2' || $protocol === 'h3')) {
+        if ($this->isCli() && $protocol === 'h2') {
             $this->streaming_producer = $generator;
         } else if ($this->isCli() && $protocol === 'h1') {
             /* H1 streams incrementally: echo each chunk and flush it
@@ -833,41 +811,6 @@ class WebSite
             }
         }
         return true;
-    }
-    /**
-     * Returns the streaming generator a route parked via stream()
-     * and clears it, so a listener can take ownership and advance
-     * it from its own event loop. Returns null when the route did
-     * not stream. Used by listeners (such as the H3 listener) that
-     * drive a parked generator outside WebSite's own H2 send path.
-     *
-     * @return \Generator|null the parked generator, or null if the
-     *      route produced an ordinary buffered body
-     */
-    public function takeStreamingProducer()
-    {
-        $producer = $this->streaming_producer;
-        $this->streaming_producer = null;
-        return $producer;
-    }
-    /**
-     * Sets, or with an empty string clears, the streaming protocol
-     * a listener is serving the current request over, so that a
-     * route calling stream() parks its generator for that protocol
-     * rather than buffering the whole body. Used by a listener (the
-     * H3 listener) that drives streaming itself, before it invokes
-     * getResponseData and after it has taken the parked generator.
-     *
-     * @param string $protocol protocol token such as 'h3', or the
-     *      empty string to clear the streaming context
-     */
-    public function setStreamingProtocol($protocol)
-    {
-        if ($protocol === '') {
-            $this->streaming_context = [];
-        } else {
-            $this->streaming_context = ['protocol' => $protocol];
-        }
     }
     /**
      * Streams the buffered output to the client immediately
@@ -943,6 +886,35 @@ class WebSite
     public function streamingFailed()
     {
         return $this->streaming_failed;
+    }
+    /**
+     * The peer's per-stream initial flow-control window for the
+     * response currently being streamed, in bytes. A route serving
+     * a large body can use this to size each span it emits so the
+     * span fits the window the client granted and the stream
+     * completes (END_STREAM) within that credit rather than parking
+     * blocked waiting for a WINDOW_UPDATE the client may not send
+     * for a body it is not actively reading. Returns 0 when there
+     * is no HTTP/2 streaming context (HTTP/1.1, HTTP/3, or off the
+     * atto server), letting the caller fall back to a fixed bound.
+     *
+     * @return int per-stream initial window in bytes, or 0 when not
+     *      applicable
+     */
+    public function peerStreamWindow()
+    {
+        if (($this->streaming_context['protocol'] ?? null) !== 'h2') {
+            return 0;
+        }
+        $key = $this->streaming_context['key'] ?? null;
+        if ($key === null) {
+            return 0;
+        }
+        $conn = $this->connection($key);
+        if ($conn === null) {
+            return 0;
+        }
+        return $conn->protocol_state['peer_initial_window'] ?? 0;
     }
     /**
      * Writes $data completely to the streaming socket, looping on
@@ -3599,10 +3571,23 @@ class WebSite
                 $frame->stream_id])) {
                 $state['stream_send_windows'][$frame->stream_id]
                     += $increment;
-                $state['stream_progress_time'][$frame->stream_id] =
-                    microtime(true);
                 $this->pumpH2PendingSend($key, $connection, $conn,
                     $frame->stream_id);
+            } else {
+                /*
+                    A peer may grant a stream's flow-control window
+                    immediately after opening the stream, before the
+                    server has begun the response and registered the
+                    stream's send window. Hold the credit so it is
+                    applied when the window is initialized, rather
+                    than dropping it (which would leave the stream
+                    stuck at the peer's initial window even though the
+                    peer had granted much more).
+                 */
+                $state['pending_stream_window_credit'][
+                    $frame->stream_id] =
+                    ($state['pending_stream_window_credit'][
+                    $frame->stream_id] ?? 0) + $increment;
             }
             return false;
         }
@@ -3617,6 +3602,8 @@ class WebSite
              */
             unset($state['pending_send'][$frame->stream_id]);
             unset($state['stream_send_windows'][
+                $frame->stream_id]);
+            unset($state['pending_stream_window_credit'][
                 $frame->stream_id]);
             unset($state['streaming_gen'][$frame->stream_id]);
             return false;
@@ -3709,6 +3696,8 @@ class WebSite
             ?? self::H2_DEFAULT_WINDOW;
         $connection->protocol_state['stream_send_windows'] = [];
         $connection->protocol_state['pending_send'] = [];
+        $connection->protocol_state['pending_stream_window_credit'] =
+            [];
     }
     /**
      * Appends serialized response bytes for connection $key to its
@@ -3758,7 +3747,9 @@ class WebSite
             $this->initH2SendWindows($conn, []);
         }
         $state['stream_send_windows'][$stream_id] =
-            $state['peer_initial_window'];
+            $state['peer_initial_window'] +
+            ($state['pending_stream_window_credit'][$stream_id] ?? 0);
+        unset($state['pending_stream_window_credit'][$stream_id]);
         $state['pending_send'][$stream_id] =
             ['data' => $body, 'offset' => 0, 'complete' => true];
         $this->pumpH2PendingSend($key, $connection, $conn,
@@ -3792,7 +3783,10 @@ class WebSite
         }
         if (!isset($state['pending_send'][$stream_id])) {
             $state['stream_send_windows'][$stream_id] =
-                $state['peer_initial_window'];
+                $state['peer_initial_window'] +
+                ($state['pending_stream_window_credit'][$stream_id]
+                ?? 0);
+            unset($state['pending_stream_window_credit'][$stream_id]);
             $state['pending_send'][$stream_id] =
                 ['data' => "", 'offset' => 0, 'complete' => false];
         }
@@ -3862,37 +3856,20 @@ class WebSite
                     - ($this->out_streams[self::DATA_OFFSET][$key]
                     ?? 0);
                 /*
-                    End a streamed response that has been unable to
-                    make progress for too long. When the stream's
-                    flow-control window is exhausted and the peer has
-                    sent no WINDOW_UPDATE, the server holds bytes it
-                    cannot send. A media player that seeks to an
-                    offset whose bytes it cannot decode never drains
-                    its receive buffer, so it never extends the
-                    window, and the response would sit wedged until
-                    the player's own timeout (twenty-odd seconds)
-                    fired. Ending the stream with a NO_ERROR
-                    RST_STREAM after a short bound lets the player
-                    re-request right away. A response that is merely
-                    draining slowly, or a paused player that resumes,
-                    keeps advancing stream_progress_time and so never
-                    trips this. The file handle is released when the
-                    discarded generator's finally block runs.
+                    When a stream's flow-control window is exhausted
+                    the pump simply sends nothing for it and the
+                    stream stays parked here, holding at most about a
+                    pump slice of buffered body, until the peer sends
+                    a WINDOW_UPDATE (which re-pumps it through the
+                    WINDOW_UPDATE handler) or the connection closes
+                    (which discards the parked generator). A browser
+                    pacing a media element legitimately leaves a
+                    stream's window at zero for seconds between reads,
+                    so the server waits rather than resetting, which
+                    would surface to the player as a broken transfer
+                    and trigger a re-request.
                  */
-                $stream_window =
-                    $state['stream_send_windows'][$stream_id] ?? 0;
-                $progress_time =
-                    $state['stream_progress_time'][$stream_id] ?? 0;
-                $stalled = $pending_unsent > 0 && $stream_window <= 0
-                    && $progress_time > 0
-                    && microtime(true) - $progress_time
-                    >= self::STREAM_STALL_TIMEOUT;
                 unset($state);
-                if ($stalled) {
-                    $this->endStalledStream($key, $connection, $conn,
-                        $stream_id);
-                    continue;
-                }
                 if ($pending_unsent + $queued_unsent
                     >= self::H2_PUMP_SLICE) {
                     continue;
@@ -3901,35 +3878,6 @@ class WebSite
                     $conn, $stream_id, $generator);
             }
         }
-    }
-    /**
-     * Ends a streamed response that has stalled with bytes it cannot
-     * send because the peer stopped extending the stream's
-     * flow-control window. Sends a NO_ERROR RST_STREAM and discards
-     * the stream's parked generator and pending state so the file
-     * handle is released and the peer is free to re-request. Used
-     * only after STREAM_STALL_TIMEOUT seconds of no send progress.
-     *
-     * @param int $key connection identifier
-     * @param resource $connection socket the frame goes out on
-     * @param object $conn Connection holding protocol_state
-     * @param int $stream_id H2 stream id to reset
-     */
-    protected function endStalledStream($key, $connection, $conn,
-        $stream_id)
-    {
-        $state = &$conn->protocol_state;
-        $reset = new RstStreamFrame($stream_id,
-            self::H2_ERROR_NO_ERROR);
-        $custom_error_handler = $this->default_server_globals[
-            "CUSTOM_ERROR_HANDLER"] ?? null;
-        set_error_handler(null);
-        fwrite($connection, $reset->serialize());
-        set_error_handler($custom_error_handler);
-        unset($state['pending_send'][$stream_id]);
-        unset($state['stream_send_windows'][$stream_id]);
-        unset($state['stream_progress_time'][$stream_id]);
-        unset($state['streaming_gen'][$stream_id]);
     }
     /**
      * Refills a single parked streaming generator for one stream:
@@ -4099,8 +4047,6 @@ class WebSite
             $pending['offset'] += $piece_len;
             $state['send_window'] -= $piece_len;
             $state['stream_send_windows'][$stream_id] -= $piece_len;
-            $state['stream_progress_time'][$stream_id] =
-                microtime(true);
             $frame = new DataFrame($stream_id, $piece);
             if ($complete && $pending['offset'] >= $total) {
                 $frame->flags->add("END_STREAM");

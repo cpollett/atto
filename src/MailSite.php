@@ -5904,18 +5904,19 @@ class MailSite implements MailVocabulary
             $reads = $this->in_streams[self::CONNECTION];
             $writes = $this->out_streams[self::CONNECTION];
             /*
-                A socket mid TLS handshake must be watched for both
-                read and write readiness, since the handshake can
-                block on either direction, so add it to the write
-                set too (it is already in the read set via
-                in_streams).
+                A socket mid TLS handshake stays in the read set
+                (via in_streams) and is driven when the peer sends
+                its next handshake record. It is deliberately not
+                added to the write set: a connected socket is almost
+                always writable, so watching a pending handshake for
+                write readiness makes stream_select return at once on
+                every iteration and the loop spins at full CPU for as
+                long as any handshake is outstanding. The crypto step
+                returning "would block" is waiting to read the peer's
+                next record, so read readiness is the correct wake
+                condition; a stalled handshake is bounded by its
+                deadline in cullDeadStreams.
              */
-            foreach ($this->handshakes as $hs_key => $hs_info) {
-                if (isset($this->in_streams[self::CONNECTION][$hs_key])) {
-                    $writes[$hs_key] =
-                        $this->in_streams[self::CONNECTION][$hs_key];
-                }
-            }
             /*
                 Cap select timeout at 5s so the loop wakes
                 regularly. IDLE pushes happen post-select, so

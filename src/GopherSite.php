@@ -762,9 +762,9 @@ class GopherSite
                 $micro_timeout = 0;
             } else {
                 $next_alarm = $this->timer_alarms->top();
-                $pre_timeout = max(0, microtime(true) - $next_alarm[0]);
+                $pre_timeout = max(0, $next_alarm[0] - microtime(true));
                 $timeout = floor($pre_timeout);
-                $micro_timeout = intval(($timeout - floor($pre_timeout))
+                $micro_timeout = intval(($pre_timeout - $timeout)
                     * 1000000);
             }
             $num_selected = stream_select($in_streams_with_data,

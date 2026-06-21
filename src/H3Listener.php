@@ -8917,11 +8917,24 @@ class H3Transport extends Transport
             than assembled in memory whole.
          */
         $this->site->setStreamingProtocol('h3');
+        $this->site->beginDeferrableH3($this, $conn, $sid);
         try {
             $body = $this->site->getResponseData(false);
         } catch (\Throwable $e) {
+            $this->site->endDeferrableH3();
             $this->site->setStreamingProtocol('');
             $this->sendErrorResponse($conn, $sid, 500);
+            return;
+        }
+        $this->site->endDeferrableH3();
+        if ($body === WebSite::RESPONSE_DEFERRED) {
+            /*
+                The route deferred itself; its response is framed and
+                sent on this same QUIC stream by the cooperative task
+                once its fiber finishes (see emitDeferredResponse).
+                Send nothing here; other streams keep being served.
+             */
+            $this->site->setStreamingProtocol('');
             return;
         }
         $producer = $this->site->takeStreamingProducer();
@@ -9049,6 +9062,37 @@ class H3Transport extends Transport
         } else {
             $conn->quic->sendStreamData($sid, '', true);
         }
+    }
+    /**
+     * Sends a deferred request's finished response on its QUIC stream,
+     * once its cooperative task has finished. Reads the status and header
+     * lines the handler left in the site's header buffer the same way
+     * dispatchRequest does for an ordinary request, then hands them and
+     * the body to sendResponse. WebSite calls this from the task's
+     * completion when the request was served over HTTP/3.
+     *
+     * @param object $conn the live QUIC connection the request arrived on
+     * @param int $sid the request's QUIC stream id
+     * @param string $body the finished response body
+     * @return void
+     */
+    public function emitDeferredResponse($conn, $sid, $body)
+    {
+        $status = 200;
+        if (preg_match('/HTTP\/[\d.]+ (\d+)/',
+            $this->site->header_data, $matches)) {
+            $status = (int) $matches[1];
+        }
+        $headers = [];
+        $lines = explode("\r\n", $this->site->header_data);
+        array_shift($lines);
+        foreach ($lines as $line) {
+            if ($line === '') {
+                continue;
+            }
+            $headers[] = $line;
+        }
+        $this->sendResponse($conn, $sid, $status, $headers, $body);
     }
     /**
      * Emits the QPACK-encoded HEADERS frame for a response on

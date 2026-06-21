@@ -85,6 +85,22 @@ class WebSite
      */
     const OUT_DATA_COMPACT_THRESHOLD = 65536;
     /**
+     * Number of random bytes in a session id. The id is stored and
+     * compared as hex, so it is twice this many characters long.
+     */
+    const SESSION_ID_BYTE_LEN = 32;
+    /**
+     * Length of a session id once written as hex, used to check that a
+     * cookie-supplied id has the right shape before it is trusted.
+     */
+    const SESSION_ID_HEX_LEN = 64;
+    /**
+     * How many sessions are kept in memory at once when the server is
+     * not told otherwise. The oldest are dropped past this point so a
+     * flood of new visitors cannot grow memory without bound.
+     */
+    const MAX_SESSIONS_DEFAULT = 10000;
+    /**
      * Number of times openListener retries a failed bind before
      * giving up. A restart spawns the replacement process while the
      * exiting one may still hold the privileged port for a short
@@ -130,6 +146,20 @@ class WebSite
      * from the peer.
      */
     const H2_DEFAULT_WINDOW = 65535;
+    /**
+     * How much upload data, in bytes, the server lets a client send
+     * on one stream before it has to pause for the server to confirm
+     * it has read the data. The HTTP/2 default is only about 64KB,
+     * which forces a client uploading a large file to send a small
+     * burst, wait for the server to acknowledge, then send another,
+     * over and over. On any connection with real round-trip delay
+     * that pause-and-wait pattern makes uploads slow. Advertising a
+     * larger window (1MB) lets the client keep the upload pipe full,
+     * which speeds up large file posts. It stays well under
+     * MAX_REQUEST_LEN, which is the real cap on how big a body the
+     * server will accept.
+     */
+    const H2_ADVERTISED_WINDOW = 1048576;
     /**
      * Most bytes of one stream's pending response body queued per
      * pump call, in bytes. Responses bigger than this go out in
@@ -274,11 +304,34 @@ class WebSite
      */
     protected $sessions = [];
     /**
-     * Keeps an ordering of currently actively sessions so if run out of
-     * memory know who to evict
-     * @var array
+     * Least-recently-used ordering of sessions, used to pick which one
+     * to drop when memory is tight. It is a min-heap of [use-count, id]
+     * pairs, smallest use-count first, so the least recently used
+     * session is found in logarithmic time rather than by scanning a
+     * list. A session reused after it was last recorded leaves an
+     * out-of-date pair behind; that pair is recognized and skipped when
+     * it surfaces during eviction (its recorded use-count no longer
+     * matches the session's current one), so no scan-and-remove is
+     * needed.
+     * @var \SplMinHeap
      */
-    protected $session_queue = [];
+    protected $session_lru;
+    /**
+     * Ever-increasing counter stamped on a session each time it is
+     * used, so the least-recently-used ordering has something to sort
+     * by. The newest use always has the largest number.
+     * @var int
+     */
+    protected $session_sequence = 0;
+    /**
+     * A well-formed session id a visitor's cookie offered that was not
+     * found in memory. It is recorded without any database work so a
+     * higher layer can decide whether it maps to a signed-in user and,
+     * if so, restore that session. Empty when the current request had
+     * no such id.
+     * @var string
+     */
+    protected $rehydrate_candidate = "";
     /**
      * Timer function callbacks that have been declared
      * @var array
@@ -331,6 +384,62 @@ class WebSite
      */
     protected $streaming_producer = null;
     /**
+     * Drives long pieces of work (a big mailbox read, a mail-server
+     * round trip) a slice at a time so they do not freeze the
+     * single-process server, handing control back to this loop between
+     * slices. Created lazily the first time a route defers work via
+     * deferTask(); null, and entirely skipped, when no long work is in
+     * flight.
+     * @var \seekquarry\atto\CooperativeScheduler|null
+     */
+    protected $cooperative_scheduler = null;
+    /**
+     * Holds the in-flight request's cooperative task between the moment a
+     * route calls deferResponse() and the moment getResponseData() notices
+     * it and tells the protocol layer to send nothing now. Null except
+     * during that brief hand-off. The task itself (its captured
+     * environment, accumulated body, and how to send it) lives on the
+     * object stored here.
+     * @var object|null
+     */
+    protected $deferred_request = null;
+    /**
+     * Set by the HTTP/3 listener for the duration of one request to the
+     * details its deferred response would need to be sent later (the
+     * listener, the QUIC connection, and the stream id). Null at all other
+     * times. HTTP/3 keeps this on its own field rather than in
+     * streaming_context so it cannot disturb the HTTP/1.1 and HTTP/2
+     * flush()/stream() path, which reads streaming_context.
+     * @var array|null
+     */
+    protected $deferrable_h3 = null;
+    /**
+     * Returned by getResponseData() in place of a response when the route
+     * deferred itself with deferResponse(): a marker, not real bytes, that
+     * tells the H1/H2/H3 send paths to send nothing now because the real
+     * response will be produced and sent later when the task's fiber
+     * finishes. The NUL bytes make it impossible to collide with a genuine
+     * response body.
+     */
+    const RESPONSE_DEFERRED = "\x00__atto_response_deferred__\x00";
+    /**
+     * How long, in microseconds, the event loop will sleep at most while
+     * a cooperative task is in flight. The loop wakes at least this often
+     * to give a fiber waiting on a slow socket a chance to make progress,
+     * without spinning the CPU at a zero-length sleep. Five milliseconds
+     * is short next to network round-trip times, so it adds no meaningful
+     * latency while a mail server is being waited on.
+     */
+    const COOPERATIVE_POLL = 5000;
+    /**
+     * Number of microseconds in a second. Used to compare a wanted
+     * stream_select wake-up, which this loop tracks as whole seconds plus
+     * microseconds, against the cooperative poll interval. atto is a
+     * self-contained server and does not read Yioop's configuration, so
+     * this conversion factor is kept here rather than pulled from Config.
+     */
+    const MICROSECONDS_PER_SECOND = 1000000;
+    /**
      * Connection resource for the in-flight request, set by
      * processRequestStreams (H1) or dispatchH2Request (H2)
      * before calling the route. Used by flush() to write
@@ -354,6 +463,17 @@ class WebSite
      * @var bool
      */
     protected $streaming_failed = false;
+    /**
+     * Whether the most recent readable-socket pass actually pulled new
+     * bytes off the wire. The event loop only refreshes a connection's
+     * activity time when it did, so a socket that select keeps reporting
+     * readable while delivering nothing (a stalled or faulting peer) ages
+     * out on the idle timeout instead of being kept alive forever. Reset
+     * to true before each connection is handled and only the H1 read path
+     * lowers it, so other protocols keep their existing behaviour.
+     * @var bool
+     */
+    protected $read_made_progress = true;
     /**
      * Used to cache in RAM files which have been read or written by the
      * fileGetContents or filePutContents
@@ -454,6 +574,7 @@ class WebSite
         $this->restart = false;
         ini_set('precision', 16);
         $this->timer_alarms = new \SplMinHeap();
+        $this->session_lru = new \SplMinHeap();
     }
     /**
      * Returns whether this class is being used from the command-line or in a
@@ -785,7 +906,7 @@ class WebSite
             return true;
         }
         $protocol = $this->streaming_context['protocol'] ?? null;
-        if ($this->isCli() && $protocol === 'h2') {
+        if ($this->isCli() && ($protocol === 'h2' || $protocol === 'h3')) {
             $this->streaming_producer = $generator;
         } else if ($this->isCli() && $protocol === 'h1') {
             /* H1 streams incrementally: echo each chunk and flush it
@@ -810,6 +931,85 @@ class WebSite
                 }
             }
         }
+        return true;
+    }
+    /**
+     * Records which HTTP protocol the request being served right now is
+     * running over, so $site->stream() can tell how to deliver a streamed
+     * body: parked and advanced by the loop, or produced whole. The
+     * HTTP/3 listener sets this to 'h3' before it runs a route and back to
+     * '' afterwards (the HTTP/1.1 and HTTP/2 paths set the equivalent
+     * inline). Passing '' clears it.
+     *
+     * @param string $protocol the protocol tag, e.g. 'h3', or '' to clear
+     * @return void
+     */
+    public function setStreamingProtocol($protocol)
+    {
+        $this->streaming_context = ($protocol === '') ? [] :
+            ['protocol' => $protocol];
+    }
+    /**
+     * Takes the streaming producer a route parked by calling
+     * $site->stream(), clearing it so the next request starts fresh.
+     * Returns null when the route did not stream. The HTTP/3 listener uses
+     * this after running a route to decide whether to stream the response
+     * incrementally or send it whole.
+     *
+     * @return \Generator|null the parked producer, or null if none
+     */
+    public function takeStreamingProducer()
+    {
+        $producer = $this->streaming_producer;
+        $this->streaming_producer = null;
+        return $producer;
+    }
+    /**
+     * Hands a long piece of work to the event loop to run a little at a
+     * time instead of all at once. The work is given as a callable; under
+     * the atto loop it is run inside a fiber, so wherever it would wait it
+     * can call Fiber::suspend() to let the loop serve every other
+     * connection and be resumed later, and when it finishes the optional
+     * completion callback runs with its result (or with the exception it
+     * threw). This is how one slow operation in this single-process server
+     * stops freezing all the others. The scheduler is built on first use,
+     * so a server that never defers work carries none of its cost. Under
+     * another web server such as Apache, where there is no atto loop and
+     * each request is its own process, the work is simply run straight
+     * through here, outside any fiber, so its waits just block.
+     *
+     * @param callable $task the work to run; under the atto loop it runs
+     *      inside a fiber and may call Fiber::suspend() at its wait points
+     * @param callable|null $on_complete called once the task ends, as
+     *      $on_complete($result, $error); see CooperativeScheduler::add
+     * @return bool true, so a route may `return $site->deferTask(...)`
+     *      and count the request as handled
+     */
+    public function deferTask(callable $task, $on_complete = null)
+    {
+        if (!$this->isCli()) {
+            /* Under another web server (Apache and the like) there is no
+               atto event loop and each request is its own process, so the
+               work blocks nobody else. Run it straight through, NOT inside
+               a fiber: with no fiber active a cooperative wait deep in the
+               work sees Fiber::getCurrent() come back null and falls back
+               to a plain blocking wait, which is exactly right here. */
+            $result = null;
+            $error = null;
+            try {
+                $result = $task();
+            } catch (\Throwable $throwable) {
+                $error = $throwable;
+            }
+            if (is_callable($on_complete)) {
+                $on_complete($result, $error);
+            }
+            return true;
+        }
+        if ($this->cooperative_scheduler === null) {
+            $this->cooperative_scheduler = new CooperativeScheduler();
+        }
+        $this->cooperative_scheduler->add(new \Fiber($task), $on_complete);
         return true;
     }
     /**
@@ -1366,16 +1566,17 @@ class WebSite
      * up. CLI mode stores session data in RAM; under another web
      * server, defaults to session_start().
      *
-     * Session IDs are random_bytes(32) hex-encoded (256-bit
-     * entropy). Cookie-supplied IDs must match the format and
-     * already exist in the table; otherwise a fresh ID is
-     * generated. This prevents session fixation.
+     * A session id is 32 random bytes written as hex, which is hard
+     * to guess. An id offered by a cookie is trusted only when it has
+     * that exact shape and already names a session held in memory;
+     * otherwise a fresh id is made. This stops someone from planting a
+     * known id and riding another person's signed-in session.
      *
-     * Table size is capped by MAX_SESSIONS (default 10000). Each
-     * request runs a soft cull of up to CULL_OLD_SESSION_NUM
-     * expired entries; if still over cap, hard eviction pops the
-     * oldest. Protects against memory exhaustion under a flood
-     * of cookie-less requests.
+     * Only so many sessions are kept in memory at once (MAX_SESSIONS,
+     * default 10000). When there are more, the least recently used are
+     * dropped first, so a flood of new visitors cannot grow memory
+     * without bound. The session being served right now is never
+     * dropped, so a busy moment cannot sign out the active person.
      *
      * @param array $options session cookie fields: 'name',
      *      'cookie_path', 'cookie_lifetime' (seconds from now),
@@ -1395,73 +1596,81 @@ class WebSite
             $lifetime = intval($options['cookie_lifetime']);
             $expires = ($lifetime > 0) ? $time + $lifetime : 0;
             /*
-                For the in-memory session expiration math below we
-                need a non-zero "lifetime" so that recently-touched
-                sessions are not immediately culled when the cull
-                loop computes $item_time + $lifetime < $time. Use a
-                large default for session-scoped cookies.
-             */
-            $cull_lifetime = ($lifetime > 0) ? $lifetime : $time;
-            /*
                 Only honor the cookie-supplied session id if it
-                matches our id format (64 hex chars) and the
-                session already exists server-side. Anything else
-                falls through to fresh session id generation. This
-                prevents session fixation where an attacker plants
-                a known id and tries to ride the victim's
-                authenticated session.
+                matches our id format and the session already exists
+                server-side. Anything else falls through to fresh
+                session id generation. This prevents session fixation
+                where an attacker plants a known id and tries to ride
+                the victim's authenticated session. A well-formed id we
+                did not have is remembered (without any lookup here) so
+                a higher layer can decide whether it maps to a signed-in
+                user and should be restored.
              */
             $session_id = "";
+            $this->rehydrate_candidate = "";
             if ($cookie_value !== ""
-                && preg_match('/^[a-f0-9]{64}$/', $cookie_value)
-                && !empty($this->sessions[$cookie_value])) {
-                $session_id = $cookie_value;
-                $_SESSION = $this->sessions[$session_id]['DATA'];
-            } else {
-                $session_id = bin2hex(random_bytes(32));
+                && preg_match('/^[a-f0-9]{' . self::SESSION_ID_HEX_LEN .
+                '}$/', $cookie_value)) {
+                if (!empty($this->sessions[$cookie_value])) {
+                    $session_id = $cookie_value;
+                    $_SESSION = $this->sessions[$session_id]['DATA'];
+                } else {
+                    $this->rehydrate_candidate = $cookie_value;
+                }
+            }
+            if ($session_id === "") {
+                $session_id = bin2hex(
+                    random_bytes(self::SESSION_ID_BYTE_LEN));
                 $this->sessions[$session_id] = ['DATA' => []];
-                array_unshift($this->session_queue, $session_id);
                 $_SESSION = [];
             }
             $this->sessions[$session_id]['TIME'] = $time;
-            $last_time = count($this->session_queue) -1;
-            // cull up to CULL_OLD_SESSION_NUM expired sessions
-            $first_time = max(0, $last_time - $this->default_server_globals[
-                'CULL_OLD_SESSION_NUM']);
-            for ($i = $last_time; $i >= $first_time; $i--) {
-                $delete_id = $this->session_queue[$i];
-                if (!isset($this->sessions[$delete_id])) {
-                    unset($this->session_queue[$i]);
-                } else {
-                    $item_time = $this->sessions[$delete_id]['TIME'];
-                    if ($item_time + $cull_lifetime < $time) {
-                        unset($this->session_queue[$i]);
-                        unset($this->sessions[$delete_id]);
-                    }
-                }
+            if ($this->session_lru === null) {
+                $this->session_lru = new \SplMinHeap();
             }
-            /*
-                Hard cap on session count. The soft cull above
-                walks only CULL_OLD_SESSION_NUM per request, so a
-                flood of cookie-less hits can outgrow it. If still
-                over MAX_SESSIONS, evict oldest from the queue
-                tail (new IDs go on the head via array_unshift)
-                until back under cap. Reindex at end so the next
-                soft cull walks contiguous indices.
-             */
-            $max_sessions = $this->default_server_globals[
-                'MAX_SESSIONS'] ?? 10000;
-            if (count($this->sessions) > $max_sessions) {
-                $this->session_queue =
-                    array_values($this->session_queue);
-                while (count($this->sessions) > $max_sessions
-                    && !empty($this->session_queue)) {
-                    $oldest_id = array_pop($this->session_queue);
-                    unset($this->sessions[$oldest_id]);
+            /* Stamp this session as most recently used and record that
+               in the heap. An earlier pair for the same session stays
+               in the heap but is now out of date; it is skipped when it
+               surfaces during eviction below. */
+            $this->session_sequence++;
+            $this->sessions[$session_id]['SEQ'] = $this->session_sequence;
+            $this->session_lru->insert(
+                [$this->session_sequence, $session_id]);
+            /* A session used more than once leaves earlier heap entries
+               behind. They clear during eviction, but steady reuse
+               while under the cap never triggers eviction, so the
+               leftovers would pile up. When they have grown well past
+               the number of live sessions, rebuild the heap from the
+               live sessions to clear them. */
+            if ($this->session_lru->count() >
+                2 * count($this->sessions) + self::MAX_SESSIONS_DEFAULT) {
+                $rebuilt = new \SplMinHeap();
+                foreach ($this->sessions as $live_id => $live_session) {
+                    $rebuilt->insert([$live_session['SEQ'], $live_id]);
                 }
-            } else {
-                $this->session_queue =
-                    array_values($this->session_queue);
+                $this->session_lru = $rebuilt;
+            }
+            $max_sessions = $this->default_server_globals[
+                'MAX_SESSIONS'] ?? self::MAX_SESSIONS_DEFAULT;
+            /* Drop the least recently used sessions while over the cap.
+               The heap gives the smallest use-count first. A pair whose
+               recorded use-count no longer matches the session (it was
+               used again since) is stale and discarded. The session
+               being served right now is never dropped, so a busy moment
+               cannot sign out the active person. */
+            while (count($this->sessions) > $max_sessions &&
+                !$this->session_lru->isEmpty()) {
+                list($pair_sequence, $drop_id) = $this->session_lru->top();
+                if (!isset($this->sessions[$drop_id]) ||
+                    $this->sessions[$drop_id]['SEQ'] != $pair_sequence) {
+                    $this->session_lru->extract();
+                    continue;
+                }
+                if ($drop_id == $session_id) {
+                    break;
+                }
+                $this->session_lru->extract();
+                unset($this->sessions[$drop_id]);
             }
             $this->setCookie($cookie_name, $session_id, $expires,
                 $options['cookie_path'], $options['cookie_domain'],
@@ -1477,6 +1686,61 @@ class WebSite
                     $options['cookie_path'] ?? "/");
             }
         }
+    }
+    /**
+     * Writes the current in-memory sessions and the counter used to
+     * order them to a file, so a server that is about to restart can
+     * hand them to its replacement and keep people signed in across the
+     * restart. Shared by the admin Restart Server path and a
+     * command-line restart.
+     *
+     * @param string $session_path file to write the saved sessions to
+     */
+    public function saveSessionsForRestart($session_path)
+    {
+        if (empty($session_path)) {
+            return;
+        }
+        $session_info = [];
+        $session_info['SESSIONS'] = $this->sessions;
+        $session_info['SESSION_SEQUENCE'] = $this->session_sequence;
+        file_put_contents($session_path, serialize($session_info));
+    }
+    /**
+     * Returns a well-formed session id the current request's cookie
+     * offered that was not in memory, or an empty string if there was
+     * none. A higher layer uses this to decide whether the id belongs
+     * to a signed-in user whose session should be restored.
+     *
+     * @return string the candidate session id, or "" if none
+     */
+    public function rehydrateCandidate()
+    {
+        return $this->rehydrate_candidate;
+    }
+    /**
+     * Restores a session under a session id the current request already
+     * carries, putting back the given data and switching the request to
+     * use that id. Used to sign a person back in from a saved session
+     * after the in-memory one was dropped or the server restarted,
+     * keeping their existing cookie so nothing changes on their side.
+     *
+     * @param string $session_id the id to restore the session under
+     * @param array $session_data the session contents to put back
+     */
+    public function adoptSession($session_id, $session_data)
+    {
+        $this->sessions[$session_id] = ['DATA' => $session_data,
+            'TIME' => time()];
+        $this->session_sequence++;
+        $this->sessions[$session_id]['SEQ'] = $this->session_sequence;
+        if ($this->session_lru === null) {
+            $this->session_lru = new \SplMinHeap();
+        }
+        $this->session_lru->insert(
+            [$this->session_sequence, $session_id]);
+        $_SESSION = $session_data;
+        $_COOKIE[$this->current_session] = $session_id;
     }
     /**
      * Reads in the file $filename and returns its contents as a string.
@@ -1828,7 +2092,7 @@ class WebSite
     {
         $path = $_SERVER['PATH'] ?? $_SERVER['Path'] ?? ".";
         $default_server_globals = ["CONNECTION_TIMEOUT" => 20,
-            "CULL_OLD_SESSION_NUM" => 5, "CUSTOM_ERROR_HANDLER" => null,
+            "CUSTOM_ERROR_HANDLER" => null,
             "DOCUMENT_ROOT" => getcwd(),
             "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
             "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
@@ -1846,10 +2110,23 @@ class WebSite
         if (is_array($config_array_or_ini_filename)) {
             if (!empty($config_array_or_ini_filename['SESSION_INFO'])) {
                 $this->sessions =
-                    $config_array_or_ini_filename['SESSION_INFO']['SESSIONS'];
-                $this->session_queue =
                     $config_array_or_ini_filename['SESSION_INFO'][
-                    'SESSION_QUEUE'];
+                    'SESSIONS'] ?? [];
+                $this->session_sequence =
+                    $config_array_or_ini_filename['SESSION_INFO'][
+                    'SESSION_SEQUENCE'] ?? 0;
+                /* A min-heap does not keep its contents through
+                   serialize/unserialize, so it is rebuilt here from the
+                   restored sessions, each of which still carries the
+                   use-count it was stamped with. */
+                $this->session_lru = new \SplMinHeap();
+                foreach ($this->sessions as $restored_id =>
+                    $restored_session) {
+                    if (isset($restored_session['SEQ'])) {
+                        $this->session_lru->insert(
+                            [$restored_session['SEQ'], $restored_id]);
+                    }
+                }
                 unset($config_array_or_ini_filename['SESSION_INFO']);
             }
             if (!empty($config_array_or_ini_filename['SERVER_CONTEXT'])) {
@@ -2058,7 +2335,7 @@ class WebSite
                 $pre_timeout = max(0, $next_alarm[0] - microtime(true));
                 $timeout = floor($pre_timeout);
                 $micro_timeout = intval(($pre_timeout - $timeout)
-                    * 1000000);
+                    * self::MICROSECONDS_PER_SECOND);
             }
             /*
                 Bound the wait by the soonest pending TLS-handshake
@@ -2072,10 +2349,12 @@ class WebSite
             if ($handshake_deadline !== null) {
                 $until = max(0, $handshake_deadline - microtime(true));
                 if ($timeout === null ||
-                    $until < $timeout + $micro_timeout / 1000000.0) {
+                    $until < $timeout +
+                        $micro_timeout / self::MICROSECONDS_PER_SECOND) {
                     $timeout = (int) floor($until);
                     $micro_timeout =
-                        (int) (($until - floor($until)) * 1000000);
+                        (int) (($until - floor($until)) *
+                            self::MICROSECONDS_PER_SECOND);
                 }
             }
             /*
@@ -2113,10 +2392,39 @@ class WebSite
             if ($h3_min_ms !== null) {
                 $h3_secs = $h3_min_ms / 1000.0;
                 if ($timeout === null
-                    || $h3_secs < $timeout + $micro_timeout / 1000000.0) {
+                    || $h3_secs < $timeout +
+                        $micro_timeout / self::MICROSECONDS_PER_SECOND) {
                     $timeout = (int) floor($h3_secs);
                     $micro_timeout = (int) (($h3_secs - $timeout)
-                        * 1000000);
+                        * self::MICROSECONDS_PER_SECOND);
+                }
+            }
+            /* A deferred task is ready to run on the next pass, so do
+               not let stream_select sleep: wake right away, advance the
+               task one slice, then re-check the sockets. The clamp is a
+               no-op whenever no long work is in flight. */
+            /* A cooperative task is in flight. If one wants to run again
+               right away (a CPU- or disk-bound job that just gave the loop
+               a brief turn), wake immediately so it is not slowed by the
+               poll interval. If every task is only waiting on a socket,
+               sleep at most one poll interval so a slow mail socket keeps
+               getting chances without the CPU spinning. Either way take
+               the smaller of that and whatever the rest of the loop wanted.
+             */
+            if ($this->cooperative_scheduler !== null &&
+                    !$this->cooperative_scheduler->isEmpty()) {
+                if ($this->cooperative_scheduler->hasImmediateWork()) {
+                    $timeout = 0;
+                    $micro_timeout = 0;
+                } else {
+                    $poll = self::COOPERATIVE_POLL;
+                    $wanted = ($timeout === null) ? $poll + 1 :
+                        $timeout * self::MICROSECONDS_PER_SECOND +
+                        $micro_timeout;
+                    if ($wanted > $poll) {
+                        $timeout = 0;
+                        $micro_timeout = $poll;
+                    }
                 }
             }
             $num_selected = stream_select($in_streams_with_data,
@@ -2147,6 +2455,9 @@ class WebSite
                 $this->processResponseStreams($out_streams_with_data);
             }
             $this->refillStreamingGenerators();
+            if ($this->cooperative_scheduler !== null) {
+                $this->cooperative_scheduler->step();
+            }
             $this->cullDeadStreams();
         }
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
@@ -2322,6 +2633,65 @@ class WebSite
             'port' => substr($stripped, $colon + 1)];
     }
     /**
+     * Takes a snapshot of everything about the request being handled
+     * right now that lives in shared or global spots, so it can be put
+     * back later.
+     *
+     * This single-process server keeps the current request's details in
+     * the PHP superglobals ($_SERVER, $_GET and the rest) and in a few
+     * fields on this object. That is fine when one request is handled
+     * start to finish before the next begins. It stops being fine when a
+     * request is set aside part-way through -- a cooperative task that
+     * gives up the loop while it waits, or an in-process call to another
+     * local page -- and another request is served in the gap: that other
+     * request overwrites those shared spots. The set-aside request needs
+     * its own copy of them to restore before it carries on. This captures
+     * exactly the set of values the in-process loopback below already
+     * saves and restores around a nested request.
+     *
+     * @return array the saved request environment, to be handed back
+     *      later to applyRequestEnvironment()
+     */
+    public function captureRequestEnvironment()
+    {
+        return [
+            "SERVER" => $_SERVER,
+            "GET" => $_GET,
+            "POST" => $_POST,
+            "REQUEST" => $_REQUEST,
+            "COOKIE" => $_COOKIE,
+            "SESSION" => $_SESSION,
+            "HEADER" => empty($this->header_data) ? "" :
+                $this->header_data,
+            "CONTENT_TYPE" => empty($this->content_type) ? false :
+                $this->content_type,
+            "CURRENT_SESSION" => empty($this->current_session) ? "" :
+                $this->current_session,
+        ];
+    }
+    /**
+     * Puts back a request environment saved earlier by
+     * captureRequestEnvironment(), so a request that was set aside
+     * part-way through sees exactly the superglobals and per-request
+     * fields it had before another request was served in between.
+     *
+     * @param array $environment a snapshot from
+     *      captureRequestEnvironment()
+     * @return void
+     */
+    public function applyRequestEnvironment($environment)
+    {
+        $_SERVER = $environment["SERVER"];
+        $_GET = $environment["GET"];
+        $_POST = $environment["POST"];
+        $_REQUEST = $environment["REQUEST"];
+        $_COOKIE = $environment["COOKIE"];
+        $_SESSION = $environment["SESSION"];
+        $this->header_data = $environment["HEADER"];
+        $this->content_type = $environment["CONTENT_TYPE"];
+        $this->current_session = $environment["CURRENT_SESSION"];
+    }
+    /**
      * Handles a local HTTP request from inside a running WebSite
      * route back to itself. The single-threaded event loop makes
      * a real curl/socket loopback deadlock; this short-circuits
@@ -2410,6 +2780,331 @@ class WebSite
         return $out_data;
     }
     /**
+     * Lets a route finish later instead of right now, so a slow request
+     * stops freezing every other connection.
+     *
+     * The route hands over a function that does its real work (the slow
+     * part and the page it prints). Under the atto event loop that
+     * function is run inside a fiber a little at a time: each time it
+     * reaches a point where it would wait -- talking to a mail server,
+     * say -- it can call Fiber::suspend() to give the loop back so other
+     * connections are served, and is picked up again on a later pass. The
+     * request's own superglobals and output are swapped in around each
+     * resume so it always runs in its own context, and the finished page
+     * is sent only once the function returns. If the function throws or
+     * runs over its time budget, that one request gets a 500 and the rest
+     * of the site is unaffected. Under another web server (Apache and the
+     * like), or on a protocol whose deferred send is not wired yet, the
+     * function is simply run straight through here instead.
+     *
+     * @param callable $handler does the request's real work and prints
+     *      its response; may call Fiber::suspend() at its wait points
+     * @return bool true, so a route may `return $site->deferResponse(...)`
+     *      and count the request as handled
+     */
+    public function deferResponse(callable $handler)
+    {
+        $send = $this->deferredSendContext();
+        if (!$this->isCli() || $send === null) {
+            $handler();
+            return true;
+        }
+        $task = new \stdClass();
+        $task->body = "";
+        $task->environment = $this->captureRequestEnvironment();
+        $task->send = $send;
+        $task->saved = null;
+        $on_enter = function () use ($task) {
+            $task->saved = $this->captureRequestEnvironment();
+            $this->applyRequestEnvironment($task->environment);
+            ob_start();
+        };
+        $on_leave = function () use ($task) {
+            $task->body .= ob_get_clean();
+            $task->environment = $this->captureRequestEnvironment();
+            $this->applyRequestEnvironment($task->saved);
+        };
+        $on_complete = function ($result, $error) use ($task) {
+            $this->completeDeferredResponse($task, $error);
+        };
+        $guarded = function () use ($handler) {
+            try {
+                $handler();
+            } catch (WebException $web_exception) {
+                /* A handler that calls webExit() -- a redirect, or any
+                   normal early exit -- throws WebException under the atto
+                   loop. The synchronous path treats that as a clean
+                   finish: whatever was written before the exit is the
+                   response. The deferred path must do the same rather
+                   than let it surface as a 500, and give the restart and
+                   stop control messages the same handling the
+                   synchronous path gives them. */
+                $message = $web_exception->getMessage();
+                $command = substr($message, 0, strlen('restart'));
+                if (in_array($command, ["restart", "stop"])) {
+                    if ($command == 'restart') {
+                        $session_path = substr($message,
+                            strlen('restart') + 1);
+                        $this->saveSessionsForRestart($session_path);
+                        $this->restart = $message;
+                    }
+                    $this->stop = true;
+                }
+            }
+        };
+        if ($this->cooperative_scheduler === null) {
+            $this->cooperative_scheduler = new CooperativeScheduler();
+        }
+        $this->cooperative_scheduler->add(new \Fiber($guarded),
+            $on_complete, $on_enter, $on_leave);
+        $this->deferred_request = $task;
+        return true;
+    }
+    /**
+     * Works out how a deferred response will eventually be sent, from the
+     * connection details the protocol layer left in place for the current
+     * request. Returns null when there is nothing to defer onto -- the
+     * route was reached some other way, or over a protocol whose deferred
+     * send is not wired yet (HTTP/3 today) -- in which case deferResponse
+     * just runs the work straight through.
+     *
+     * @return array|null the bits needed later to send the response on
+     *      this request's connection, or null if it cannot be deferred
+     */
+    protected function deferredSendContext()
+    {
+        $protocol = $this->streaming_context['protocol'] ?? '';
+        if ($protocol === 'h1') {
+            return ['protocol' => 'h1',
+                'socket' => $this->streaming_socket,
+                'key' => (int) $this->streaming_socket];
+        }
+        if ($protocol === 'h2') {
+            return ['protocol' => 'h2',
+                'connection' => $this->streaming_socket,
+                'key' => $this->streaming_context['key'],
+                'stream_id' => $this->streaming_context['stream_id'],
+                'hpack_encode' =>
+                    $this->streaming_context['hpack_encode']];
+        }
+        if ($this->deferrable_h3 !== null) {
+            return ['protocol' => 'h3',
+                'listener' => $this->deferrable_h3['listener'],
+                'connection' => $this->deferrable_h3['connection'],
+                'stream_id' => $this->deferrable_h3['stream_id']];
+        }
+        return null;
+    }
+    /**
+     * Sends a deferred request's response once its fiber has finished,
+     * over the same connection the request arrived on. On success the
+     * accumulated page is finished off (status line, content type, length)
+     * and handed to the right protocol's send path; on failure the one
+     * request gets a plain 500 and nothing else is disturbed.
+     *
+     * @param object $task the finished deferred request, carrying its
+     *      saved environment, accumulated body, and send details
+     * @param \Throwable|null $error the reason it failed, or null if it
+     *      finished cleanly
+     * @return void
+     */
+    protected function completeDeferredResponse($task, $error)
+    {
+        $this->applyRequestEnvironment($task->environment);
+        if ($error !== null) {
+            error_log("Deferred request failed: " . $error->getMessage());
+            $body = "Internal Server Error";
+            $this->header_data =
+                ($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
+                " 500 Internal Server Error\x0D\x0A";
+            $this->content_type = "text/plain";
+        } else {
+            $body = $task->body;
+        }
+        if ($task->send['protocol'] === 'h1') {
+            $out_data = $this->finalizeDeferredResponse($body, true);
+            $this->emitDeferredH1($task->send, $out_data);
+            return;
+        }
+        if ($task->send['protocol'] === 'h2') {
+            $body = $this->finalizeDeferredResponse($body, false);
+            $this->emitDeferredH2($task->send, $body);
+            return;
+        }
+        if ($task->send['protocol'] === 'h3') {
+            $body = $this->finalizeDeferredResponse($body, false);
+            $task->send['listener']->emitDeferredResponse(
+                $task->send['connection'], $task->send['stream_id'],
+                $body);
+        }
+    }
+    /**
+     * Marks the current request, which is being served over HTTP/3, as
+     * one whose response may be deferred, recording what its task would
+     * need to send the finished page later. Called by the HTTP/3 listener
+     * just before it runs the route, and cleared again right after with
+     * endDeferrableH3() whether or not the route deferred.
+     *
+     * @param object $listener the HTTP/3 listener that will do the send
+     * @param object $connection the live QUIC connection
+     * @param int $stream_id the request's QUIC stream id
+     * @return void
+     */
+    public function beginDeferrableH3($listener, $connection, $stream_id)
+    {
+        $this->deferrable_h3 = ['listener' => $listener,
+            'connection' => $connection, 'stream_id' => $stream_id];
+    }
+    /**
+     * Clears the HTTP/3 deferred-response details set by
+     * beginDeferrableH3(); a route that did defer has already had them
+     * copied onto its task by then, so clearing here only stops them
+     * leaking into the next request.
+     * @return void
+     */
+    public function endDeferrableH3()
+    {
+        $this->deferrable_h3 = null;
+    }
+    /**
+     * Finishes off a deferred response the same way getResponseData()
+     * finishes a normal one: saves the session, adds a status line and a
+     * default content type if the route set none, advertises HTTP/3 when
+     * configured, and (for HTTP/1.1) prepends the headers and a correct
+     * Content-Length. Kept separate from getResponseData() on purpose so
+     * the ordinary request path is left exactly as it was.
+     *
+     * @param string $body the page the deferred handler printed
+     * @param bool $include_headers true to return headers plus body (the
+     *      HTTP/1.1 wire form), false to return just the body with the
+     *      header buffer filled in (what the HTTP/2 framer wants)
+     * @return string the finished response, or just its body
+     */
+    protected function finalizeDeferredResponse($body, $include_headers)
+    {
+        if ($this->current_session != "" &&
+            !empty($_COOKIE[$this->current_session])) {
+            $session_id = $_COOKIE[$this->current_session];
+            $this->sessions[$session_id]['DATA'] = $_SESSION;
+        }
+        if (!str_starts_with($this->header_data, "HTTP/")) {
+            if (stristr($this->header_data, "Location") != false) {
+                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                    " 301 Moved Permanently\x0D\x0A" . $this->header_data;
+            } else if (stristr($this->header_data, "Refresh") != false) {
+                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                    " 302 Found\x0D\x0A" . $this->header_data;
+            } else {
+                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
+                    " 200 OK\x0D\x0A" . $this->header_data;
+            }
+        }
+        if (!$this->content_type) {
+            $this->header_data .= "Content-Type: text/html\x0D\x0A";
+        }
+        if ($this->h3_advertise_port > 0
+            && ($_SERVER['SERVER_PROTOCOL'] ?? '') !== 'HTTP/3'
+            && stripos($this->header_data, "\nAlt-Svc:") === false
+            && stripos($this->header_data, "\rAlt-Svc:") === false) {
+            $this->header_data .= 'Alt-Svc: h3=":'
+                . $this->h3_advertise_port . '"; ma=86400'
+                . "\x0D\x0A";
+        }
+        if ($include_headers) {
+            $this->header_data = preg_replace(
+                '/^Content-Length:[^\r\n]*\r\n/im', '',
+                $this->header_data);
+            return $this->header_data . "Content-Length: " .
+                strlen($body) . "\x0D\x0A\x0D\x0A" . $body;
+        }
+        return $body;
+    }
+    /**
+     * Queues a finished deferred response on an HTTP/1.1 connection, the
+     * same way the normal H1 path does, so the event loop's writer drains
+     * it to the client.
+     *
+     * @param array $send the request's send details (its stream key and
+     *      socket)
+     * @param string $out_data the finished response bytes
+     * @return void
+     */
+    protected function emitDeferredH1($send, $out_data)
+    {
+        $key = $send['key'];
+        if (!empty($this->out_streams[self::CONNECTION][$key])) {
+            return;
+        }
+        $this->out_streams[self::CONNECTION][$key] = $send['socket'];
+        $this->out_streams[self::DATA][$key] = $out_data;
+        $this->out_streams[self::DATA_OFFSET][$key] = 0;
+        $this->out_streams[self::CONTEXT][$key] = $_SERVER;
+        $this->out_streams[self::MODIFIED_TIME][$key] = time();
+    }
+    /**
+     * Sends a finished deferred response on an HTTP/2 stream, building the
+     * HEADERS frame and the DATA frames the same way the normal H2 path
+     * does (lowercased header names, a default content type and length if
+     * the route set none, body split and flow-controlled by sendH2Body).
+     *
+     * @param array $send the request's send details (stream key,
+     *      connection, stream id, and HPACK encoder)
+     * @param string $body the response body
+     * @return void
+     */
+    protected function emitDeferredH2($send, $body)
+    {
+        $key = $send['key'];
+        $connection = $send['connection'];
+        $stream_id = $send['stream_id'];
+        $hpack_encode = $send['hpack_encode'];
+        $conn = $this->connection($key);
+        $status = "200";
+        if (preg_match("/HTTP\/[\d.]+ (\d+)/",
+                $this->header_data, $matches)) {
+            $status = $matches[1];
+        }
+        $resp_headers_data = [[":status", $status]];
+        $forbidden = ["connection", "keep-alive", "proxy-connection",
+            "transfer-encoding", "upgrade"];
+        $has_content_type = false;
+        $has_content_length = false;
+        $header_lines = explode("\r\n", $this->header_data);
+        array_shift($header_lines);
+        foreach ($header_lines as $line) {
+            $colon = strpos($line, ":");
+            if ($colon === false) {
+                continue;
+            }
+            $name = strtolower(trim(substr($line, 0, $colon)));
+            $value = trim(substr($line, $colon + 1));
+            if ($name === "" || $name[0] === ":"
+                || in_array($name, $forbidden)) {
+                continue;
+            }
+            if ($name === "content-type") {
+                $has_content_type = true;
+            }
+            if ($name === "content-length") {
+                $has_content_length = true;
+            }
+            $resp_headers_data[] = [$name, $value];
+        }
+        if (!$has_content_type) {
+            $resp_headers_data[] =
+                ["content-type", "text/html; charset=utf-8"];
+        }
+        if (!$has_content_length) {
+            $resp_headers_data[] =
+                ["content-length", (string) strlen($body)];
+        }
+        $resp_headers = new HeaderFrame($stream_id, $resp_headers_data);
+        $resp_headers->flags->add("END_HEADERS");
+        $out = $resp_headers->serialize($hpack_encode);
+        $this->queueResponseData($key, $connection, $out);
+        $this->sendH2Body($key, $connection, $conn, $stream_id, $body);
+    }
+    /**
      * Used to export info (but not change) about running sessions
      *
      * @return array map session id => session record (with TIME and
@@ -2445,12 +3140,7 @@ class WebSite
             if (in_array($cmd, ["restart", "stop"])) {
                 if ($cmd == 'restart') {
                     $session_path = substr($msg, strlen('restart') + 1);
-                    if (!empty($session_path)) {
-                        $session_info['SESSIONS'] = $this->sessions;
-                        $session_info['SESSION_QUEUE'] = $this->session_queue;
-                        file_put_contents($session_path,
-                            serialize($session_info));
-                    }
+                    $this->saveSessionsForRestart($session_path);
                     $this->restart = $msg;
                 }
                 $this->stop = true;
@@ -2458,6 +3148,13 @@ class WebSite
         }
         $out_data = ob_get_contents();
         ob_end_clean();
+        if ($this->deferred_request !== null) {
+            /* The route called deferResponse(): its real output is
+               produced across later loop passes and sent when its task
+               finishes, so tell the caller to send nothing now. */
+            $this->deferred_request = null;
+            return self::RESPONSE_DEFERRED;
+        }
         if ($this->is_streaming) {
             /*
                 Route used $site->flush(). Headers and body
@@ -2688,6 +3385,7 @@ class WebSite
                 $proto = 'h1';
             }
             try {
+                $this->read_made_progress = true;
                 $this->transports[$proto]->onReadable($key, $conn,
                     $in_stream, $too_long);
             } catch (\Throwable $throwable) {
@@ -2704,7 +3402,10 @@ class WebSite
                 $this->shutdownHttpStream($key);
                 continue;
             }
-            $this->in_streams[self::MODIFIED_TIME][$key] = time();
+            if ($this->read_made_progress &&
+                isset($this->in_streams[self::CONNECTION][$key])) {
+                $this->in_streams[self::MODIFIED_TIME][$key] = time();
+            }
         }
     }
     /**
@@ -2731,9 +3432,46 @@ class WebSite
         $len = strlen($this->in_streams[self::DATA][$key]);
         if (!$too_long) {
             stream_set_blocking($in_stream, false);
+            /* A peer can reset the TLS connection while we are still
+               reading its request, which surfaces as a "Connection
+               reset by peer" warning from stream_get_contents. That
+               is a normal client disconnect, not a server fault, so
+               swallow just that notice for the read and let any other
+               warning through. The write side suppresses the same
+               notice when draining a response. */
+            set_error_handler(function ($error_number, $error_text) {
+                return stripos($error_text, "reset by peer") !== false
+                    || stripos($error_text, "SSL operation failed")
+                    !== false;
+            });
             $data = stream_get_contents($in_stream, min(
                 $this->default_server_globals['MAX_IO_LEN'],
                 $max_len - $len));
+            restore_error_handler();
+            /* select reported this socket readable, so a read that
+               comes back with no bytes means the peer has closed
+               (end of file) or the TLS layer faulted mid-stream (for
+               example a "bad record mac" alert, which surfaces as a
+               false return). Either way the connection is finished;
+               tear it down now. Leaving it in place would keep it
+               perpetually readable, spinning the event loop at full
+               CPU, and because the read path refreshes the
+               connection's activity time every pass it would never
+               age out of cullDeadStreams. */
+            if ($data === false ||
+                ($data === "" && feof($in_stream))) {
+                $this->shutdownHttpStream($key);
+                return;
+            }
+            /* A readable socket that hands back no bytes yet is not at
+               end of file and did not error (for instance a peer that
+               sent only a partial TLS record) made no progress this
+               pass. Leave its activity time untouched so it ages out on
+               the idle timeout rather than holding the connection open
+               indefinitely. */
+            if ($data === "") {
+                $this->read_made_progress = false;
+            }
         } else {
             $data = "";
             $this->initializeBadRequestResponse($key);
@@ -2772,6 +3510,18 @@ class WebSite
         $out_data = $this->getResponseData();
         $this->streaming_socket = null;
         $this->streaming_context = [];
+        if ($out_data === self::RESPONSE_DEFERRED) {
+            /* The route deferred itself; its response is queued by the
+               cooperative task when it finishes. Still reset for the
+               next keep-alive request, but send nothing here. (A client
+               that pipelines a second request before the deferred one is
+               sent is not yet handled; browsers wait for the response.) */
+            if (empty($this->in_streams[self::CONTEXT][$key][
+                    'BAD_RESPONSE'])) {
+                $this->initRequestStream($key);
+            }
+            return;
+        }
         if (empty($this->in_streams[self::CONTEXT][$key][
                 'BAD_RESPONSE'])) {
             /*
@@ -3262,20 +4012,42 @@ class WebSite
             client doesn't have to assume defaults:
               0x03 MAX_CONCURRENT_STREAMS=100 caps in-flight
                 requests per connection (resource exhaustion).
-              0x04 INITIAL_WINDOW_SIZE=65535 (the default, made
-                explicit so flow-control state starts in agreement).
+              0x04 INITIAL_WINDOW_SIZE is the upload window: how
+                much a client may send on a stream before waiting
+                for the server to acknowledge it has read the data.
+                Raised above the 64KB default so large file posts
+                keep the pipe full instead of stalling between
+                small bursts.
               0x05 MAX_FRAME_SIZE=16384 matches H2_MAX_FRAME_SIZE
                 guard in parseH2Request.
          */
         $server_settings = new SettingsFrame(0, [
             0x03 => 100,
-            0x04 => 65535,
+            0x04 => self::H2_ADVERTISED_WINDOW,
             0x05 => self::H2_MAX_FRAME_SIZE,
         ]);
         @fwrite($connection, $server_settings->serialize());
         $ack = new SettingsFrame(0, []);
         $ack->flags->add('ACK');
         @fwrite($connection, $ack->serialize());
+        /*
+            The larger upload window advertised above only applies to
+            individual streams. The whole connection has its own
+            receive window that starts at the 64KB default and caps
+            the total upload data in flight across all streams, so by
+            itself the per-stream raise would still be held back by it.
+            Send a connection-level window update (stream id 0) to
+            raise the connection window to the same size, so a single
+            large upload can actually use the bigger window.
+         */
+        $connection_window_growth = self::H2_ADVERTISED_WINDOW -
+            self::H2_DEFAULT_WINDOW;
+        if ($connection_window_growth > 0) {
+            $connection_window_update = new WindowUpdateFrame(0,
+                $connection_window_growth);
+            @fwrite($connection,
+                $connection_window_update->serialize());
+        }
         stream_set_blocking($connection, false);
         return $client_settings->settings;
     }
@@ -4110,6 +4882,13 @@ class WebSite
         $this->streaming_producer = null;
         $this->streaming_socket = null;
         $this->streaming_context = [];
+        if ($body === self::RESPONSE_DEFERRED) {
+            /* The route deferred itself; its response is framed and sent
+               by the cooperative task on this same stream when it
+               finishes. Send nothing here. Other streams on this
+               connection keep being served meanwhile. */
+            return true;
+        }
         if ($was_streaming) {
             /*
                 Route streamed via $site->flush(); response was
@@ -4793,16 +5572,23 @@ class WebSite
             //suppress connection reset notices
             set_error_handler(null);
             /*
-                fwrite second arg is "the data to write". When
-                we're past the head pointer we want only the tail
-                from $offset onwards. substr is constant-time
-                relative to the slice length (the tail), not the
-                whole buffer. Advancing $offset rather than
-                rewriting $data avoids the O(n^2) cumulative cost
-                that hit large responses on slow drains.
+                fwrite needs the bytes as a string, so the slice we
+                hand it has to be copied out of the buffer. Copy at
+                most one MAX_IO_LEN block per pass instead of the
+                whole unsent tail: a multi-hundred-megabyte response
+                would otherwise duplicate its entire remaining body
+                here, and that copy on top of the buffer already in
+                memory was large enough to exhaust the process (a
+                ~1.5 GB response in production did exactly this). The
+                socket only drains a bounded amount per writable
+                event anyway, so capping the slice costs no
+                throughput; $offset still advances (with periodic
+                compaction below) so $data is never rewritten per
+                pass.
              */
-            $tail = ($offset === 0)
-                ? $data : substr($data, $offset);
+            $chunk_len = min($unsent,
+                $this->default_server_globals['MAX_IO_LEN']);
+            $tail = substr($data, $offset, $chunk_len);
             $num_bytes = @fwrite($out_stream, $tail);
             set_error_handler($custom_error_handler);
             $remaining_bytes = ($num_bytes === false) ? 0
@@ -5153,11 +5939,42 @@ class WebSite
                     'data' => $content,
                     'size' => strlen($content),
                     'full_path' => $file_name];
-                if (empty($_FILES[$name])) {
+                $file_fields = ['name', 'tmp_name', 'type', 'error',
+                    'data', 'size', 'full_path'];
+                /*
+                    A multi-file upload arrives as separate parts named
+                    field[0], field[1], and so on. PHP under Apache or
+                    Nginx turns those into a single $_FILES['field']
+                    whose 'name', 'tmp_name', etc. are arrays indexed by
+                    the bracket number, and the resource upload handler
+                    reads that shape. Reproduce it here: peel off the
+                    bracket index and store each file's parts at that
+                    index under the base field name. A plain field name
+                    with no brackets keeps the simple single-file shape,
+                    and two parts that really do share one name still
+                    collect into arrays as before.
+                 */
+                if (preg_match('/^(\w+)\[(\w+)\]$/', $name, $matches)) {
+                    $base_name = $matches[1];
+                    $file_index = $matches[2];
+                    if (empty($_FILES[$base_name])) {
+                        $_FILES[$base_name] = [];
+                        foreach ($file_fields as $field) {
+                            $_FILES[$base_name][$field] = [];
+                        }
+                    }
+                    foreach ($file_fields as $field) {
+                        if (!is_array($_FILES[$base_name][$field])) {
+                            $_FILES[$base_name][$field] =
+                                [$_FILES[$base_name][$field]];
+                        }
+                        $_FILES[$base_name][$field][$file_index] =
+                            $file_array[$field];
+                    }
+                } else if (empty($_FILES[$name])) {
                     $_FILES[$name] = $file_array;
                 } else {
-                    foreach (['name', 'tmp_name', 'type', 'error', 'data',
-                        'size', 'full_path'] as $field) {
+                    foreach ($file_fields as $field) {
                         if (!is_array($_FILES[$name][$field])) {
                             $_FILES[$name][$field] = [$_FILES[$name][$field]];
                         }
@@ -8467,4 +9284,207 @@ class HPack
         '11111111100' => 124,
         '11111111111101' => 125,  '1111111111101' => 126
     ];
+}
+/**
+ * Runs long pieces of work a little at a time so a single-process
+ * server stays responsive.
+ *
+ * The atto web server handles every connection in one loop, so any
+ * request that does something slow -- reading a huge mailbox, talking to
+ * a mail server, hashing a password -- would freeze every other
+ * connection until it finished. This scheduler lets that work run inside
+ * a fiber: ordinary-looking code that, when it reaches a point where it
+ * would otherwise wait, calls Fiber::suspend() to hand control back to
+ * the loop and is resumed later once there is reason to. The key reason a
+ * fiber is used rather than a plain generator is that suspend() works
+ * from any depth in the call stack, so a low-level mail-socket read can
+ * give up the loop without every controller and model method above it
+ * having to be rewritten to pass a yield along. WebSite::listen() calls
+ * step() once each time around the loop; each call resumes every waiting
+ * fiber once and then serves the ready sockets, so the slow work and the
+ * rest of the site make progress together. (When Yioop runs under another
+ * web server such as Apache there is no atto loop and each request is its
+ * own process, so WebSite::deferTask() runs the work straight through,
+ * outside any fiber, and this scheduler is never used.)
+ *
+ * A task that finishes hands its return value to an optional completion
+ * callback; a task that throws hands the exception to the same callback
+ * instead, so the layer that started the task can turn it into a normal
+ * error response. A task that keeps suspending without ever finishing is
+ * stopped once it has used more than its work-time budget, so a buggy
+ * fiber cannot quietly starve every other connection.
+ *
+ * @author Chris Pollett
+ */
+class CooperativeScheduler
+{
+    /**
+     * Default ceiling, in seconds, on the total running time one task may
+     * use across all the times it is resumed. A task that goes past this
+     * is stopped with an error rather than allowed to keep taking the
+     * loop's attention. Generous on purpose: it is a guard against a
+     * runaway fiber, not a normal request deadline.
+     */
+    const DEFAULT_BUDGET = 30.0;
+    /**
+     * The tasks the loop is currently driving. Each entry holds the task
+     * fiber, the optional completion callback, and the total running time
+     * the fiber has used so far. Empty whenever no long work is in flight.
+     * @var array
+     */
+    protected $tasks = [];
+    /**
+     * Largest total running time, in seconds, any one task is allowed
+     * before it is stopped with a budget error.
+     * @var float
+     */
+    protected $budget;
+    /**
+     * @param float $budget largest total running time, in seconds, a
+     *      single task may use before it is aborted; defaults to
+     *      DEFAULT_BUDGET
+     */
+    public function __construct($budget = self::DEFAULT_BUDGET)
+    {
+        $this->budget = (float) $budget;
+    }
+    /**
+     * Hands a new piece of work to the loop to run a little at a time.
+     *
+     * @param \Fiber $fiber the work as a not-yet-started fiber; it should
+     *      call Fiber::suspend() wherever it would otherwise wait, so the
+     *      loop can serve other connections in the meantime
+     * @param callable|null $on_complete called once when the task
+     *      finishes, as $on_complete($result, $error): $result is the
+     *      fiber's return value on success (and $error null), or $error
+     *      holds the thrown/abort exception on failure (and $result null)
+     * @param callable|null $on_enter called with no arguments just before
+     *      each resume of the fiber; a request task uses it to swap its
+     *      own superglobals and output buffer into place so it resumes in
+     *      its own context rather than whatever the last request left
+     * @param callable|null $on_leave called with no arguments right after
+     *      each resume returns or suspends (even if it threw); the partner
+     *      of $on_enter, used to capture what the slice produced and put
+     *      the previous context back
+     * @return void
+     */
+    public function add(\Fiber $fiber, $on_complete = null,
+        $on_enter = null, $on_leave = null)
+    {
+        $this->tasks[] = [
+            'fiber' => $fiber,
+            'on_complete' => $on_complete,
+            'on_enter' => $on_enter,
+            'on_leave' => $on_leave,
+            'work_time' => 0.0,
+            'wait' => null,
+        ];
+    }
+    /**
+     * Whether no task is currently in flight. The event loop uses this to
+     * decide it can go back to sleeping in select() rather than spinning
+     * to resume work that is not there.
+     *
+     * @return bool true when there is nothing to drive
+     */
+    public function isEmpty()
+    {
+        return $this->tasks === [];
+    }
+    /**
+     * Whether any in-flight task wants to run again right away rather than
+     * waiting on a socket. A task that suspended with a plain
+     * Fiber::suspend() -- a CPU- or disk-bound job giving the loop a brief
+     * turn between chunks of work -- wants to be resumed at once; a task
+     * that suspended asking to wait for a socket to be readable or
+     * writable does not, and can be polled at the slower cooperative
+     * interval. The event loop uses this to choose a zero-length select
+     * when there is immediate work, so a long page assembly is not slowed
+     * by the poll interval, while still letting a slow socket be polled
+     * gently.
+     *
+     * @return bool true if at least one task should be resumed without
+     *      waiting
+     */
+    public function hasImmediateWork()
+    {
+        foreach ($this->tasks as $task) {
+            if (!$task['fiber']->isStarted()) {
+                return true;
+            }
+            $wait = $task['wait'];
+            if (!is_array($wait) ||
+                (!isset($wait['read']) && !isset($wait['write']))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /**
+     * Resumes every in-flight task once, then drops the ones that
+     * finished, threw, or ran past their budget. The event loop calls
+     * this once each pass, right after it refills the streaming-response
+     * generators. A fiber that has not been started yet is started; one
+     * that is suspended is resumed; one that has finished hands back its
+     * return value.
+     *
+     * A budget overrun is only noticed between resumes: a single stretch
+     * of work that loops forever without suspending still cannot be
+     * interrupted, because PHP does not preempt running code. The contract
+     * is that a cooperative task must suspend often enough to be a good
+     * citizen; the budget catches a task that suspends but never makes an
+     * end of itself, not one that hangs without ever giving up the loop.
+     *
+     * @return void
+     */
+    public function step()
+    {
+        if ($this->tasks === []) {
+            return;
+        }
+        $still_running = [];
+        foreach ($this->tasks as $task) {
+            $finished = false;
+            $error = null;
+            $result = null;
+            $slice_start = microtime(true);
+            try {
+                if ($task['on_enter'] !== null) {
+                    ($task['on_enter'])();
+                }
+                try {
+                    if (!$task['fiber']->isStarted()) {
+                        $task['wait'] = $task['fiber']->start();
+                    } elseif ($task['fiber']->isSuspended()) {
+                        $task['wait'] = $task['fiber']->resume();
+                    }
+                } finally {
+                    if ($task['on_leave'] !== null) {
+                        ($task['on_leave'])();
+                    }
+                }
+                if ($task['fiber']->isTerminated()) {
+                    $finished = true;
+                    $result = $task['fiber']->getReturn();
+                }
+            } catch (\Throwable $throwable) {
+                $finished = true;
+                $error = $throwable;
+            }
+            $task['work_time'] += microtime(true) - $slice_start;
+            if (!$finished && $task['work_time'] > $this->budget) {
+                $finished = true;
+                $error = new \RuntimeException(
+                    'cooperative task exceeded its work-time budget');
+            }
+            if ($finished) {
+                if (is_callable($task['on_complete'])) {
+                    $task['on_complete']($result, $error);
+                }
+                continue;
+            }
+            $still_running[] = $task;
+        }
+        $this->tasks = $still_running;
+    }
 }

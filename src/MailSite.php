@@ -1743,6 +1743,33 @@ class FileMailStorage extends MailStorage
         return @rename($temp, $path);
     }
     /**
+     * Takes an advisory lock on an open file without freezing the web
+     * server while it waits. Outside the cooperative server (the ordinary
+     * case for the mail daemon and command-line tools) this is a plain
+     * blocking lock, so behaviour there is unchanged. Inside the
+     * cooperative web server (a fiber), it asks for the lock without
+     * blocking and, if another process holds it, hands the event loop a
+     * turn and tries again, so reading a local mailbox cannot freeze every
+     * other web connection while the mail daemon is mid-write on the same
+     * folder. The lock is the same one a plain flock would take, so it
+     * still keeps readers and the daemon's writer from stepping on each
+     * other.
+     *
+     * @param resource $handle open file handle to lock
+     * @param int $operation the lock to take, LOCK_SH or LOCK_EX
+     * @return void
+     */
+    protected static function cooperativeFlock($handle, $operation)
+    {
+        if (\Fiber::getCurrent() === null) {
+            @flock($handle, $operation);
+            return;
+        }
+        while (!@flock($handle, $operation | LOCK_NB)) {
+            \Fiber::suspend();
+        }
+    }
+    /**
      * Reads a folder's reuid journal into the planned UIDVALIDITY
      * and per-message mapping, or null when no journal is present.
      * @param string $user username (no @domain)
@@ -1759,7 +1786,7 @@ class FileMailStorage extends MailStorage
         if ($handle === false) {
             return null;
         }
-        @flock($handle, LOCK_SH);
+        self::cooperativeFlock($handle, LOCK_SH);
         $uidvalidity = 0;
         $plan = [];
         while (($line = fgets($handle)) !== false) {
@@ -1857,7 +1884,7 @@ class FileMailStorage extends MailStorage
         if ($handle === false) {
             return $flags_by_uid;
         }
-        @flock($handle, LOCK_SH);
+        self::cooperativeFlock($handle, LOCK_SH);
         while (($line = fgets($handle)) !== false) {
             $line = rtrim($line, "\r\n");
             if ($line === "") {
@@ -2222,7 +2249,7 @@ class FileMailStorage extends MailStorage
         if ($handle === false) {
             return null;
         }
-        @flock($handle, LOCK_SH);
+        self::cooperativeFlock($handle, LOCK_SH);
         $live = [];
         while (($line = fgets($handle)) !== false) {
             $line = rtrim($line, "\r\n");
@@ -2281,7 +2308,7 @@ class FileMailStorage extends MailStorage
         if ($handle === false) {
             return null;
         }
-        @flock($handle, LOCK_SH);
+        self::cooperativeFlock($handle, LOCK_SH);
         /*
             Read the log one line at a time rather than slurping
             the whole file and exploding it. A busy folder's
@@ -6431,7 +6458,11 @@ class MailSite implements MailVocabulary
      * Reads pending bytes from a client socket into the
      * inbound buffer and drains the buffer by calling
      * processOne until no more complete commands parse.
-     * Closes the connection on EOF. Short reads are
+     * Closes the connection on end-of-file or a read fault
+     * (for example a TLS layer error on an established secure
+     * connection); a readable socket that simply has no bytes
+     * ready yet is left untouched so it ages out on the idle
+     * timeout rather than spinning the loop. Short reads are
      * tolerated: leftover bytes carry over to the next tick.
      *
      * @param resource $stream client socket
@@ -6445,7 +6476,18 @@ class MailSite implements MailVocabulary
             return;
         }
         $chunk = @fread($stream, 8192);
-        if ($chunk === false || $chunk === "") {
+        /* select reported this socket readable. A false return
+           means the read faulted (for example a TLS "bad record
+           mac" on an established secure connection); an empty read
+           at end-of-file means the peer closed. Either way the
+           connection is finished, so close it now instead of
+           leaving it perpetually readable and spinning the loop
+           until the idle timeout (30 minutes) eventually reaps it. */
+        if ($chunk === false || ($chunk === "" && feof($stream))) {
+            $this->shutdownStream($key);
+            return;
+        }
+        if ($chunk === "") {
             return;
         }
         $this->in_streams[self::DATA][$key] .= $chunk;

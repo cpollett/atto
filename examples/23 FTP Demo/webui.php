@@ -1730,14 +1730,21 @@ $site->post('/browser/upload', function () use ($site,
     }
     $u = $cfg['demo_users'][$who];
     $cwd = isset($_POST['cwd']) ? $_POST['cwd'] : '/';
+    /*
+        WebSite delivers uploads in memory ($_FILES['file']['data']
+        with a synthetic tmp_name), so SAPI is_uploaded_file() and
+        the on-disk tmp file don't apply; gate on error, read data.
+     */
     if (!isset($_FILES['file']) ||
-        !is_uploaded_file($_FILES['file']['tmp_name'])) {
+        ($_FILES['file']['error'] ?? UPLOAD_ERR_NO_FILE) !==
+        UPLOAD_ERR_OK) {
         $site->header("Location: /browser?who=$who&cwd=" .
             urlencode($cwd));
         return;
     }
     $name = basename($_FILES['file']['name']);
-    $body = file_get_contents($_FILES['file']['tmp_name']);
+    $body = $_FILES['file']['data'] ??
+        file_get_contents($_FILES['file']['tmp_name']);
     $path = $cwd === '/' ? '/' . $name :
         rtrim($cwd, '/') . '/' . $name;
     ftpSession($cfg['host'], $cfg['port'],

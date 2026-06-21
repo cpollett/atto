@@ -238,6 +238,7 @@ var KNOWN_CASES = [
     {key: 'HEADERS',   label: '/headers (HPACK/QPACK vs plain)'},
     {key: 'KEEPALIVE', label: '/small over one connection'},
     {key: 'POST',      label: '/echo-post (round-trip body)'},
+    {key: 'DEFER',     label: '/defer (cooperative overlap)'},
 ];
 var raw_el = document.getElementById('raw_block');
 var results_el = document.getElementById('results');
@@ -593,6 +594,50 @@ $test->post('/echo-post', function () use ($test) {
     $test->header("Content-Type: application/octet-stream");
     $test->header("Content-Length: " . strlen($body));
     echo $body;
+});
+$test->get('/defer', function () use ($test) {
+    /*
+        A request that does its slow work the cooperative way. It
+        runs a short child process and waits for that child by
+        suspending the request fiber, so the event loop keeps
+        serving every other connection in the meantime. Fetch many
+        of these at once (the runner's "defer" case) and they
+        overlap: the wall time stays near one request's, not the
+        sum, because the children run side by side instead of the
+        loop blocking on each in turn. Under Apache there is no atto
+        loop, so deferResponse runs the work straight through in
+        this request's own process and the wait simply blocks here.
+     */
+    return $test->deferResponse(function () use ($test) {
+        $milliseconds = 150;
+        $child = 'usleep(' . ($milliseconds * 1000) . '); echo "ok";';
+        $command = escapeshellarg(PHP_BINARY) . ' -r ' .
+            escapeshellarg($child);
+        $process = proc_open($command, [1 => ['pipe', 'w']], $pipes);
+        if (is_resource($process)) {
+            stream_set_blocking($pipes[1], false);
+            while (!feof($pipes[1])) {
+                if (\Fiber::getCurrent() !== null) {
+                    $ready = [$pipes[1]];
+                    $writable = null;
+                    $except = null;
+                    $count = @stream_select($ready, $writable,
+                        $except, 0);
+                    if ($count === 0) {
+                        \Fiber::suspend(['read' => $pipes[1]]);
+                        continue;
+                    }
+                }
+                if (fread($pipes[1], 256) === false) {
+                    break;
+                }
+            }
+            fclose($pipes[1]);
+            proc_close($process);
+        }
+        $test->header("Content-Type: text/plain");
+        echo "deferred $milliseconds ms\n";
+    });
 });
 $test->get('/h3stats', function () use ($test) {
     /*

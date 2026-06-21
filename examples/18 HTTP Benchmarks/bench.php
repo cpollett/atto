@@ -536,6 +536,24 @@ $cases['post'] = function ($t) use ($iterations) {
     return postShot($url, $t['curl_opts'], $body, $iterations,
         '64 KiB POST round-trip with body verification');
 };
+$cases['defer'] = function ($t) use ($concurrency) {
+    /*
+        Cooperative-defer test. Each /defer request runs a short
+        child process and suspends on its output, so the server
+        overlaps all of them instead of blocking on each in turn.
+        The wall time sits near a single request's, not the sum --
+        the speed-up the cooperative loop buys. Capped well below
+        the asset concurrency because each request here spawns a
+        real process, not just a socket.
+     */
+    $fanout = min($concurrency, 12);
+    $urls = [];
+    for ($i = 1; $i <= $fanout; $i++) {
+        $urls[] = ($t['endpoint'])('/defer');
+    }
+    return parallelShot($urls, $t['curl_opts'],
+        "{$fanout} parallel cooperative-defer requests");
+};
 foreach ($skip as $s) {
     unset($cases[$s]);
 }

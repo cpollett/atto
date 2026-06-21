@@ -65,6 +65,14 @@ class GopherSite
     const LINE_STARTS = ['0', '1', '2', '3', '4', '5', '6', '7', '8',
         '9', '+', 'g', 'I', 'M', 'T', 'h', 'i', 's'];
     /**
+     * How many bytes a cooperative file read pulls from disk before
+     * giving the event loop a turn. A served file is read in pieces of
+     * this size, yielding between them, so a large read does not freeze
+     * the loop. 256 KB balances few yields against a brief stall.
+     * @var int
+     */
+    const FILE_READ_CHUNK = 262144;
+    /**
      * Keys of stream that won't disappear (for example the server socket)
      * @var array
      */
@@ -87,6 +95,17 @@ class GopherSite
      * @var array
      */
     protected $routes = ["ERROR"  => [], "REQUEST" => []];
+    /**
+     * Request handlers waiting to run, one at a time, each as a fiber.
+     * A handler that serves a large file yields mid-read; the entry it
+     * sits in keeps the fiber together with the request's saved $_SERVER
+     * context, so the handler resumes in its own environment. Only the
+     * head of the queue is actually running, which keeps the response
+     * output buffer and $_SERVER consistent across its yields while the
+     * loop still accepts and reads other connections.
+     * @var array
+     */
+    protected $pending_request_fibers = [];
     /**
      * List of Gopher methods for which routes have been declared
      * @var array
@@ -391,13 +410,13 @@ class GopherSite
         if (isset($this->file_cache['MARKED'][$path])) {
             if ($force_read) {
                 $this->file_cache['MARKED'][$path] =
-                    file_get_contents($path);
+                    $this->coopFileRead($path);
             }
             return $this->file_cache['MARKED'][$path];
         } else if (isset($this->file_cache['UNMARKED'][$path])) {
             if ($force_read) {
                 $this->file_cache['MARKED'][$path] =
-                    file_get_contents($path);
+                    $this->coopFileRead($path);
             } else {
                 $this->file_cache['MARKED'][$path] =
                     $this->file_cache['UNMARKED'][$path];
@@ -405,7 +424,7 @@ class GopherSite
             unset($this->file_cache['UNMARKED'][$path]);
             return $this->file_cache['MARKED'][$path];
         }
-        $data = file_get_contents($path);
+        $data = $this->coopFileRead($path);
         if (strlen($data) < $this->default_server_globals[
             'MAX_CACHE_FILESIZE']) {
             if (count($this->file_cache['MARKED']) +
@@ -767,6 +786,13 @@ class GopherSite
                 $micro_timeout = intval(($pre_timeout - $timeout)
                     * 1000000);
             }
+            if (!empty($this->pending_request_fibers)) {
+                /* a request handler is mid-run (for example reading a
+                   large file in pieces); do not sleep so it keeps being
+                   resumed while the loop still serves other connections */
+                $timeout = 0;
+                $micro_timeout = 0;
+            }
             $num_selected = stream_select($in_streams_with_data,
                 $out_streams_with_data, $excepts, $timeout, $micro_timeout);
             $this->processTimers();
@@ -777,6 +803,7 @@ class GopherSite
                     $out_streams_with_data, $excepts, $timeout, $micro_timeout);
                 $this->processResponseStreams($out_streams_with_data);
             }
+            $this->driveRequestFibers();
             $this->cullDeadStreams();
         }
     }
@@ -950,8 +977,17 @@ class GopherSite
             }
             $meta = stream_get_meta_data($in_stream);
             $key = (int)$in_stream;
+            if ($this->hasPendingFiber($key)) {
+                /* its handler is running and owns the response; leave the
+                   connection untouched until that response is sent */
+                continue;
+            }
             if ($meta['eof']) {
-                $this->shutdownGopherStream($key);
+                if (empty($this->out_streams[self::DATA][$key])) {
+                    /* only close on the client's eof when no reply is
+                       still queued for this connection */
+                    $this->shutdownGopherStream($key);
+                }
                 continue;
             }
             $len = strlen($this->in_streams[self::DATA][$key]);
@@ -971,22 +1007,148 @@ class GopherSite
                         true;
                     $_SERVER['BAD_RESPONSE'] = true;
                 }
-                ob_start();
-                $this->process();
-                $out_data = ob_get_clean();
-                if (empty($this->in_streams[self::CONTEXT][$key][
-                    'BAD_RESPONSE'])) {
-                    $this->initRequestStream($key);
-                }
-                if (empty($this->out_streams[self::CONNECTION][$key])) {
-                    $this->out_streams[self::CONNECTION][$key] = $in_stream;
-                    $this->out_streams[self::DATA][$key] = $out_data;
-                    $this->out_streams[self::CONTEXT][$key] = $_SERVER;
-                    $this->out_streams[self::MODIFIED_TIME][$key] = time();
-                }
+                $this->enqueueRequestFiber($key, $in_stream);
             }
             $this->in_streams[self::MODIFIED_TIME][$key] = time();
         }
+    }
+    /**
+     * Builds a fiber to run one request's handler and adds it to the
+     * back of the one-at-a-time queue. The request's $_SERVER context
+     * (already set by parseRequest) is saved with the entry so the
+     * handler resumes in its own environment even after the loop has
+     * served other connections in between. The fiber opens its own
+     * output buffer, runs the handler, and returns the finished response
+     * body, so the buffer lives entirely inside the fiber and is never
+     * left half-open between yields.
+     *
+     * @param int $key id of the request stream whose handler to run
+     * @param resource $in_stream the connection the response goes back on
+     * @return void
+     */
+    protected function enqueueRequestFiber($key, $in_stream)
+    {
+        $handler = function () {
+            ob_start();
+            $this->process();
+            return ob_get_clean();
+        };
+        $this->pending_request_fibers[] = [
+            'key' => $key,
+            'stream' => $in_stream,
+            'context' => $_SERVER,
+            'fiber' => new \Fiber($handler),
+        ];
+    }
+    /**
+     * Whether the connection with id $key has a request handler still in
+     * the queue (running or waiting to run). The event loop uses this to
+     * leave such a connection alone: it must not be re-read, treated as a
+     * dead idle connection, or closed until its handler has produced a
+     * response and that response has been sent.
+     *
+     * @param int $key id of the connection to check
+     * @return bool true if a handler for this connection is still queued
+     */
+    protected function hasPendingFiber($key)
+    {
+        foreach ($this->pending_request_fibers as $entry) {
+            if ($entry['key'] === $key) {
+                return true;
+            }
+        }
+        return false;
+    }
+    /**
+     * Advances the request handler at the head of the queue by one
+     * slice. The head is the only handler running, so the response
+     * output buffer and $_SERVER stay consistent across its yields. The
+     * request's saved context is swapped in before the slice and saved
+     * back after, so reads of other connections in between cannot
+     * disturb it. When the head finishes, its response is queued for
+     * sending and the next handler becomes the head.
+     *
+     * @return void
+     */
+    protected function driveRequestFibers()
+    {
+        if (empty($this->pending_request_fibers)) {
+            return;
+        }
+        $entry = &$this->pending_request_fibers[0];
+        $saved_globals = $_SERVER;
+        $_SERVER = $entry['context'];
+        $fiber = $entry['fiber'];
+        if (!$fiber->isStarted()) {
+            $fiber->start();
+        } else if ($fiber->isSuspended()) {
+            $fiber->resume();
+        }
+        $entry['context'] = $_SERVER;
+        $_SERVER = $saved_globals;
+        $finished = $fiber->isTerminated();
+        if ($finished) {
+            $this->finishRequestFiber($entry, $fiber->getReturn());
+        }
+        unset($entry);
+        if ($finished) {
+            array_shift($this->pending_request_fibers);
+        }
+    }
+    /**
+     * Queues a finished handler's response for sending, the same way the
+     * old inline path did once process() returned. Runs with the
+     * request's own context so the saved $_SERVER travels with the
+     * response.
+     *
+     * @param array $entry the finished queue entry: its stream key,
+     *      connection, and saved $_SERVER context
+     * @param string $out_data the response body the handler produced
+     * @return void
+     */
+    protected function finishRequestFiber($entry, $out_data)
+    {
+        $key = $entry['key'];
+        if (empty($this->out_streams[self::CONNECTION][$key])) {
+            $this->out_streams[self::CONNECTION][$key] = $entry['stream'];
+            $this->out_streams[self::DATA][$key] = $out_data;
+            $this->out_streams[self::CONTEXT][$key] = $entry['context'];
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        }
+    }
+    /**
+     * Reads a file the cooperative way when running inside a request
+     * fiber: it pulls the file in fixed-size pieces and yields the event
+     * loop between them, so serving a large file does not freeze every
+     * other connection for the length of the read. Outside a fiber (for
+     * example under another web server, where each request is its own
+     * process) it falls back to one blocking read, which is exactly
+     * right there. Returns the file's contents, or false if the file
+     * could not be opened.
+     *
+     * @param string $path path of the file to read
+     * @return string|false the file's contents, or false on open failure
+     */
+    protected function coopFileRead($path)
+    {
+        if (\Fiber::getCurrent() === null) {
+            return file_get_contents($path);
+        }
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            return false;
+        }
+        $data = '';
+        while (!feof($handle)) {
+            $chunk = fread($handle, self::FILE_READ_CHUNK);
+            if ($chunk === false) {
+                break;
+            }
+            $data .= $chunk;
+            \Fiber::suspend(null);
+        }
+        fclose($handle);
+        return $data;
     }
     /**
      * Used to process any timers for GopherSite and
@@ -1223,6 +1385,11 @@ class GopherSite
             if (in_array($key, $this->immortal_stream_keys)) {
                 continue;
             }
+            if ($this->hasPendingFiber($key)) {
+                /* a handler is still producing this connection's response;
+                   do not mistake it for an idle connection and close it */
+                continue;
+            }
             if (empty($this->in_streams[self::CONNECTION][$key])) {
                 $meta = ['eof' => true];
                 $in_time = 0;
@@ -1235,7 +1402,18 @@ class GopherSite
             $out_time = empty($this->out_streams[self::MODIFIED_TIME][$key]) ?
                 0 : $this->out_streams[self::MODIFIED_TIME][$key];
             $modified_time = max($in_time, $out_time);
-            if ($meta['eof'] ||
+            $awaiting_send = !empty($this->out_streams[self::DATA][$key]);
+            /*
+                A Gopher client closes its write side as soon as it has
+                sent its one-line request, so the connection reads as eof
+                while we are still writing the reply back. Only treat eof
+                as a reason to close when there is nothing left to send;
+                otherwise a reply larger than one socket buffer, which
+                takes several passes to drain, would be cut off partway.
+                The idle timeout still applies and remains the backstop
+                for a connection whose send is genuinely stuck.
+             */
+            if ((!$awaiting_send && $meta['eof']) ||
                 time() - $modified_time > $this->default_server_globals[
                 'CONNECTION_TIMEOUT']) {
                 $this->shutdownGopherStream($key);

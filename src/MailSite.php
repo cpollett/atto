@@ -1424,7 +1424,7 @@ class FileMailStorage extends MailStorage
         if ($file_handle === false) {
             return false;
         }
-        if (!flock($file_handle, LOCK_EX)) {
+        if (!self::cooperativeFlock($file_handle, LOCK_EX)) {
             fclose($file_handle);
             return false;
         }
@@ -1757,17 +1757,22 @@ class FileMailStorage extends MailStorage
      *
      * @param resource $handle open file handle to lock
      * @param int $operation the lock to take, LOCK_SH or LOCK_EX
-     * @return void
+     * @return bool true once the lock is held, false on a real lock error
      */
     protected static function cooperativeFlock($handle, $operation)
     {
         if (\Fiber::getCurrent() === null) {
-            @flock($handle, $operation);
-            return;
+            return @flock($handle, $operation);
         }
-        while (!@flock($handle, $operation | LOCK_NB)) {
+        $would_block = false;
+        while (!@flock($handle, $operation | LOCK_NB, $would_block)) {
+            if (!$would_block) {
+                return false;
+            }
             \Fiber::suspend();
+            $would_block = false;
         }
+        return true;
     }
     /**
      * Reads a folder's reuid journal into the planned UIDVALIDITY
@@ -1927,7 +1932,7 @@ class FileMailStorage extends MailStorage
         if ($file_handle === false) {
             return;
         }
-        if (!flock($file_handle, LOCK_EX)) {
+        if (!self::cooperativeFlock($file_handle, LOCK_EX)) {
             fclose($file_handle);
             return;
         }
@@ -5039,6 +5044,8 @@ class MailSite implements MailVocabulary
     protected $handshakes = [];
     /** @var array */
     protected $out_streams = [];
+    /** @var array key => fiber for a connection paused on a lock wait */
+    protected $pending_fibers = [];
     /** @var \SplPriorityQueue|null */
     protected $timer_alarms;
     /** @var array */
@@ -5952,6 +5959,9 @@ class MailSite implements MailVocabulary
              */
             $timeout = 5;
             $microtimeout = 0;
+            if (!empty($this->pending_fibers)) {
+                $timeout = 0;
+            }
             if (!$this->timer_alarms->isEmpty()) {
                 $top = $this->timer_alarms->top();
                 $when = $top['data'][1];
@@ -6003,6 +6013,7 @@ class MailSite implements MailVocabulary
                     $this->writeClient($stream);
                 }
             }
+            $this->resumePendingFibers();
             $this->processIdleNotifications();
             $this->cullDeadStreams();
         }
@@ -6499,8 +6510,48 @@ class MailSite implements MailVocabulary
             terminators; the DATA phase has its own end-of-
             message sentinel.
          */
-        while ($this->processOne($key)) {
-            /* loop until buffer drains */
+        $this->driveConnectionFiber($key);
+    }
+    /**
+     * Runs a connection's buffered commands in a fiber, so a store lock
+     * wait yields to the loop instead of freezing every other connection.
+     * If a fiber is already parked for this connection it is left alone:
+     * it picks up the new bytes when it resumes.
+     * @param int $key connection key in the in_streams map
+     * @return void
+     */
+    protected function driveConnectionFiber($key)
+    {
+        if (isset($this->pending_fibers[$key])) {
+            return;
+        }
+        $fiber = new \Fiber(function () use ($key) {
+            while ($this->processOne($key)) {
+            }
+        });
+        $fiber->start();
+        if ($fiber->isSuspended()) {
+            $this->pending_fibers[$key] = $fiber;
+        }
+    }
+    /**
+     * Resumes connection fibers parked on a lock wait and drops the ones
+     * that finish. Runs once per loop pass.
+     * @return void
+     */
+    protected function resumePendingFibers()
+    {
+        foreach ($this->pending_fibers as $key => $fiber) {
+            if (!isset($this->in_streams[self::CONTEXT][$key])) {
+                unset($this->pending_fibers[$key]);
+                continue;
+            }
+            if ($fiber->isSuspended()) {
+                $fiber->resume();
+            }
+            if (!$fiber->isSuspended()) {
+                unset($this->pending_fibers[$key]);
+            }
         }
     }
     /**
@@ -10602,6 +10653,7 @@ class MailSite implements MailVocabulary
         if (in_array($key, $this->immortal_stream_keys)) {
             return;
         }
+        unset($this->pending_fibers[$key]);
         if (isset($this->in_streams[self::CONNECTION][$key])) {
             $stream = $this->in_streams[self::CONNECTION][$key];
             @stream_socket_shutdown($stream, STREAM_SHUT_RDWR);

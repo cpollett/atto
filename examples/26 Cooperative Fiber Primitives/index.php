@@ -1,6 +1,14 @@
 <?php
-/**
-    Cooperative fiber primitives -- a runnable reference.
+require '../../src/WebSite.php';
+
+use seekquarry\atto\WebSite;
+
+if (!defined("seekquarry\\atto\\RUN")) {
+    exit(); /* you need to comment this line to be able to run this example
+               under a web server */
+}
+/*
+    Cooperative fiber primitives, shown as a live web page.
 
     Atto's servers are single-process reactors: one select loop drives
     every connection. A handler that blocks -- on a lock, a socket, a
@@ -9,32 +17,29 @@
     blocking step can suspend, let the loop serve everyone else, and be
     resumed once its resource is ready.
 
-    This example is not a server. It is a small, self-contained loop that
-    exercises the five primitives that work depends on, printing a
-    timestamped trace so you can watch tasks take turns instead of one
-    blocking the rest:
+    This example is itself an Atto WebSite. Its landing page runs a small,
+    self-contained cooperative loop that exercises the primitives those
+    servers depend on, and renders a timestamped trace so you can watch
+    tasks take turns in the browser instead of one blocking the rest:
 
-        1. the command-fiber frame  -- the loop itself: run tasks as
-           fibers, park them when they suspend, resume them when ready
+        1. the cooperative loop     -- run tasks as fibers, park them when
+           they suspend, resume them when ready
         2. plain yield              -- hand control back so others run
         3. readable / writable wait -- suspend until a socket is ready
         4. cooperative lock         -- yield while waiting for a flock
-        5. worker offload           -- run a child process, suspend on
-                                       its output, collect the result
+        5. worker offload           -- run a child process, suspend on its
+                                       output, collect the result
 
-    RUN:
-        php index.php
+    After commenting the exit() line above, you can run the example by
+    typing:
+       php index.php
+    and pointing a browser to http://localhost:8080/. Reload the page to
+    run the trace again.
 
     Everything here is plain PHP -- Fiber, streams, flock, proc_open --
     with no outside dependencies, so it mirrors what the real servers do
     without pulling any of them in.
  */
-
-namespace seekquarry\atto;
-
-if (PHP_SAPI !== 'cli') {
-    exit("Run this reference from the command line: php index.php\n");
-}
 
 /**
  * A miniature cooperative loop: the same shape the atto servers use,
@@ -43,7 +48,8 @@ if (PHP_SAPI !== 'cli') {
  * named is ready. A task says what it is waiting for by returning a
  * ['stream' => ..., 'dir' => 'r' or 'w'] pair from its suspend, or null
  * to simply yield. The loop sleeps in stream_select on the named sockets,
- * so a parked task costs no CPU until its socket is ready.
+ * so a parked task costs no CPU until its socket is ready. Each trace line
+ * is collected rather than printed, so the landing page can show the run.
  */
 class CooperativeLoop
 {
@@ -53,6 +59,8 @@ class CooperativeLoop
     protected $waits = [];
     /** @var float wall-clock start time, used for the trace timestamps */
     protected $started;
+    /** @var array collected trace lines for the current section */
+    protected $lines = [];
 
     /**
      * Records the loop's start time so trace() can report each line's
@@ -64,8 +72,20 @@ class CooperativeLoop
     }
 
     /**
-     * Prints one trace line: milliseconds since the loop started, the
-     * task label, and a message. Reading the timestamps down the page
+     * Clears the collected trace and restarts the clock. Each demo calls
+     * this first so its section reads from zero milliseconds.
+     *
+     * @return void
+     */
+    public function reset()
+    {
+        $this->lines = [];
+        $this->started = microtime(true);
+    }
+
+    /**
+     * Records one trace line: milliseconds since the section started, the
+     * task label, and a message. Reading the timestamps down the block
      * shows how the tasks interleave.
      *
      * @param string $label which task is speaking
@@ -75,7 +95,21 @@ class CooperativeLoop
     public function trace($label, $message)
     {
         $elapsed = (microtime(true) - $this->started) * 1000;
-        printf("[%7.1f ms] %-11s %s\n", $elapsed, $label, $message);
+        $this->lines[] = sprintf("[%7.1f ms] %-11s %s", $elapsed,
+            $label, $message);
+    }
+
+    /**
+     * Returns the trace collected so far as one block of text and clears
+     * it, ready for the next section.
+     *
+     * @return string the collected trace lines joined by newlines
+     */
+    public function takeLines()
+    {
+        $text = implode("\n", $this->lines);
+        $this->lines = [];
+        return $text;
     }
 
     /**
@@ -275,17 +309,27 @@ class CooperativeLoop
 }
 
 /**
- * Prints a titled banner before each demonstration so the trace that
- * follows is easy to place.
+ * Renders one demonstration as an HTML block: a heading, a sentence on
+ * what to watch for, the collected trace, and an optional summary line.
  *
  * @param string $title short name of the primitive being shown
  * @param string $note a sentence or two on what to watch for
- * @return void
+ * @param string $trace the timestamped trace produced by the demo
+ * @param string $summary optional closing remark below the trace
+ * @return string the section's HTML
  */
-function section($title, $note)
+function section($title, $note, $trace, $summary = '')
 {
-    echo "\n=== $title ===\n";
-    echo wordwrap($note, 72) . "\n\n";
+    $html = '<section class="demo">';
+    $html .= '<h2>' . htmlspecialchars($title) . '</h2>';
+    $html .= '<p class="note">' . htmlspecialchars($note) . '</p>';
+    $html .= '<pre class="trace">' . htmlspecialchars($trace) . '</pre>';
+    if ($summary !== '') {
+        $html .= '<p class="summary">' . htmlspecialchars($summary) .
+            '</p>';
+    }
+    $html .= '</section>';
+    return $html;
 }
 
 /**
@@ -294,13 +338,11 @@ function section($title, $note)
  * before the other starts.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return void
+ * @return string the section's HTML
  */
 function demoPlainYield($loop)
 {
-    section("Plain yield",
-        "Two compute tasks give control back after every step, so the " .
-        "loop runs them turn by turn rather than one to completion first.");
+    $loop->reset();
     foreach (['compute-a', 'compute-b'] as $name) {
         $loop->addTask($name, function () use ($loop, $name) {
             for ($i = 1; $i <= 3; $i++) {
@@ -311,6 +353,10 @@ function demoPlainYield($loop)
         });
     }
     $loop->run();
+    return section("Plain yield",
+        "Two compute tasks give control back after every step, so the " .
+        "loop runs them turn by turn rather than one to completion first.",
+        $loop->takeLines());
 }
 
 /**
@@ -321,15 +367,11 @@ function demoPlainYield($loop)
  * the loop.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return void
+ * @return string the section's HTML
  */
 function demoSocketWait($loop)
 {
-    section("Readable / writable wait",
-        "A producer and a slow consumer share a socket. Each parks when " .
-        "the socket is not ready -- the producer when the buffer is " .
-        "full, the consumer when it is empty -- while a compute task " .
-        "keeps running, proving neither park stalls the loop.");
+    $loop->reset();
     $pair = stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, 0);
     stream_set_blocking($pair[0], false);
     stream_set_blocking($pair[1], false);
@@ -383,6 +425,12 @@ function demoSocketWait($loop)
         }
     });
     $loop->run();
+    return section("Readable / writable wait",
+        "A producer and a slow consumer share a socket. Each parks when " .
+        "the socket is not ready -- the producer when the buffer is " .
+        "full, the consumer when it is empty -- while a compute task " .
+        "keeps running, proving neither park stalls the loop.",
+        $loop->takeLines());
 }
 
 /**
@@ -392,15 +440,11 @@ function demoSocketWait($loop)
  * free.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return void
+ * @return string the section's HTML
  */
 function demoCooperativeLock($loop)
 {
-    section("Cooperative lock",
-        "Two tasks want the same exclusive file lock. The holder keeps " .
-        "it across a few steps; the waiter yields and retries instead " .
-        "of blocking, so the compute task keeps running until the lock " .
-        "is free.");
+    $loop->reset();
     $path = tempnam(sys_get_temp_dir(), 'attocoop');
     $loop->addTask('holder', function () use ($loop, $path) {
         $handle = fopen($path, 'c');
@@ -430,6 +474,12 @@ function demoCooperativeLock($loop)
     });
     $loop->run();
     @unlink($path);
+    return section("Cooperative lock",
+        "Two tasks want the same exclusive file lock. The holder keeps " .
+        "it across a few steps; the waiter yields and retries instead " .
+        "of blocking, so the compute task keeps running until the lock " .
+        "is free.",
+        $loop->takeLines());
 }
 
 /**
@@ -438,14 +488,11 @@ function demoCooperativeLock($loop)
  * the two overlap, so the total is about one job's time rather than two.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return void
+ * @return string the section's HTML
  */
 function demoWorkerOffload($loop)
 {
-    section("Worker offload",
-        "Two slow jobs run in child processes at once. The loop suspends " .
-        "on each child's output instead of waiting, so the two run side " .
-        "by side rather than one after the other.");
+    $loop->reset();
     $code = 'usleep(400000); $sum = 0; ' .
         'for ($i = 1; $i <= 1000; $i++) { $sum += $i; } echo $sum;';
     $command = escapeshellarg(PHP_BINARY) . ' -r ' .
@@ -460,16 +507,93 @@ function demoWorkerOffload($loop)
     }
     $loop->run();
     $spent = round((microtime(true) - $began) * 1000);
-    echo "\nboth jobs (400 ms each) finished in {$spent} ms; run one " .
-        "after another they would take about 800 ms.\n";
+    $summary = "Both jobs (400 ms each) finished in {$spent} ms; run " .
+        "one after another they would take about 800 ms.";
+    return section("Worker offload",
+        "Two slow jobs run in child processes at once. The loop suspends " .
+        "on each child's output instead of waiting, so the two run side " .
+        "by side rather than one after the other.",
+        $loop->takeLines(), $summary);
 }
 
-$loop = new CooperativeLoop();
-echo "Cooperative fiber primitives -- live trace\n";
-echo "Each line is [elapsed] task message. Watch the tasks take turns.\n";
-demoPlainYield($loop);
-demoSocketWait($loop);
-demoCooperativeLock($loop);
-demoWorkerOffload($loop);
-echo "\nThe loop served every task without blocking on any one of them " .
-    "-- the same way atto's servers stay responsive.\n";
+$test = new WebSite();
+
+$test->get('/', function () {
+    $loop = new CooperativeLoop();
+    $body = demoPlainYield($loop);
+    $body .= demoSocketWait($loop);
+    $body .= demoCooperativeLock($loop);
+    $body .= demoWorkerOffload($loop);
+    ?>
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <title>Cooperative Fiber Primitives - Atto Server</title>
+    <style>
+    body {
+        font-family: system-ui, sans-serif;
+        max-width: 62em;
+        margin: 2em auto;
+        padding: 0 1em;
+        color: #222;
+        line-height: 1.5;
+    }
+    h1 { margin-bottom: 0.2em; }
+    .lead { color: #555; margin-top: 0; }
+    .demo {
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        margin: 1.4em 0;
+        padding: 0 1.2em 1em;
+    }
+    .demo h2 { margin-bottom: 0.2em; }
+    .note { color: #555; margin-top: 0.3em; }
+    .trace {
+        background: #1e1e1e;
+        color: #d4d4d4;
+        padding: 1em;
+        border-radius: 4px;
+        overflow-x: auto;
+        font-size: 0.85em;
+        line-height: 1.4;
+    }
+    .summary { font-weight: bold; }
+    footer { color: #555; margin: 2em 0; }
+    </style>
+    </head>
+    <body>
+    <h1>Cooperative Fiber Primitives</h1>
+    <p class="lead">
+    Atto's servers are single-process reactors: one loop drives every
+    connection, and a handler runs inside a Fiber so a blocking step can
+    suspend and let the loop serve everyone else. The blocks below run a
+    small cooperative loop that exercises the same primitives. Read each
+    trace top to bottom and watch the tasks take turns.
+    </p>
+    <?= $body ?>
+    <footer>
+    The loop served every task without blocking on any one of them -- the
+    same way atto's servers stay responsive. Reload to run the trace
+    again.
+    </footer>
+    </body>
+    </html>
+    <?php
+});
+
+if ($test->isCli()) {
+    /*
+       This line is used if the app is run from the command line with a
+       line like:
+       php index.php
+       It causes the server to run on port 8080.
+     */
+    $test->listen(8080);
+} else {
+    /* This line is for when the site is run under a web server like
+       Apache, nginx, lighttpd, etc. This folder contains a .htaccess to
+       redirect traffic through this index.php file, so redirects need to
+       be on to use this example under a different web server.
+     */
+    $test->process();
+}

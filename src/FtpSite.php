@@ -897,6 +897,8 @@ class FtpSite
      * @var array map of (int) stream resource id => FtpConnection
      */
     protected $connections = [];
+    /** @var array key => fiber for a connection paused on a data wait */
+    protected $pending_fibers = [];
     /**
      * Sets the authenticator. Returns $this for chaining.
      *
@@ -1075,7 +1077,9 @@ class FtpSite
             }
             $writes = null;
             $excepts = null;
-            $n = @stream_select($reads, $writes, $excepts, 5);
+            $timeout = empty($this->pending_fibers) ? 5 : 0;
+            $n = @stream_select($reads, $writes, $excepts, $timeout);
+            $this->resumePendingFibers();
             if ($n === false || $n === 0) {
                 $this->reapIdle();
                 continue;
@@ -1192,6 +1196,56 @@ class FtpSite
             bare LF; accept both. We loop because one read
             may have delivered multiple commands.
          */
+        $this->driveConnectionFiber($key);
+    }
+    /**
+     * Runs a connection's buffered commands in a fiber, so a data-channel
+     * accept or connect can yield to the loop instead of freezing every
+     * other connection. A parked fiber is left to pick up later bytes.
+     * @param int $key connection key
+     * @return void
+     */
+    protected function driveConnectionFiber($key)
+    {
+        if (isset($this->pending_fibers[$key])) {
+            return;
+        }
+        $fiber = new \Fiber(function () use ($key) {
+            $this->processBuffered($key);
+        });
+        $fiber->start();
+        if ($fiber->isSuspended()) {
+            $this->pending_fibers[$key] = $fiber;
+        }
+    }
+    /**
+     * Resumes connection fibers parked on a data wait and drops the ones
+     * that finish. Runs once per loop pass.
+     * @return void
+     */
+    protected function resumePendingFibers()
+    {
+        foreach ($this->pending_fibers as $key => $fiber) {
+            if (!isset($this->connections[$key])) {
+                unset($this->pending_fibers[$key]);
+                continue;
+            }
+            if ($fiber->isSuspended()) {
+                $fiber->resume();
+            }
+            if (!$fiber->isSuspended()) {
+                unset($this->pending_fibers[$key]);
+            }
+        }
+    }
+    /**
+     * Runs the buffered CRLF-terminated commands for one connection.
+     * @param int $key connection key
+     * @return void
+     */
+    protected function processBuffered($key)
+    {
+        $conn = $this->connections[$key];
         while (($eol = strpos($conn->buffer, "\n")) !== false) {
             $line = substr($conn->buffer, 0, $eol);
             $conn->buffer = substr($conn->buffer, $eol + 1);
@@ -1201,7 +1255,6 @@ class FtpSite
             }
             $this->dispatch($conn, $line);
             if (!isset($this->connections[$key])) {
-                /* dispatch() called closeConnection() */
                 return;
             }
         }
@@ -1239,7 +1292,9 @@ class FtpSite
             $conn->pasv_listener = false;
         }
         @fclose($conn->control);
-        unset($this->connections[(int) $conn->control]);
+        $key = (int) $conn->control;
+        unset($this->connections[$key]);
+        unset($this->pending_fibers[$key]);
     }
     /**
      * Closes idle control connections that have not seen a
@@ -1330,6 +1385,78 @@ class FtpSite
      * false on failure (after sending the appropriate error
      * reply).
      */
+    /**
+     * Waits for the client to open a passive data connection without
+     * freezing the loop. Outside a fiber it is a plain blocking accept,
+     * so the daemon and command-line use behave as before; inside a
+     * fiber it polls and yields until a connection arrives or the
+     * timeout passes.
+     * @param resource $listener passive-mode listening socket
+     * @param int $timeout seconds to wait
+     * @return resource|false the data socket, or false on timeout
+     */
+    protected function cooperativeAccept($listener, $timeout)
+    {
+        if (\Fiber::getCurrent() === null) {
+            return @stream_socket_accept($listener, $timeout);
+        }
+        $deadline = microtime(true) + $timeout;
+        while (true) {
+            $reads = [$listener];
+            $writes = null;
+            $excepts = null;
+            if (@stream_select($reads, $writes, $excepts, 0) > 0) {
+                return @stream_socket_accept($listener, 0);
+            }
+            if (microtime(true) >= $deadline) {
+                return false;
+            }
+            \Fiber::suspend();
+        }
+    }
+    /**
+     * Opens an active-mode data connection to the client without
+     * freezing the loop. Outside a fiber it is a plain blocking
+     * connect; inside a fiber it starts the connect, then yields until
+     * the socket is writable (connected) or the timeout passes.
+     * @param string $addr client data address
+     * @param int $errno set on failure
+     * @param string $errstr set on failure
+     * @param int $timeout seconds to wait
+     * @return resource|false the data socket, or false on failure
+     */
+    protected function cooperativeConnect($addr, &$errno, &$errstr,
+        $timeout)
+    {
+        if (\Fiber::getCurrent() === null) {
+            return @stream_socket_client($addr, $errno, $errstr,
+                $timeout);
+        }
+        $stream = @stream_socket_client($addr, $errno, $errstr,
+            $timeout,
+            STREAM_CLIENT_CONNECT | STREAM_CLIENT_ASYNC_CONNECT);
+        if (!$stream) {
+            return false;
+        }
+        $deadline = microtime(true) + $timeout;
+        while (true) {
+            $reads = null;
+            $writes = [$stream];
+            $excepts = null;
+            if (@stream_select($reads, $writes, $excepts, 0) > 0) {
+                if (stream_socket_get_name($stream, true) !== false) {
+                    return $stream;
+                }
+                @fclose($stream);
+                return false;
+            }
+            if (microtime(true) >= $deadline) {
+                @fclose($stream);
+                return false;
+            }
+            \Fiber::suspend();
+        }
+    }
     protected function openDataChannel($conn)
     {
         $stream = false;
@@ -1342,7 +1469,7 @@ class FtpSite
                 something is wrong with the network and we
                 should fail rather than block.
              */
-            $stream = @stream_socket_accept(
+            $stream = $this->cooperativeAccept(
                 $conn->pasv_listener, 5);
             @fclose($conn->pasv_listener);
             $conn->pasv_listener = false;
@@ -1356,7 +1483,7 @@ class FtpSite
             list($host, $port) = $conn->active_addr;
             $conn->active_addr = false;
             $addr = $this->formatBindAddress($host, $port);
-            $stream = @stream_socket_client(
+            $stream = $this->cooperativeConnect(
                 $addr, $errno, $errstr, 5);
             if (!$stream) {
                 $this->reply($conn, self::REPLY_NO_DATA_CONN,

@@ -900,6 +900,16 @@ class FtpSite
     /** @var array key => fiber for a connection paused on a data wait */
     protected $pending_fibers = [];
     /**
+     * For each parked connection fiber, the socket it is waiting on and
+     * whether it wants to read or write, so the main loop can sleep
+     * until that socket is ready instead of spinning. Keyed by the same
+     * connection key as pending_fibers; each value is
+     * ['stream' => resource, 'dir' => 'r' or 'w'], or null when the
+     * fiber yielded without naming a socket.
+     * @var array
+     */
+    protected $fiber_waits = [];
+    /**
      * Sets the authenticator. Returns $this for chaining.
      *
      * @param FtpAuthenticator $authenticator
@@ -1075,10 +1085,21 @@ class FtpSite
             foreach ($this->connections as $c) {
                 $reads[] = $c->control;
             }
-            $writes = null;
+            $writes = [];
             $excepts = null;
-            $timeout = empty($this->pending_fibers) ? 5 : 0;
-            $n = @stream_select($reads, $writes, $excepts, $timeout);
+            foreach ($this->fiber_waits as $wait) {
+                if (is_array($wait) && isset($wait['stream'])) {
+                    if ($wait['dir'] === 'w') {
+                        $writes[] = $wait['stream'];
+                    } else {
+                        $reads[] = $wait['stream'];
+                    }
+                }
+            }
+            if (empty($writes)) {
+                $writes = null;
+            }
+            $n = @stream_select($reads, $writes, $excepts, 5);
             $this->resumePendingFibers();
             if ($n === false || $n === 0) {
                 $this->reapIdle();
@@ -1213,9 +1234,10 @@ class FtpSite
         $fiber = new \Fiber(function () use ($key) {
             $this->processBuffered($key);
         });
-        $fiber->start();
+        $wait = $fiber->start();
         if ($fiber->isSuspended()) {
             $this->pending_fibers[$key] = $fiber;
+            $this->fiber_waits[$key] = $wait;
         }
     }
     /**
@@ -1227,14 +1249,16 @@ class FtpSite
     {
         foreach ($this->pending_fibers as $key => $fiber) {
             if (!isset($this->connections[$key])) {
-                unset($this->pending_fibers[$key]);
+                unset($this->pending_fibers[$key],
+                    $this->fiber_waits[$key]);
                 continue;
             }
             if ($fiber->isSuspended()) {
-                $fiber->resume();
+                $this->fiber_waits[$key] = $fiber->resume();
             }
             if (!$fiber->isSuspended()) {
-                unset($this->pending_fibers[$key]);
+                unset($this->pending_fibers[$key],
+                    $this->fiber_waits[$key]);
             }
         }
     }
@@ -1295,6 +1319,7 @@ class FtpSite
         $key = (int) $conn->control;
         unset($this->connections[$key]);
         unset($this->pending_fibers[$key]);
+        unset($this->fiber_waits[$key]);
     }
     /**
      * Closes idle control connections that have not seen a
@@ -1411,7 +1436,7 @@ class FtpSite
             if (microtime(true) >= $deadline) {
                 return false;
             }
-            \Fiber::suspend();
+            \Fiber::suspend(['stream' => $listener, 'dir' => 'r']);
         }
     }
     /**
@@ -1454,8 +1479,54 @@ class FtpSite
                 @fclose($stream);
                 return false;
             }
-            \Fiber::suspend();
+            \Fiber::suspend(['stream' => $stream, 'dir' => 'w']);
         }
+    }
+    /**
+     * Sends a block of bytes over a data socket without freezing the
+     * whole server when the receiving client reads slowly. The socket
+     * is expected to be in non-blocking mode: when its send buffer is
+     * full this parks the transfer (inside a connection fiber it yields
+     * so other clients keep running; outside a fiber it waits on the
+     * socket directly) and resumes once the client drains it. Gives up
+     * only if the socket breaks or makes no progress for the whole
+     * timeout, so a steadily-slow client is served to completion.
+     *
+     * @param resource $stream non-blocking data socket to write to
+     * @param string $bytes block of data to send
+     * @param int $timeout seconds to allow with no progress at all
+     *      before treating the client as dead and giving up
+     * @return bool true once every byte is sent, false on a broken or
+     *      stalled socket
+     */
+    protected function cooperativeWrite($stream, $bytes, $timeout)
+    {
+        $length = strlen($bytes);
+        $written = 0;
+        $deadline = microtime(true) + $timeout;
+        while ($written < $length) {
+            $count = @fwrite($stream, substr($bytes, $written));
+            if ($count === false) {
+                return false;
+            }
+            if ($count === 0) {
+                if (microtime(true) >= $deadline) {
+                    return false;
+                }
+                if (\Fiber::getCurrent() !== null) {
+                    \Fiber::suspend(['stream' => $stream, 'dir' => 'w']);
+                } else {
+                    $reads = null;
+                    $writes = [$stream];
+                    $excepts = null;
+                    @stream_select($reads, $writes, $excepts, 1);
+                }
+                continue;
+            }
+            $written += $count;
+            $deadline = microtime(true) + $timeout;
+        }
+        return true;
     }
     protected function openDataChannel($conn)
     {
@@ -2266,6 +2337,8 @@ class FtpSite
         if (!$data) {
             return;
         }
+        stream_set_blocking($data, false);
+        $payload = '';
         foreach ($entries as $e) {
             if ($format === 'nlst') {
                 $line = $e['name'];
@@ -2274,11 +2347,18 @@ class FtpSite
             } else {
                 $line = $this->formatListLine($e);
             }
-            @fwrite($data, $line . "\r\n");
+            $payload .= $line . "\r\n";
         }
+        $ok = $this->cooperativeWrite($data, $payload,
+            (int) $this->config['IDLE_TIMEOUT']);
         @fclose($data);
-        $this->reply($conn, self::REPLY_TRANSFER_OK,
-            "Listing complete.");
+        if ($ok) {
+            $this->reply($conn, self::REPLY_TRANSFER_OK,
+                "Listing complete.");
+        } else {
+            $this->reply($conn, self::REPLY_DATA_ABORTED,
+                "Listing aborted: data connection failed.");
+        }
     }
     /**
      * Formats one entry as an ls -l style line, the format
@@ -2364,26 +2444,28 @@ class FtpSite
             return;
         }
         $conn->rest_offset = 0;
+        stream_set_blocking($data, false);
+        $ok = true;
         while (!feof($stream)) {
             $chunk = @fread($stream, 65536);
             if ($chunk === false || $chunk === '') {
                 break;
             }
-            $written = 0;
-            $length = strlen($chunk);
-            while ($written < $length) {
-                $n = @fwrite($data,
-                    substr($chunk, $written));
-                if ($n === false || $n === 0) {
-                    break 2;
-                }
-                $written += $n;
+            if (!$this->cooperativeWrite($data, $chunk,
+                (int) $this->config['IDLE_TIMEOUT'])) {
+                $ok = false;
+                break;
             }
         }
         fclose($stream);
         @fclose($data);
-        $this->reply($conn, self::REPLY_TRANSFER_OK,
-            "Transfer complete.");
+        if ($ok) {
+            $this->reply($conn, self::REPLY_TRANSFER_OK,
+                "Transfer complete.");
+        } else {
+            $this->reply($conn, self::REPLY_DATA_ABORTED,
+                "Transfer aborted: data connection failed.");
+        }
     }
     protected function cmdSTOR($conn, $arg)
     {

@@ -30,6 +30,11 @@ if (!defined("seekquarry\\atto\\RUN")) {
         5. worker offload           -- run a child process, suspend on its
                                        output, collect the result
 
+    Each section starts as a one-line description and a trace. The
+    description is a link: click it to reveal the exact code that produced
+    the trace, read straight from this file so the page can never drift
+    from what actually ran.
+
     After commenting the exit() line above, you can run the example by
     typing:
        php index.php
@@ -309,20 +314,63 @@ class CooperativeLoop
 }
 
 /**
- * Renders one demonstration as an HTML block: a heading, a sentence on
- * what to watch for, the collected trace, and an optional summary line.
+ * Returns the source text of a top-level function, read straight from
+ * this file, so the page can show the exact code a demo ran next to the
+ * trace it produced. Reflection points at the line of the function
+ * keyword, so the docblock above it is left out.
  *
+ * @param string $function_name name of the function to read
+ * @return string the function's source lines
+ */
+function functionSource($function_name)
+{
+    $reflection = new \ReflectionFunction($function_name);
+    $source = file($reflection->getFileName());
+    $start = $reflection->getStartLine() - 1;
+    $length = $reflection->getEndLine() - $start;
+    return rtrim(implode('', array_slice($source, $start, $length)));
+}
+
+/**
+ * Returns the source text of a class, read straight from this file, so
+ * the page can reveal the cooperative loop itself on request.
+ *
+ * @param string $class_name name of the class to read
+ * @return string the class's source lines
+ */
+function classSource($class_name)
+{
+    $reflection = new \ReflectionClass($class_name);
+    $source = file($reflection->getFileName());
+    $start = $reflection->getStartLine() - 1;
+    $length = $reflection->getEndLine() - $start;
+    return rtrim(implode('', array_slice($source, $start, $length)));
+}
+
+/**
+ * Renders one demonstration as an HTML block. The note is a link: a
+ * click toggles a panel holding the exact code the demo ran, so the page
+ * stays short until the reader asks to see how a result was made. Below
+ * the note sit that hidden code panel, the timestamped trace the code
+ * produced, and an optional summary line.
+ *
+ * @param string $code_id unique id tying the note's toggle to its panel
  * @param string $title short name of the primitive being shown
- * @param string $note a sentence or two on what to watch for
- * @param string $trace the timestamped trace produced by the demo
+ * @param string $note a sentence on what to watch for; also the toggle
+ * @param string $code the exact source the demo ran
+ * @param string $trace the timestamped trace the code produced
  * @param string $summary optional closing remark below the trace
  * @return string the section's HTML
  */
-function section($title, $note, $trace, $summary = '')
+function section($code_id, $title, $note, $code, $trace, $summary = '')
 {
     $html = '<section class="demo">';
     $html .= '<h2>' . htmlspecialchars($title) . '</h2>';
-    $html .= '<p class="note">' . htmlspecialchars($note) . '</p>';
+    $html .= '<p class="note"><a class="toggle" href="#" onclick="' .
+        'return toggleCode(\'' . $code_id . '\')">' .
+        htmlspecialchars($note) . '</a></p>';
+    $html .= '<pre class="code" id="' . $code_id . '">' .
+        htmlspecialchars($code) . '</pre>';
     $html .= '<pre class="trace">' . htmlspecialchars($trace) . '</pre>';
     if ($summary !== '') {
         $html .= '<p class="summary">' . htmlspecialchars($summary) .
@@ -338,7 +386,7 @@ function section($title, $note, $trace, $summary = '')
  * before the other starts.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return string the section's HTML
+ * @return array the trace and an empty summary
  */
 function demoPlainYield($loop)
 {
@@ -353,10 +401,7 @@ function demoPlainYield($loop)
         });
     }
     $loop->run();
-    return section("Plain yield",
-        "Two compute tasks give control back after every step, so the " .
-        "loop runs them turn by turn rather than one to completion first.",
-        $loop->takeLines());
+    return ['trace' => $loop->takeLines(), 'summary' => ''];
 }
 
 /**
@@ -367,7 +412,7 @@ function demoPlainYield($loop)
  * the loop.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return string the section's HTML
+ * @return array the trace and an empty summary
  */
 function demoSocketWait($loop)
 {
@@ -425,12 +470,7 @@ function demoSocketWait($loop)
         }
     });
     $loop->run();
-    return section("Readable / writable wait",
-        "A producer and a slow consumer share a socket. Each parks when " .
-        "the socket is not ready -- the producer when the buffer is " .
-        "full, the consumer when it is empty -- while a compute task " .
-        "keeps running, proving neither park stalls the loop.",
-        $loop->takeLines());
+    return ['trace' => $loop->takeLines(), 'summary' => ''];
 }
 
 /**
@@ -440,7 +480,7 @@ function demoSocketWait($loop)
  * free.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return string the section's HTML
+ * @return array the trace and an empty summary
  */
 function demoCooperativeLock($loop)
 {
@@ -474,12 +514,7 @@ function demoCooperativeLock($loop)
     });
     $loop->run();
     @unlink($path);
-    return section("Cooperative lock",
-        "Two tasks want the same exclusive file lock. The holder keeps " .
-        "it across a few steps; the waiter yields and retries instead " .
-        "of blocking, so the compute task keeps running until the lock " .
-        "is free.",
-        $loop->takeLines());
+    return ['trace' => $loop->takeLines(), 'summary' => ''];
 }
 
 /**
@@ -488,15 +523,14 @@ function demoCooperativeLock($loop)
  * the two overlap, so the total is about one job's time rather than two.
  *
  * @param CooperativeLoop $loop the shared loop
- * @return string the section's HTML
+ * @return array the trace and a summary noting the overlap
  */
 function demoWorkerOffload($loop)
 {
     $loop->reset();
-    $code = 'usleep(400000); $sum = 0; ' .
+    $job = 'usleep(400000); $sum = 0; ' .
         'for ($i = 1; $i <= 1000; $i++) { $sum += $i; } echo $sum;';
-    $command = escapeshellarg(PHP_BINARY) . ' -r ' .
-        escapeshellarg($code);
+    $command = escapeshellarg(PHP_BINARY) . ' -r ' . escapeshellarg($job);
     $began = microtime(true);
     foreach (['job-1', 'job-2'] as $name) {
         $loop->addTask($name, function () use ($loop, $name, $command) {
@@ -509,21 +543,47 @@ function demoWorkerOffload($loop)
     $spent = round((microtime(true) - $began) * 1000);
     $summary = "Both jobs (400 ms each) finished in {$spent} ms; run " .
         "one after another they would take about 800 ms.";
-    return section("Worker offload",
-        "Two slow jobs run in child processes at once. The loop suspends " .
-        "on each child's output instead of waiting, so the two run side " .
-        "by side rather than one after the other.",
-        $loop->takeLines(), $summary);
+    return ['trace' => $loop->takeLines(), 'summary' => $summary];
 }
 
 $test = new WebSite();
 
 $test->get('/', function () {
     $loop = new CooperativeLoop();
-    $body = demoPlainYield($loop);
-    $body .= demoSocketWait($loop);
-    $body .= demoCooperativeLock($loop);
-    $body .= demoWorkerOffload($loop);
+    $demos = [
+        ['plain-yield', 'Plain yield',
+            'Two compute tasks give control back after every step, so ' .
+            'the loop runs them turn by turn rather than one to ' .
+            'completion first.',
+            'demoPlainYield'],
+        ['socket-wait', 'Readable / writable wait',
+            'A producer and a slow consumer share a socket. Each parks ' .
+            'when the socket is not ready -- the producer when the ' .
+            'buffer is full, the consumer when it is empty -- while a ' .
+            'compute task keeps running, proving neither park stalls ' .
+            'the loop.',
+            'demoSocketWait'],
+        ['coop-lock', 'Cooperative lock',
+            'Two tasks want the same exclusive file lock. The holder ' .
+            'keeps it across a few steps; the waiter yields and retries ' .
+            'instead of blocking, so the compute task keeps running ' .
+            'until the lock is free.',
+            'demoCooperativeLock'],
+        ['worker-offload', 'Worker offload',
+            'Two slow jobs run in child processes at once. The loop ' .
+            'suspends on each child\'s output instead of waiting, so ' .
+            'the two run side by side rather than one after the other.',
+            'demoWorkerOffload'],
+    ];
+    $body = '';
+    foreach ($demos as $demo) {
+        list($code_id, $title, $note, $function_name) = $demo;
+        $result = $function_name($loop);
+        $body .= section($code_id, $title, $note,
+            functionSource($function_name), $result['trace'],
+            $result['summary']);
+    }
+    $loop_source = classSource('CooperativeLoop');
     ?>
     <!DOCTYPE html>
     <html>
@@ -547,7 +607,26 @@ $test->get('/', function () {
         padding: 0 1.2em 1em;
     }
     .demo h2 { margin-bottom: 0.2em; }
-    .note { color: #555; margin-top: 0.3em; }
+    .note { color: #333; margin-top: 0.3em; }
+    .toggle {
+        color: #0366d6;
+        text-decoration: none;
+        cursor: pointer;
+        border-bottom: 1px dotted #0366d6;
+    }
+    .toggle:hover { background: #eef4ff; }
+    .toggle::before { content: "\25B8\00a0\00a0"; }
+    .code {
+        display: none;
+        background: #f6f8fa;
+        color: #24292e;
+        border: 1px solid #e1e4e8;
+        padding: 1em;
+        border-radius: 4px;
+        overflow-x: auto;
+        font-size: 0.82em;
+        line-height: 1.45;
+    }
     .trace {
         background: #1e1e1e;
         color: #d4d4d4;
@@ -567,15 +646,31 @@ $test->get('/', function () {
     Atto's servers are single-process reactors: one loop drives every
     connection, and a handler runs inside a Fiber so a blocking step can
     suspend and let the loop serve everyone else. The blocks below run a
-    small cooperative loop that exercises the same primitives. Read each
-    trace top to bottom and watch the tasks take turns.
+    small cooperative loop that exercises the same primitives. Each
+    description is a link -- click it to see the exact code that produced
+    the trace beneath it. You can also
+    <a class="toggle" href="#" onclick="return toggleCode('loop-source')">
+    show the cooperative loop itself</a>.
     </p>
+    <pre class="code" id="loop-source"><?=
+        htmlspecialchars($loop_source) ?></pre>
     <?= $body ?>
     <footer>
     The loop served every task without blocking on any one of them -- the
     same way atto's servers stay responsive. Reload to run the trace
     again.
     </footer>
+    <script>
+    function toggleCode(id) {
+        var element = document.getElementById(id);
+        if (element.style.display === 'block') {
+            element.style.display = 'none';
+        } else {
+            element.style.display = 'block';
+        }
+        return false;
+    }
+    </script>
     </body>
     </html>
     <?php

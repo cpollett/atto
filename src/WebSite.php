@@ -101,6 +101,21 @@ class WebSite
      */
     const MAX_SESSIONS_DEFAULT = 10000;
     /**
+     * How long in seconds a session may sit untouched before the
+     * periodic sweep drops it from memory, used when the server config
+     * does not set SESSION_IDLE_TIMEOUT. Stops one-shot visitors and
+     * bots, who make a single cookieless request and never return to
+     * reuse their cookie, from piling up server-side sessions for the
+     * whole life of the always-on server.
+     */
+    const SESSION_IDLE_TIMEOUT_DEFAULT = 3600;
+    /**
+     * How many seconds to leave between idle-session sweeps. The sweep
+     * walks every live session, so it runs on this cadence rather than
+     * on every event-loop pass to keep its cost away.
+     */
+    const SESSION_REAP_INTERVAL = 60;
+    /**
      * Number of times openListener retries a failed bind before
      * giving up. A restart spawns the replacement process while the
      * exiting one may still hold the privileged port for a short
@@ -117,7 +132,7 @@ class WebSite
     /*
       CONNECT OPTIONS and the longest named HTTP method. It has length 7
      */
-    const LEN_LONGEST_HTTP_METHOD = 7;
+    const LEN_LONGEST_HTTP_METHOD = 9;
     /*
         Length in bytes of an HTTP/2 frame header (RFC 7540 sec 4.1):
         3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream id
@@ -187,6 +202,39 @@ class WebSite
      * per event; remaining bytes are read on the next event.
      */
     const H2_READ_CHUNK_SIZE = 65536;
+    /**
+     * Most HTTP/2 streams the server keeps open at once on one
+     * connection. A request that would open a stream past this is
+     * refused with RST_STREAM rather than served, so a client that
+     * sends requests faster than it reads the replies cannot make
+     * the server hold an unbounded amount of request and response
+     * state for that one connection. This is also the value the
+     * server advertises in its SETTINGS, so a well-behaved client
+     * never reaches it; the limit is enforced for clients that
+     * ignore the advertisement.
+     */
+    const H2_MAX_CONCURRENT_STREAMS = 100;
+    /**
+     * Most unsent response bytes plus unread request-body bytes, in
+     * bytes, the server will hold for one HTTP/2 connection before
+     * it refuses to open further streams on that connection until
+     * the backlog drains. The per-stream limit alone is not enough,
+     * because a single stream can carry a sizeable body, so a client
+     * could stay under the stream count yet still tie up far too much
+     * memory; this caps the total a single slow-reading client can
+     * hold. 64 megabytes leaves room for a normal page's worth of
+     * concurrent responses and one large upload while staying far
+     * below the level that exhausted the process in production.
+     */
+    const H2_MAX_CONN_BUFFER = 67108864;
+    /**
+     * RFC 7540 sec 7 REFUSED_STREAM error code. Sent in an
+     * RST_STREAM frame when the server declines to open a stream
+     * because the connection is at its concurrent-stream or
+     * buffered-byte limit. It tells the client the request was not
+     * acted on and may be retried once the connection frees up.
+     */
+    const H2_ERROR_REFUSED_STREAM = 0x7;
     /*
         Magic GUID concatenated with the client-supplied
         Sec-WebSocket-Key during the WebSocket handshake to compute
@@ -251,9 +299,11 @@ class WebSite
      *  that method
      * @var array
      */
-    protected $routes = ["CONNECT" => [], "DELETE" => [], "ERROR" => [],
-        "GET" => [], "HEAD" => [], "OPTIONS" => [], "POST" => [],
-        "PUT" => [], "TRACE" => [], "WS" => []];
+    protected $routes = ["CONNECT" => [], "COPY" => [], "DELETE" => [],
+        "ERROR" => [], "GET" => [], "HEAD" => [], "LOCK" => [],
+        "MKCOL" => [], "MOVE" => [], "OPTIONS" => [], "POST" => [],
+        "PROPFIND" => [], "PROPPATCH" => [], "PUT" => [], "TRACE" => [],
+        "UNLOCK" => [], "WS" => []];
     /**
      * Default values used to set up session variables
      * @var array
@@ -293,6 +343,23 @@ class WebSite
      * @var array
      */
     protected $middle_wares = [];
+    /**
+     * Callbacks run after a response is finalized, each given the
+     * response's status code and body size in bytes. Used to record an
+     * access line that includes how a request turned out, not just that
+     * it arrived.
+     * @var array
+     */
+    protected $response_loggers = [];
+    /**
+     * Whether the response currently being built has already had its
+     * access line recorded by the streaming path. A streamed body does not
+     * pass through getResponseData's size accounting, so the streaming
+     * entry point logs it directly; this flag stops getResponseData from
+     * then logging the same response a second time with a zero length.
+     * @var bool
+     */
+    protected $streaming_response_logged = false;
     /**
      * Filename of currently requested script
      * @var array
@@ -342,6 +409,27 @@ class WebSite
      * @var \SplMinHeap
      */
     protected $timer_alarms;
+    /**
+     * Wall-clock time in whole seconds when the last memory-usage
+     * sample was written to the error log, or zero before the first
+     * one. Used to keep samples spaced out by the configured period.
+     * @var int
+     */
+    protected $last_memory_sample_time = 0;
+    /**
+     * How many seconds to leave between memory-usage samples, set from
+     * the server config when the server starts, with zero meaning the
+     * sampling is off. See sampleMemoryUsage.
+     * @var int
+     */
+    protected $memory_sample_period = 0;
+    /**
+     * Unix time in seconds of the last idle-session sweep, used to keep
+     * the sweep to the SESSION_REAP_INTERVAL cadence. See
+     * reapIdleSessions.
+     * @var int
+     */
+    protected $last_session_reap_time = 0;
     /**
      * Cookie name value of the currently active request's session
      * @var string
@@ -440,6 +528,24 @@ class WebSite
      */
     const MICROSECONDS_PER_SECOND = 1000000;
     /**
+     * Number of bytes in one megabyte, used to show memory figures in
+     * megabytes in the memory-usage samples. This is the binary
+     * megabyte (1024 times 1024) so the figures line up with the way
+     * PHP itself reports its memory limit. As with the conversion
+     * factor above, atto is self-contained and keeps this here rather
+     * than reading a Yioop constant.
+     */
+    const BYTES_PER_MEGABYTE = 1048576;
+    /**
+     * Size in bytes above which a single response body is written to the
+     * error log when the server config does not set LARGE_RESPONSE_LOG_LEN.
+     * A response is held whole in memory before it drains to the socket,
+     * so an unusually large one is the likeliest thing to push the
+     * always-on server over its memory limit; the default catches those
+     * while staying well above any ordinary page.
+     */
+    const LARGE_RESPONSE_LOG_LEN_DEFAULT = 50 * self::BYTES_PER_MEGABYTE;
+    /**
      * Connection resource for the in-flight request, set by
      * processRequestStreams (H1) or dispatchH2Request (H2)
      * before calling the route. Used by flush() to write
@@ -487,6 +593,15 @@ class WebSite
      * @var bool
      */
     protected $is_cli;
+    /**
+     * Host names this server should answer to, lower-cased. When this
+     * list is non-empty, each request's $_SERVER['SERVER_NAME'] is set
+     * to the served domain the visitor's Host header named (when it is
+     * one of these) or to the first name here otherwise. Empty means
+     * the per-request naming is off and the bound name is kept.
+     * @var array
+     */
+    protected $served_domains = [];
     /**
      * Active Listener instances, indexed by (int)$server resource
      * so processRequestStreams can match an incoming readable
@@ -575,6 +690,175 @@ class WebSite
         ini_set('precision', 16);
         $this->timer_alarms = new \SplMinHeap();
         $this->session_lru = new \SplMinHeap();
+    }
+    /**
+     * Decides whether enough time has gone by to write another
+     * memory-usage sample, based on the sample period the server was
+     * started with (in seconds, with zero meaning off). When it says
+     * yes it also records the current time as the last sample time.
+     * Kept apart from the logging itself so the timing rule can be
+     * checked on its own.
+     *
+     * @param int $now current wall-clock time in whole seconds
+     * @return bool true when a sample should be written now
+     */
+    protected function memorySampleDue($now)
+    {
+        if ($this->memory_sample_period <= 0) {
+            return false;
+        }
+        if ($now - $this->last_memory_sample_time <
+            $this->memory_sample_period) {
+            return false;
+        }
+        $this->last_memory_sample_time = $now;
+        return true;
+    }
+    /**
+     * Writes one line to the error log every so often describing how
+     * much memory the running server is using and how many connections
+     * and related items it is holding. This is a switchable aid for
+     * tracking down slow memory growth in the always-on server: turned
+     * on, the log shows whether memory climbs while the connection and
+     * stream counts stay flat, which would point at something held
+     * across requests rather than a connection that is never released.
+     * It does nothing unless the server was started with a positive
+     * WEBSITE_MEMORY_SAMPLE_PERIOD in its config; the loop calls this
+     * on every pass and the timing check keeps the cost away.
+     */
+    protected function sampleMemoryUsage()
+    {
+        if (!$this->memorySampleDue(time())) {
+            return;
+        }
+        $used = round(memory_get_usage(true) /
+            self::BYTES_PER_MEGABYTE, 1);
+        $peak = round(memory_get_peak_usage(true) /
+            self::BYTES_PER_MEGABYTE, 1);
+        $connections = count($this->connections);
+        $reading = count($this->in_streams[self::CONNECTION] ?? []);
+        $writing = count($this->out_streams[self::CONNECTION] ?? []);
+        $sessions = count($this->sessions);
+        $timers = count($this->timers);
+        error_log("[website-memory] used={$used}MB peak={$peak}MB " .
+            "connections={$connections} reading={$reading} " .
+            "writing={$writing} sessions={$sessions} timers={$timers}");
+    }
+    /**
+     * Returns whether enough time has passed since the last idle-session
+     * sweep to run another one, recording the new sweep time when it has.
+     * Keeps the sweep on the SESSION_REAP_INTERVAL cadence instead of
+     * running it on every event-loop pass.
+     *
+     * @param int $now current Unix time in seconds
+     * @return bool true if a sweep is due now
+     */
+    protected function sessionReapDue($now)
+    {
+        if ($now - $this->last_session_reap_time <
+            self::SESSION_REAP_INTERVAL) {
+            return false;
+        }
+        $this->last_session_reap_time = $now;
+        return true;
+    }
+    /**
+     * Drops sessions that have sat untouched longer than the configured
+     * idle timeout. Without this, a one-shot visitor or bot that makes a
+     * single cookieless request and never comes back would keep its
+     * server-side session in memory for the whole life of the always-on
+     * server, so the session count, and the memory those sessions hold,
+     * would only ever grow. The session being served right now was just
+     * stamped with the current time, so it is never near the cutoff and
+     * cannot be signed out by a sweep. An idle timeout of zero or less
+     * turns the sweep off. The least-recently-used heap that backs the
+     * session cap tolerates these removals: its now-stale entries are
+     * skipped during cap eviction and cleared when that heap is rebuilt.
+     */
+    protected function reapIdleSessions()
+    {
+        $now = time();
+        if (!$this->sessionReapDue($now)) {
+            return;
+        }
+        $idle_timeout =
+            $this->default_server_globals['SESSION_IDLE_TIMEOUT']
+            ?? self::SESSION_IDLE_TIMEOUT_DEFAULT;
+        if ($idle_timeout <= 0) {
+            return;
+        }
+        $cutoff = $now - $idle_timeout;
+        foreach ($this->sessions as $reap_id => $session) {
+            $session_time = $session['TIME'] ?? $now;
+            if ($session_time < $cutoff) {
+                unset($this->sessions[$reap_id]);
+            }
+        }
+    }
+    /**
+     * Writes one line to the error log when a single response body is
+     * larger than the configured threshold. The whole body is held in
+     * memory before it drains to the socket, so an unexpectedly large
+     * one is the thing most likely to push the always-on server past its
+     * memory limit; recording its size, status, and request makes the
+     * offending request identifiable instead of guessed at. The check is
+     * one length comparison on every response and logs nothing in the
+     * normal case; a threshold of zero or less turns it off.
+     *
+     * @param int $body_size size in bytes of the response body
+     */
+    protected function logLargeResponse($body_size)
+    {
+        $threshold =
+            $this->default_server_globals['LARGE_RESPONSE_LOG_LEN']
+            ?? self::LARGE_RESPONSE_LOG_LEN_DEFAULT;
+        if ($threshold <= 0 || $body_size < $threshold) {
+            return;
+        }
+        $status = "200";
+        if (preg_match('/^HTTP\/\S+\s+(\d+)/', $this->header_data,
+            $matches)) {
+            $status = $matches[1];
+        }
+        $method = $_SERVER['REQUEST_METHOD'] ?? "?";
+        $uri = $_SERVER['REQUEST_URI'] ?? "?";
+        $remote = $_SERVER['REMOTE_ADDR'] ?? "?";
+        $megabytes = round($body_size / self::BYTES_PER_MEGABYTE, 1);
+        error_log("[website-large-response] {$megabytes}MB " .
+            "status={$status} {$method} {$remote} {$uri}");
+    }
+    /**
+     * Records, once, when a single connection's outbound buffer first grows
+     * past the large-response threshold. Each response body is already
+     * checked on its own, but under HTTP/2 many stream responses are
+     * appended into one per-connection buffer, so a connection whose client
+     * drains slowly can pile up hundreds of megabytes that no single
+     * response would reveal. Logging the moment the buffer crosses the
+     * threshold, together with the chunk just added and the request, points
+     * at the connection responsible instead of leaving it to guesswork. It
+     * logs at most once per crossing and nothing in the normal case; a
+     * threshold of zero or less turns it off.
+     *
+     * @param int $chunk_size size in bytes of the chunk just appended
+     * @param int $buffer_size size in bytes of the whole outbound buffer
+     *      after appending the chunk
+     */
+    protected function logOutboundBuffer($chunk_size, $buffer_size)
+    {
+        $threshold =
+            $this->default_server_globals['LARGE_RESPONSE_LOG_LEN']
+            ?? self::LARGE_RESPONSE_LOG_LEN_DEFAULT;
+        if ($threshold <= 0 || $buffer_size < $threshold ||
+            $buffer_size - $chunk_size >= $threshold) {
+            return;
+        }
+        $method = $_SERVER['REQUEST_METHOD'] ?? "?";
+        $uri = $_SERVER['REQUEST_URI'] ?? "?";
+        $remote = $_SERVER['REMOTE_ADDR'] ?? "?";
+        $buffer_megabytes =
+            round($buffer_size / self::BYTES_PER_MEGABYTE, 1);
+        error_log("[website-outbound-buffer] {$buffer_megabytes}MB " .
+            "chunk={$chunk_size}B {$method} {$remote} {$uri}");
     }
     /**
      * Returns whether this class is being used from the command-line or in a
@@ -724,6 +1008,36 @@ class WebSite
         $this->middle_wares[] = $callback;
     }
     /**
+     * Adds a callback to run after a response has been finalized. Each
+     * such callback is passed the response status code and the response
+     * body size in bytes, so a caller can log how a request actually
+     * turned out (its status and how large a reply it produced) rather
+     * than only that the request arrived.
+     *
+     * @param callable $callback function called with (int status code,
+     *      int body size in bytes) once a response is ready to send
+     */
+    public function logResponses(callable $callback)
+    {
+        $this->response_loggers[] = $callback;
+    }
+    /**
+     * Reads the numeric HTTP status code from the response status line
+     * built so far. Falls back to 200 when no status line has been set,
+     * which matches the default the server fills in for a route that
+     * only emitted a body.
+     *
+     * @return int the response status code
+     */
+    public function responseStatusCode()
+    {
+        if (preg_match('/^HTTP\/\S+\s+(\d+)/', $this->header_data,
+            $matches)) {
+            return (int)$matches[1];
+        }
+        return 200;
+    }
+    /**
      * Cause all the current HTTP request to be processed according to the
      * middleware callbacks and routes currently set on this WebSite object.
      */
@@ -746,8 +1060,8 @@ class WebSite
          */
         if (!empty($_SERVER['HTTP_UPGRADE'])
             && strtolower($_SERVER['HTTP_UPGRADE']) === 'websocket') {
-            header("HTTP/1.1 501 Not Implemented");
-            header("Content-Type: text/plain");
+            $this->header("HTTP/1.1 501 Not Implemented");
+            $this->header("Content-Type: text/plain");
             echo "WebSocket upgrades require running this script "
                 . "from the command line (php index.php). The PHP "
                 . "SAPI used by Apache, nginx-FPM, and CGI does not "
@@ -816,7 +1130,7 @@ class WebSite
         if (empty($_SERVER['RECURSION'])) {
             $_SERVER['RECURSION'] = [];
         }
-        if(empty($this->routes[$method])) {
+        if (empty($this->routes[$method])) {
             return false;
         }
         if (in_array($method . " " . $route, $_SERVER['RECURSION']) ) {
@@ -826,7 +1140,7 @@ class WebSite
         $method_routes = $this->routes[$method];
         $handled = false;
         foreach ($method_routes as $check_route => $callback) {
-            if(($add_vars = $this->checkMatch($route, $check_route)) !==
+            if (($add_vars = $this->checkMatch($route, $check_route)) !==
                 false) {
                 $_GET = array_merge($_GET, $add_vars);
                 $_REQUEST = array_merge($_REQUEST, $add_vars);
@@ -905,6 +1219,7 @@ class WebSite
         if (!($generator instanceof \Generator)) {
             return true;
         }
+        $this->logStreamingResponse();
         $protocol = $this->streaming_context['protocol'] ?? null;
         if ($this->isCli() && ($protocol === 'h2' || $protocol === 'h3')) {
             $this->streaming_producer = $generator;
@@ -932,6 +1247,31 @@ class WebSite
             }
         }
         return true;
+    }
+    /**
+     * Records the access line for a response whose body is streamed rather
+     * than buffered. A streamed body (a video range, a large download)
+     * never passes through getResponseData's size accounting, so without
+     * this such a reply would be missing from the access log or recorded
+     * with a zero length. The status and length are read from the headers
+     * the route has already set before it began streaming. The response is
+     * marked as logged so getResponseData does not record it a second time.
+     */
+    protected function logStreamingResponse()
+    {
+        if ($this->streaming_response_logged) {
+            return;
+        }
+        $this->streaming_response_logged = true;
+        $length = 0;
+        if (preg_match('/^Content-Length:\s*(\d+)/im', $this->header_data,
+            $matches)) {
+            $length = (int)$matches[1];
+        }
+        $status = $this->responseStatusCode();
+        foreach ($this->response_loggers as $response_logger) {
+            $response_logger($status, $length);
+        }
     }
     /**
      * Records which HTTP protocol the request being served right now is
@@ -1142,14 +1482,11 @@ class WebSite
         $zero_writes = 0;
         $stall_limit =
             $this->default_server_globals['CONNECTION_TIMEOUT'];
-        $custom_error_handler =
-            $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
-            null;
         while ($written < $total) {
             set_error_handler(null);
             $num_written = fwrite($socket, ($written == 0) ? $data :
                 substr($data, $written));
-            set_error_handler($custom_error_handler);
+            restore_error_handler();
             if ($num_written === false || feof($socket)) {
                 $this->streaming_failed = true;
                 return false;
@@ -1172,7 +1509,7 @@ class WebSite
                 set_error_handler(null);
                 $ready = stream_select($read_streams,
                     $write_streams, $except_streams, $stall_limit);
-                set_error_handler($custom_error_handler);
+                restore_error_handler();
                 if (empty($ready)) {
                     $this->streaming_failed = true;
                     return false;
@@ -1540,10 +1877,7 @@ class WebSite
                 set_error_handler(null);
                 $out_cookie .= "; Expires=" . @gmdate("D, d M Y H:i:s",
                     $expire) . " GMT";
-                $custom_error_handler =
-                    $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
-                    null;
-                set_error_handler($custom_error_handler);
+                restore_error_handler();
             }
             if ($path != "") {
                 $out_cookie .= "; Path=$path";
@@ -2097,6 +2431,9 @@ class WebSite
             "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
             "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
             "MAX_REQUEST_LEN" => 10000000, "MAX_SESSIONS" => 10000,
+            "SESSION_IDLE_TIMEOUT" => self::SESSION_IDLE_TIMEOUT_DEFAULT,
+            "LARGE_RESPONSE_LOG_LEN" =>
+                self::LARGE_RESPONSE_LOG_LEN_DEFAULT,
             "MAX_INPUT_VARS" => 1000,
             "PATH" => $path,  "PHP_PATH" => "",
             "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
@@ -2144,6 +2481,31 @@ class WebSite
             }
             $shared_globals = $ini_data;
         }
+        /* The host names this server should answer to. setGlobals
+           uses them to set $_SERVER['SERVER_NAME'] per request to the
+           served domain a visitor actually used, so links built during
+           the request (the account-activation mail among them) point
+           back at that domain rather than the one name the server
+           bound to. The list may arrive as a top-level config entry or
+           inside SERVER_CONTEXT, as a list or a comma- or
+           space-separated string. It is taken out of the globals so it
+           does not leak into $_SERVER as a stray CGI variable. */
+        $served_source = $shared_globals['SECURE_DOMAINS'] ??
+            ($shared_context['SECURE_DOMAINS'] ?? []);
+        unset($shared_globals['SECURE_DOMAINS'],
+            $shared_context['SECURE_DOMAINS']);
+        $this->served_domains = $this->normalizeServedDomains(
+            $served_source);
+        /* How many seconds to leave between memory-usage samples may
+           arrive as a top-level config value or inside SERVER_CONTEXT;
+           zero or absent leaves the sampling off. It is taken out of
+           the globals so it does not leak into $_SERVER as a stray CGI
+           variable. */
+        $this->memory_sample_period = (int)($shared_globals[
+            'WEBSITE_MEMORY_SAMPLE_PERIOD'] ??
+            ($shared_context['WEBSITE_MEMORY_SAMPLE_PERIOD'] ?? 0));
+        unset($shared_globals['WEBSITE_MEMORY_SAMPLE_PERIOD'],
+            $shared_context['WEBSITE_MEMORY_SAMPLE_PERIOD']);
         foreach ($default_server_globals as $server_global =>
             $server_value) {
             if (!empty($shared_context[$server_global])) {
@@ -2315,6 +2677,8 @@ class WebSite
         $excepts = null;
         $num_selected = 1;
         while (!$this->stop || $num_selected > 0) {
+            $this->sampleMemoryUsage();
+            $this->reapIdleSessions();
             if ($this->stop) {
                 $in_streams_with_data = $this->in_streams[self::CONNECTION];
                 foreach ($this->listeners as $key => $entry) {
@@ -2452,7 +2816,27 @@ class WebSite
             if ($num_selected > 0) {
                 $this->processRequestStreams(null,
                     $in_streams_with_data);
-                $this->processResponseStreams($out_streams_with_data);
+                /*
+                    Drain the connections that have unsent response
+                    bytes right now, not the writable set captured
+                    before this tick read inbound frames. Reading a
+                    frame can re-arm a connection that had nothing to
+                    send a moment ago: a flow-control WINDOW_UPDATE or
+                    a raised SETTINGS_INITIAL_WINDOW_SIZE re-pumps a
+                    stream that was parked with its send window at
+                    zero (its connection was dropped from the writable
+                    set when it last drained), queueing the rest of a
+                    large response. The pre-read snapshot does not
+                    list that connection, so draining it would wait
+                    for the next select; if the peer stops reading in
+                    between, the tail never goes out and the transfer
+                    ends partial. out_streams holds only connections
+                    with bytes still to send, and a socket that is not
+                    yet writable just takes no bytes this pass and is
+                    retried, so draining the live set here is safe.
+                 */
+                $this->processResponseStreams(
+                    $this->out_streams[self::CONNECTION]);
             }
             $this->refillStreamingGenerators();
             if ($this->cooperative_scheduler !== null) {
@@ -3059,6 +3443,16 @@ class WebSite
         $stream_id = $send['stream_id'];
         $hpack_encode = $send['hpack_encode'];
         $conn = $this->connection($key);
+        if ($conn === null) {
+            /* The client disconnected while this deferred response was
+               still pending, so its connection object is already gone.
+               Returning here skips queuing headers and a body that
+               could never be sent -- which also avoids leaving
+               orphaned bytes in the out-stream buffer that would never
+               drain -- and avoids faulting on the missing protocol
+               state when the body send tries to use it. */
+            return;
+        }
         $status = "200";
         if (preg_match("/HTTP\/[\d.]+ (\d+)/",
                 $this->header_data, $matches)) {
@@ -3102,7 +3496,8 @@ class WebSite
         $resp_headers->flags->add("END_HEADERS");
         $out = $resp_headers->serialize($hpack_encode);
         $this->queueResponseData($key, $connection, $out);
-        $this->sendH2Body($key, $connection, $conn, $stream_id, $body);
+        $this->sendH2BodyPaced($key, $connection, $conn, $stream_id,
+            $body);
     }
     /**
      * Used to export info (but not change) about running sessions
@@ -3131,6 +3526,7 @@ class WebSite
         $this->current_session = "";
         $_SESSION = [];
         $this->content_type = false;
+        $this->streaming_response_logged = false;
         ob_start();
         try {
             $this->process();
@@ -3221,7 +3617,20 @@ class WebSite
                 . $this->h3_advertise_port . '"; ma=86400'
                 . "\x0D\x0A";
         }
+        $body_size = strlen($out_data);
+        $this->logLargeResponse($body_size);
         if ($include_headers) {
+            /* this header-composing pass runs once for a response, so
+               tell any registered response loggers how it turned out,
+               unless a streamed body already logged its own access line
+               (getResponseData sees an empty body for a streamed reply,
+               so its length here would be zero) */
+            if (!$this->streaming_response_logged) {
+                $status = $this->responseStatusCode();
+                foreach ($this->response_loggers as $response_logger) {
+                    $response_logger($status, $body_size);
+                }
+            }
             /* the computed length is authoritative; drop any
                Content-Length the route set itself (resource range
                replies do) so the response carries exactly one */
@@ -3229,7 +3638,7 @@ class WebSite
                 '/^Content-Length:[^\r\n]*\r\n/im', '',
                 $this->header_data);
             $out_data = $this->header_data .
-                    "Content-Length: ". strlen($out_data) .
+                    "Content-Length: ". $body_size .
                     "\x0D\x0A\x0D\x0A" .  $out_data;
         }
         return $out_data;
@@ -3899,10 +4308,8 @@ class WebSite
         if ($this->connection_acceptor === null) {
             $site = $this;
             $post_tls = function () use ($site) {
-                set_error_handler(null);
-                $custom = $site->default_server_globals[
-                    'CUSTOM_ERROR_HANDLER'] ?? null;
-                set_error_handler($custom);
+                set_error_handler($site->default_server_globals[
+                    'CUSTOM_ERROR_HANDLER'] ?? null);
             };
             $this->connection_acceptor = new ConnectionAcceptor(
                 self::H2_CLIENT_MAGIC, null, $post_tls);
@@ -3953,7 +4360,8 @@ class WebSite
             return ["CLIENT_HTTP" => "h2c"];
         }
         if (preg_match(
-            "/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT)".
+            "/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT|" .
+            "PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK)".
             " \S+ HTTP\/1\.1/",
             $stream_start)) {
             return ["CLIENT_HTTP" => "HTTP/1.1"];
@@ -4022,7 +4430,7 @@ class WebSite
                 guard in parseH2Request.
          */
         $server_settings = new SettingsFrame(0, [
-            0x03 => 100,
+            0x03 => self::H2_MAX_CONCURRENT_STREAMS,
             0x04 => self::H2_ADVERTISED_WINDOW,
             0x05 => self::H2_MAX_FRAME_SIZE,
         ]);
@@ -4080,15 +4488,45 @@ class WebSite
         }
         $state = &$conn->protocol_state;
         /*
-            Read whatever is available without blocking and append
-            it to the inbound buffer. Reading frames from this
-            buffer rather than with blocking reads means a client
-            that sends a partial frame and stalls leaves its bytes
-            buffered and does not hold the single event loop.
+            Read whatever is available without blocking and append it to
+            the inbound buffer, draining to empty on each wakeup rather
+            than taking a single chunk. Buffering frames this way means a
+            client that sends a partial frame and stalls leaves its bytes
+            buffered and does not hold the single event loop. Draining
+            fully matters over TLS: OpenSSL decrypts a whole record at a
+            time into its own buffer, while stream_select watches the raw
+            socket rather than that buffer, so if one read leaves
+            decrypted bytes behind, the next stream_select can report
+            nothing to read and those bytes stay unseen until some later,
+            unrelated socket activity wakes the loop. When the
+            left-behind bytes are a whole frame that arrived right after
+            a request, such as the flow-control WINDOW_UPDATE a browser
+            sends just after a stream's headers to enlarge the response
+            window, the server never learns it may send more and the
+            transfer stalls part way until a keep-alive ping seconds
+            later happens to wake the read. Each read is capped at the
+            chunk size and the loop ends as soon as a read comes back
+            empty, so a peer that keeps sending cannot hold the loop
+            here: at most one socket buffer's worth is taken per wakeup.
          */
-        $chunk = @fread($connection, self::H2_READ_CHUNK_SIZE);
-        if ($chunk === false ||
-            ($chunk === "" && feof($connection))) {
+        $chunk = "";
+        $read_error = false;
+        while (true) {
+            $piece = @fread($connection, self::H2_READ_CHUNK_SIZE);
+            if ($piece === false) {
+                $read_error = ($chunk === "");
+                break;
+            }
+            if ($piece === "") {
+                break;
+            }
+            $chunk .= $piece;
+        }
+        if ($read_error ||
+            ($chunk === "" && feof($connection)
+            && empty($this->out_streams[self::DATA][$key])
+            && empty($state['pending_send'])
+            && empty($state['streaming_gen']))) {
             $this->shutdownHttpStream($key);
             return false;
         }
@@ -4133,16 +4571,19 @@ class WebSite
                     $payload_len)
                 : "";
             $state['input_buffer'] = substr($buffer, $frame_len);
-            $result = $this->processH2Frame($key, $connection,
+            $this->processH2Frame($key, $connection,
                 $conn, $frame, $payload, $payload_len);
-            if ($result !== false) {
-                return $result;
-            }
             /*
-                processH2Frame returns false both for a routine
-                control frame (keep draining the buffer) and after
-                tearing the connection down. Stop draining once the
-                connection is gone so we do not touch freed state.
+                processH2Frame may dispatch a request, handle a
+                routine control frame, or tear the connection down. A
+                single read can carry frames for several streams at
+                once, so keep draining the buffer to handle them all
+                rather than stopping after the first. Were it to stop
+                after the first, the later streams' frames would sit
+                buffered with nothing left to wake the loop and read
+                them, and those requests would hang until the client
+                gave up. Stop only once the connection is gone, so we
+                do not touch freed state.
              */
             if ($this->connection($key) === null) {
                 return false;
@@ -4324,12 +4765,9 @@ class WebSite
                 $goaway = new GoAwayFrame(0,
                     $state['last_stream_id'] ?? 0,
                     self::H2_ERROR_PROTOCOL, "");
-                $custom_error_handler =
-                    $this->default_server_globals[
-                    "CUSTOM_ERROR_HANDLER"] ?? null;
                 set_error_handler(null);
                 fwrite($connection, $goaway->serialize());
-                set_error_handler($custom_error_handler);
+                restore_error_handler();
                 $this->shutdownHttpStream($key);
                 return false;
             }
@@ -4345,6 +4783,21 @@ class WebSite
                     += $increment;
                 $this->pumpH2PendingSend($key, $connection, $conn,
                     $frame->stream_id);
+            } else if (isset($state['closed_streams'][
+                $frame->stream_id])) {
+                /*
+                    A WINDOW_UPDATE for a stream the server has
+                    already finished sending and closed. RFC 7540
+                    sec 6.9 lets a closed stream's WINDOW_UPDATE be
+                    ignored, and it must be: a browser keeps sending
+                    these as it drains a completed response, so
+                    holding the credit (as if for a not-yet-started
+                    stream) would strand one entry per closed stream
+                    and, on a page that streams many ranges, build up
+                    until the guard below mistook it for an attack
+                    and closed the connection.
+                 */
+                return false;
             } else {
                 /*
                     A peer may grant a stream's flow-control window
@@ -4354,8 +4807,26 @@ class WebSite
                     applied when the window is initialized, rather
                     than dropping it (which would leave the stream
                     stuck at the peer's initial window even though the
-                    peer had granted much more).
+                    peer had granted much more). Only as many distinct
+                    streams as the connection may have open at once can
+                    legitimately have credit waiting this way; a client
+                    that stashes credit for more distinct stream ids
+                    than that is crediting streams it never opened,
+                    which would grow this map without bound (its small
+                    entries are not counted by the per-connection byte
+                    ceiling), so that is treated as a protocol error.
                  */
+                if (!isset($state['pending_stream_window_credit'][
+                    $frame->stream_id]) &&
+                    count($state['pending_stream_window_credit'] ?? [])
+                    >= self::H2_MAX_CONCURRENT_STREAMS) {
+                    $goaway = new GoAwayFrame(0,
+                        $state['last_stream_id'] ?? 0,
+                        self::H2_ERROR_PROTOCOL, "");
+                    @fwrite($connection, $goaway->serialize());
+                    $this->shutdownHttpStream($key);
+                    return false;
+                }
                 $state['pending_stream_window_credit'][
                     $frame->stream_id] =
                     ($state['pending_stream_window_credit'][
@@ -4378,6 +4849,7 @@ class WebSite
             unset($state['pending_stream_window_credit'][
                 $frame->stream_id]);
             unset($state['streaming_gen'][$frame->stream_id]);
+            $this->markH2StreamClosed($state, $frame->stream_id);
             return false;
         }
         if (!($frame instanceof HeaderFrame)) {
@@ -4431,6 +4903,32 @@ class WebSite
             $propagate['HTTPS'] = $conn->https;
         }
         $context = array_merge($propagate, $context);
+        /*
+            Refuse the stream if this connection is already at its
+            stream count or its buffered-byte ceiling. The header
+            block was decoded above so the shared HPACK table stays
+            in step, and the stream id was recorded as the new high
+            water mark, but the request is not parked or dispatched:
+            a single client that pipelines requests faster than it
+            reads the replies, or asks for more at once than the
+            connection can hold, cannot grow the server's per-
+            connection memory without bound. RST_STREAM with
+            REFUSED_STREAM tells the client the request was not acted
+            on so it may retry once the connection drains.
+         */
+        $open_streams = count($state['pending_streams'] ?? []) +
+            count($state['pending_send'] ?? []) +
+            count($state['streaming_gen'] ?? []);
+        $backlog = $this->h2ConnectionBacklog($key, $state);
+        if ($open_streams >= self::H2_MAX_CONCURRENT_STREAMS ||
+            $backlog >= self::H2_MAX_CONN_BUFFER) {
+            $refusal = new RstStreamFrame($client_stream_id,
+                self::H2_ERROR_REFUSED_STREAM);
+            set_error_handler(null);
+            fwrite($connection, $refusal->serialize());
+            restore_error_handler();
+            return false;
+        }
         if (!$frame->flags->contains('END_STREAM')) {
             /*
                 HEADERS without END_STREAM means a request body is
@@ -4445,6 +4943,34 @@ class WebSite
         }
         return $this->dispatchH2Request($key, $connection,
             $client_stream_id, $context);
+    }
+    /**
+     * Adds up the response and request bytes the server is currently
+     * holding in memory for one HTTP/2 connection. This is the
+     * unsent bytes already queued on the connection's outbound
+     * buffer, plus each stream's not-yet-sent response body, plus
+     * each stream's request body that is still arriving. The total
+     * is what the stream-acceptance check compares against the
+     * per-connection ceiling so one slow-reading client cannot tie
+     * up an unbounded amount of memory.
+     *
+     * @param int $key connection key in the out_streams arrays
+     * @param array $state the connection's protocol_state holding
+     *      the per-stream pending send and request buffers
+     * @return int total buffered bytes held for this connection
+     */
+    protected function h2ConnectionBacklog($key, $state)
+    {
+        $backlog = strlen($this->out_streams[self::DATA][$key]
+            ?? "") - ($this->out_streams[self::DATA_OFFSET][$key] ?? 0);
+        foreach (($state['pending_send'] ?? []) as $pending) {
+            $backlog += strlen($pending['data'] ?? "") -
+                ($pending['offset'] ?? 0);
+        }
+        foreach (($state['pending_streams'] ?? []) as $pending) {
+            $backlog += strlen($pending['body'] ?? "");
+        }
+        return $backlog;
     }
     /**
      * Seeds the outbound HTTP/2 flow-control bookkeeping for a
@@ -4470,6 +4996,42 @@ class WebSite
         $connection->protocol_state['pending_send'] = [];
         $connection->protocol_state['pending_stream_window_credit'] =
             [];
+        $connection->protocol_state['closed_streams'] = [];
+    }
+    /**
+     * Records that the server has finished with a stream, either
+     * because its response is complete or because the client reset
+     * it, so a flow-control WINDOW_UPDATE that turns up for that
+     * stream afterwards is recognized as belonging to a closed
+     * stream and ignored rather than mistaken for credit granted
+     * ahead of a not-yet-started response. A browser sends
+     * WINDOW_UPDATE frames as it consumes a response, and some of
+     * them arrive after the server has already sent the whole body
+     * and closed the stream. Without this record each such late
+     * update would be stashed as pending credit for a stream that
+     * will never send again, and a page that streams many ranges in
+     * a row (a playing video fetched a chunk at a time) would
+     * accumulate one stranded entry per range until the
+     * pending-credit guard mistook the buildup for a misbehaving
+     * peer and dropped the connection, stalling the video. Only the
+     * most recent closed streams are remembered, capped at the most
+     * a connection may have open at once, since a client does not
+     * send window updates for a stream it closed long ago; the
+     * lowest (oldest) ids are dropped once the cap is passed.
+     *
+     * @param array $state connection protocol state, by reference
+     * @param int $stream_id the stream that has just closed
+     */
+    protected function markH2StreamClosed(&$state, $stream_id)
+    {
+        $state['closed_streams'][$stream_id] = true;
+        if (count($state['closed_streams'])
+            > self::H2_MAX_CONCURRENT_STREAMS) {
+            ksort($state['closed_streams'], SORT_NUMERIC);
+            $state['closed_streams'] = array_slice(
+                $state['closed_streams'],
+                -self::H2_MAX_CONCURRENT_STREAMS, null, true);
+        }
     }
     /**
      * Appends serialized response bytes for connection $key to its
@@ -4495,6 +5057,8 @@ class WebSite
             $this->out_streams[self::CONTEXT][$key] = [];
         }
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        $this->logOutboundBuffer(strlen($out),
+            strlen($this->out_streams[self::DATA][$key]));
     }
     /**
      * Starts sending an HTTP/2 response body on stream $stream_id,
@@ -4514,18 +5078,78 @@ class WebSite
     protected function sendH2Body($key, $connection, $conn,
         $stream_id, $body)
     {
+        if ($conn === null) {
+            /* No connection object means the peer is gone: there is no
+               protocol state to update and nowhere to send the body,
+               so do nothing rather than fault on the null. */
+            return;
+        }
         $state = &$conn->protocol_state;
         if (!isset($state['send_window'])) {
             $this->initH2SendWindows($conn, []);
         }
         $state['stream_send_windows'][$stream_id] =
-            $state['peer_initial_window'] +
+            ($state['peer_initial_window'] ?? self::H2_DEFAULT_WINDOW) +
             ($state['pending_stream_window_credit'][$stream_id] ?? 0);
         unset($state['pending_stream_window_credit'][$stream_id]);
         $state['pending_send'][$stream_id] =
             ['data' => $body, 'offset' => 0, 'complete' => true];
         $this->pumpH2PendingSend($key, $connection, $conn,
             $stream_id);
+    }
+    /**
+     * Sends a complete HTTP/2 response body, pacing it across the
+     * event loop when it is larger than the client's per-stream
+     * receive window. A body that fits the window is handed to
+     * sendH2Body and sent in one burst. A larger body cannot all
+     * leave at once: only the first window-sized slice would go and
+     * the rest would sit waiting for the client to return credit it
+     * does not always send for a response it already knows the length
+     * of. So the larger body is registered as a streaming producer
+     * that the event loop advances in frame-sized blocks as the
+     * client takes the data, the same mechanism that serves large
+     * files, which keeps the stream re-driven every loop turn instead
+     * of parked after the first slice.
+     *
+     * @param int $key connection key
+     * @param resource $connection client socket
+     * @param object $conn Connection holding protocol_state
+     * @param int $stream_id stream the response belongs to
+     * @param string $body the complete response body
+     */
+    protected function sendH2BodyPaced($key, $connection, $conn,
+        $stream_id, $body)
+    {
+        if ($conn === null) {
+            return;
+        }
+        if (!isset($conn->protocol_state['send_window'])) {
+            $this->initH2SendWindows($conn, []);
+        }
+        $stream_window =
+            $conn->protocol_state['peer_initial_window']
+            ?? self::H2_DEFAULT_WINDOW;
+        if (strlen($body) <= $stream_window) {
+            $this->sendH2Body($key, $connection, $conn, $stream_id,
+                $body);
+            return;
+        }
+        $producer = (function () use ($body) {
+            $body_len = strlen($body);
+            for ($pos = 0; $pos < $body_len;
+                $pos += self::H2_MAX_FRAME_SIZE) {
+                yield substr($body, $pos, self::H2_MAX_FRAME_SIZE);
+            }
+        })();
+        $state = &$conn->protocol_state;
+        $state['stream_send_windows'][$stream_id] = $stream_window +
+            ($state['pending_stream_window_credit'][$stream_id] ?? 0);
+        unset($state['pending_stream_window_credit'][$stream_id]);
+        $state['pending_send'][$stream_id] =
+            ['data' => "", 'offset' => 0, 'complete' => false];
+        $state['streaming_gen'][$stream_id] = $producer;
+        $this->refillOneStreamingGenerator($key, $connection, $conn,
+            $stream_id, $producer);
     }
     /**
      * Appends another chunk of a streamed response body to a
@@ -4555,7 +5179,8 @@ class WebSite
         }
         if (!isset($state['pending_send'][$stream_id])) {
             $state['stream_send_windows'][$stream_id] =
-                $state['peer_initial_window'] +
+                ($state['peer_initial_window']
+                ?? self::H2_DEFAULT_WINDOW) +
                 ($state['pending_stream_window_credit'][$stream_id]
                 ?? 0);
             unset($state['pending_stream_window_credit'][$stream_id]);
@@ -4833,6 +5458,7 @@ class WebSite
         if ($complete && $pending['offset'] >= $total) {
             unset($state['pending_send'][$stream_id]);
             unset($state['stream_send_windows'][$stream_id]);
+            $this->markH2StreamClosed($state, $stream_id);
         }
         if ($out !== "") {
             $this->queueResponseData($key, $connection, $out);
@@ -4976,7 +5602,7 @@ class WebSite
                 $conn, $stream_id, $streaming_producer);
             return true;
         }
-        $this->sendH2Body($key, $connection, $conn, $stream_id,
+        $this->sendH2BodyPaced($key, $connection, $conn, $stream_id,
             $body);
         return true;
     }
@@ -5567,8 +6193,6 @@ class WebSite
             $offset =
                 $this->out_streams[self::DATA_OFFSET][$key] ?? 0;
             $unsent = strlen($data) - $offset;
-            $custom_error_handler =
-                $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ?? null;
             //suppress connection reset notices
             set_error_handler(null);
             /*
@@ -5590,7 +6214,7 @@ class WebSite
                 $this->default_server_globals['MAX_IO_LEN']);
             $tail = substr($data, $offset, $chunk_len);
             $num_bytes = @fwrite($out_stream, $tail);
-            set_error_handler($custom_error_handler);
+            restore_error_handler();
             $remaining_bytes = ($num_bytes === false) ? 0
                 : max(0, $unsent - $num_bytes);
             if ($num_bytes > 0) {
@@ -5709,7 +6333,6 @@ class WebSite
             $request_start = substr($this->in_streams[self::DATA][$key], 0,
                 self::LEN_LONGEST_HTTP_METHOD + 1);
             $start_parts = explode(" ", $request_start);
-
             if (!in_array($start_parts[0], $this->http_methods)) {
                 $this->initializeBadRequestResponse($key);
                 return true;
@@ -5734,8 +6357,9 @@ class WebSite
             $next_line_pos = strpos($data, $eol);
             $first_line = substr($this->in_streams[self::DATA][$key], 0,
                 $next_line_pos);
-            $first_lines_regex = "/^(CONNECT|DELETE|ERROR|GET|HEAD|".
-                "OPTIONS|POST|PUT|TRACE)\s+([^\s]+)\s+(HTTP\/\d+\.\d+)/";
+            $first_lines_regex = "/^(CONNECT|COPY|DELETE|ERROR|GET|HEAD|".
+                "LOCK|MKCOL|MOVE|OPTIONS|POST|PROPFIND|PROPPATCH|PUT|TRACE|".
+                "UNLOCK)\s+([^\s]+)\s+(HTTP\/\d+\.\d+)/";
             if (!preg_match($first_lines_regex, $first_line, $matches)) {
                 $this->initializeBadRequestResponse($key);
                 return true;
@@ -5829,8 +6453,27 @@ class WebSite
             $context['LISTENER_PORT'] = $conn->listener_port;
             $context['LISTENER_NAME'] = $conn->listener_name;
             $context['CLIENT_HTTP'] = $conn->client_http;
+            if (!empty($conn->server_addr)) {
+                $context['SERVER_ADDR'] = $conn->server_addr;
+            }
             if ($conn->https !== '') {
                 $context['HTTPS'] = $conn->https;
+            }
+        }
+        if (!empty($this->served_domains)) {
+            /* Name this request by the served domain the visitor used.
+               The Host header is attacker-controllable, so it is only
+               adopted as SERVER_NAME when it is one of the served
+               domains; anything else, including a missing or forged
+               Host, falls back to the first served domain. Set on the
+               context before the merges below so $_SERVER carries it. */
+            $request_host = strtolower($this->hostWithoutPort(
+                $context['HTTP_HOST'] ?? ''));
+            if ($request_host !== '' &&
+                in_array($request_host, $this->served_domains, true)) {
+                $context['SERVER_NAME'] = $request_host;
+            } else {
+                $context['SERVER_NAME'] = $this->served_domains[0];
             }
         }
         $_SERVER = array_merge($this->default_server_globals, $context);
@@ -5876,7 +6519,8 @@ class WebSite
                         match past the first closing quote and
                         smuggle extra attributes.
                      */
-                    if(preg_match("/\s*Content-Disposition\:\s*form-data\;\s*" .
+                    if (preg_match(
+                        "/\s*Content-Disposition\:\s*form-data\;\s*" .
                         "name\s*=\s*[\"\'](.*?)[\"\']\s*\;\s*filename=".
                         "\s*[\"\'](.*?)[\"\']\s*/i", $head_part, $matches)) {
                         list(, $name, $file_name) = $matches;
@@ -6004,6 +6648,58 @@ class WebSite
             }
         }
         $_REQUEST = array_merge($_GET, $_POST, $_COOKIE);
+    }
+    /**
+     * Cleans a configured list of served host names into a plain
+     * lower-cased list. The input may already be a list, or a single
+     * string with the names separated by commas or whitespace.
+     * Surrounding spaces are trimmed and empty entries dropped, so a
+     * trailing comma or a blank line does not produce an empty name.
+     *
+     * @param mixed $source the configured names, as a list or a
+     *      comma- or whitespace-separated string
+     * @return array the host names, lower-cased, in their given order
+     */
+    protected function normalizeServedDomains($source)
+    {
+        if (is_string($source)) {
+            $source = preg_split('/[\s,]+/', $source);
+        }
+        if (!is_array($source)) {
+            return [];
+        }
+        $names = [];
+        foreach ($source as $name) {
+            $name = strtolower(trim((string)$name));
+            if ($name !== '') {
+                $names[] = $name;
+            }
+        }
+        return $names;
+    }
+    /**
+     * Returns the bare host from an HTTP authority, dropping any
+     * trailing port. A bracketed IPv6 literal such as [::1]:8080 keeps
+     * its brackets and loses only the port; a plain name or IPv4
+     * address such as host:8080 loses the port after the last colon.
+     *
+     * @param string $authority the Host header value, possibly with a
+     *      port
+     * @return string the host alone, without a port
+     */
+    protected function hostWithoutPort($authority)
+    {
+        $authority = trim((string)$authority);
+        if ($authority === '') {
+            return '';
+        }
+        if ($authority[0] === '[') {
+            $close = strpos($authority, ']');
+            return ($close !== false) ? substr($authority, 0, $close + 1) :
+                $authority;
+        }
+        $colon = strrpos($authority, ':');
+        return ($colon !== false) ? substr($authority, 0, $colon) : $authority;
     }
     /**
      * Outputs HTTP error response message in the case that no specific error
@@ -6160,10 +6856,7 @@ class WebSite
             set_error_handler(null);
             @stream_socket_shutdown($this->in_streams[self::CONNECTION][$key],
                 STREAM_SHUT_RDWR);
-            $custom_error_handler =
-                $this->default_server_globals["CUSTOM_ERROR_HANDLER"] ??
-                null;
-            set_error_handler($custom_error_handler);
+            restore_error_handler();
         }
         unset($this->in_streams[self::CONNECTION][$key],
             $this->in_streams[self::CONTEXT][$key],
@@ -7285,13 +7978,13 @@ class Frame
      * RFC 7540 §6.5.2 initial value for SETTINGS_MAX_FRAME_SIZE;
      * peers may negotiate a larger value up to FRAME_MAX_ALLOWED_LEN
      */
-    const FRAME_MAX_LEN = (2 ** 14); //initial
+    const FRAME_MAX_LEN = (2 ** 14);
     /**
      * RFC 7540 §6.5.2 ceiling for SETTINGS_MAX_FRAME_SIZE; the
      * frame-length field is 24 bits so no larger value can be
      * encoded
      */
-    const FRAME_MAX_ALLOWED_LEN = (2 ** 24) - 1; //max-allowed
+    const FRAME_MAX_ALLOWED_LEN = (2 ** 24) - 1;
     /**
      * reads the stream id and flags set for the frame
      *
@@ -7520,8 +8213,8 @@ class SettingsFrame extends Frame
      * @param object $hpack HPack encoder for this connection; unused
      *      for non-HEADERS frame bodies but accepted for signature
      *      compatibility with HeaderFrame::serializeBody
-     
-     * @return string Returns the settings as serialized binary data.*/
+     * @return string Returns the settings as serialized binary data.
+     */
     public function serializeBody($hpack = null)
     {
         $body = '';
@@ -7879,12 +8572,11 @@ class PriorityFrame extends Frame
     }
     /**
      * Serializes the PRIORITY frame body into binary format.
-     *
      * @param object $hpack HPack encoder for this connection; unused
      *      for non-HEADERS frame bodies but accepted for signature
      *      compatibility with HeaderFrame::serializeBody
-     
-     * @return string 5-byte serialized priority data*/
+     * @return string 5-byte serialized priority data
+     */
     public function serializeBody($hpack = null)
     {
         $dep = $this->depends_on
@@ -8120,8 +8812,8 @@ class PingFrame extends Frame
      * @param object $hpack HPack encoder for this connection; unused
      *      for non-HEADERS frame bodies but accepted for signature
      *      compatibility with HeaderFrame::serializeBody
-     
-     * @return string The serialized binary data.*/
+     * @return string The serialized binary data.
+     */
     public function serializeBody($hpack = null)
     {
         if (strlen($this->opaque_data) != 8) {
@@ -8194,8 +8886,8 @@ class GoAwayFrame extends Frame
      * @param object $hpack HPack encoder for this connection; unused
      *      for non-HEADERS frame bodies but accepted for signature
      *      compatibility with HeaderFrame::serializeBody
-     
-     * @return string The serialized binary data.*/
+     * @return string The serialized binary data.
+     */
     public function serializeBody($hpack = null)
     {
         $data = pack('N', $this->last_stream_id & 0x7FFFFFFF) .

@@ -398,23 +398,36 @@ abstract class MailStorage implements MailVocabulary
                 'deleted messages'],
         ];
         $consolidations = [];
+        /*
+            List the mailbox once. The earlier version called
+            listFolders inside the per-role loop, so every login
+            walked the whole mailbox tree four times even though the
+            usual case is that all canonical folders already exist
+            and no alias folder is present. On a large mailbox that
+            walk is the dominant cost of a login, so it is done a
+            single time here and the result reused. The lowercase map
+            also lets a missing canonical folder be created without a
+            second existence check.
+         */
+        $existing_by_lower = [];
+        foreach ($this->listFolders($user) as $existing) {
+            $existing_by_lower[strtolower($existing)] = $existing;
+        }
         foreach ($roles as $canonical => $aliases) {
-            $this->createFolder($user, $canonical);
-            $canonical_lower = strtolower($canonical);
-            foreach ($this->listFolders($user) as $existing) {
-                $existing_lower = strtolower($existing);
-                if ($existing_lower === $canonical_lower) {
+            if (!isset($existing_by_lower[strtolower($canonical)])) {
+                $this->createFolder($user, $canonical);
+            }
+            foreach ($aliases as $alias) {
+                if (!isset($existing_by_lower[$alias])) {
                     continue;
                 }
-                if (!in_array($existing_lower, $aliases, true)) {
-                    continue;
-                }
+                $source = $existing_by_lower[$alias];
                 $moved = 0;
                 $failed = 0;
                 $copied_uids = [];
-                foreach ($this->listMessages($user, $existing)
+                foreach ($this->listMessages($user, $source)
                     as $meta) {
-                    $body = $this->fetchMessage($user, $existing,
+                    $body = $this->fetchMessage($user, $source,
                         $meta['uid']);
                     if ($body === false) {
                         $failed++;
@@ -440,11 +453,11 @@ abstract class MailStorage implements MailVocabulary
                     rather than duplicating what already moved.
                  */
                 foreach ($copied_uids as $copied_uid) {
-                    $this->setFlags($user, $existing, $copied_uid,
+                    $this->setFlags($user, $source, $copied_uid,
                         [self::FLAG_DELETED]);
                 }
                 if (!empty($copied_uids)) {
-                    $this->expunge($user, $existing, $copied_uids);
+                    $this->expunge($user, $source, $copied_uids);
                 }
                 /*
                     Drop the now-empty source only when every
@@ -453,9 +466,9 @@ abstract class MailStorage implements MailVocabulary
                  */
                 $deleted = false;
                 if ($failed === 0) {
-                    $deleted = $this->deleteFolder($user, $existing);
+                    $deleted = $this->deleteFolder($user, $source);
                 }
-                $consolidations[] = ['from' => $existing,
+                $consolidations[] = ['from' => $source,
                     'into' => $canonical, 'moved' => $moved,
                     'failed' => $failed, 'deleted' => $deleted];
             }
@@ -469,7 +482,8 @@ abstract class MailStorage implements MailVocabulary
      * recursively).
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool true on success
      */
     abstract public function deleteFolder($user, $folder);
@@ -488,7 +502,8 @@ abstract class MailStorage implements MailVocabulary
      * Returns whether the named folder exists for this user.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool true if the named folder exists under $user, false otherwise
      */
     abstract public function folderExists($user, $folder);
@@ -536,7 +551,8 @@ abstract class MailStorage implements MailVocabulary
      * not found.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
      * @return string|false
      */
@@ -548,7 +564,8 @@ abstract class MailStorage implements MailVocabulary
      * internal_date (int unix ts).
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return array list of message metadata records
      */
     abstract public function listMessages($user, $folder);
@@ -562,7 +579,8 @@ abstract class MailStorage implements MailVocabulary
      * empty query returns an empty list.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param string $query substring to match against subject/from/to
      * @return array list of matching uids that are present in the folder
      */
@@ -573,9 +591,11 @@ abstract class MailStorage implements MailVocabulary
      * of listMessages, or false if not found.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
-     * @return array|false metadata record (uid, size, flags, internal_date), or false if the message does not exist
+     * @return array|false metadata record (uid, size, flags, internal_date), or
+     * false if the message does not exist
      */
     abstract public function messageMeta($user, $folder, $uid);
     /**
@@ -583,7 +603,8 @@ abstract class MailStorage implements MailVocabulary
      * to clear all flags.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
      * @param array $flags list of IMAP flag strings to set on the message
      * @return bool
@@ -594,7 +615,8 @@ abstract class MailStorage implements MailVocabulary
      * \Deleted flag set. Returns the UIDs that were removed.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param array $uid_restriction when non-null, only deleted
      *      messages whose UID is in this list are removed (the
      *      UID EXPUNGE case, RFC 4315); when null every deleted
@@ -618,8 +640,10 @@ abstract class MailStorage implements MailVocabulary
      * Returns the message count for the named folder.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int number of messages currently in the folder, or -1 if the folder is unknown
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int number of messages currently in the folder, or -1 if the
+     * folder is unknown
      */
     abstract public function messageCount($user, $folder);
     /**
@@ -629,8 +653,10 @@ abstract class MailStorage implements MailVocabulary
      * lifetime.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int fixed UIDVALIDITY value for the folder per RFC 3501 sec 2.3.1.1
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int fixed UIDVALIDITY value for the folder per RFC 3501 sec
+     * 2.3.1.1
      */
     abstract public function uidValidity($user, $folder);
     /**
@@ -639,8 +665,10 @@ abstract class MailStorage implements MailVocabulary
      * appends).
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int next UID that will be assigned for an appended message in the folder
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int next UID that will be assigned for an appended message in the
+     * folder
      */
     abstract public function uidNext($user, $folder);
     /**
@@ -653,7 +681,8 @@ abstract class MailStorage implements MailVocabulary
      * only after an explicit SUBSCRIBE.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool
      */
     abstract public function isSubscribed($user, $folder);
@@ -664,7 +693,8 @@ abstract class MailStorage implements MailVocabulary
      * folder might be unmounted at the moment). Idempotent.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool true on success
      */
     abstract public function subscribe($user, $folder);
@@ -673,7 +703,8 @@ abstract class MailStorage implements MailVocabulary
      * folder that is not subscribed succeeds silently.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool true on success
      */
     abstract public function unsubscribe($user, $folder);
@@ -710,9 +741,11 @@ abstract class MailStorage implements MailVocabulary
      *   'size'        - body length in bytes
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
-     * @return array|false metadata record describing where the body bytes live, or false if (user, folder, uid) does not resolve to a stored message
+     * @return array|false metadata record describing where the body bytes live,
+     * or false if (user, folder, uid) does not resolve to a stored message
      */
     abstract public function messageBodyLocation($user,
         $folder, $uid);
@@ -801,7 +834,8 @@ abstract class MailStorage implements MailVocabulary
      * pattern: $folder = $this->safeNormalizeFolder($folder);
      * if ($folder === false) { return <appropriate sentinel>; }
      * @param string $folder folder name with full hierarchy path
-     * @return string|false normalized folder name, or false if the input was unsafe
+     * @return string|false normalized folder name, or false if the input was
+     * unsafe
      */
     protected function safeNormalizeFolder($folder)
     {
@@ -961,6 +995,16 @@ class FileMailStorage extends MailStorage
      */
     const USER_SUBSCRIBED_FILE = "subscribed.txt";
     /**
+     * Per-user file holding a short token that is rewritten every
+     * time any process creates, deletes, or renames one of the
+     * user's folders. A reader compares this token against the one
+     * its cached folder list was built with, so a folder change
+     * made by another process (for example the web interface) is
+     * picked up on the next listing without re-walking the mailbox
+     * when nothing has changed.
+     */
+    const FOLDER_GENERATION_FILE = "folder_generation.txt";
+    /**
      * Per-folder append-only metadata index. Each line records one
      * mutation: "+ uid size date flag..." for an appended or
      * moved-in message, "f uid flag..." for a flag change, and
@@ -1027,6 +1071,16 @@ class FileMailStorage extends MailStorage
      */
     const INDEX_REMOVE_MARKER = "-";
     /**
+     * Largest number of distinct folder indexes kept in memory at
+     * once. The cache makes repeated work on one folder cheap, but a
+     * mail server that visits many mailboxes over a long life would
+     * otherwise keep every index it ever read; once this many folders
+     * are cached the least recently used one is dropped, then simply
+     * re-read from disk the next time that folder is touched. This
+     * bounds the number of folders held, not their combined size.
+     */
+    const MAX_CACHED_FOLDER_INDEXES = 64;
+    /**
      * Filesystem directory under which the per-user storage
      * tree is created. Set once by the constructor and never
      * changed.
@@ -1046,6 +1100,20 @@ class FileMailStorage extends MailStorage
      */
     protected $index_cache = [];
     /**
+     * In-memory per-user folder listing, kept so a busy account is
+     * not re-walked on every login. Each entry is
+     * ['gen' => token, 'folders' => paths]; the token is the
+     * contents of the user's folders generation file at the time
+     * the list was built. listFolders rereads that small file and
+     * only trusts the cached paths while the token still matches,
+     * so a folder created, deleted, or renamed by any process
+     * (this daemon or the web interface) is reflected on the next
+     * listing. Lives for the life of this storage object, like the
+     * index cache.
+     * @var array
+     */
+    protected $folders_cache = [];
+    /**
      * @param string $base directory under which the "users/"
      *      subtree is created
      */
@@ -1053,6 +1121,7 @@ class FileMailStorage extends MailStorage
     {
         $this->base = rtrim($base, "/\\");
         $this->index_cache = [];
+        $this->folders_cache = [];
     }
     /**
      * Returns the absolute directory path for a user's account.
@@ -1116,7 +1185,8 @@ class FileMailStorage extends MailStorage
      * @param string $folder_dir absolute folder directory path
      * @param int $uid persistent IMAP unique identifier of the message
      * @param string $ext filename extension without leading dot
-     * @return string absolute path of the per-message file with the given extension
+     * @return string absolute path of the per-message file with the given
+     * extension
      */
     protected function messagePath($folder_dir, $uid, $ext)
     {
@@ -1183,6 +1253,11 @@ class FileMailStorage extends MailStorage
      */
     public function listFolders($user)
     {
+        $generation = $this->foldersGeneration($user);
+        if (isset($this->folders_cache[$user]) &&
+            $this->folders_cache[$user]['gen'] === $generation) {
+            return $this->folders_cache[$user]['folders'];
+        }
         $base = $this->userDir($user);
         if (!is_dir($base)) {
             return [];
@@ -1190,7 +1265,57 @@ class FileMailStorage extends MailStorage
         $folders = [];
         $this->collectFolderTree($base, "", $folders);
         sort($folders);
+        $this->folders_cache[$user] = [
+            'gen' => $generation,
+            'folders' => $folders,
+        ];
         return $folders;
+    }
+    /**
+     * Reads the user's folder generation token, the small marker
+     * rewritten whenever any process changes the user's folder set.
+     * Returns an empty string when the file is absent (a mailbox
+     * that pre-dates this marker, or one no folder change has
+     * touched yet); an empty token still works as a stable value to
+     * compare against, and the first folder change writes a real
+     * one. The whole token is written in a single rename, so a
+     * reader sees either the old or the new value, never a partial
+     * one, and no lock is needed here.
+     * @param string $user username (no @domain)
+     * @return string the current token, or "" when none is stored
+     */
+    protected function foldersGeneration($user)
+    {
+        $path = $this->userDir($user) . "/" .
+            self::FOLDER_GENERATION_FILE;
+        $token = @file_get_contents($path);
+        return ($token === false) ? "" : $token;
+    }
+    /**
+     * Rewrites the user's folder generation token to a fresh random
+     * value so any cached folder list, in this process or another,
+     * is treated as out of date on its next use. Called right after
+     * a folder is created, deleted, or renamed. The token is staged
+     * to a temporary file and renamed into place so a concurrent
+     * reader never sees a half-written value.
+     * @param string $user username (no @domain)
+     * @return void
+     */
+    protected function bumpFoldersGeneration($user)
+    {
+        $dir = $this->userDir($user);
+        if (!is_dir($dir)) {
+            return;
+        }
+        $path = $dir . "/" . self::FOLDER_GENERATION_FILE;
+        $stem = pathinfo(self::FOLDER_GENERATION_FILE,
+            PATHINFO_FILENAME);
+        $temp = $dir . "/" . $stem . "_temp_" .
+            bin2hex(random_bytes(6)) . ".txt";
+        if (self::cooperativeFilePut($temp,
+            bin2hex(random_bytes(8))) !== false) {
+            @rename($temp, $path);
+        }
     }
     /**
      * Recursively gathers folder paths under a directory. Folders
@@ -1233,11 +1358,6 @@ class FileMailStorage extends MailStorage
             stay in the skip-list so any such orphans are not
             mistaken for child folders.
          */
-        $message_suffixes = [
-            "." . self::MESSAGE_FILE_EXTENSION,
-            "." . self::FLAGS_FILE_EXTENSION,
-            "." . self::DATE_FILE_EXTENSION,
-        ];
         $metadata_files = [
             self::MESSAGE_INDEX_FILE,
             self::MESSAGE_SEARCH_FILE,
@@ -1247,23 +1367,33 @@ class FileMailStorage extends MailStorage
             self::FOLDER_REUID_JOURNAL_FILE,
             self::USER_UIDNEXT_FILE,
             self::USER_SUBSCRIBED_FILE,
+            self::FOLDER_GENERATION_FILE,
         ];
+        $message_extension = "." . self::MESSAGE_FILE_EXTENSION;
         $children = [];
         while (($entry = readdir($handle)) !== false) {
             if ($entry === "." || $entry === "..") {
                 continue;
             }
+            /*
+                On a large mailbox almost every entry is a
+                <uid>.eml message file, so test that one common
+                suffix first and skip it before the metadata-name
+                and orphaned-suffix checks below. That keeps the
+                per-entry work to a single comparison for the
+                overwhelming majority of entries, which is what
+                makes a rebuild of a big folder's listing cheap.
+             */
+            if (str_ends_with($entry, $message_extension)) {
+                continue;
+            }
             if (in_array($entry, $metadata_files, true)) {
                 continue;
             }
-            $is_message_file = false;
-            foreach ($message_suffixes as $suffix) {
-                if (str_ends_with($entry, $suffix)) {
-                    $is_message_file = true;
-                    break;
-                }
-            }
-            if ($is_message_file) {
+            if (str_ends_with($entry,
+                    "." . self::FLAGS_FILE_EXTENSION) ||
+                str_ends_with($entry,
+                    "." . self::DATE_FILE_EXTENSION)) {
                 continue;
             }
             $sub = $dir . "/" . $entry;
@@ -1320,6 +1450,7 @@ class FileMailStorage extends MailStorage
             $path . "/" .
                 self::FOLDER_UIDVALIDITY_FILE,
             (string) $this->nextUidValidity());
+        $this->bumpFoldersGeneration($user);
         return true;
     }
     /**
@@ -1372,6 +1503,7 @@ class FileMailStorage extends MailStorage
             @unlink($entry_path);
         }
         $this->invalidateIndexCache($user, $folder);
+        $this->bumpFoldersGeneration($user);
         return @rmdir($path);
     }
     /**
@@ -1394,6 +1526,7 @@ class FileMailStorage extends MailStorage
         }
         $this->invalidateIndexCache($user, $old);
         $this->invalidateIndexCache($user, $new);
+        $this->bumpFoldersGeneration($user);
         return @rename($old_path, $new_path);
     }
     /**
@@ -1449,7 +1582,8 @@ class FileMailStorage extends MailStorage
      * @param string $folder folder name with full hierarchy path
      * @param int $bytes number of bytes
      * @param array $flags list of IMAP flag strings
-     * @param int $internal_date Unix timestamp to record as the message internal date
+     * @param int $internal_date Unix timestamp to record as the message
+     * internal date
      */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
@@ -1737,7 +1871,7 @@ class FileMailStorage extends MailStorage
         }
         $path = $this->reuidJournalPath($user, $folder);
         $temp = $path . ".tmp";
-        if (@file_put_contents($temp, $buffer, LOCK_EX) === false) {
+        if (self::cooperativeFilePut($temp, $buffer) === false) {
             return false;
         }
         return @rename($temp, $path);
@@ -1773,6 +1907,42 @@ class FileMailStorage extends MailStorage
             $would_block = false;
         }
         return true;
+    }
+    /**
+     * Writes a file taking its exclusive lock cooperatively, so a
+     * contended write yields the event loop instead of freezing it
+     * the way file_put_contents with LOCK_EX does. Inside the
+     * cooperative server (a fiber) it hands the loop a turn while
+     * another holder has the lock; outside one (the mail daemon or a
+     * command-line tool) it waits plainly. Replaces the file's
+     * contents, or appends to the end when $append is true.
+     *
+     * @param string $path file to write
+     * @param string $data bytes to write
+     * @param bool $append true to append, false to replace contents
+     * @return int|false bytes written, or false on an open or lock
+     *      failure
+     */
+    protected static function cooperativeFilePut($path, $data,
+        $append = false)
+    {
+        $file_handle = @fopen($path, $append ? "ab" : "cb");
+        if ($file_handle === false) {
+            return false;
+        }
+        if (!self::cooperativeFlock($file_handle, LOCK_EX)) {
+            @fclose($file_handle);
+            return false;
+        }
+        if (!$append) {
+            ftruncate($file_handle, 0);
+            rewind($file_handle);
+        }
+        $written = fwrite($file_handle, $data);
+        fflush($file_handle);
+        flock($file_handle, LOCK_UN);
+        @fclose($file_handle);
+        return $written;
     }
     /**
      * Reads a folder's reuid journal into the planned UIDVALIDITY
@@ -1866,9 +2036,8 @@ class FileMailStorage extends MailStorage
             $buffer .= (int) $uid . "\t" .
                 implode(" ", $record['flags']) . "\n";
         }
-        @file_put_contents(
-            $this->flagsSnapshotPath($user, $folder), $buffer,
-            LOCK_EX);
+        self::cooperativeFilePut(
+            $this->flagsSnapshotPath($user, $folder), $buffer);
     }
     /**
      * Reads a folder's flags snapshot into a uid-keyed map of flag
@@ -1996,8 +2165,7 @@ class FileMailStorage extends MailStorage
     protected function appendIndexRecord($user, $folder, $line)
     {
         $path = $this->messageIndexPath($user, $folder);
-        $written = @file_put_contents($path, $line,
-            FILE_APPEND | LOCK_EX);
+        $written = self::cooperativeFilePut($path, $line, true);
         if ($written === false) {
             @unlink($path);
         }
@@ -2044,8 +2212,7 @@ class FileMailStorage extends MailStorage
         $haystack = str_replace(["\t", "\n", "\r"], " ",
             $haystack);
         $line = (int) $uid . "\t" . $haystack . "\n";
-        $written = @file_put_contents($path, $line,
-            FILE_APPEND | LOCK_EX);
+        $written = self::cooperativeFilePut($path, $line, true);
         if ($written === false) {
             @unlink($path);
         }
@@ -2081,7 +2248,7 @@ class FileMailStorage extends MailStorage
             $buffer .= (int) $uid . "\t" . $haystack . "\n";
         }
         $path = $this->messageSearchPath($user, $folder);
-        $written = @file_put_contents($path, $buffer, LOCK_EX);
+        $written = self::cooperativeFilePut($path, $buffer);
         if ($written === false) {
             @unlink($path);
         }
@@ -2224,6 +2391,53 @@ class FileMailStorage extends MailStorage
         return $messages;
     }
     /**
+     * Returns a folder's cached index entry, if present, and marks
+     * that folder as the most recently used so steady work on one
+     * mailbox keeps its index resident. Returns null on a miss.
+     * Promoting on each read is what makes the bounded cache behave
+     * as least-recently-used.
+     * @param string $cache_key the "user\0folder" cache key
+     * @return array|null the cached entry, or null when not cached
+     */
+    protected function cachedFolderIndex($cache_key)
+    {
+        if (!isset($this->index_cache[$cache_key])) {
+            return null;
+        }
+        $entry = $this->index_cache[$cache_key];
+        unset($this->index_cache[$cache_key]);
+        $this->index_cache[$cache_key] = $entry;
+        return $entry;
+    }
+    /**
+     * Caches a folder's parsed index as the most recently used
+     * entry, first dropping the least recently used folders until
+     * the cache is back under its limit. Bounding the cache keeps a
+     * long-running mail server that visits many mailboxes from
+     * growing without limit; an evicted folder is re-read from disk
+     * the next time it is touched.
+     * @param string $cache_key the "user\0folder" cache key
+     * @param array $records uid-keyed map of metadata records
+     * @param int $line_count number of index lines replayed
+     */
+    protected function storeFolderIndex($cache_key, $records,
+        $line_count)
+    {
+        unset($this->index_cache[$cache_key]);
+        while (count($this->index_cache) >=
+            self::MAX_CACHED_FOLDER_INDEXES) {
+            $oldest = array_key_first($this->index_cache);
+            if ($oldest === null) {
+                break;
+            }
+            unset($this->index_cache[$oldest]);
+        }
+        $this->index_cache[$cache_key] = [
+            'records' => $records,
+            'line_count' => $line_count,
+        ];
+    }
+    /**
      * Streams a folder's index log and returns the set of live
      * uids as a uid-keyed boolean map. Unlike readFolderIndex this
      * keeps no per-message metadata record, so counting a folder
@@ -2238,10 +2452,10 @@ class FileMailStorage extends MailStorage
     protected function liveUidsFromIndex($user, $folder)
     {
         $cache_key = $user . "\0" . $folder;
-        if (isset($this->index_cache[$cache_key])) {
+        $cached = $this->cachedFolderIndex($cache_key);
+        if ($cached !== null) {
             $live = [];
-            foreach ($this->index_cache[$cache_key]['records']
-                as $uid => $record) {
+            foreach ($cached['records'] as $uid => $record) {
                 $live[$uid] = true;
             }
             return $live;
@@ -2300,10 +2514,10 @@ class FileMailStorage extends MailStorage
     {
         $line_count = 0;
         $cache_key = $user . "\0" . $folder;
-        if (isset($this->index_cache[$cache_key])) {
-            $line_count =
-                $this->index_cache[$cache_key]['line_count'];
-            return $this->index_cache[$cache_key]['records'];
+        $cached = $this->cachedFolderIndex($cache_key);
+        if ($cached !== null) {
+            $line_count = $cached['line_count'];
+            return $cached['records'];
         }
         $path = $this->messageIndexPath($user, $folder);
         if (!is_file($path)) {
@@ -2355,10 +2569,7 @@ class FileMailStorage extends MailStorage
         }
         @flock($handle, LOCK_UN);
         fclose($handle);
-        $this->index_cache[$cache_key] = [
-            'records' => $records,
-            'line_count' => $line_count,
-        ];
+        $this->storeFolderIndex($cache_key, $records, $line_count);
         return $records;
     }
     /**
@@ -2401,9 +2612,9 @@ class FileMailStorage extends MailStorage
                 $record['uid'], $record['size'],
                 $record['internal_date'], $record['flags']);
         }
-        @file_put_contents(
+        self::cooperativeFilePut(
             $this->messageIndexPath($user, $folder),
-            $snapshot, LOCK_EX);
+            $snapshot);
         $by_uid = [];
         foreach ($records as $record) {
             $by_uid[(int) $record['uid']] = $record;
@@ -2524,14 +2735,14 @@ class FileMailStorage extends MailStorage
                 $record['uid'], $record['size'],
                 $record['internal_date'], $record['flags']);
         }
-        @file_put_contents($this->messageIndexPath($user, $folder),
-            $index_text, LOCK_EX);
+        self::cooperativeFilePut($this->messageIndexPath($user, $folder),
+            $index_text);
         $this->writeFlagsSnapshot($user, $folder, $renumbered);
-        @file_put_contents($this->folderUidNextPath($user, $folder),
-            (string) ($total + 1), LOCK_EX);
-        @file_put_contents(
+        self::cooperativeFilePut($this->folderUidNextPath($user, $folder),
+            (string) ($total + 1));
+        self::cooperativeFilePut(
             $dir . "/" . self::FOLDER_UIDVALIDITY_FILE,
-            (string) $uidvalidity, LOCK_EX);
+            (string) $uidvalidity);
         $this->invalidateIndexCache($user, $folder);
         $this->rebuildSearchIndex($user, $folder);
         @unlink($this->reuidJournalPath($user, $folder));
@@ -3119,7 +3330,8 @@ class RamMailStorage extends MailStorage
      * @param string $folder folder name with full hierarchy path
      * @param int $bytes number of bytes
      * @param array $flags list of IMAP flag strings
-     * @param int $internal_date Unix timestamp to record as the message internal date
+     * @param int $internal_date Unix timestamp to record as the message
+     * internal date
      */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
@@ -3976,7 +4188,8 @@ class SqlMailStorage extends MailStorage
      * "INSERT IGNORE", Postgres keeps the leading verb and
      * appends "ON CONFLICT DO NOTHING".
      * @param mixed $insert_sql insert_sql parameter
-     * @return string INSERT ... ON CONFLICT IGNORE statement appropriate to the active dialect
+     * @return string INSERT ... ON CONFLICT IGNORE statement appropriate to the
+     * active dialect
      */
     protected function insertIgnoreSql($insert_sql)
     {
@@ -4032,7 +4245,8 @@ class SqlMailStorage extends MailStorage
      * neither the user nor the folder exists.
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
-     * @return array|false folder database row, or false if no such folder exists
+     * @return array|false folder database row, or false if no such folder
+     * exists
      */
     protected function folderRow($user, $folder)
     {
@@ -4199,7 +4413,8 @@ class SqlMailStorage extends MailStorage
      * @param string $folder folder name with full hierarchy path
      * @param int $bytes number of bytes
      * @param array $flags list of IMAP flag strings
-     * @param int $internal_date Unix timestamp to record as the message internal date
+     * @param int $internal_date Unix timestamp to record as the message
+     * internal date
      */
     public function appendMessage($user, $folder, $bytes,
         $flags = [], $internal_date = 0)
@@ -4438,7 +4653,8 @@ class SqlMailStorage extends MailStorage
      * Shapes a raw mail_messages row into the public record
      * format that the abstract MailStorage interface promises.
      * @param array $row database row
-     * @return array|false message metadata row, or false if no such message exists
+     * @return array|false message metadata row, or false if no such message
+     * exists
      */
     protected function messageRecord($row)
     {
@@ -4874,7 +5090,8 @@ class SqlMailStorage extends MailStorage
      * than an expected condition once mail_blobs is the
      * authoritative refcount).
      * @param mixed $hash hash parameter
-     * @return string|false raw blob bytes, or false if the content-id is unknown
+     * @return string|false raw blob bytes, or false if the content-id is
+     * unknown
      */
     protected function blobRead($hash)
     {
@@ -5194,7 +5411,8 @@ class MailSite implements MailVocabulary
      * 'header_block', 'bytes'. Returning 'reject' replies
      * 550 5.6.0 and the message is discarded.
      * @param callable $callback callback to invoke
-     * @return bool false to reject the message during header phase; true to continue
+     * @return bool false to reject the message during header phase; true to
+     * continue
      */
     public function onHeader(callable $callback)
     {
@@ -5292,8 +5510,10 @@ class MailSite implements MailVocabulary
      * they returned null so a buggy filter cannot kill the loop.
      * @param mixed $stage stage parameter
      * @param mixed $info info parameter
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
-     * @return bool true if every hook returned true; false if any returned false
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
+     * @return bool true if every hook returned true; false if any returned
+     * false
      */
     protected function runHooks($stage, $info, $context)
     {
@@ -5425,7 +5645,8 @@ class MailSite implements MailVocabulary
      * DELETE semantics.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool true on success
      */
     public function deleteFolder($user, $folder)
@@ -5453,7 +5674,8 @@ class MailSite implements MailVocabulary
      * placed verbatim with caller-chosen flags.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param string $bytes full RFC 5322 message
      * @param array $flags initial flag set
      * @param int $date Unix timestamp; 0 means "now"
@@ -5473,7 +5695,8 @@ class MailSite implements MailVocabulary
      * Returns the raw RFC 5322 bytes of a single message.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
      * @return string|false the bytes, or false if not found
      */
@@ -5506,9 +5729,11 @@ class MailSite implements MailVocabulary
      * MailStorage::messageBodyLocation for the return shape.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
-     * @return array|false metadata record describing where the body bytes live, or false if (user, folder, uid) does not resolve to a stored message
+     * @return array|false metadata record describing where the body bytes live,
+     * or false if (user, folder, uid) does not resolve to a stored message
      */
     public function messageBodyLocation($user, $folder, $uid)
     {
@@ -5523,7 +5748,8 @@ class MailSite implements MailVocabulary
      * direct-call shape a webmail message-list view consumes.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return array list of metadata records
      */
     public function listMessages($user, $folder)
@@ -5536,7 +5762,8 @@ class MailSite implements MailVocabulary
      * delegating to the configured storage's search index.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param string $query substring to match against subject/from/to
      * @return array list of matching uids present in the folder
      */
@@ -5550,9 +5777,11 @@ class MailSite implements MailVocabulary
      * the same shape as one entry of listMessages.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
-     * @return array|false metadata record (uid, size, flags, internal_date), or false if the message does not exist
+     * @return array|false metadata record (uid, size, flags, internal_date), or
+     * false if the message does not exist
      */
     public function messageMeta($user, $folder, $uid)
     {
@@ -5564,7 +5793,8 @@ class MailSite implements MailVocabulary
      * to clear all flags.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param int $uid persistent IMAP unique identifier of the message
      * @param array $flags list of IMAP flag strings to set on the message
      * @return bool true on success
@@ -5584,7 +5814,8 @@ class MailSite implements MailVocabulary
      * removed. Mirrors IMAP EXPUNGE.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @param array $uid_restriction when non-null, only deleted
      *      messages whose UID is in this list are removed (UID
      *      EXPUNGE, RFC 4315); when null every deleted message is
@@ -5626,8 +5857,10 @@ class MailSite implements MailVocabulary
      * Matches the count IMAP reports as EXISTS in SELECT.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int number of messages currently in the folder, or -1 if the folder is unknown
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int number of messages currently in the folder, or -1 if the
+     * folder is unknown
      */
     public function messageCount($user, $folder)
     {
@@ -5639,7 +5872,8 @@ class MailSite implements MailVocabulary
      * membership when the caller only needs a yes/no answer.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      * @return bool true if the named folder exists under $user, false otherwise
      */
     public function folderExists($user, $folder)
@@ -5656,8 +5890,10 @@ class MailSite implements MailVocabulary
      * caller acts on it.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int next UID that will be assigned for an appended message in the folder
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int next UID that will be assigned for an appended message in the
+     * folder
      */
     public function uidNext($user, $folder)
     {
@@ -5672,8 +5908,10 @@ class MailSite implements MailVocabulary
      * folder hands out a fresh value.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int fixed UIDVALIDITY value for the folder per RFC 3501 sec 2.3.1.1
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int fixed UIDVALIDITY value for the folder per RFC 3501 sec
+     * 2.3.1.1
      */
     public function uidValidity($user, $folder)
     {
@@ -5688,7 +5926,8 @@ class MailSite implements MailVocabulary
      * the idle window.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
      */
     protected function bumpMailboxChange($user, $folder)
     {
@@ -5708,8 +5947,10 @@ class MailSite implements MailVocabulary
      * later.
      *
      * @param string $user username (no @domain) identifying the mail account
-     * @param string $folder folder name with full hierarchy path (e.g. "Archive/2026")
-     * @return int monotonic counter incremented on each storage change, used by IMAP IDLE to detect changes
+     * @param string $folder folder name with full hierarchy path (e.g.
+     * "Archive/2026")
+     * @return int monotonic counter incremented on each storage change, used by
+     * IMAP IDLE to detect changes
      */
     protected function currentChangeCounter($user, $folder)
     {
@@ -5727,7 +5968,8 @@ class MailSite implements MailVocabulary
      * three slots are kept null rather than deleted so later
      * isset() checks can short-circuit without keying through
      * an undefined index notice in strict environments.
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; IDLE state for the session is reset
      */
     protected function clearImapIdleState(&$context)
@@ -5749,7 +5991,8 @@ class MailSite implements MailVocabulary
      * Delivered-To header, so a reply can still default to the
      * alias the sender used.
      * @param string $address address
-     * @return string|false local username if the address resolves to a local mailbox, false otherwise
+     * @return string|false local username if the address resolves to a local
+     * mailbox, false otherwise
      */
     public function resolveLocalUser($address)
     {
@@ -5823,7 +6066,8 @@ class MailSite implements MailVocabulary
      * greeting). STARTTLS is advertised on the plaintext SMTP
      * and IMAP listeners whenever a TLS context is configured.
      * @param array $config configuration overrides
-     * @return void no return; the event loop runs until the process is killed or a fatal listener error
+     * @return void no return; the event loop runs until the process is killed
+     * or a fatal listener error
      */
     public function listen($config = [])
     {
@@ -6030,7 +6274,8 @@ class MailSite implements MailVocabulary
      * if implicit) so they see the eventual TLS state.
      * @param mixed $server server parameter
      * @param mixed $listener listener parameter
-     * @return void no return; the new connection is registered in $this->in_streams
+     * @return void no return; the new connection is registered in
+     * $this->in_streams
      */
     protected function acceptConnection($server, $listener)
     {
@@ -6160,7 +6405,8 @@ class MailSite implements MailVocabulary
      * unconditionally since RFC 2177 places no auth requirement
      * on advertising it.
      * @param mixed $tls_active tls_active parameter
-     * @return string CAPABILITY response string appropriate to the current TLS / auth state
+     * @return string CAPABILITY response string appropriate to the current TLS
+     * / auth state
      */
     protected function imapPreAuthCapabilities($tls_active)
     {
@@ -6458,7 +6704,8 @@ class MailSite implements MailVocabulary
      * AUTH PLAIN / LOGIN over a plaintext (non-TLS) channel.
      * Default false; deployments that explicitly opt in to
      * loopback-only or test setups can flip this.
-     * @return bool true if plaintext AUTH (PLAIN/LOGIN) is permitted on this connection
+     * @return bool true if plaintext AUTH (PLAIN/LOGIN) is permitted on this
+     * connection
      */
     protected function allowsPlaintextAuth()
     {
@@ -6558,7 +6805,8 @@ class MailSite implements MailVocabulary
      * Returns true if it consumed a command (caller should loop),
      * false if it needs more bytes or the stream was destroyed.
      * @param int $key connection key in the in_streams map
-     * @return bool true if one command line was processed; false if more input is needed
+     * @return bool true if one command line was processed; false if more input
+     * is needed
      */
     protected function processOne($key)
     {
@@ -6647,7 +6895,8 @@ class MailSite implements MailVocabulary
      *   DATA  + ".\r\n"           -> READY (message accepted)
      * @param int $key connection key in the in_streams map
      * @param string $line raw line received from the client
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; one SMTP line was processed inline
      */
     protected function dispatchSmtp($key, $line, &$context)
@@ -6753,7 +7002,8 @@ class MailSite implements MailVocabulary
      * because anything written before the handshake corrupts
      * the TLS framing the client expects.
      * @param int $key connection key in the in_streams map
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the STARTTLS response was queued for the client
      */
     protected function dispatchSmtpStarttls($key, &$context)
@@ -6779,7 +7029,8 @@ class MailSite implements MailVocabulary
      * then password, both base64-encoded.
      * @param int $key connection key in the in_streams map
      * @param string $line raw line received from the client
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the AUTH continuation was queued for the client
      */
     protected function dispatchSmtpAuth($key, $line, &$context)
@@ -6872,10 +7123,15 @@ class MailSite implements MailVocabulary
     protected function verifyAndSetAuth($key, $user, $pass, &$context)
     {
         $ok = false;
+        $prof_start = microtime(true);
         if ($this->authenticator !== null) {
             $ok = $this->authenticator->verifyPassword($user,
                 $pass);
         }
+        /* TEMPORARY auth profiling; remove after measuring */
+        file_put_contents("/tmp/yioop_authprof.log", sprintf(
+            "SMTP %s verify=%.0fms\n", strtolower($user),
+            (microtime(true) - $prof_start) * 1000), FILE_APPEND);
         if ($ok) {
             $context['AUTH_USER'] = strtolower($user);
             $context['STATE'] = 'READY';
@@ -6948,7 +7204,8 @@ class MailSite implements MailVocabulary
      * hook; a 'reject' verdict refuses with 550 5.7.1.
      * @param int $key connection key in the in_streams map
      * @param string $line raw line received from the client
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the MAIL FROM response was queued for the client
      */
     protected function dispatchSmtpMailFrom($key, $line, &$context)
@@ -6982,7 +7239,8 @@ class MailSite implements MailVocabulary
      * anti-relay check.
      * @param int $key connection key in the in_streams map
      * @param string $line raw line received from the client
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the RCPT TO response was queued for the client
      */
     protected function dispatchSmtpRcptTo($key, $line, &$context)
@@ -7065,8 +7323,10 @@ class MailSite implements MailVocabulary
      * Performs CRLF dot-unstuffing per RFC 5321 sec 4.5.2.
      * @param int $key connection key in the in_streams map
      * @param mixed $buffer buffer parameter
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
-     * @return bool true if the DATA phase produced a complete message and was delivered
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
+     * @return bool true if the DATA phase produced a complete message and was
+     * delivered
      */
     protected function consumeSmtpDataPhase($key, &$buffer, &$context)
     {
@@ -7226,7 +7486,8 @@ class MailSite implements MailVocabulary
      * suffix when the hop used TLS, the A suffix when it was
      * authenticated), and the receipt timestamp.
      * @param string $message raw RFC 5322 message bytes
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return string message with a Received: header prepended
      */
     protected function prependReceivedHeader($message, $context)
@@ -7284,7 +7545,8 @@ class MailSite implements MailVocabulary
      * Tags are echoed back in the tagged status response.
      * @param int $key connection key in the in_streams map
      * @param string $line raw line received from the client
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; one command was processed inline
      */
     protected function dispatchImap($key, $line, &$context)
@@ -7470,7 +7732,8 @@ class MailSite implements MailVocabulary
      * advertise the same string post-auth.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdCapability($key, $tag, $context)
@@ -7491,8 +7754,10 @@ class MailSite implements MailVocabulary
      * accept that and still reply with our own identification.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdId($key, $tag, $arguments, $context)
@@ -7512,7 +7777,8 @@ class MailSite implements MailVocabulary
      * separated by spaces.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdNamespace($key, $tag, $context)
@@ -7532,8 +7798,10 @@ class MailSite implements MailVocabulary
      * continueImapLiteral).
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdLogin($key, $tag, $arguments, &$context)
@@ -7583,14 +7851,18 @@ class MailSite implements MailVocabulary
      * @param string $tag IMAP tag prefix the client used on the command line
      * @param string $user username (no @domain) identifying the mail account
      * @param mixed $pass pass parameter
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the login response was queued for the client
      */
     protected function finishImapLogin($key, $tag, $user, $pass,
         &$context)
     {
-        if ($this->authenticator === null ||
-            !$this->authenticator->verifyPassword($user, $pass)) {
+        $prof_start = microtime(true);
+        $prof_ok = ($this->authenticator !== null &&
+            $this->authenticator->verifyPassword($user, $pass));
+        $prof_verified = microtime(true);
+        if (!$prof_ok) {
             $this->queueWrite($key,
                 "$tag NO [AUTHENTICATIONFAILED] " .
                 "Authentication failed\r\n");
@@ -7599,8 +7871,16 @@ class MailSite implements MailVocabulary
         $context['AUTH_USER'] = strtolower($user);
         $context['STATE'] = 'AUTH';
         $this->mail_storage?->ensureUser($context['AUTH_USER']);
+        $prof_ensured = microtime(true);
         $consolidations = $this->mail_storage?->ensureStandardFolders(
             $context['AUTH_USER']) ?? [];
+        $prof_done = microtime(true);
+        /* TEMPORARY auth profiling; remove after measuring */
+        file_put_contents("/tmp/yioop_authprof.log", sprintf(
+            "IMAP %s verify=%.0fms ensureuser=%.0fms folders=%.0fms\n",
+            $context['AUTH_USER'], ($prof_verified - $prof_start) * 1000,
+            ($prof_ensured - $prof_verified) * 1000,
+            ($prof_done - $prof_ensured) * 1000), FILE_APPEND);
         foreach ($consolidations as $consolidation) {
             $outcome = $consolidation['deleted'] ?
                 "and removed \"" . $consolidation['from'] . "\"" :
@@ -7625,8 +7905,10 @@ class MailSite implements MailVocabulary
      * arrives via continueImapLiteral on subsequent lines.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdAuthenticate($key, $tag, $arguments, &$context)
@@ -7666,8 +7948,10 @@ class MailSite implements MailVocabulary
      * the pending slot.
      * @param int $key connection key in the in_streams map
      * @param string $line raw line received from the client
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
-     * @return bool true if the literal was fully consumed and the command was dispatched
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
+     * @return bool true if the literal was fully consumed and the command was
+     * dispatched
      */
     protected function continueImapLiteral($key, $line, &$context)
     {
@@ -7890,7 +8174,8 @@ class MailSite implements MailVocabulary
      * handling and cannot be returned synchronously).
      * @param mixed $tokens tokens parameter
      * @param mixed $index index parameter
-     * @return string IMAP wire representation of the token value (quoted, literal, or atom)
+     * @return string IMAP wire representation of the token value (quoted,
+     * literal, or atom)
      */
     protected function tokenString($tokens, $index)
     {
@@ -7919,8 +8204,10 @@ class MailSite implements MailVocabulary
      * way.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $is_lsub is_lsub parameter
      * @return void no return; the response is queued for the client
      */
@@ -8051,7 +8338,8 @@ class MailSite implements MailVocabulary
      * to non-INBOX folders. Sub-folders under a special-use
      * parent (e.g. "Archive/2025") are not flagged.
      * @param string $folder folder name with full hierarchy path
-     * @return string IMAP SPECIAL-USE attribute (\\Trash, \\Sent, ...) or empty string
+     * @return string IMAP SPECIAL-USE attribute (\\Trash, \\Sent, ...) or empty
+     * string
      */
     protected function imapSpecialUseAttr($folder)
     {
@@ -8086,7 +8374,8 @@ class MailSite implements MailVocabulary
      * sequence not containing the delimiter. All other regex
      * metacharacters are escaped.
      * @param string $pattern pattern string
-     * @return string regex equivalent of the IMAP LIST pattern (% / * wildcards)
+     * @return string regex equivalent of the IMAP LIST pattern (% / *
+     * wildcards)
      */
     protected function imapPatternToRegex($pattern)
     {
@@ -8142,9 +8431,11 @@ class MailSite implements MailVocabulary
      * (idempotency per RFC 3501 sec 6.3.7).
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
      * @param mixed $verb verb parameter
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdSubscribe($key, $tag, $arguments, $verb,
@@ -8172,8 +8463,10 @@ class MailSite implements MailVocabulary
      * is NOT made the selected mailbox.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdStatus($key, $tag, $arguments, &$context)
@@ -8268,8 +8561,10 @@ class MailSite implements MailVocabulary
      * folder validation.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdCreate($key, $tag, $arguments, &$context)
@@ -8312,8 +8607,10 @@ class MailSite implements MailVocabulary
      * those as NO responses.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdDelete($key, $tag, $arguments, &$context)
@@ -8370,8 +8667,10 @@ class MailSite implements MailVocabulary
      * the new name so the SELECTED state stays consistent.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdRename($key, $tag, $arguments, &$context)
@@ -8418,8 +8717,10 @@ class MailSite implements MailVocabulary
      * the connection STATE is SELECTED.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $is_examine is_examine parameter
      * @return void no return; the response is queued for the client
      */
@@ -8499,7 +8800,8 @@ class MailSite implements MailVocabulary
      * EXPUNGE either way, so the deviation is rarely visible.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdClose($key, $tag, &$context)
@@ -8525,8 +8827,10 @@ class MailSite implements MailVocabulary
      * clients such as iOS Mail delete a single message.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdUid($key, $tag, $arguments, &$context)
@@ -8665,8 +8969,10 @@ class MailSite implements MailVocabulary
      * arrives in many TCP fragments).
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdAppend($key, $tag, $arguments, &$context)
@@ -8932,6 +9238,30 @@ class MailSite implements MailVocabulary
         if ($end === false) {
             return $record;
         }
+        /*
+            A "<first.count>" (or just "<first>") suffix after the
+            closing bracket is a partial fetch: the client wants only
+            "count" octets of the section starting at octet "first"
+            (RFC 3501 6.4.5). Record it so the renderer returns just
+            that slice and labels the response with the origin octet;
+            without this the whole section was returned and clients
+            such as Apple Mail kept re-requesting the same range.
+         */
+        $after_bracket = substr($token, $end + 1);
+        if ($after_bracket !== '' && $after_bracket[0] === '<') {
+            $range = trim($after_bracket, '<>');
+            $dot_position = strpos($range, '.');
+            if ($dot_position === false) {
+                $record['partial'] = ['offset' => (int) $range,
+                    'length' => null];
+            } else {
+                $record['partial'] = [
+                    'offset' => (int) substr($range, 0,
+                        $dot_position),
+                    'length' => (int) substr($range,
+                        $dot_position + 1)];
+            }
+        }
         $section_full = substr($token, $bracket_position + 1,
             $end - $bracket_position - 1);
         /*
@@ -9021,7 +9351,30 @@ class MailSite implements MailVocabulary
                     $section_repr .= ' (' .
                         implode(' ', $item['fields']) . ')';
                 }
-                return "BODY[$section_repr] " .
+                $response_label = "BODY[" . $section_repr . "]";
+                /*
+                    For a partial fetch return only the requested
+                    octet slice and tag the response with the origin
+                    octet ("<first>"), as RFC 3501 7.4.2 requires, so
+                    the client knows where the bytes start. The count
+                    may run past the end of the section; substr then
+                    returns the shorter remainder, which is allowed.
+                 */
+                if ($item['partial'] !== null) {
+                    $first_octet = $item['partial']['offset'];
+                    $octet_count = $item['partial']['length'];
+                    if ($octet_count === null) {
+                        $payload = substr($payload, $first_octet);
+                    } else {
+                        $payload = substr($payload, $first_octet,
+                            $octet_count);
+                    }
+                    if ($payload === false) {
+                        $payload = "";
+                    }
+                    $response_label .= "<" . $first_octet . ">";
+                }
+                return $response_label . " " .
                     $this->imapLiteralOf($payload);
             }
             return "BODYSTRUCTURE " .
@@ -9035,7 +9388,8 @@ class MailSite implements MailVocabulary
      * atom; the client reads exactly N bytes after the {N}\r\n
      * before resuming line-based parsing.
      * @param mixed $s s parameter
-     * @return string IMAP literal-syntax encoding of the value (with {n}\r\n prefix)
+     * @return string IMAP literal-syntax encoding of the value (with {n}\r\n
+     * prefix)
      */
     protected function imapLiteralOf($s)
     {
@@ -9802,8 +10156,10 @@ class MailSite implements MailVocabulary
      * BODY request.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $by_uid by_uid parameter
      * @return void no return; the response is queued for the client
      */
@@ -9873,8 +10229,10 @@ class MailSite implements MailVocabulary
      * list itself is a parenthesized atom list.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $by_uid by_uid parameter
      * @return void no return; the response is queued for the client
      */
@@ -9957,8 +10315,10 @@ class MailSite implements MailVocabulary
      * message.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $by_uid by_uid parameter
      * @return void no return; the response is queued for the client
      */
@@ -10020,8 +10380,10 @@ class MailSite implements MailVocabulary
      * for each removed source message after the move.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $by_uid by_uid parameter
      * @return void no return; the response is queued for the client
      */
@@ -10096,7 +10458,8 @@ class MailSite implements MailVocabulary
      * client deletes a single message.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param array $restrict_uids when non-null, only deleted
      *      messages whose UID is in this list are expunged; when
      *      null every deleted message in the folder is expunged
@@ -10148,8 +10511,10 @@ class MailSite implements MailVocabulary
      * UID-set restrictions also work.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param string $arguments arguments substring following the IMAP command verb
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param string $arguments arguments substring following the IMAP command
+     * verb
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @param mixed $by_uid by_uid parameter
      * @return void no return; the response is queued for the client
      */
@@ -10449,7 +10814,8 @@ class MailSite implements MailVocabulary
      * to terminate; we ack with tagged OK and clear state.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response is queued for the client
      */
     protected function imapCmdIdle($key, $tag, &$context)
@@ -10481,7 +10847,8 @@ class MailSite implements MailVocabulary
      *             EXISTS push can use it without rewalking
      * @param string $user username (no @domain) identifying the mail account
      * @param string $folder folder name with full hierarchy path
-     * @return array snapshot of folder counters and uids used by IMAP IDLE notifications
+     * @return array snapshot of folder counters and uids used by IMAP IDLE
+     * notifications
      */
     protected function captureFolderState($user, $folder)
     {
@@ -10510,7 +10877,8 @@ class MailSite implements MailVocabulary
      * behaved client re-issues CAPABILITY.
      * @param int $key connection key in the in_streams map
      * @param string $tag IMAP tag prefix the client used on the command line
-     * @param array $context per-session context array (TLS state, auth state, selected folder, etc.)
+     * @param array $context per-session context array (TLS state, auth state,
+     * selected folder, etc.)
      * @return void no return; the response was queued for the client
      */
     protected function dispatchImapStarttls($key, $tag, &$context)

@@ -2291,7 +2291,8 @@ class QuicPacketKeys
      * falls back to pure PHP. Self-tests against the RFC
      * 8439 sec 2.3.2 vector; a mismatch is treated as the
      * cipher being absent.
-     * @return bool true if the OpenSSL ChaCha20 path should be used; false to fall back to the pure-PHP implementation
+     * @return bool true if the OpenSSL ChaCha20 path should be used;
+     * false to fall back to the pure-PHP implementation
      */
     public static function chachaUseOpenssl()
     {
@@ -2445,7 +2446,8 @@ class QuicPacketKeys
      * @param int $packet_number packet number for the packet number space
      * @param string $aad additional authenticated data (AAD) for AEAD
      * @param string $plaintext plaintext bytes
-     * @return string AEAD-sealed bytes (ciphertext including authentication tag)
+     * @return string AEAD-sealed bytes (ciphertext including authentication
+     * tag)
      */
     public function seal($packet_number, $aad, $plaintext)
     {
@@ -2453,10 +2455,8 @@ class QuicPacketKeys
         if ($this->cipher ===
             Tls13Engine::CIPHER_AES_128_GCM_SHA256) {
             $tag = '';
-            $ct = openssl_encrypt($plaintext, 'aes-128-gcm',
-                $this->key,
-                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
-                $nonce, $tag, $aad);
+            $ct = openssl_encrypt($plaintext, 'aes-128-gcm', $this->key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $nonce, $tag, $aad);
             return $ct . $tag;
         }
         return sodium_crypto_aead_chacha20poly1305_ietf_encrypt(
@@ -2480,10 +2480,8 @@ class QuicPacketKeys
             }
             $ct = substr($ciphertext, 0, -16);
             $tag = substr($ciphertext, -16);
-            return openssl_decrypt($ct, 'aes-128-gcm',
-                $this->key,
-                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
-                $nonce, $tag, $aad);
+            return openssl_decrypt($ct, 'aes-128-gcm', $this->key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $nonce, $tag, $aad);
         }
         return @sodium_crypto_aead_chacha20poly1305_ietf_decrypt(
             $ciphertext, $aad, $nonce, $this->key);

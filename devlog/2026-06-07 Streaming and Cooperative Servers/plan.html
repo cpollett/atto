@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>atto &mdash; Streaming and Cooperative Servers</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 760px;
+    margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+    color: #1a1a1a; }
+ol { margin: 0.4rem 0; }
+ol ol { margin: 0.3rem 0 0.8rem; }
+li { margin: 0.3rem 0; }
+.check { color: #1a7f37; font-weight: bold; }
+.note { color: #555; font-size: 0.92em; margin: 0.6rem 0 1.2rem; }
+code { background: #f2f2f2; padding: 0 0.2em; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>atto &mdash; Streaming and Cooperative Servers</h1>
+<p class="note">This arc runs from 07-Jun-2026 to 20-Jun-2026. It has
+two halves. The first backports the streaming and non-blocking work that
+had been developed in the Yioop project so that atto's own servers no
+longer block a whole process on a single slow read or write. The second
+reworks the servers' event loops around PHP Fibers so that one atto
+process can carry several long-lived transfers cooperatively rather than
+serially. Both were driven by the same need seen in the pure-PHP HTTP/3
+work: a single-file, single-process server has to yield the CPU
+carefully or one client stalls the rest. Commits below are grouped by
+the two halves.</p>
+
+<ol>
+  <li><span class="check">&#10003;</span> Non-blocking streaming, backported
+    from Yioop (07-Jun to 13-Jun).
+    <ol>
+      <li><span class="check">&#10003;</span> Remove the stream-blocking
+        behaviour in both <code>MailSite</code> and <code>WebSite</code>,
+        and make the <code>FileStorage</code> backend more efficient so a
+        large body is neither read nor written in one blocking call
+        (<code>a48193d</code>).</li>
+      <li><span class="check">&#10003;</span> Backport the streaming
+        tweaks worked out in Yioop so the two projects share the same
+        streaming shape (<code>b788bed</code>).</li>
+      <li><span class="check">&#10003;</span> Better streaming HTTP/2
+        support in <code>WebSite</code>, then a memory-bounded HTTP/3
+        generator-based streaming path so a response body is produced and
+        sent in bounded chunks rather than materialised whole; the H3
+        stream is refilled on the inbound path so throughput does not
+        stall waiting for the next chunk (<code>ff8317b</code>,
+        <code>fd562c3</code>, <code>ecef6df</code>).</li>
+      <li><span class="check">&#10003;</span> Wire the streaming case into
+        the benchmarks dashboard and refresh examples 15 (Streaming) and
+        18 (HTTP Benchmarks) to exercise it (<code>61c4647</code>,
+        <code>9ce4685</code>).</li>
+      <li><span class="check">&#10003;</span> Fix a fractional-timeout
+        calculation bug in <code>WebSite</code> and a <code>select</code>
+        spin in <code>GopherSite</code>; a MailSite spin fix landed
+        alongside the WebSite streaming work (<code>9ded403</code>,
+        <code>db462ca</code>, <code>532166d</code>).</li>
+    </ol>
+  </li>
+  <li><span class="check">&#10003;</span> Cooperative event loops with PHP
+    Fibers (20-Jun).
+    <ol>
+      <li><span class="check">&#10003;</span> Rework the event loops so a
+        long-running server step (a mail delivery, an FTP transfer) runs
+        inside a Fiber that yields back to the loop instead of blocking
+        it, letting one process interleave several transfers
+        (<code>1029c8f</code>).</li>
+      <li><span class="check">&#10003;</span> Make <code>MailSite</code>
+        cooperative, then <code>FtpSite</code>: a cooperative setup path,
+        transfer pumps that move bytes a chunk at a time between yields,
+        and a fix to the FTP web UI upload (<code>3514b4b</code>,
+        <code>882f939</code>, <code>c090140</code>,
+        <code>b39e214</code>).</li>
+      <li><span class="check">&#10003;</span> A benchmark defer case for
+        the fourth slice so the cooperative path is measured against the
+        blocking one (<code>8de775a</code>).</li>
+      <li><span class="check">&#10003;</span> Add example 26, Cooperative
+        Fiber Primitives, showing the raw yield/resume primitives, with a
+        web rewrite and code toggles so a reader can watch the loop hand
+        off between tasks (<code>f5682f8</code>, <code>72b9de6</code>,
+        <code>55eda06</code>).</li>
+    </ol>
+  </li>
+  <li><span class="check">&#10003;</span> Follow-up fix (02-Jul). A
+    <code>set_error_handler</code> memory leak: the handler was only ever
+    pushed onto the internal stack and never popped, so long-lived server
+    processes grew over time. Fixed so each temporary handler is restored
+    (<code>e89641d</code>). This same shape was later removed outright on
+    the Yioop side of the streaming write path.</li>
+</ol>
+</body>
+</html>

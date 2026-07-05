@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>atto &mdash; WebDAV Back-Port</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 760px;
+    margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+    color: #1a1a1a; }
+ol { margin: 0.4rem 0; }
+ol ol { margin: 0.3rem 0 0.8rem; }
+li { margin: 0.3rem 0; }
+.check { color: #1a7f37; font-weight: bold; }
+.next { color: #b35900; font-weight: bold; }
+.note { color: #555; font-size: 0.92em; margin: 0.6rem 0 1.2rem; }
+code { background: #f2f2f2; padding: 0 0.2em; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>atto &mdash; WebDAV Back-Port</h1>
+<p class="note">Started 05-Jul-2026. The WebDAV read-and-write support
+that grew up in the Yioop project's copy of <code>WebSite</code> &mdash;
+where it backs the self-hosted git wiki pages that clients clone, pull,
+and push over dumb WebDAV &mdash; is brought back into atto's own
+<code>WebSite</code> so the framework ships it directly, with an example
+that shows it and a reworked final example that demonstrates extending
+an existing server rather than the raw Fiber primitives.</p>
+
+<ol>
+  <li><span class="next">Next</span> Back-port the <code>WebSite</code>
+    WebDAV changes from Yioop into <code>github.com/cpollett/atto</code>.
+    The WebDAV verbs (<code>OPTIONS</code>, <code>PROPFIND</code>,
+    <code>MKCOL</code>, <code>PUT</code>, <code>GET</code>,
+    <code>DELETE</code>, <code>MOVE</code>, and the lock verbs where
+    present) and their routing should live in atto's own
+    <code>WebSite</code>, decoupled from anything Yioop-specific, keeping
+    atto's no-config, single-file character.</li>
+  <li>Add a WebDAV example as example 14, and renumber every existing
+    example from 14 onward up by one so nothing is lost:
+    <ol>
+      <li>14 becomes the new WebDAV example.</li>
+      <li>WebSockets 14 &rarr; 15, Streaming 15 &rarr; 16, Server Push
+        16 &rarr; 17, HTTP-3 Access 17 &rarr; 18, HTTP Benchmarks
+        18 &rarr; 19, GopherSite 19 &rarr; 20, MailSite 20 &rarr; 21,
+        Anonymous WebMail 21 &rarr; 22, DNS 22 &rarr; 23, FTP
+        23 &rarr; 24, SSH 24 &rarr; 25, TURN 25 &rarr; 26, and the final
+        example 26 &rarr; 27.</li>
+      <li>Fix any in-example references (titles, links, and the examples
+        index) so the numbering stays internally consistent.</li>
+    </ol>
+  </li>
+  <li>Replace the Fiber example (the current 26, which becomes 27 after
+    the renumber) with one that extends an existing server. Instead of
+    showing the raw cooperative-Fiber primitives, the example should
+    subclass or wrap one of atto's servers (for instance
+    <code>WebSite</code>) and add behaviour to it, so the example teaches
+    the ordinary way a reader would build on atto rather than the
+    internal loop mechanics.</li>
+</ol>
+</body>
+</html>

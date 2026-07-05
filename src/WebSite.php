@@ -85,6 +85,13 @@ class WebSite
      */
     const OUT_DATA_COMPACT_THRESHOLD = 65536;
     /**
+     * Largest number of bytes moved between a socket and memory in a
+     * single read or write pass, 128 kibibytes, when the server is not
+     * told otherwise. Capping each pass keeps one very large response
+     * from being copied whole and running the process out of memory.
+     */
+    const MAX_IO_LEN_DEFAULT = 128 * 1024;
+    /**
      * Number of random bytes in a session id. The id is stored and
      * compared as hex, so it is twice this many characters long.
      */
@@ -675,7 +682,8 @@ class WebSite
      */
     public function __construct(public $base_path = "")
     {
-        $this->default_server_globals = ["MAX_CACHE_FILESIZE" => 2000000];
+        $this->default_server_globals = ["MAX_CACHE_FILESIZE" => 2000000,
+            "MAX_IO_LEN" => self::MAX_IO_LEN_DEFAULT];
         $this->http_methods = array_keys($this->routes);
         if (empty($this->base_path)) {
             $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
@@ -1290,6 +1298,29 @@ class WebSite
             ['protocol' => $protocol];
     }
     /**
+     * Tells which HTTP protocol version the request being served right
+     * now arrived over, as a short tag: 'h1' for HTTP/1.1, 'h2' for
+     * HTTP/2, or 'h3' for HTTP/3. The access log uses this so each line
+     * shows how the client connected. It reads the per-request
+     * SERVER_PROTOCOL the dispatcher stamps for the request being
+     * served, which is the reliable value even for a buffered reply;
+     * anything other than the HTTP/2 and HTTP/3 markers is reported as
+     * 'h1'.
+     *
+     * @return string the protocol tag 'h1', 'h2', or 'h3'
+     */
+    public function requestProtocol()
+    {
+        $server_protocol = $_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1';
+        if ($server_protocol === 'HTTP/2.0') {
+            return 'h2';
+        }
+        if ($server_protocol === 'HTTP/3') {
+            return 'h3';
+        }
+        return 'h1';
+    }
+    /**
      * Takes the streaming producer a route parked by calling
      * $site->stream(), clearing it so the next request starts fresh.
      * Returns null when the route did not stream. The HTTP/3 listener uses
@@ -1483,10 +1514,8 @@ class WebSite
         $stall_limit =
             $this->default_server_globals['CONNECTION_TIMEOUT'];
         while ($written < $total) {
-            set_error_handler(null);
-            $num_written = fwrite($socket, ($written == 0) ? $data :
+            $num_written = @fwrite($socket, ($written == 0) ? $data :
                 substr($data, $written));
-            restore_error_handler();
             if ($num_written === false || feof($socket)) {
                 $this->streaming_failed = true;
                 return false;
@@ -2429,7 +2458,7 @@ class WebSite
             "CUSTOM_ERROR_HANDLER" => null,
             "DOCUMENT_ROOT" => getcwd(),
             "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
-            "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => 128 * 1024,
+            "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => self::MAX_IO_LEN_DEFAULT,
             "MAX_REQUEST_LEN" => 10000000, "MAX_SESSIONS" => 10000,
             "SESSION_IDLE_TIMEOUT" => self::SESSION_IDLE_TIMEOUT_DEFAULT,
             "LARGE_RESPONSE_LOG_LEN" =>

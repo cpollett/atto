@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>atto &mdash; Post v2 Notes: pure-PHP HTTP/3 status and bottlenecks</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 760px;
+    margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+    color: #1a1a1a; }
+h2 { margin-top: 2rem; border-bottom: 1px solid #ddd;
+    padding-bottom: 0.2rem; }
+ol, ul { margin: 0.4rem 0; }
+li { margin: 0.3rem 0; }
+.note { color: #555; font-size: 0.92em; margin: 0.6rem 0 1.2rem; }
+code { background: #f2f2f2; padding: 0 0.2em; border-radius: 3px; }
+table { border-collapse: collapse; margin: 0.8rem 0; }
+td, th { border: 1px solid #ddd; padding: 0.2rem 0.6rem;
+    text-align: left; }
+.total { font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>atto &mdash; Post v2 Notes</h1>
+<p class="note">Pure-PHP HTTP/3: status and known bottlenecks. Captured
+at the end of the H3-prep work series (phases through 15). Two things
+are recorded here: the decision to defer full 0-RTT session resumption,
+and a measured list of where the pure-PHP HTTP/3 listener spends its
+time relative to the HTTP/2 implementation. This is a planning document
+for the next round of work, not a final spec.</p>
+
+<h2>0-RTT (RFC 9001 &sect;4.6) &mdash; deferred</h2>
+<p>Status: the constants and extension IDs are in place
+(<code>HS_NEW_SESSION_TICKET</code>, <code>HS_END_OF_EARLY_DATA</code>,
+<code>EXT_PRE_SHARED_KEY</code>, <code>EXT_EARLY_DATA</code>,
+<code>EXT_PSK_KEY_EXCHANGE_MODES</code>). Nothing else is wired.</p>
+<p>Why it didn't ship in this round: 0-RTT touches more surface than any
+of phases 12&ndash;15 combined, and the parts that are easy to get wrong
+(PSK binder math, anti-replay accounting, ticket key rotation) are also
+the parts that, when wrong, fail silently or accept replay attacks. It
+is better to leave the feature off than to claim partial support.</p>
+<p>Concretely, a working 0-RTT implementation needs all of:</p>
+<ol>
+  <li><b>NewSessionTicket emission.</b> RFC 8446 &sect;4.6.1 message
+    format; lives in the encrypted handshake (an application_data record
+    after Finished). Carries ticket_lifetime, ticket_age_add,
+    ticket_nonce, the ticket bytes, and a quic_transport_parameters
+    extension carrying the server's max_early_data_size plus the original
+    transport params (RFC 9001 &sect;7.4.1).</li>
+  <li><b>Stateless ticket encryption</b> with a server STEK (Session
+    Ticket Encryption Key). AES-GCM is fine and atto already has it. The
+    ticket payload should bind the ALPN, the cipher suite, and the
+    resumption_master_secret from the original handshake. Stateful
+    tickets are simpler but tie a ticket to one server process; for a
+    single-process atto deployment that is acceptable too.</li>
+  <li><b>ClientHello PSK extension parsing on resumption.</b> RFC 8446
+    &sect;4.2.11: psk_key_exchange_modes extension plus the PSK identity
+    list plus binder MACs over the truncated ClientHello transcript hash.
+    The transcript boundary for the binder is the tricky part: it ends
+    just before the binder list itself, needing a custom hash boundary
+    that does not align with any other transcript boundary the engine
+    currently computes.</li>
+  <li><b>Binder verification.</b> HMAC of the truncated transcript using
+    the binder_key derived from the resumption secret. If verification
+    fails, fall back to a normal handshake rather than erroring &mdash;
+    the spec permits server-side rejection of any PSK.</li>
+  <li><b>New encryption level LEVEL_EARLY_DATA</b> plus the 0-RTT key
+    schedule per RFC 9001 &sect;5.5. 0-RTT keys derive from
+    client_early_traffic_secret, which itself derives from the resumption
+    master secret (RFC 8446 &sect;7.1). This is a new
+    <code>QuicPacketKeys::fromTrafficSecret</code> usage with a different
+    label.</li>
+  <li><b>0-RTT packet decoding.</b> Long-header type 0b01. Same
+    packet-number space as 1-RTT (per RFC 9001 &sect;17.2.3, 0-RTT and
+    1-RTT share PNs after handshake completion; the server discards 0-RTT
+    keys at that point per &sect;5.5).</li>
+  <li><b>Anti-replay buffer.</b> A bounded LRU keyed on (ticket_id, PN)
+    or on a token nonce in the ticket. RFC 9001 &sect;9.2: the server
+    must detect replays within the window the ticket allows. atto's
+    single-process model makes this easier than a distributed server, but
+    the buffer still needs reasonable sizing and a ticket-validity
+    timeout.</li>
+  <li><b>EncryptedExtensions handling:</b> include or omit the early_data
+    extension based on whether 0-RTT was accepted; the client uses that
+    signal to know whether to expect 1-RTT to promote its already-sent
+    0-RTT data or to retransmit it as 1-RTT.</li>
+</ol>
+<p>The quick parts (1, 2, 6) are a few hundred lines. The TLS-side PSK
+and binder math (3, 4, 5) plus the anti-replay buffer (7) are the bulk
+of the work, and exactly where correctness matters. A future pass should
+plan a multi-session scope rather than trying to land it in one go.</p>
+<p>For now, atto's HTTP/3 server completes a full 1-RTT handshake on
+every new connection. Connection mobility (phase 15) and stateless reset
+(phase 14) cover the operational pain 0-RTT would also have addressed;
+the remaining gap is purely the handshake-RTT saving on resumed
+connections.</p>
+
+<h2>Bottlenecks: where pure-PHP HTTP/3 spends time vs HTTP/2</h2>
+<p>Measurements taken on the dev sandbox over loopback. The bench
+command is <code>examples/18 HTTP Benchmarks/bench.php</code> with
+<code>--skip</code> filtered to the case under analysis. Wall-time
+numbers are medians over 10 iterations of <code>/big</code> (1 MiB body)
+unless noted.</p>
+<table>
+  <tr><th>Path</th><th>Median</th></tr>
+  <tr><td>HTTP/2 over loopback</td><td>~8 ms</td></tr>
+  <tr><td>HTTP/3 (pure-PHP) loopback</td><td>~100 ms (12x slower)</td></tr>
+</table>
+<p>The ratio narrows on real RTT (5&ndash;10 ms each way) because H3's
+0-RTT-after-resumption advantage shows there, and because H2's TCP
+head-of-line blocking starts to bite. On loopback it is a pure PHP-side
+processing comparison.</p>
+<p>Per-method bottleneck list, ordered by total cost:</p>
+<ol>
+  <li><b>AEAD (encrypt/decrypt + header protection) &mdash; ~36 ms
+    (~36% of /big).</b> <code>QuicPacketKeys::seal</code> ~4.2 us/call,
+    n~4880, ~21 ms; <code>headerProtectionMask</code> ~2.6 us/call,
+    n~5161, ~13 ms; <code>open</code> ~8 us/call, n~281, ~2 ms. Each
+    /big response goes through ~950 packets, each getting one seal, one
+    HP mask, and over the connection lifetime a handful of opens for
+    incoming ACKs. The seal cost is openssl's per-call dispatch overhead,
+    not the cipher math &mdash; <code>openssl_encrypt</code> at 1100
+    bytes is 2 us for AES-128-GCM but the PHP&rarr;openssl roundtrip adds
+    another 2 us per call. Helpful improvements: batch ~16 HP
+    sample-blocks into one openssl call and slice the output (~6 ms,
+    halves HP cost); sodium for AES-GCM is not available (sodium only
+    exposes AES-256-GCM, atto needs 128), though ChaCha20-Poly1305
+    already uses the faster sodium path; PHP 8.4's openssl functions are
+    slightly faster and mostly already captured.</li>
+  <li><b>Frame encode/decode dispatch &mdash; ~5&ndash;8 ms.</b>
+    <code>QuicFrame::encode</code> (~5000 calls per /big) dispatches via
+    a switch on type and concatenates a few varints plus the payload; the
+    hot case <code>encodeStream</code> could be inlined into
+    <code>flushStreams</code> to skip the case lookup, saving ~1 us per
+    packet. <code>decodeAll</code> runs ~30 times per /big (ACKs
+    only).</li>
+  <li><b>Per-packet emit() loop bookkeeping &mdash; ~10&ndash;15 ms.</b>
+    <code>QuicConnection::emit</code> walks send_queue, classifies the
+    payload, increments PN, builds a QuicPacket, calls
+    <code>encodeShort</code>, appends to sent_packets, and bumps
+    bytes_in_flight. For 950 packets that is many array operations (PHP
+    array writes cost 100&ndash;200 ns each; the inner loop touches ~5
+    arrays per iteration). Wins: pool QuicPacket objects instead of
+    allocating fresh per packet (~0.5 ms); pack the sent_packets entry
+    into a string/array instead of an associative array (~1 ms); hoist
+    the <code>next_pn[$level]++</code> deref outside the loop where
+    missed.</li>
+  <li><b>Stream send-buffer chunking &mdash; ~8&ndash;12 ms.</b> For /big
+    the body is one 1 MiB string in <code>QuicStream::send_buf</code>;
+    <code>flushStreams</code> <code>takeForFrame()</code>s 1100-byte
+    chunks repeatedly, each a <code>substr()</code> of the remaining
+    buffer. substr on a 1 MiB string is O(N) because it allocates a new
+    buffer; over 950 chunks that is ~480 MiB of allocator churn for a
+    1 MiB transfer. Best fix: keep an integer offset into send_buf
+    instead of mutating it &mdash; takeForFrame returns
+    <code>substr($buf, $offset, $chunk)</code> and offset advances;
+    send_buf stays immutable until the transfer completes (~5 ms).</li>
+  <li><b>processDatagram per-packet path &mdash; ~3&ndash;5 ms (inbound
+    only).</b> Most /big load is outbound, so this cost is dominated by
+    the inbound ACK stream (~30 ACK packets per 1 MiB response). Each ACK
+    runs <code>decodeShort</code> + AEAD open + frame decode + processAck;
+    processAck walks ACK ranges, which is cheap for the small ACK packets
+    aioquic sends.</li>
+  <li><b>Loss-detection timer arithmetic &mdash; ~2&ndash;3 ms.</b>
+    <code>setLossDetectionTimer</code> (called on every PN change to
+    sent_packets) walks loss_time across all three PN spaces and
+    sent_packets to find the earliest deadline. Could cache the earliest
+    entry and invalidate only on insert/remove of packets earlier than
+    the cached value (~1&ndash;2 ms).</li>
+  <li><b>UDP send syscall overhead &mdash; ~10 ms.</b>
+    <code>stream_socket_sendto</code> once per emitted packet (~950 calls
+    per /big). Could batch via sendmmsg if PHP exposed it (it doesn't).
+    On Linux, sendto for a 1200-byte UDP packet is ~10 us. The real fix
+    is at the PHP/libc level, not actionable from inside atto today.</li>
+  <li><b>Header protection ChaCha20 openssl vs sodium-XOR.</b> Already on
+    the openssl-or-sodium fallback path; openssl is used when available
+    (the faster of the two). On macOS + LibreSSL the pure-PHP RFC 8439
+    fallback fires and is significantly slower &mdash; mostly a packaging
+    note, not a code fix.</li>
+</ol>
+
+<h2>Totals and the H2-vs-H3 gap</h2>
+<table>
+  <tr><td>AEAD / HP</td><td>~36 ms</td></tr>
+  <tr><td>emit loop overhead</td><td>~10&ndash;15 ms</td></tr>
+  <tr><td>flushStreams chunking</td><td>~8&ndash;12 ms</td></tr>
+  <tr><td>frame encode/decode</td><td>~5&ndash;8 ms</td></tr>
+  <tr><td>processDatagram</td><td>~3&ndash;5 ms</td></tr>
+  <tr><td>loss timer</td><td>~2&ndash;3 ms</td></tr>
+  <tr><td>syscall overhead</td><td>~10 ms</td></tr>
+  <tr class="total"><td>measured roughly</td><td>~75&ndash;90 ms</td></tr>
+  <tr><td>remainder (~10&ndash;25 ms)</td><td>PHP call overhead,
+    allocator pressure, GC</td></tr>
+</table>
+<p>H2 over the same /big bench is ~8 ms total because HTTP/2 framing is
+much simpler (one HEADERS + one DATA frame with a length prefix versus
+~950 QUIC packets each with AEAD); TLS wrapping happens inside openssl in
+one go via stream filters rather than per-record from PHP; and there is
+no per-packet PN bookkeeping, no congestion control inside PHP, and no
+header protection.</p>
+
+<h2>Realistic future-perf ceiling</h2>
+<p>Most of the H2/H3 gap is intrinsic to the design choice: H3 does in
+PHP what H2 lets the kernel and openssl do in C. The biggest realizable
+wins from inside the H3 listener:</p>
+<ul>
+  <li>flushStreams substr chunking (~5 ms saved) &mdash; easy</li>
+  <li>loss-timer caching (~1&ndash;2 ms saved) &mdash; easy</li>
+  <li>HP mask batching (~6 ms saved) &mdash; medium</li>
+  <li>pool / streamline emit() per-packet allocations &mdash; medium</li>
+  <li>sent_packets entries packed instead of associative &mdash;
+    medium</li>
+</ul>
+<p>If all landed cleanly, /big would drop from ~100 ms to ~80 ms &mdash;
+still ~10x slower than H2. To get materially closer, the path forward is
+the libquiche-FFI listener (<code>H3QuicheListener</code>), which
+delegates the hot loop to native code. But on this dev box even
+libquiche came in slower than the pure-PHP listener for /big (the FFI
+roundtrip per call dominates), which is the surprise that motivated
+keeping <code>H3Listener</code> as primary.</p>
+<p>For deployments where H3 throughput matters more than the joys of a
+single-file framework, the real answer is a frontend reverse proxy
+(nginx, caddy, h2o) speaking H3 to clients and H2 to atto. That puts atto
+in the role where its measured strengths show: expressive routing,
+low-overhead H2/H1 dispatch, and a single PHP file you can read end to
+end.</p>
+</body>
+</html>

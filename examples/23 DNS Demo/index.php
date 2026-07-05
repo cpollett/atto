@@ -115,7 +115,7 @@ if (!is_dir($zone_dir)) {
 $authority = new FileDnsAuthority($zone_dir);
 $dns = new DnsSite($authority);
 /*
-    Spawn the companion web UI exactly like example 21.
+    Spawn the companion web UI exactly like example 22.
     Detached child so the parent process is free to run the
     DNS event loop. On Unix we capture the child PID and
     kill it on shutdown via register_shutdown_function. On

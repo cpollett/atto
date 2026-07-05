@@ -60,7 +60,7 @@ $store_dir = __DIR__ . '/maildata';
     file is plain text containing one of "file", "ram", or
     "sql"; an absent or unrecognized value is treated as
     "file" so a fresh checkout behaves like the original
-    example 20.
+    example 21.
  */
 $engine_file = __DIR__ . '/engine.txt';
 $engine = readEngineNow();

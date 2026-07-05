@@ -27,7 +27,7 @@ that shows it and a reworked final example that demonstrates extending
 an existing server rather than the raw Fiber primitives.</p>
 
 <ol>
-  <li><span class="next">Next</span> Back-port the <code>WebSite</code>
+  <li><span class="check">&#10003;</span> Back-port the <code>WebSite</code>
     WebDAV changes from Yioop into <code>github.com/cpollett/atto</code>.
     The WebDAV verbs (<code>OPTIONS</code>, <code>PROPFIND</code>,
     <code>MKCOL</code>, <code>PUT</code>, <code>GET</code>,
@@ -35,8 +35,15 @@ an existing server rather than the raw Fiber primitives.</p>
     present) and their routing should live in atto's own
     <code>WebSite</code>, decoupled from anything Yioop-specific, keeping
     atto's no-config, single-file character.</li>
-  <li>Add a WebDAV example as example 14, and renumber every existing
-    example from 14 onward up by one so nothing is lost:
+  <li><span class="check">&#10003;</span> Add a WebDAV example as example
+    14, and renumber every existing example from 14 onward up by one so
+    nothing is lost. Example 14 serves a folder over WebDAV under /dav/ by
+    registering route handlers for OPTIONS, PROPFIND, GET, PUT, MKCOL,
+    DELETE, and MOVE, using a <code>/dav/*</code> wildcard route so a
+    resource can sit any number of folders deep and the bare share root
+    resolves too; every path is confirmed to stay inside the share before a
+    read or write. The next-numbered example after the shift becomes the
+    final one (now 27):
     <ol>
       <li>14 becomes the new WebDAV example.</li>
       <li>WebSockets 14 &rarr; 15, Streaming 15 &rarr; 16, Server Push
@@ -49,7 +56,8 @@ an existing server rather than the raw Fiber primitives.</p>
         index) so the numbering stays internally consistent.</li>
     </ol>
   </li>
-  <li>Replace the Fiber example (the current 26, which becomes 27 after
+  <li><span class="next">Next</span> Replace the Fiber example (the
+    current 26, which becomes 27 after
     the renumber) with one that extends an existing server. Instead of
     showing the raw cooperative-Fiber primitives, the example should
     subclass or wrap one of atto's servers (for instance

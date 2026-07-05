@@ -14,7 +14,7 @@
  * Demonstrates:
  *   - RamMailStorage: zero-disk storage backend, exercised
  *     end-to-end through the same SMTP and IMAP code paths
- *     as the on-disk file backend in example 20
+ *     as the on-disk file backend in example 21
  *   - AnonAuthenticator: shared-password authenticator used
  *     only on the IMAP loopback between the webmail UI
  *     process and the mail server process; the webmail UI
@@ -27,8 +27,8 @@
  *
  *      php index.php
  *
- * Listens on the same SMTP and IMAP ports as example 20
- * (2525 / 1143) -- if you have example 20 running, kill it
+ * Listens on the same SMTP and IMAP ports as example 21
+ * (2525 / 1143) -- if you have example 21 running, kill it
  * first or these binds will fail. The companion webmail UI
  * is spawned automatically and lives at
  *
@@ -108,7 +108,7 @@
  *   - Allocate a real domain instead of anon.test
  *
  * The demo skips all of that to keep the example readable.
- * The same MailSite hooks shown in example 20 still work
+ * The same MailSite hooks shown in example 21 still work
  * here; nothing about RamMailStorage changes the policy
  * surface.
  */
@@ -182,10 +182,10 @@ $mail->onMailFrom(function ($info, $context) {
 });
 /*
     Spawn the companion webmail UI. Same detached-child
-    pattern as example 20; see that file for cross-platform
+    pattern as example 21; see that file for cross-platform
     notes. The webui is reached at http://localhost:8080/
     -- the conventional port for atto example webuis. If
-    you have example 20 (or any other example webui)
+    you have example 21 (or any other example webui)
     running on the same machine, kill it before starting
     this one.
  */

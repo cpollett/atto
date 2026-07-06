@@ -415,6 +415,42 @@ ok("the status line carries the request's protocol",
     strncmp($line_two, "HTTP/2.0 200 ", 13) === 0 &&
     strncmp($line_three, "HTTP/3.0 200 ", 13) === 0);
 
+/*
+    -----------------------------------------------------------
+    Autodiscovery: bootstrap redirect and principal properties
+    -----------------------------------------------------------
+ */
+
+/* Test 23: the well-known bootstrap redirects to the calendar
+   service root a client can read the principal from. */
+$site->reset();
+request("/.well-known/caldav");
+$dav->handleWellKnown();
+ok("the well-known path redirects to the service root",
+    $site->status() === 301 &&
+    $site->headerValue("Location") === "$prefix/");
+
+/* Test 24: PROPFIND on a calendar reports the discovery
+   properties pointing at the calendar home. */
+$site->reset();
+request("$prefix/work", "", ["HTTP_DEPTH" => "0"]);
+$out = capture([$dav, "handlePropfind"]);
+$principal = "<D:current-user-principal><D:href>$prefix/</D:href>";
+$home = "<C:calendar-home-set><D:href>$prefix/</D:href>";
+ok("PROPFIND on a calendar reports the discovery properties",
+    strpos($out, $principal) !== false &&
+    strpos($out, $home) !== false);
+
+/* Test 25: PROPFIND on the plain collection that holds the
+   calendars reports the discovery properties too, so a client that
+   lands there can walk on. */
+$site->reset();
+request("$prefix", "", ["HTTP_DEPTH" => "0"]);
+$out = capture([$dav, "handlePropfind"]);
+ok("PROPFIND on the calendar home reports the discovery properties",
+    strpos($out, $principal) !== false &&
+    strpos($out, $home) !== false);
+
 /**
  * Removes a file, or a folder and everything under it, so the
  * test leaves nothing behind on disk.

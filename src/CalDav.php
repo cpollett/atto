@@ -78,6 +78,14 @@ class CalDav
      */
     const NS_CALSERVER = "http://calendarserver.org/ns/";
     /**
+     * The bootstrap path a calendar client probes when given only a
+     * base URL, fixed by RFC 6764. A request here is redirected to
+     * the calendar service so the client can read the principal and
+     * calendar-home properties from there.
+     * @var string
+     */
+    const WELL_KNOWN_PATH = "/.well-known/caldav";
+    /**
      * Seconds in a minute, for reading an iCalendar duration.
      * @var int
      */
@@ -163,9 +171,16 @@ class CalDav
      * Adds every calendar route to the site. Both the bare prefix
      * (the list of calendars) and any path beneath it are routed,
      * so a handler can address a calendar or an event any number
-     * of folders deep. Call this once after construction.
+     * of folders deep. When $with_well_known is left on, the
+     * RFC 6764 bootstrap path is routed too, so a client given only
+     * the base URL can find the service; a project that manages
+     * <code>/.well-known</code> itself can pass false to skip it.
+     * Call this once after construction.
+     *
+     * @param bool $with_well_known whether to route the
+     *      /.well-known/caldav bootstrap redirect
      */
-    public function register()
+    public function register($with_well_known = true)
     {
         $prefix = $this->route_prefix;
         $verbs = [
@@ -180,6 +195,12 @@ class CalDav
         foreach ($verbs as $verb => $method) {
             $this->site->addRoute($verb, $prefix, [$this, $method]);
             $this->site->addRoute($verb, $prefix . "/*", [$this, $method]);
+        }
+        if ($with_well_known) {
+            $this->site->addRoute("GET", self::WELL_KNOWN_PATH,
+                [$this, "handleWellKnown"]);
+            $this->site->addRoute("PROPFIND", self::WELL_KNOWN_PATH,
+                [$this, "handleWellKnown"]);
         }
     }
 
@@ -460,6 +481,20 @@ class CalDav
     }
 
     /**
+     * Answers the /.well-known/caldav bootstrap: redirects a probing
+     * client to the calendar service root, from which it reads the
+     * principal and calendar-home properties and then the calendars.
+     * The redirect carries nothing sensitive, so it is not gated on
+     * log-in; the properties it points at are. (RFC 6764.)
+     */
+    public function handleWellKnown()
+    {
+        $this->status(301, "Moved Permanently");
+        $this->site->header("Location: " . $this->route_prefix . "/");
+        $this->site->header("Content-Length: 0");
+    }
+
+    /**
      * Answers MKCALENDAR: makes a new calendar folder and writes
      * its metadata (display name and accepted component types) from
      * the request body. A fresh calendar answers 201; a name that
@@ -576,6 +611,26 @@ class CalDav
     }
 
     /**
+     * Builds the two discovery properties a client reads to find its
+     * calendars from the base URL alone: current-user-principal
+     * names the principal, and calendar-home-set names the folder the
+     * calendars live under. This server keeps one home for everyone,
+     * so both point at the route prefix; a project with per-user
+     * homes (for instance Yioop) overrides this to return per-user
+     * hrefs. (RFC 5397, RFC 4791.)
+     *
+     * @return string the property elements
+     */
+    protected function principalProps()
+    {
+        $home = htmlspecialchars($this->route_prefix . "/");
+        return "<D:current-user-principal><D:href>" . $home .
+            "</D:href></D:current-user-principal>" .
+            "<C:calendar-home-set><D:href>" . $home .
+            "</D:href></C:calendar-home-set>";
+    }
+
+    /**
      * Builds the response element for a calendar folder: it is a
      * collection and a calendar, and it carries a display name,
      * its accepted component types, and its change tag.
@@ -599,21 +654,23 @@ class CalDav
             "<C:supported-calendar-component-set>" . $components .
             "</C:supported-calendar-component-set>" .
             "<CS:getctag>" . $this->computeCTag($disk_path) .
-            "</CS:getctag>";
+            "</CS:getctag>" . $this->principalProps();
         return $this->wrapResponse($href, $prop);
     }
 
     /**
      * Builds the response element for a plain folder, such as the
-     * folder that holds the calendars: it is a collection and
-     * nothing more.
+     * folder that holds the calendars: it is a collection, and it
+     * carries the discovery properties so a client that lands here
+     * can walk on to the calendars.
      *
      * @param string $href the href to report for it
      * @return string the response element
      */
     protected function collectionResponse($href)
     {
-        $prop = "<D:resourcetype><D:collection/></D:resourcetype>";
+        $prop = "<D:resourcetype><D:collection/></D:resourcetype>" .
+            $this->principalProps();
         return $this->wrapResponse($href, $prop);
     }
 

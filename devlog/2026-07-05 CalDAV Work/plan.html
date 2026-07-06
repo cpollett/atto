@@ -139,7 +139,7 @@ is new versus the existing WebDAV share, in one place:</p>
     pure helpers and the full lifecycle over a scratch folder.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Add the <code>REPORT</code> verb and
+  <li><span class="check">&#10003;</span> Add the <code>REPORT</code> verb and
     the iCalendar reading it needs, the one part of the calendar lifecycle
     not yet in place. The other verbs shipped with the class above; this
     item is what lets a client ask a calendar questions rather than only
@@ -168,10 +168,21 @@ is new versus the existing WebDAV share, in one place:</p>
         pure checks on known input, and each report driven over a scratch
         folder with events at known times.</li>
     </ul>
+    <p class="note">Done: <code>handleReport</code> answers
+    <code>calendar-multiget</code> (returns each named event's ETag and
+    data, a not-found entry for a missing one) and <code>calendar-query</code>
+    (filters by component type and an optional time range). The iCalendar
+    reader &mdash; <code>parseIcalTime</code>, <code>parseDuration</code>,
+    <code>icalComponents</code>, <code>icalEventRange</code>, and an overlap
+    test &mdash; reads times as UTC and covers the common VEVENT cases, not
+    the full RFC&nbsp;4791 &sect;9.9 matrix or named-zone conversion; the
+    <code>REPORT</code> route is registered and advertised in
+    <code>OPTIONS</code>. Tests in
+    <code>tests/caldav/test_caldav_report.php</code> (20 checks).</p>
   </li>
 
-  <li>Client autodiscovery on the class, so a real client needs only the
-    base URL:
+  <li><span class="next">&rarr;</span> Client autodiscovery on the class,
+    so a real client needs only the base URL:
     <ul>
       <li>A <code>/.well-known/caldav</code> bootstrap (RFC&nbsp;6764) that
         redirects a probing client to the service.</li>

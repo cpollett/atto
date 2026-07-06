@@ -59,7 +59,7 @@ is new versus the existing WebDAV share, in one place:</p>
 </ul>
 
 <ol>
-  <li><span class="next">&rarr;</span> Add the two CalDAV verbs,
+  <li><span class="check">&#10003;</span> Add the two CalDAV verbs,
     <code>REPORT</code> and <code>MKCALENDAR</code>, to atto's
     <code>WebSite</code> routing, so a CalDAV handler is an ordinary route
     callback the way the WebDAV verbs already are. Concretely this touches
@@ -78,9 +78,18 @@ is new versus the existing WebDAV share, in one place:</p>
       <li>Confirm the existing WebDAV example and its tests still pass
         unchanged, since this step only widens the set of accepted verbs.</li>
     </ol>
+    <p class="note">Done: the two verbs were added to the routes table, the
+    length constant (9&rarr;10, docblock corrected), the
+    <code>checkHttpType</code> sniff, and the request-line parser. The
+    HTTP/2 path needed no change &mdash; it passes <code>:method</code>
+    through. A unit test,
+    <code>tests/caldav/test_caldav_verbs.php</code>, covers registration,
+    dispatch, the length budget, the sniff, and a full request-line parse,
+    each with a bogus-verb control; the whole suite stays green.</p>
   </li>
 
-  <li>Put the calendar behaviour in a reusable <code>CalDav</code> class in
+  <li><span class="next">&rarr;</span> Put the calendar behaviour in a
+    reusable <code>CalDav</code> class in
     <code>src/CalDav.php</code>, and have the example wire it into a
     <code>WebSite</code>. This class is the calendar endpoint the atto
     example uses, and is written so the Yioop project can reuse it against

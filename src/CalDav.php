@@ -77,6 +77,27 @@ class CalDav
      * @var string
      */
     const NS_CALSERVER = "http://calendarserver.org/ns/";
+    /**
+     * Seconds in a minute, for reading an iCalendar duration.
+     * @var int
+     */
+    const SECONDS_PER_MINUTE = 60;
+    /**
+     * Seconds in an hour, for reading an iCalendar duration.
+     * @var int
+     */
+    const SECONDS_PER_HOUR = 3600;
+    /**
+     * Seconds in a day, for reading an iCalendar duration and for
+     * the span an all-day (DATE) event covers.
+     * @var int
+     */
+    const SECONDS_PER_DAY = 86400;
+    /**
+     * Seconds in a week, for reading an iCalendar duration.
+     * @var int
+     */
+    const SECONDS_PER_WEEK = 604800;
 
     /**
      * The WebSite (or subclass) this calendar attaches to. Route
@@ -154,6 +175,7 @@ class CalDav
             "GET" => "handleGet",
             "PUT" => "handlePut",
             "DELETE" => "handleDelete",
+            "REPORT" => "handleReport",
         ];
         foreach ($verbs as $verb => $method) {
             $this->site->addRoute($verb, $prefix, [$this, $method]);
@@ -433,7 +455,7 @@ class CalDav
         $this->status(200, "OK");
         $this->site->header("DAV: 1, calendar-access");
         $this->site->header("Allow: OPTIONS, PROPFIND, MKCALENDAR, GET, " .
-            "PUT, DELETE");
+            "PUT, DELETE, REPORT");
         $this->site->header("Content-Length: 0");
     }
 
@@ -762,5 +784,408 @@ class CalDav
             return;
         }
         unlink($path);
+    }
+
+    /**
+     * Answers REPORT: runs one of the two calendar reports a client
+     * uses to read events. calendar-multiget returns a named set of
+     * events; calendar-query returns the events matching a filter.
+     * Both answer a 207 multi-status. An unrecognized report answers
+     * 400.
+     */
+    public function handleReport()
+    {
+        if (!$this->authenticate()) {
+            return;
+        }
+        $body = $_SERVER['CONTENT'] ?? "";
+        if (stripos($body, "calendar-multiget") !== false) {
+            $this->reportMultiget($body);
+            return;
+        }
+        if (stripos($body, "calendar-query") !== false) {
+            $this->reportQuery($body);
+            return;
+        }
+        $this->status(400, "Bad Request");
+    }
+
+    /**
+     * Runs a calendar-multiget report: the body lists event hrefs,
+     * and the reply returns each named event's ETag and calendar
+     * data, or a not-found entry for one that is missing, so a
+     * client fetches many events in a single round trip.
+     *
+     * @param string $body the REPORT request body
+     */
+    protected function reportMultiget($body)
+    {
+        $responses = "";
+        foreach ($this->parseHrefs($body) as $href) {
+            $disk_path = $this->containedPath($this->resourceForUri($href));
+            if ($disk_path === false || !is_file($disk_path)) {
+                $responses .= $this->notFoundResponse($href);
+                continue;
+            }
+            $bytes = $this->site->fileGetContents($disk_path);
+            $responses .= $this->calendarDataResponse($href, $bytes);
+        }
+        $this->emitMultistatus($responses);
+    }
+
+    /**
+     * Runs a calendar-query report: the body filters by component
+     * type and an optional time range, and the reply returns each
+     * stored event that matches. Each event is read only far enough
+     * to decide whether it belongs; the returned bytes are the
+     * stored bytes.
+     *
+     * @param string $body the REPORT request body
+     */
+    protected function reportQuery($body)
+    {
+        $resource = $this->resourceForUri();
+        $disk_path = $this->containedPath($resource);
+        if ($disk_path === false || !is_dir($disk_path)) {
+            $this->status(404, "Not Found");
+            return;
+        }
+        $component = $this->parseQueryComponent($body);
+        list($range_start, $range_end) = $this->parseQueryRange($body);
+        $responses = "";
+        foreach (scandir($disk_path) as $entry) {
+            if (!$this->isResourceName($entry)) {
+                continue;
+            }
+            $bytes = $this->site->fileGetContents($disk_path . "/" . $entry);
+            if (!$this->eventMatches($bytes, $component, $range_start,
+                $range_end)) {
+                continue;
+            }
+            $child_rel = ltrim($resource . "/" . $entry, "/");
+            $href = $this->hrefFor($child_rel, false);
+            $responses .= $this->calendarDataResponse($href, $bytes);
+        }
+        $this->emitMultistatus($responses);
+    }
+
+    /**
+     * Wraps a set of response elements in a 207 multi-status
+     * document with the DAV and CalDAV namespaces, and sends it.
+     *
+     * @param string $responses the response elements to wrap
+     */
+    protected function emitMultistatus($responses)
+    {
+        $body = '<?xml version="1.0" encoding="utf-8"?>' .
+            '<D:multistatus xmlns:D="' . self::NS_DAV . '" xmlns:C="' .
+            self::NS_CALDAV . '" xmlns:CS="' . self::NS_CALSERVER . '">' .
+            $responses . "</D:multistatus>";
+        $this->status(207, "Multi-Status");
+        $this->site->header("Content-Type: application/xml; charset=utf-8");
+        echo $body;
+    }
+
+    /**
+     * Builds a response element carrying an event's ETag and its
+     * calendar data, as the two calendar reports return for a
+     * matched event. The event's bytes are XML-escaped so they nest
+     * safely inside the reply.
+     *
+     * @param string $href the event's href
+     * @param string $bytes the event's stored bytes
+     * @return string the response element
+     */
+    protected function calendarDataResponse($href, $bytes)
+    {
+        $prop = "<D:getetag>" . $this->computeETag($bytes) .
+            "</D:getetag><C:calendar-data>" . htmlspecialchars($bytes) .
+            "</C:calendar-data>";
+        return $this->wrapResponse($href, $prop);
+    }
+
+    /**
+     * Builds a response element marking an href not found, as a
+     * calendar-multiget reply does for an event the client named
+     * that is not there. The status here is response-document
+     * content the client reads, not the transport status line.
+     *
+     * @param string $href the href that was not found
+     * @return string the response element
+     */
+    protected function notFoundResponse($href)
+    {
+        return "<D:response><D:href>" . htmlspecialchars($href) .
+            "</D:href><D:status>HTTP/1.1 404 Not Found</D:status>" .
+            "</D:response>";
+    }
+
+    /**
+     * Reads the href list out of a calendar-multiget body. Only the
+     * fixed vocabulary is looked for, so each href element's text is
+     * taken directly.
+     *
+     * @param string $body the REPORT request body
+     * @return array the hrefs the body named
+     */
+    public function parseHrefs($body)
+    {
+        $pattern = "/<(?:[\\w.-]+:)?href[^>]*>(.*?)" .
+            "<\\/(?:[\\w.-]+:)?href>/si";
+        $hrefs = [];
+        if (preg_match_all($pattern, $body, $matches)) {
+            foreach ($matches[1] as $href) {
+                $hrefs[] = trim(html_entity_decode($href));
+            }
+        }
+        return $hrefs;
+    }
+
+    /**
+     * Reads the component type a calendar-query filters on, that is,
+     * the innermost comp-filter that is not the VCALENDAR wrapper.
+     * An empty string means the query did not narrow to one
+     * component, so every component matches.
+     *
+     * @param string $body the REPORT request body
+     * @return string the component type name, or an empty string
+     */
+    public function parseQueryComponent($body)
+    {
+        $pattern = "/<(?:[\\w.-]+:)?comp-filter\\s+[^>]*name=" .
+            "\"([^\"]+)\"/i";
+        $component = "";
+        if (preg_match_all($pattern, $body, $matches)) {
+            foreach ($matches[1] as $name) {
+                if (strtoupper($name) !== "VCALENDAR") {
+                    $component = strtoupper($name);
+                }
+            }
+        }
+        return $component;
+    }
+
+    /**
+     * Reads the time range a calendar-query asks for as a pair of
+     * unix timestamps, or a pair of nulls when the query names no
+     * range, in which case a matching component is returned whatever
+     * its time.
+     *
+     * @param string $body the REPORT request body
+     * @return array the start and end timestamps, each an int or null
+     */
+    public function parseQueryRange($body)
+    {
+        $pattern = "/<(?:[\\w.-]+:)?time-range\\b[^>]*>/i";
+        if (!preg_match($pattern, $body, $matches)) {
+            return [null, null];
+        }
+        $element = $matches[0];
+        $start = null;
+        $end = null;
+        if (preg_match("/\\bstart=\"([^\"]+)\"/", $element, $found)) {
+            $start = $this->parseIcalTime($found[1]);
+        }
+        if (preg_match("/\\bend=\"([^\"]+)\"/", $element, $found)) {
+            $end = $this->parseIcalTime($found[1]);
+        }
+        return [$start, $end];
+    }
+
+    /**
+     * Reads the component types present in an event's iCalendar
+     * text, such as VEVENT or VTODO, from its BEGIN lines. The
+     * VCALENDAR wrapper is left out.
+     *
+     * @param string $ics the event's iCalendar text
+     * @return array the component type names present
+     */
+    public function icalComponents($ics)
+    {
+        $pattern = "/^BEGIN:(V[A-Z]+)\\s*$/mi";
+        $found = [];
+        if (preg_match_all($pattern, $ics, $matches)) {
+            foreach ($matches[1] as $name) {
+                $name = strtoupper($name);
+                if ($name !== "VCALENDAR") {
+                    $found[$name] = true;
+                }
+            }
+        }
+        return array_keys($found);
+    }
+
+    /**
+     * Reads an event's start and end as unix timestamps from its
+     * DTSTART and, when present, DTEND or DURATION. An event given
+     * only a DATE start covers the day; one given only a date-time
+     * start is instantaneous. Times are read as UTC; a named-zone
+     * start is read by its clock digits, which serves the common
+     * all-day and UTC events without carrying a timezone database.
+     *
+     * @param string $ics the event's iCalendar text
+     * @return array the start and end timestamps, each an int or null
+     */
+    public function icalEventRange($ics)
+    {
+        $start_line = $this->icalPropertyLine($ics, "DTSTART");
+        if ($start_line === null) {
+            return [null, null];
+        }
+        $start = $this->parseIcalTime($start_line);
+        if ($start === null) {
+            return [null, null];
+        }
+        $end_line = $this->icalPropertyLine($ics, "DTEND");
+        if ($end_line !== null) {
+            $end = $this->parseIcalTime($end_line);
+            return [$start, ($end === null) ? $start : $end];
+        }
+        $duration_line = $this->icalPropertyLine($ics, "DURATION");
+        if ($duration_line !== null) {
+            return [$start, $start + $this->parseDuration($duration_line)];
+        }
+        if (stripos($start_line, "VALUE=DATE") !== false ||
+            preg_match("/:\\d{8}\\s*$/", $start_line)) {
+            return [$start, $start + self::SECONDS_PER_DAY];
+        }
+        return [$start, $start];
+    }
+
+    /**
+     * Finds an iCalendar property line by name and returns it whole,
+     * or null when the event has no such line. The name may carry
+     * parameters after a semicolon, as DTSTART;VALUE=DATE does.
+     *
+     * @param string $ics the event's iCalendar text
+     * @param string $prop the property name to find, such as DTSTART
+     * @return string|null the matching line, trimmed, or null
+     */
+    protected function icalPropertyLine($ics, $prop)
+    {
+        $pattern = "/^" . preg_quote($prop, "/") . "[;:][^\\r\\n]*/mi";
+        if (preg_match($pattern, $ics, $matches)) {
+            return trim($matches[0]);
+        }
+        return null;
+    }
+
+    /**
+     * Parses an iCalendar date or date-time into a unix timestamp,
+     * read as UTC. Accepts a bare value such as 20260115T130000Z or
+     * a whole property line, taking the text after the last colon as
+     * the value. Returns null when no date is found.
+     *
+     * @param string $text a value or property line holding the date
+     * @return int|null the timestamp, or null when none is found
+     */
+    public function parseIcalTime($text)
+    {
+        $colon = strrpos($text, ":");
+        $value = ($colon === false) ? $text : substr($text, $colon + 1);
+        $value = trim($value);
+        if (preg_match("/^(\\d{4})(\\d{2})(\\d{2})" .
+            "(?:T(\\d{2})(\\d{2})(\\d{2}))?/", $value, $parts)) {
+            $hour = isset($parts[4]) ? (int)$parts[4] : 0;
+            $minute = isset($parts[5]) ? (int)$parts[5] : 0;
+            $second = isset($parts[6]) ? (int)$parts[6] : 0;
+            return gmmktime($hour, $minute, $second, (int)$parts[2],
+                (int)$parts[3], (int)$parts[1]);
+        }
+        return null;
+    }
+
+    /**
+     * Parses an iCalendar duration such as PT1H30M or P1D into a
+     * number of seconds, reading the week, day, hour, minute, and
+     * second parts it carries. An unreadable duration reads as zero.
+     *
+     * @param string $text a value or property line holding a duration
+     * @return int the duration in seconds
+     */
+    public function parseDuration($text)
+    {
+        $colon = strrpos($text, ":");
+        $value = ($colon === false) ? $text : substr($text, $colon + 1);
+        $seconds = 0;
+        if (preg_match("/(\\d+)W/", $value, $found)) {
+            $seconds += (int)$found[1] * self::SECONDS_PER_WEEK;
+        }
+        if (preg_match("/(\\d+)D/", $value, $found)) {
+            $seconds += (int)$found[1] * self::SECONDS_PER_DAY;
+        }
+        if (preg_match("/(\\d+)H/", $value, $found)) {
+            $seconds += (int)$found[1] * self::SECONDS_PER_HOUR;
+        }
+        if (preg_match("/(\\d+)M/", $value, $found)) {
+            $seconds += (int)$found[1] * self::SECONDS_PER_MINUTE;
+        }
+        if (preg_match("/(\\d+)S/", $value, $found)) {
+            $seconds += (int)$found[1];
+        }
+        return $seconds;
+    }
+
+    /**
+     * Decides whether a stored event matches a calendar-query: its
+     * component type must match the filter, when the filter named
+     * one, and, when the query gave a time range, the event must
+     * overlap it.
+     *
+     * @param string $ics the event's iCalendar text
+     * @param string $component the component type filtered on, or ""
+     * @param int|null $range_start the query range start, or null
+     * @param int|null $range_end the query range end, or null
+     * @return bool whether the event matches
+     */
+    public function eventMatches($ics, $component, $range_start, $range_end)
+    {
+        if ($component !== "" &&
+            !in_array($component, $this->icalComponents($ics))) {
+            return false;
+        }
+        if ($range_start === null && $range_end === null) {
+            return true;
+        }
+        list($event_start, $event_end) = $this->icalEventRange($ics);
+        if ($event_start === null) {
+            return false;
+        }
+        return $this->rangesOverlap($event_start, $event_end,
+            $range_start, $range_end);
+    }
+
+    /**
+     * Tests whether an event's span overlaps a query window. A null
+     * bound on the query leaves that side open. A zero-length event
+     * counts as overlapping when its instant falls within the
+     * window; a spanning event overlaps when it starts before the
+     * window ends and ends after the window starts.
+     *
+     * @param int $event_start the event's start timestamp
+     * @param int $event_end the event's end timestamp
+     * @param int|null $range_start the window start, or null for open
+     * @param int|null $range_end the window end, or null for open
+     * @return bool whether the spans overlap
+     */
+    protected function rangesOverlap($event_start, $event_end,
+        $range_start, $range_end)
+    {
+        if ($event_end <= $event_start) {
+            if ($range_start !== null && $event_start < $range_start) {
+                return false;
+            }
+            if ($range_end !== null && $event_start >= $range_end) {
+                return false;
+            }
+            return true;
+        }
+        if ($range_end !== null && $event_start >= $range_end) {
+            return false;
+        }
+        if ($range_start !== null && $event_end <= $range_start) {
+            return false;
+        }
+        return true;
     }
 }

@@ -64,7 +64,7 @@ is new versus the existing WebDAV share, in one place:</p>
     <code>WebSite</code> routing, so a CalDAV handler is an ordinary route
     callback the way the WebDAV verbs already are. Concretely this touches
     the places that each carry an explicit method list:
-    <ol>
+    <ul>
       <li>The <code>$routes</code> method table (add
         <code>REPORT</code> and <code>MKCALENDAR</code> keys).</li>
       <li>The two request-line method patterns &mdash; the one in
@@ -76,8 +76,8 @@ is new versus the existing WebDAV share, in one place:</p>
         constant's docblock, which today reads &ldquo;length 7&rdquo; and
         is already wrong for the 9-character <code>PROPFIND</code>.</li>
       <li>Confirm the existing WebDAV example and its tests still pass
-        unchanged, since this step only widens the set of accepted verbs.</li>
-    </ol>
+        unchanged, since this step only widens the accepted verbs.</li>
+    </ul>
     <p class="note">Done: the two verbs were added to the routes table, the
     length constant (9&rarr;10, docblock corrected), the
     <code>checkHttpType</code> sniff, and the request-line parser. The
@@ -88,7 +88,7 @@ is new versus the existing WebDAV share, in one place:</p>
     each with a bogus-verb control; the whole suite stays green.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Put the calendar behaviour in a
+  <li><span class="check">&#10003;</span> Put the calendar behaviour in a
     reusable <code>CalDav</code> class in
     <code>src/CalDav.php</code>, and have the example wire it into a
     <code>WebSite</code>. This class is the calendar endpoint the atto
@@ -97,7 +97,7 @@ is new versus the existing WebDAV share, in one place:</p>
     style: the <code>seekquarry\atto</code> namespace, no framework or
     config references, no Composer, and a docblock on the class and on every
     method.
-    <ol>
+    <ul>
       <li><b>Composition, not a subclass.</b> The constructor takes the
         <code>WebSite</code> (or subclass) instance it serves, the directory
         the calendars live in, a URL prefix (default
@@ -119,55 +119,60 @@ is new versus the existing WebDAV share, in one place:</p>
         resolve-and-contain path guard so a request cannot escape the
         base.</li>
       <li><b>A small built-in reader for the request bodies</b>, covering
-        just the fixed CalDAV vocabulary (the few elements in a
-        <code>calendar-query</code>, <code>calendar-multiget</code>,
-        <code>PROPFIND</code>, and <code>MKCALENDAR</code> body), rather
-        than depending on <code>ext-dom</code>. atto's WebDAV code already
-        builds its XML by hand; this keeps <code>CalDav.php</code> pure-PHP
-        and working where the DOM extension is absent, and the vocabulary is
-        small and closed enough to read directly.</li>
-    </ol>
+        just the fixed CalDAV vocabulary, rather than depending on
+        <code>ext-dom</code>. atto's WebDAV code already builds its XML by
+        hand; this keeps <code>CalDav.php</code> pure-PHP and working where
+        the DOM extension is absent.</li>
+    </ul>
+    <p class="note">Done: <code>src/CalDav.php</code> attaches to a
+    <code>WebSite</code> by composition and serves the calendar lifecycle
+    over its prefix: <code>OPTIONS</code> (advertises <code>DAV: 1,
+    calendar-access</code>), <code>MKCALENDAR</code>, <code>PROPFIND</code>
+    (a calendar reports as a calendar with its component set and change tag;
+    an event reports its ETag, type, size, and modified time), and
+    <code>PUT</code>, <code>GET</code>, <code>DELETE</code> of
+    <code>.ics</code> events with the ETag preconditions
+    <code>If-Match</code> and <code>If-None-Match</code>. Entity and change
+    tags use SHA-256. Each handler's status line takes its protocol from the
+    request, so the same code serves HTTP/1.1, HTTP/2, and HTTP/3. Tests in
+    <code>tests/caldav/test_caldav_class.php</code> (22 checks) cover the
+    pure helpers and the full lifecycle over a scratch folder.</p>
   </li>
 
-  <li>The verbs the <code>CalDav</code> class answers over its prefix:
-    <ol>
-      <li><code>OPTIONS</code> advertising <code>DAV: 1, 2, 3,
-        calendar-access</code> and listing <code>REPORT</code> and
-        <code>MKCALENDAR</code> in <code>Allow</code>, so a client knows it
-        is talking to a CalDAV server.</li>
-      <li><code>MKCALENDAR</code> creating a calendar collection (a folder)
-        and recording its display name and supported component set from the
-        request body.</li>
-      <li><code>PROPFIND</code> extended over the WebDAV one to report the
-        calendar properties on collections (<code>resourcetype</code>
-        including <code>&lt;C:calendar/&gt;</code>,
-        <code>supported-calendar-component-set</code>, a change tag) and an
-        ETag on each <code>.ics</code> resource.</li>
-      <li><code>PUT</code> / <code>GET</code> / <code>DELETE</code> of
-        <code>.ics</code> resources, returning and honouring ETags
-        (<code>If-Match</code> for a safe overwrite,
-        <code>If-None-Match: *</code> for a safe create).</li>
-      <li><code>REPORT</code> for the two calendaring reports clients rely
-        on: <code>calendar-query</code> (filter by component type and time
-        range) and <code>calendar-multiget</code> (return a named set of
-        resources), each answered as a 207 multi-status carrying the
-        matching calendar data.</li>
-    </ol>
+  <li><span class="next">&rarr;</span> Add the <code>REPORT</code> verb and
+    the iCalendar reading it needs, the one part of the calendar lifecycle
+    not yet in place. The other verbs shipped with the class above; this
+    item is what lets a client ask a calendar questions rather than only
+    list it.
+    <ul>
+      <li><code>calendar-multiget</code>: the body names a set of event
+        hrefs and the reply returns each one's ETag and calendar data in a
+        207 multi-status, so a client fetches many events in one round trip.
+        This needs no date reading &mdash; it returns named events as
+        stored.</li>
+      <li><code>calendar-query</code>: the body carries a filter by
+        component type (VEVENT, VTODO) and an optional time range, and the
+        reply returns the matching events. This is the report a client uses
+        to load a month or a week.</li>
+      <li>The iCalendar (RFC&nbsp;5545) reading <code>calendar-query</code>
+        needs: a method that pulls the component type and the
+        <code>DTSTART</code>/<code>DTEND</code> (or <code>DURATION</code>)
+        out of a stored <code>.ics</code> file, and an overlap test that
+        decides whether an event falls in the queried window. The stored
+        bytes are still returned verbatim; the reading only decides what to
+        include.</li>
+      <li>Wiring: register the <code>REPORT</code> route, and add it to the
+        <code>OPTIONS</code> <code>Allow</code> list now that it is
+        answered.</li>
+      <li>Tests ride in the same patch: the time parsing and overlap test as
+        pure checks on known input, and each report driven over a scratch
+        folder with events at known times.</li>
+    </ul>
   </li>
-
-  <li>Give <code>CalDav</code> just enough iCalendar (RFC&nbsp;5545) reading
-    to serve <code>calendar-query</code>: a method that pulls the component
-    type and the <code>DTSTART</code>/<code>DTEND</code> (or
-    <code>DURATION</code>) out of a stored <code>.ics</code> file so the
-    time-range filter can include or exclude it. The class stores the file's
-    bytes verbatim on <code>PUT</code> and hands them back verbatim on
-    <code>GET</code> and in a report &mdash; it reads the calendar data but
-    does not rewrite it, which keeps the round trip lossless and the parsing
-    surface small.</li>
 
   <li>Client autodiscovery on the class, so a real client needs only the
     base URL:
-    <ol>
+    <ul>
       <li>A <code>/.well-known/caldav</code> bootstrap (RFC&nbsp;6764) that
         redirects a probing client to the service.</li>
       <li>The principal properties a client walks to find a calendar:
@@ -175,33 +180,22 @@ is new versus the existing WebDAV share, in one place:</p>
         <code>calendar-home-set</code>, answered by <code>PROPFIND</code> so
         the client can go base URL &rarr; principal &rarr; calendar home
         &rarr; calendar without the user pasting a collection URL.</li>
-      <li>A cheap change signal for sync &mdash; a collection change tag
-        (CTag) reported on the calendar, so a client polls one property to
-        learn whether anything changed before listing the collection.</li>
-    </ol>
+      <li>A cheap change signal for sync &mdash; the collection change tag
+        (CTag) already reported on a calendar, so a client polls one
+        property to learn whether anything changed before listing.</li>
+    </ul>
   </li>
 
-  <li>Tests under <code>tests/caldav/test_*.php</code>, following atto's
-    standalone-script contract (assert helper, <code>Tests run:</code> /
-    <code>Tests passed:</code> summary, non-zero exit on failure, each check
-    well under the I/O-flag threshold). Because the logic lives on the
-    <code>CalDav</code> class as methods, the tests exercise it directly
-    without a live server: the iCalendar time-range filter (does this event
-    fall in this window), the ETag computation, the small body parser, and
-    the 207 XML building each get direct assertions on known input and
-    output.</li>
-
-  <li>Documentation to match the other examples: a file header docblock on
-    <code>CalDav.php</code>, and an example whose <code>index.php</code>
-    constructs a <code>WebSite</code>, hands it to <code>CalDav</code> with a
-    calendar directory and an authenticator, and adds a browser landing page
-    giving a self-contained <code>curl</code> round trip
-    (<code>MKCALENDAR</code> a calendar &rarr; <code>PUT</code> an event
-    &rarr; <code>REPORT</code> a <code>calendar-query</code> &rarr;
+  <li>Documentation and a runnable example: a file header docblock on
+    <code>CalDav.php</code> (already in place), and an example whose
+    <code>index.php</code> constructs a <code>WebSite</code>, hands it to
+    <code>CalDav</code> with a calendar directory and an authenticator, and
+    adds a browser landing page giving a self-contained <code>curl</code>
+    round trip (<code>MKCALENDAR</code> a calendar &rarr; <code>PUT</code>
+    an event &rarr; <code>REPORT</code> a <code>calendar-query</code> &rarr;
     <code>GET</code> it back &rarr; <code>DELETE</code> it), plus a
-    &ldquo;how to connect&rdquo; pointer for pointing Apple Calendar,
-    Thunderbird, or DAVx5 at the share. Add the new example to the examples
-    index and the README example tour.</li>
+    &ldquo;how to connect&rdquo; pointer for Apple Calendar, Thunderbird, or
+    DAVx5. Add the example to the examples index and the README tour.</li>
 </ol>
 
 <h2>Open decisions to settle before coding</h2>

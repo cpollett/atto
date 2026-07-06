@@ -227,7 +227,7 @@ if (is_file($cert) && is_file($key)) {
 }
 /*
     Spawn the companion web UI. Same detached-child pattern
-    as examples 20-22; on Unix we capture the child PID and
+    as examples 21-23; on Unix we capture the child PID and
     kill it on shutdown via register_shutdown_function. On
     Windows "start /B" does not surface the PID, so the user
     closes the cmd window or kills php.exe via Task Manager

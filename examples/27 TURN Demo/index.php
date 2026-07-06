@@ -154,7 +154,7 @@ $config = [
 ];
 /*
     Spawn the companion web UI. Same detached-child pattern
-    as examples 20-23. We export ATTOTURN_SERVER_PID into
+    as examples 21-24. We export ATTOTURN_SERVER_PID into
     the spawned webui's environment so the bind-switch
     endpoint can signal index.php (us) to shut down.
  */

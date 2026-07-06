@@ -165,7 +165,7 @@ if (!is_file($users_file)) {
     index.php after writing the new selection so the
     operator just relaunches "php index.php" to see the
     change). Default is "file" -- the on-disk backend that
-    example 21 originally shipped with -- so existing users
+    example 22 originally shipped with -- so existing users
     see no behavior change.
 
     Each backend is a drop-in implementation of the same

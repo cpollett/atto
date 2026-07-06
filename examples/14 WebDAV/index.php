@@ -19,14 +19,39 @@ $test = new WebSite();
     After commenting the exit() line above, you can run the example by
     typing:
         php index.php
-    and then talking to it with any WebDAV client. With curl:
+    and then talking to it with any WebDAV client. The curl commands below
+    form one self-contained round trip; each says what it does and what to
+    expect back:
+
+        # make a small file locally so there is something to upload
+        echo 'hello webdav' > hello.txt
+
+        # upload it. Expect: 201 Created (204 if it already existed). Use a
+        # real file with -T; curl's -T - streams chunked, which this simple
+        # example does not read, so it would store an empty file.
+        curl -T hello.txt http://localhost:8080/dav/hello.txt
+
+        # read it back. Expect: the file's contents, "hello webdav".
+        curl http://localhost:8080/dav/hello.txt
+
+        # list the share at depth 1. Expect: a 207 Multi-Status XML body
+        # listing the share and its entries, including hello.txt.
         curl -X PROPFIND http://localhost:8080/dav/ -H 'Depth: 1'
-        curl -T local.txt http://localhost:8080/dav/local.txt
-        curl -X MKCOL http://localhost:8080/dav/folder/
-        curl http://localhost:8080/dav/local.txt
-        curl -X DELETE http://localhost:8080/dav/local.txt
-    Or mount it: macOS Finder "Connect to Server" http://localhost:8080/dav/,
-    or `cadaver http://localhost:8080/dav/`.
+
+        # make a folder. Expect: 201 Created (409 if it already exists).
+        curl -X MKCOL http://localhost:8080/dav/folder
+
+        # delete the file. Expect: 204 No Content; a following GET of the
+        # same URL then returns 404.
+        curl -X DELETE http://localhost:8080/dav/hello.txt
+
+    Or mount the share in a file manager. The command-line client cadaver
+    works the same on every platform: cadaver http://localhost:8080/dav/ .
+    To mount it graphically: on macOS, Finder > Go > Connect to Server and
+    enter http://localhost:8080/dav/ ; on Windows, File Explorer > Map
+    network drive > "Connect to a Web site..." with the same URL, or
+    run: net use * http://localhost:8080/dav/ ; on Linux (GNOME Files),
+    Other Locations > Connect to Server with dav://localhost:8080/dav/ .
 
     A plain browser visiting / gets a short page explaining the above.
 
@@ -274,17 +299,37 @@ $test->get('/', function () {
     <a href="/dav/">/dav/</a>. Atto routes the WebDAV verbs the same way it
     routes GET and POST, so the whole share is the handful of route
     handlers in this file.</p>
-    <p>Talk to it with any WebDAV client. For example, with curl:</p>
+    <p>Talk to it with any WebDAV client. The curl commands below form one
+    self-contained round trip; the comment on each says what it does and
+    what to expect back:</p>
     <pre>
+# make a small file locally so there is something to upload
+echo 'hello webdav' &gt; hello.txt
+
+# upload it -- expect 201 Created (204 if it already existed)
+curl -T hello.txt http://localhost:8080/dav/hello.txt
+
+# read it back -- expect the contents: hello webdav
+curl http://localhost:8080/dav/hello.txt
+
+# list the share -- expect a 207 Multi-Status XML listing
 curl -X PROPFIND http://localhost:8080/dav/ -H 'Depth: 1'
-curl -T local.txt   http://localhost:8080/dav/local.txt
-curl -X MKCOL       http://localhost:8080/dav/folder/
-curl                http://localhost:8080/dav/local.txt
-curl -X DELETE      http://localhost:8080/dav/local.txt
+
+# make a folder -- expect 201 Created (409 if it already exists)
+curl -X MKCOL http://localhost:8080/dav/folder
+
+# delete the file -- expect 204; a following GET then returns 404
+curl -X DELETE http://localhost:8080/dav/hello.txt
     </pre>
-    <p>Or mount it: in macOS Finder use Connect to Server with
-    <code>http://localhost:8080/dav/</code>, or run
-    <code>cadaver http://localhost:8080/dav/</code>.</p>
+    <p>Or mount the share in a file manager. The command-line client
+    <code>cadaver http://localhost:8080/dav/</code> works the same on every
+    platform. To mount it graphically: on <b>macOS</b>, Finder &rarr; Go
+    &rarr; Connect to Server with <code>http://localhost:8080/dav/</code>;
+    on <b>Windows</b>, File Explorer &rarr; Map network drive &rarr;
+    "Connect to a Web site..." with the same URL (or
+    <code>net use * http://localhost:8080/dav/</code>); on <b>Linux</b>
+    (GNOME Files), Other Locations &rarr; Connect to Server with
+    <code>dav://localhost:8080/dav/</code>.</p>
     </body>
     </html>
     <?php

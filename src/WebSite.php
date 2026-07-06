@@ -320,7 +320,8 @@ class WebSite
      */
     protected $session_configs = [ 'cookie_lifetime' => '0',
         'cookie_path' => '/', 'cookie_domain' => '', 'cookie_secure' => '',
-        'cookie_httponly' => '', 'name' => 'PHPSESSID', 'save_path' => ''];
+        'cookie_httponly' => true, 'cookie_samesite' => 'Lax',
+        'name' => 'PHPSESSID', 'save_path' => ''];
     /**
      * Array of all connection streams for which we are receiving data from
      * client together with associated stream info
@@ -1462,35 +1463,6 @@ class WebSite
         return $this->streaming_failed;
     }
     /**
-     * The peer's per-stream initial flow-control window for the
-     * response currently being streamed, in bytes. A route serving
-     * a large body can use this to size each span it emits so the
-     * span fits the window the client granted and the stream
-     * completes (END_STREAM) within that credit rather than parking
-     * blocked waiting for a WINDOW_UPDATE the client may not send
-     * for a body it is not actively reading. Returns 0 when there
-     * is no HTTP/2 streaming context (HTTP/1.1, HTTP/3, or off the
-     * atto server), letting the caller fall back to a fixed bound.
-     *
-     * @return int per-stream initial window in bytes, or 0 when not
-     *      applicable
-     */
-    public function peerStreamWindow()
-    {
-        if (($this->streaming_context['protocol'] ?? null) !== 'h2') {
-            return 0;
-        }
-        $key = $this->streaming_context['key'] ?? null;
-        if ($key === null) {
-            return 0;
-        }
-        $conn = $this->connection($key);
-        if ($conn === null) {
-            return 0;
-        }
-        return $conn->protocol_state['peer_initial_window'] ?? 0;
-    }
-    /**
      * Writes $data completely to the streaming socket, looping on
      * the partial writes a non-blocking socket gives when the
      * kernel send buffer is full. Between attempts it waits for
@@ -1896,9 +1868,12 @@ class WebSite
      * @param string $domain request domain scope
      * @param string $secure HTTPS-only cookie if true
      * @param bool $httponly hide from client-side JavaScript
+     * @param string $samesite cross-site sending policy for the cookie,
+     *      "Lax", "Strict", or "None"; left off when empty
      */
     public function setCookie($name, $value = "", $expire = 0,
-        $path = "", $domain = "", $secure = false, $httponly = false)
+        $path = "", $domain = "", $secure = false, $httponly = false,
+        $samesite = "")
     {
         if ($this->isCli()) {
             if ($secure && empty($_SERVER['HTTPS'])) {
@@ -1917,13 +1892,20 @@ class WebSite
             if ($domain != "") {
                 $out_cookie .= "; Domain=$domain";
             }
+            if ($secure) {
+                $out_cookie .= "; Secure";
+            }
             if ($httponly) {
                 $out_cookie .= "; HttpOnly";
             }
+            if ($samesite != "") {
+                $out_cookie .= "; SameSite=$samesite";
+            }
             $this->header($out_cookie);
         } else {
-            setcookie($name, $value, $expire, $path, $domain, $secure,
-                $httponly);
+            setcookie($name, $value, ['expires' => $expire,
+                'path' => $path, 'domain' => $domain, 'secure' => $secure,
+                'httponly' => $httponly, 'samesite' => $samesite]);
         }
     }
     /**
@@ -2040,7 +2022,8 @@ class WebSite
             }
             $this->setCookie($cookie_name, $session_id, $expires,
                 $options['cookie_path'], $options['cookie_domain'],
-                $options['cookie_secure'], $options['cookie_httponly']);
+                $options['cookie_secure'], $options['cookie_httponly'],
+                $options['cookie_samesite'] ?? "");
             $_COOKIE[$cookie_name] = $session_id;
             $this->current_session = $cookie_name;
         } else {

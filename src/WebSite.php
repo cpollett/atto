@@ -137,9 +137,12 @@ class WebSite
      */
     const BIND_RETRY_WAIT = 250;
     /*
-      CONNECT OPTIONS and the longest named HTTP method. It has length 7
+      Length in characters of the longest HTTP method atto routes. The
+      CalDAV verb MKCALENDAR, which makes a calendar collection, is the
+      longest at ten. The request reader peeks at this many bytes plus one
+      to read the method name off the front of a request line.
      */
-    const LEN_LONGEST_HTTP_METHOD = 9;
+    const LEN_LONGEST_HTTP_METHOD = 10;
     /*
         Length in bytes of an HTTP/2 frame header (RFC 7540 sec 4.1):
         3 bytes length + 1 byte type + 1 byte flags + 4 bytes stream id
@@ -308,9 +311,9 @@ class WebSite
      */
     protected $routes = ["CONNECT" => [], "COPY" => [], "DELETE" => [],
         "ERROR" => [], "GET" => [], "HEAD" => [], "LOCK" => [],
-        "MKCOL" => [], "MOVE" => [], "OPTIONS" => [], "POST" => [],
-        "PROPFIND" => [], "PROPPATCH" => [], "PUT" => [], "TRACE" => [],
-        "UNLOCK" => [], "WS" => []];
+        "MKCALENDAR" => [], "MKCOL" => [], "MOVE" => [], "OPTIONS" => [],
+        "POST" => [], "PROPFIND" => [], "PROPPATCH" => [], "PUT" => [],
+        "REPORT" => [], "TRACE" => [], "UNLOCK" => [], "WS" => []];
     /**
      * Default values used to set up session variables
      * @var array
@@ -4390,7 +4393,8 @@ class WebSite
         }
         if (preg_match(
             "/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE|CONNECT|" .
-            "PROPFIND|PROPPATCH|MKCOL|COPY|MOVE|LOCK|UNLOCK)".
+            "PROPFIND|PROPPATCH|MKCALENDAR|MKCOL|COPY|MOVE|LOCK|UNLOCK|" .
+            "REPORT)" .
             " \S+ HTTP\/1\.1/",
             $stream_start)) {
             return ["CLIENT_HTTP" => "HTTP/1.1"];
@@ -6387,8 +6391,9 @@ class WebSite
             $first_line = substr($this->in_streams[self::DATA][$key], 0,
                 $next_line_pos);
             $first_lines_regex = "/^(CONNECT|COPY|DELETE|ERROR|GET|HEAD|".
-                "LOCK|MKCOL|MOVE|OPTIONS|POST|PROPFIND|PROPPATCH|PUT|TRACE|".
-                "UNLOCK)\s+([^\s]+)\s+(HTTP\/\d+\.\d+)/";
+                "LOCK|MKCALENDAR|MKCOL|MOVE|OPTIONS|POST|PROPFIND|".
+                "PROPPATCH|PUT|REPORT|TRACE|UNLOCK)".
+                "\s+([^\s]+)\s+(HTTP\/\d+\.\d+)/";
             if (!preg_match($first_lines_regex, $first_line, $matches)) {
                 $this->initializeBadRequestResponse($key);
                 return true;

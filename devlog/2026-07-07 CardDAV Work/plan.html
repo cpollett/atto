@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>atto &mdash; CardDAV Server</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 760px;
+    margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+    color: #1a1a1a; }
+ol { margin: 0.4rem 0; }
+ol ol { margin: 0.3rem 0 0.8rem; }
+li { margin: 0.3rem 0; }
+.check { color: #1a7f37; font-weight: bold; }
+.next { color: #b35900; font-weight: bold; }
+.note { color: #555; font-size: 0.92em; margin: 0.6rem 0 1.2rem; }
+code { background: #f2f2f2; padding: 0 0.2em; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>atto &mdash; CardDAV Server</h1>
+<p class="note">Started 07-Jul-2026. CardDAV (RFC&nbsp;6352) is the
+address-book sibling of CalDAV: same WebDAV substrate, but a collection
+holds contacts instead of events. An address book is a folder
+(collection), each contact is a small file inside it in the vCard text
+format (RFC&nbsp;6350), and the same read verbs let a client list a book
+and ask property questions about it. atto already routes every WebDAV verb
+CardDAV needs &mdash; <code>MKCOL</code> and <code>REPORT</code> both route
+today (the latter was added for CalDAV) &mdash; and already ships the
+folder-backed collection pattern twice, in the WebDAV share (example 14)
+and the CalDAV server (example 15). This arc puts the contact behaviour in
+a reusable class in <code>src/</code> that an example wires into a
+<code>WebSite</code>, the same shape as those two, and written so the Yioop
+project can reuse it against its own <code>WebSite</code>. The goal is an
+address book a real contacts client (Apple Contacts on macOS and iOS,
+Mozilla Thunderbird, the Android DAVx5 app) can be pointed at and left to
+sync on its own, while keeping atto's no-config, single-file character:
+nothing Yioop-specific, no framework, no build step.</p>
+
+<h2>What CardDAV adds on top of what is already here</h2>
+<p class="note">So the plan below reads plainly, here is the whole of what
+is new versus the CalDAV server, in one place. The two protocols share a
+large WebDAV and collection core; the list is short because most of that
+core already exists.</p>
+<ul>
+  <li>No new HTTP verbs. An address book is created with an <b>extended
+    <code>MKCOL</code></b> (RFC&nbsp;5689) whose body sets the collection's
+    resource type, where CalDAV used a dedicated <code>MKCALENDAR</code>;
+    both <code>MKCOL</code> and <code>REPORT</code> already route.</li>
+  <li>An address book is a folder that reports the
+    <code>&lt;CARD:addressbook/&gt;</code> resource type and a
+    supported-address-data media type (<code>text/vcard</code>) in its
+    properties, where a calendar reports
+    <code>&lt;C:calendar/&gt;</code> and a component list.</li>
+  <li>A contact is a <code>.vcf</code> file (one vCard object) whose bytes
+    the client writes with <code>PUT</code> and reads with
+    <code>GET</code>, exactly as an event is a <code>.ics</code> file.</li>
+  <li>The <code>REPORT</code> query is different in kind: CalDAV's
+    <code>calendar-query</code> filters components by a time range;
+    CardDAV's <code>addressbook-query</code> filters contacts by matching
+    text against vCard <b>properties</b> (name, e-mail, and so on). The
+    multiget report and the ETag/change-tag machinery carry over
+    unchanged.</li>
+  <li>Discovery uses <code>/.well-known/carddav</code> and reports an
+    <code>addressbook-home-set</code>, the direct analogue of CalDAV's
+    well-known path and calendar-home-set.</li>
+</ul>
+
+<ol>
+  <li><span class="next">&rarr;</span> The contact-server class:
+    construction, route registration, and the WebDAV verbs an address book
+    answers. Nearly all of this is the same collection machinery the CalDAV
+    class already runs; the address-book-specific parts are the resource
+    type, the supported-address-data property, the <code>text/vcard</code>
+    content type, and creation by extended <code>MKCOL</code>.
+    <ul>
+      <li>Construct against a <code>WebSite</code>, a contacts directory, a
+        route prefix, and an optional authenticator, then
+        <code>register()</code> the routes, the same constructor shape as
+        the CalDAV class.</li>
+      <li>Answer <code>OPTIONS</code> (advertising
+        <code>addressbook-access</code>), <code>PROPFIND</code> (reporting
+        an address book, a plain collection, or a contact),
+        <code>GET</code>, <code>PUT</code>, and <code>DELETE</code>, with
+        the same path-containment guard, SHA-256 ETags, and
+        <code>If-Match</code> / <code>If-None-Match</code> preconditions
+        the CalDAV class uses.</li>
+      <li>Create an address book from an extended <code>MKCOL</code> whose
+        body carries a resource type including <code>addressbook</code> and
+        an optional display name, writing the same kind of hidden metadata
+        file the CalDAV class writes for a calendar.</li>
+      <li>Tests in the same patch: create a book, PUT and GET a contact,
+        PROPFIND the book at depth 0 and 1, and the ETag preconditions,
+        each over a scratch folder.</li>
+    </ul>
+  </li>
+
+  <li>The <code>REPORT</code> verb and the vCard reading it needs. Multiget
+    carries over from CalDAV almost verbatim; the query is the new work.
+    <ul>
+      <li><code>addressbook-multiget</code>: return each named contact's
+        ETag and data, and a not-found entry for a missing one &mdash; the
+        same shape as <code>calendar-multiget</code>.</li>
+      <li><code>addressbook-query</code>: filter contacts with a
+        <code>prop-filter</code> and a <code>text-match</code> (match a
+        vCard property such as <code>FN</code> or <code>EMAIL</code> by
+        equals, contains, starts-with, or ends-with), combined under an
+        <code>anyof</code> or <code>allof</code> test, and return the
+        matches' data.</li>
+      <li>A small vCard reader for the query: pull a named property's
+        value from a contact's lines, enough for the common unfolded
+        <code>PROP;PARAMS:VALUE</code> form, mirroring the scope note the
+        CalDAV query carries for iCalendar.</li>
+      <li>Tests: the property match as pure checks on known vCards, and
+        each report driven over a scratch folder of contacts with known
+        names and addresses.</li>
+    </ul>
+  </li>
+
+  <li>Client autodiscovery, so a real client needs only the base URL.
+    <ul>
+      <li>Redirect <code>/.well-known/carddav</code> to the service root,
+        the analogue of the CalDAV well-known path.</li>
+      <li>Report <code>current-user-principal</code> and
+        <code>addressbook-home-set</code> on the collection and address-book
+        responses, both pointing at the route prefix by default and
+        overridable for a project (such as Yioop) with per-user homes.</li>
+      <li>Tests: the redirect's status and location, and the discovery
+        properties present in a PROPFIND.</li>
+    </ul>
+  </li>
+
+  <li>Documentation and a runnable example: a file header docblock on the
+    class, and an example whose <code>index.php</code> wires the class into
+    a <code>WebSite</code>, seeds a demo address book, and serves a live
+    contacts page &mdash; on a timer it sends the book an
+    <code>addressbook-query</code> and lists the contacts that come back,
+    links add fixed sample contacts with a <code>PUT</code>, and a portable
+    <code>printf</code>-into-a-file plus
+    <code>curl --data-binary&nbsp;@file</code> block adds one from the
+    command line (no <code>$'&hellip;'</code>, so it runs in tcsh), the same
+    shape as the CalDAV example's calendar page. Add a
+    &ldquo;connect a real client&rdquo; pointer for Apple Contacts,
+    Thunderbird, and DAVx5, and add the example to the examples index and
+    the README tour.</li>
+</ol>
+
+<h2>Open decisions to settle before coding</h2>
+<ul>
+  <li><b>How the two servers share code.</b> CalDAV and CardDAV share a
+    large WebDAV and collection core (construction, containment, ETags,
+    <code>PROPFIND</code>, the
+    <code>GET</code>/<code>PUT</code>/<code>DELETE</code> verbs,
+    multiget, discovery); they differ in the resource type, the well-known
+    path, the home-set property, the create mechanism, the content type,
+    and the <code>REPORT</code> query. Two shapes both fit atto's rule that
+    a <code>src/</code> file is self-contained (no cross-file requires or
+    inheritance): <b>(a)</b> a standalone <code>CardDav.php</code> that
+    reimplements the shared core, self-contained and touching neither the
+    shipped <code>CalDav.php</code> nor Yioop, at the cost of duplicating
+    roughly two dozen methods &mdash; the way each other <code>src/</code>
+    server stands on its own today; or <b>(b)</b> one file holding an
+    abstract collection base plus both <code>CalDav</code> and
+    <code>CardDav</code> subclasses, the way <code>DnsSite</code> and
+    <code>FtpSite</code> keep an abstract base with its concretes, which
+    removes the duplication but restructures the shipped
+    <code>CalDav.php</code>, changes the file the CalDAV example and Yioop
+    require, and puts two protocols in one file. Shape (a) keeps shipped
+    code untouched and matches how the other servers are organised; shape
+    (b) is the one with no duplication. If (b) is chosen, item&nbsp;1 above
+    absorbs extracting the base and retrofitting <code>CalDav</code> onto
+    it, guarded by the existing CalDAV tests. Chris to pick which.</li>
+  <li><b>Address-book creation.</b> RFC&nbsp;6352 has no MKADDRESSBOOK
+    verb; a book is made with an extended <code>MKCOL</code> (RFC&nbsp;5689)
+    carrying a resource type, which is what Apple Contacts and DAVx5 send.
+    The plan implements that. The example additionally seeds a demo book at
+    start-up so its page shows contacts before anything is created, the way
+    the CalDAV example seeds a demo calendar.</li>
+  <li><b>vCard query scope.</b> The first cut handles the common
+    <code>addressbook-query</code>: <code>prop-filter</code> with a
+    <code>text-match</code> and match type, under <code>anyof</code> or
+    <code>allof</code>. Left for later, and named in a scope note the way
+    the CalDAV <code>REPORT</code> names its own limits:
+    <code>param-filter</code>, collation negotiation, restricting the
+    returned <code>address-data</code> to named properties, and vCard line
+    folding. If a wider first cut is wanted, say which parts.</li>
+  <li><b>Example placement and numbering.</b> CardDAV belongs next to
+    CalDAV (example&nbsp;15). Inserting it as example&nbsp;16 renumbers
+    16&ndash;28 upward, the same churn the CalDAV insert just did (renames
+    plus a handful of inter-example reference and README edits); appending
+    it as the next free number avoids the renumber but separates it from
+    the CalDAV example it mirrors. The CalDAV arc chose the insert for
+    coherence; this arc can follow that or not. Chris to pick which.</li>
+</ul>
+</body>
+</html>

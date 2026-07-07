@@ -208,16 +208,23 @@ is new versus the existing WebDAV share, in one place:</p>
     &ldquo;how to connect&rdquo; pointer for Apple Calendar, Thunderbird, or
     DAVx5. Add the example to the examples index and the README tour.
     <p class="note">Done: <code>examples/15 CalDAV</code> makes a
-    <code>WebSite</code>, gates it with a Basic-auth check whose 401 status
-    line follows the request protocol, hands it to <code>CalDav</code>, and
-    calls <code>register()</code>; a browser landing page walks the curl
-    round trip and the connect steps for Apple Calendar, Thunderbird, and
-    DAVx5. Placed at 15 next to WebDAV, so examples 15&ndash;27 were
-    renumbered to 16&ndash;28, their inter-example references and the README
-    tour updated to match. Verified by running the example through
-    <code>php index.php 15</code>: the auth gate, the full MKCALENDAR &rarr;
-    PUT &rarr; REPORT &rarr; GET &rarr; DELETE round trip, and the
-    well-known redirect all behave.</p></li>
+    <code>WebSite</code>, hands it to <code>CalDav</code>, calls
+    <code>register()</code>, and seeds a demo calendar. The browser page is
+    a live calendar: on a timer it sends the demo calendar a calendar-query
+    REPORT and lists the events that come back, so a change shows up on the
+    next refresh. Links on the page add fixed sample events with a CalDAV
+    PUT, and a portable <code>printf</code>-into-a-file plus
+    <code>curl --data-binary&nbsp;@file</code> block adds one from the
+    command line the same way (no <code>$'&hellip;'</code>, so it runs in
+    tcsh as written); a &ldquo;connect a real client&rdquo; pointer covers
+    Apple Calendar, Thunderbird, and DAVx5. The demo runs open (no
+    authenticator) to keep the page and curl friction-free; a note points
+    at example&nbsp;14 for the authenticator shape. Placed at 15 next to
+    WebDAV, so examples 15&ndash;27 were renumbered to 16&ndash;28, their
+    inter-example references and the README tour updated to match. Verified
+    by running <code>php index.php 15</code>: the REPORT refresh, the PUT
+    add links, the portable curl add, a DELETE, and the well-known redirect
+    all behave, each event appearing or leaving on the next refresh.</p></li>
 </ol>
 
 <h2>Open decisions to settle before coding</h2>

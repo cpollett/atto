@@ -92,6 +92,18 @@ core already exists.</p>
         PROPFIND the book at depth 0 and 1, and the ETag preconditions,
         each over a scratch folder.</li>
     </ul>
+    <p class="note">Done: <code>src/CardDav.php</code> (standalone,
+    self-contained) answers <code>OPTIONS</code> (advertising
+    <code>addressbook-access</code> and <code>extended-mkcol</code>),
+    <code>PROPFIND</code> (an address book, a plain collection, or a
+    contact), an extended <code>MKCOL</code> (an address book when the
+    body's resource type asks for one, else a plain folder), and
+    <code>GET</code>/<code>PUT</code>/<code>DELETE</code>, with the same
+    path-containment guard, SHA-256 ETags, and <code>If-Match</code> /
+    <code>If-None-Match</code> preconditions the CalDAV class uses. Tests in
+    <code>tests/carddav/test_carddav_class.php</code> (18 checks). Verified
+    live over the wire: MKCOL a book, PUT and GET a contact as
+    <code>text/vcard</code>, PROPFIND list it, and DELETE remove it.</p>
   </li>
 
   <li>The <code>REPORT</code> verb and the vCard reading it needs. Multiget

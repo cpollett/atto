@@ -27,16 +27,18 @@ $test = new WebSite();
     then open http://localhost:8080/ in a browser. The page shows a demo
     address book that re-reads itself every few seconds by sending the
     server a CardDAV addressbook-query (a REPORT) and listing what comes
-    back. Two ways to add a contact both land on that same book and show up
-    on the next refresh:
+    back. Each way of changing the book lands on it and shows up on the
+    next refresh:
 
-      * Click one of the "add" links on the page. Each sends a CardDAV PUT
-        of a small contact to the demo book.
+      * Click an "add" link on the page to add a sample contact, or a
+        row's "edit" link to change its e-mail, or a row's "delete" link
+        to remove it. Each is a CardDAV request: a PUT to add or change a
+        card, a DELETE to remove one.
 
-      * Or add one from the command line and watch the page pick it up.
-        Build the contact in a file first so its line endings are the CRLF
-        the vCard format calls for (printf and this redirect work the same
-        in tcsh, bash, and sh), then send the file:
+      * Or do the same from the command line and watch the page pick it
+        up. Build the card in a file first so its line endings are the
+        CRLF the vCard format calls for (printf and this redirect work the
+        same in tcsh, bash, and sh), then send the file:
 
             printf 'BEGIN:VCARD\r\n' > ada.vcf
             printf 'VERSION:3.0\r\nUID:ada\r\n' >> ada.vcf
@@ -46,8 +48,9 @@ $test = new WebSite();
             curl -X PUT --data-binary @ada.vcf \
               http://localhost:8080/addressbooks/demo/ada.vcf
 
-        Within a few seconds the page lists "Ada Lovelace". A following
-        DELETE makes the contact disappear the same way:
+        Within a few seconds the page lists "Ada Lovelace". Sending a new
+        version of the card to the same path changes it (the server
+        answers 204 rather than 201), and a DELETE removes it:
 
             curl -X DELETE http://localhost:8080/addressbooks/demo/ada.vcf
 
@@ -119,6 +122,8 @@ $test->get('/', function () {
     ul.book li { border: 1px solid #ddd; border-radius: 6px;
         padding: 0.5rem 0.8rem; margin: 0.4rem 0; }
     ul.book li .email { color: #555; font-size: 0.9em; }
+    ul.book li .row-action { margin-left: 0.5rem; font-size: 0.85em;
+        color: #b35900; text-decoration: none; }
     .adds a { display: inline-block; margin: 0.2rem 0.4rem 0.2rem 0;
         padding: 0.3rem 0.6rem; border: 1px solid #b35900;
         border-radius: 6px; color: #b35900; text-decoration: none; }
@@ -141,12 +146,16 @@ $test->get('/', function () {
         'Grace Hopper', 'grace@example.com')">Grace Hopper</a>
     </p>
 
-    <p>Each link sends a CardDAV <code>PUT</code> to
-    <code>/addressbooks/demo/</code>. You can do the same from the command
-    line and watch the list above update within a few seconds. Build the
-    contact in a file first so its line endings are CRLF (this works the
-    same in tcsh, bash, and sh), then send the file:</p>
+    <p>Each contact in the list has an <b>edit</b> link, which asks for a
+    new e-mail and sends the changed card back, and a <b>delete</b> link,
+    which removes it. The add links, and both row links, are just CardDAV
+    requests to <code>/addressbooks/demo/</code>: a <code>PUT</code> to add
+    or change a card, a <code>DELETE</code> to remove one. You can do the
+    same from the command line and watch the list above update within a few
+    seconds. Build the card in a file first so its line endings are CRLF
+    (this works the same in tcsh, bash, and sh), then send it:</p>
     <pre>
+# add a contact -- a PUT to a new path (201 Created)
 printf 'BEGIN:VCARD\r\n' &gt; ada.vcf
 printf 'VERSION:3.0\r\nUID:ada\r\n' &gt;&gt; ada.vcf
 printf 'FN:Ada Lovelace\r\n' &gt;&gt; ada.vcf
@@ -154,12 +163,25 @@ printf 'EMAIL:ada@example.com\r\n' &gt;&gt; ada.vcf
 printf 'END:VCARD\r\n' &gt;&gt; ada.vcf
 curl -X PUT --data-binary @ada.vcf \
   http://localhost:8080/addressbooks/demo/ada.vcf
+
+# change it -- a PUT of a new version to the same path (204 No Content)
+printf 'BEGIN:VCARD\r\n' &gt; ada.vcf
+printf 'VERSION:3.0\r\nUID:ada\r\n' &gt;&gt; ada.vcf
+printf 'FN:Ada Lovelace\r\n' &gt;&gt; ada.vcf
+printf 'EMAIL:ada@newmail.example\r\n' &gt;&gt; ada.vcf
+printf 'END:VCARD\r\n' &gt;&gt; ada.vcf
+curl -X PUT --data-binary @ada.vcf \
+  http://localhost:8080/addressbooks/demo/ada.vcf
+
+# delete it (204 No Content)
+curl -X DELETE http://localhost:8080/addressbooks/demo/ada.vcf
     </pre>
 
     <script>
     /* Reads the contacts by sending the demo book an addressbook-query
        REPORT with an empty filter, which returns every contact, and
-       pulling FN and EMAIL out of each returned card. */
+       pulling the href, UID, FN, and EMAIL out of each returned
+       response so a row can later be changed or deleted by its href. */
     async function loadContacts() {
         var query =
             '<C:addressbook-query xmlns:D="DAV:" ' +
@@ -173,15 +195,25 @@ curl -X PUT --data-binary @ada.vcf \
         });
         var text = await reply.text();
         var contacts = [];
-        var block = /<CARD:address-data>([\s\S]*?)<\/CARD:address-data>/g;
+        var block = /<D:response>([\s\S]*?)<\/D:response>/g;
         var found;
         while ((found = block.exec(text)) !== null) {
-            var vcf = found[1]
+            var chunk = found[1];
+            var data = chunk.match(
+                /<CARD:address-data>([\s\S]*?)<\/CARD:address-data>/);
+            if (data === null) {
+                continue;
+            }
+            var vcf = data[1]
                 .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
                 .replace(/&amp;/g, '&');
+            var href = (chunk.match(/<D:href>([^<]*)<\/D:href>/) ||
+                [])[1] || '';
+            var uid = (vcf.match(/UID:(.*)/) || [])[1] || '';
             var name = (vcf.match(/FN:(.*)/) || [])[1] || '(no name)';
             var email = (vcf.match(/EMAIL[^:]*:(.*)/) || [])[1] || '';
-            contacts.push({ name: name.trim(), email: email.trim() });
+            contacts.push({ href: href.trim(), uid: uid.trim(),
+                name: name.trim(), email: email.trim() });
         }
         contacts.sort(function (a, b) {
             return a.name.localeCompare(b.name);
@@ -189,7 +221,8 @@ curl -X PUT --data-binary @ada.vcf \
         return contacts;
     }
 
-    /* Draws the list and updates the status line. */
+    /* Draws the list and updates the status line. Each row carries an
+       edit link (which changes the contact) and a delete link. */
     function draw(contacts) {
         var list = document.getElementById('contacts');
         list.innerHTML = '';
@@ -202,12 +235,28 @@ curl -X PUT --data-binary @ada.vcf \
                 email.textContent = ' \u2014 ' + contact.email;
                 item.appendChild(email);
             }
+            item.appendChild(rowLink('edit', function () {
+                return editContact(contact);
+            }));
+            item.appendChild(rowLink('delete', function () {
+                return deleteContact(contact);
+            }));
             list.appendChild(item);
         });
         var now = new Date().toLocaleTimeString();
         document.getElementById('status').textContent =
             contacts.length + ' contact(s); refreshed ' + now +
             '; updates every 3s';
+    }
+
+    /* Builds one row-action link with its click handler. */
+    function rowLink(label, handler) {
+        var link = document.createElement('a');
+        link.href = '#';
+        link.className = 'row-action';
+        link.textContent = label;
+        link.onclick = handler;
+        return link;
     }
 
     /* Refreshes the list from the server. */
@@ -231,6 +280,33 @@ curl -X PUT --data-binary @ada.vcf \
             method: 'PUT',
             body: vcf
         });
+        refresh();
+        return false;
+    }
+
+    /* Changes a contact: asks for a new e-mail, then sends a new
+       version of the card to the same path with a PUT, which the
+       server takes as an overwrite (204 rather than 201), then
+       refreshes so the change shows right away. */
+    async function editContact(contact) {
+        var email = window.prompt('New e-mail for ' + contact.name,
+            contact.email);
+        if (email === null) {
+            return false;
+        }
+        var vcf =
+            'BEGIN:VCARD\r\nVERSION:3.0\r\nUID:' + contact.uid + '\r\n' +
+            'FN:' + contact.name + '\r\nEMAIL:' + email + '\r\n' +
+            'END:VCARD\r\n';
+        await fetch(contact.href, { method: 'PUT', body: vcf });
+        refresh();
+        return false;
+    }
+
+    /* Deletes a contact by sending a DELETE to its path, then
+       refreshes so it drops off the list. */
+    async function deleteContact(contact) {
+        await fetch(contact.href, { method: 'DELETE' });
         refresh();
         return false;
     }

@@ -203,7 +203,15 @@ core already exists.</p>
     inter-example references and the README tour updated to match. Verified
     by running <code>php index.php 16</code>: the REPORT refresh, a
     link-added contact, a portable-curl-added contact, and a DELETE each
-    show on the next refresh.</p></li>
+    show on the next refresh.</p>
+    <p class="note">Follow-up: each contact row gained an edit link (which
+    asks for a new e-mail and PUTs the changed card to the same path, an
+    overwrite the server answers 204) and a delete link (a DELETE), and the
+    page's curl block now shows adding, changing, and deleting a card. The
+    list read now pulls each contact's href and UID from the report so a
+    row can be changed or deleted by its own path. Verified live: a change
+    updates the e-mail on the next refresh and a delete drops the row.</p>
+    </li>
 </ol>
 
 <h2>Open decisions to settle before coding</h2>

@@ -36,7 +36,7 @@
  *     what /etc/ssh/ uses on Unix.
  *   - CompositeSshAuthenticator: combines the two so
  *     either password or publickey login succeeds.
- *   - FilesystemFtpStorage: shared with examples 24
+ *   - FilesystemFtpStorage: shared with examples 25
  *     (FTP) -- the same path-traversal-guarded backend
  *     serves both protocols from one tree.
  *
@@ -267,7 +267,7 @@ $config = [
 ];
 /*
     Spawn the companion web UI. Same detached-child pattern
-    as examples 21-26. ATTOSSH_SERVER_PID lets the bind-
+    as examples 22-27. ATTOSSH_SERVER_PID lets the bind-
     switch endpoint in webui.php signal index.php (us) to
     shut down.
  */

@@ -72,7 +72,7 @@ $test = new WebSite();
     return promptly. For long-lived "push" channels prefer the
     SSE auto-reconnect pattern (the EventSource constructor
     reconnects automatically when the server closes), or use
-    WebSockets (example 16) for true bidirectional streaming.
+    WebSockets (example 17) for true bidirectional streaming.
 
     DEPLOYMENT NOTE: streaming responses require Atto to run in
     CLI mode. They cannot work when this script is invoked by

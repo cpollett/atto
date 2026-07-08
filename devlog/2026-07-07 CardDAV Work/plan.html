@@ -145,7 +145,7 @@ core already exists.</p>
     and a multiget returns the named contacts with a not-found for a gap.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Client autodiscovery, so a real
+  <li><span class="check">&#10003;</span> Client autodiscovery, so a real
     client needs only the base URL.
     <ul>
       <li>Redirect <code>/.well-known/carddav</code> to the service root,
@@ -173,7 +173,8 @@ core already exists.</p>
     properties.</p>
   </li>
 
-  <li>Documentation and a runnable example: a file header docblock on the
+  <li><span class="next">&rarr;</span> Documentation and a runnable
+    example: a file header docblock on the
     class, and an example whose <code>index.php</code> wires the class into
     a <code>WebSite</code>, seeds a demo address book, and serves a live
     contacts page &mdash; on a timer it sends the book an
@@ -185,7 +186,24 @@ core already exists.</p>
     shape as the CalDAV example's calendar page. Add a
     &ldquo;connect a real client&rdquo; pointer for Apple Contacts,
     Thunderbird, and DAVx5, and add the example to the examples index and
-    the README tour.</li>
+    the README tour.
+    <p class="note">Done: <code>examples/16 CardDAV</code> makes a
+    <code>WebSite</code>, hands it to <code>CardDav</code>, calls
+    <code>register()</code>, and seeds a demo book. The browser page is a
+    live address book: on a timer it sends the book an addressbook-query
+    and lists the contacts that come back, so a change shows up on the next
+    refresh. Links add fixed sample contacts with a <code>PUT</code>, and a
+    portable <code>printf</code>-into-a-file plus
+    <code>curl --data-binary&nbsp;@file</code> block adds one from the
+    command line (no <code>$'&hellip;'</code>, so it runs in tcsh); a
+    &ldquo;connect a real client&rdquo; pointer covers Apple Contacts,
+    Thunderbird, and DAVx5. The demo runs open, with a note pointing at
+    example&nbsp;14 for the authenticator shape. Placed at 16 next to
+    CalDAV, so examples 16&ndash;28 were renumbered to 17&ndash;29, their
+    inter-example references and the README tour updated to match. Verified
+    by running <code>php index.php 16</code>: the REPORT refresh, a
+    link-added contact, a portable-curl-added contact, and a DELETE each
+    show on the next refresh.</p></li>
 </ol>
 
 <h2>Open decisions to settle before coding</h2>
@@ -212,7 +230,10 @@ core already exists.</p>
     code untouched and matches how the other servers are organised; shape
     (b) is the one with no duplication. If (b) is chosen, item&nbsp;1 above
     absorbs extracting the base and retrofitting <code>CalDav</code> onto
-    it, guarded by the existing CalDAV tests. Chris to pick which.</li>
+    it, guarded by the existing CalDAV tests. Resolved: the standalone
+    shape &mdash; <code>src/CardDav.php</code> reimplements the shared core,
+    leaving the shipped <code>CalDav.php</code> and Yioop untouched, in
+    keeping with how the other servers each stand on their own.</li>
   <li><b>Address-book creation.</b> RFC&nbsp;6352 has no MKADDRESSBOOK
     verb; a book is made with an extended <code>MKCOL</code> (RFC&nbsp;5689)
     carrying a resource type, which is what Apple Contacts and DAVx5 send.
@@ -233,7 +254,10 @@ core already exists.</p>
     plus a handful of inter-example reference and README edits); appending
     it as the next free number avoids the renumber but separates it from
     the CalDAV example it mirrors. The CalDAV arc chose the insert for
-    coherence; this arc can follow that or not. Chris to pick which.</li>
+    coherence; this arc can follow that or not. Resolved: inserted at 16
+    next to CalDAV; examples 16&ndash;28 were renumbered to 17&ndash;29,
+    and their inter-example references and the README tour updated to
+    match.</li>
 </ul>
 </body>
 </html>

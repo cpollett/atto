@@ -109,21 +109,21 @@ Then `require "vendor/autoload.php"` and the Atto Site classes autoload.
 Examples
 --------
 
-The `examples/` folder has a numbered tour: 01-20 are WebSite features
-(routing, forms, sessions, WebDAV, CalDAV, WebSockets, streaming,
-HTTP/3, benchmarks), and 21 onward are full-protocol demos:
+The `examples/` folder has a numbered tour: 01-21 are WebSite features
+(routing, forms, sessions, WebDAV, CalDAV, CardDAV, WebSockets,
+streaming, HTTP/3, benchmarks), and 22 onward are full-protocol demos:
 
- * **21 GopherSite Demo** -- a working gopher hole.
- * **22 MailSite Demo** -- SMTP + IMAP, with `swaks` and `openssl s_client`
+ * **22 GopherSite Demo** -- a working gopher hole.
+ * **23 MailSite Demo** -- SMTP + IMAP, with `swaks` and `openssl s_client`
    smoke tests.
- * **23 Anonymous WebMail** -- a webmail front-end on top of MailSite.
- * **24 DNS Demo** -- click-through DNS scenarios, a query box, and a
+ * **24 Anonymous WebMail** -- a webmail front-end on top of MailSite.
+ * **25 DNS Demo** -- click-through DNS scenarios, a query box, and a
    browser-style zone-file editor.
- * **25 FTP Demo** -- click-through FTP scenarios, a raw command box, and
+ * **26 FTP Demo** -- click-through FTP scenarios, a raw command box, and
    a live FTP-driven file browser.
- * **26 SSH Demo** -- click-through SSH/SFTP scenarios with on-wire
+ * **27 SSH Demo** -- click-through SSH/SFTP scenarios with on-wire
    transcripts, a raw exec command box, and a multi-user file browser.
- * **27 TURN Demo** -- click-through STUN/TURN scenarios with full STUN
+ * **28 TURN Demo** -- click-through STUN/TURN scenarios with full STUN
    message decode and a raw STUN/TURN method explorer.
 
 To run any example:

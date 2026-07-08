@@ -66,7 +66,7 @@ core already exists.</p>
 </ul>
 
 <ol>
-  <li><span class="next">&rarr;</span> The contact-server class:
+  <li><span class="check">&#10003;</span> The contact-server class:
     construction, route registration, and the WebDAV verbs an address book
     answers. Nearly all of this is the same collection machinery the CalDAV
     class already runs; the address-book-specific parts are the resource
@@ -106,7 +106,8 @@ core already exists.</p>
     <code>text/vcard</code>, PROPFIND list it, and DELETE remove it.</p>
   </li>
 
-  <li>The <code>REPORT</code> verb and the vCard reading it needs. Multiget
+  <li><span class="next">&rarr;</span> The <code>REPORT</code> verb and the
+    vCard reading it needs. Multiget
     carries over from CalDAV almost verbatim; the query is the new work.
     <ul>
       <li><code>addressbook-multiget</code>: return each named contact's
@@ -126,6 +127,22 @@ core already exists.</p>
         each report driven over a scratch folder of contacts with known
         names and addresses.</li>
     </ul>
+    <p class="note">Done: <code>handleReport</code> answers
+    <code>addressbook-multiget</code> (each named contact's ETag and data,
+    a not-found entry for a missing one) and <code>addressbook-query</code>
+    (filter contacts by a <code>prop-filter</code> under an
+    <code>anyof</code> or <code>allof</code> test). A prop-filter judges a
+    contact by a <code>text-match</code> (equals, starts-with, ends-with,
+    or contains, case-insensitively), by <code>is-not-defined</code> (the
+    property absent), or by presence when it carries neither. The vCard
+    reader pulls a named property's values from the common unfolded
+    <code>PROP;PARAMS:VALUE</code> lines; folding, <code>param-filter</code>,
+    collation negotiation, and restricting the returned
+    <code>address-data</code> stay out of this first cut, as the plan's
+    scope note says. Tests in
+    <code>tests/carddav/test_carddav_report.php</code> (13 checks).
+    Verified live: an FN-contains query returns only the matching contact,
+    and a multiget returns the named contacts with a not-found for a gap.</p>
   </li>
 
   <li>Client autodiscovery, so a real client needs only the base URL.

@@ -285,6 +285,17 @@ interface MailVocabulary
     const FLAG_DRAFT = '\Draft';
     /** RFC 3501 session-only system flag for recent arrival. */
     const FLAG_RECENT = '\Recent';
+    /**
+     * Seconds a fiber will keep trying for a contended file lock before it
+     * gives up, so a lock a dead process never releases cannot wedge the
+     * event loop in an endless retry.
+     */
+    const FLOCK_WAIT_SECONDS = 30;
+    /**
+     * Seconds a single pass through the event loop may take before the
+     * watchdog treats it as wedged and logs where it is stuck.
+     */
+    const WATCHDOG_SECONDS = 60;
     /** Canonical name of the always-present base folder. */
     const FOLDER_INBOX = 'INBOX';
     /** Canonical Sent folder (RFC 6154 \Sent special-use). */
@@ -1899,8 +1910,15 @@ class FileMailStorage extends MailStorage
             return @flock($handle, $operation);
         }
         $would_block = false;
+        $deadline = microtime(true) + self::FLOCK_WAIT_SECONDS;
         while (!@flock($handle, $operation | LOCK_NB, $would_block)) {
             if (!$would_block) {
+                return false;
+            }
+            if (microtime(true) >= $deadline) {
+                /* another process has held this lock far too long, most
+                   likely because it died holding it; give up rather than
+                   spin the event loop forever retrying */
                 return false;
             }
             \Fiber::suspend();
@@ -5267,6 +5285,19 @@ class MailSite implements MailVocabulary
     protected $timer_alarms;
     /** @var array */
     protected $timers = [];
+    /**
+     * Wall-clock time, as a float, when the current pass through the event
+     * loop began, so the watchdog can tell a wedged pass from a busy one.
+     * @var float
+     */
+    protected $loop_tick = 0.0;
+    /**
+     * A short note of what the event loop is doing right now, such as
+     * "read key=5" or "fibers", updated as the loop moves through its
+     * phases so the watchdog can say where a stall happened.
+     * @var string
+     */
+    protected $loop_activity = "idle";
     /** @var array stream context array (for TLS) */
     protected $server_context_array = [];
     /** @var bool whether listen() detected an SSL config */
@@ -6057,6 +6088,55 @@ class MailSite implements MailVocabulary
         unset($this->timers[$id]);
     }
     /**
+     * Returns how many connection fibers are currently parked waiting to be
+     * resumed. A number that climbs without falling is a sign fibers are
+     * stuck, for instance on a lock that is never released, and is worth
+     * logging alongside the memory and uptime heartbeat.
+     * @return int the count of parked connection fibers
+     */
+    public function pendingFiberCount()
+    {
+        return count($this->pending_fibers);
+    }
+    /**
+     * Installs a watchdog that notices when a single pass through the event
+     * loop runs far too long, the mark of a wedged loop, and logs what the
+     * loop was doing together with a backtrace, so the stuck code can be
+     * found even though the loop itself has stopped logging. It works
+     * through an asynchronous SIGALRM, which interrupts a running PHP loop,
+     * where an ordinary timer, driven by the same stuck loop, could not
+     * fire. The alarm re-arms itself, so a stall is reported roughly every
+     * WATCHDOG_SECONDS for as long as it lasts. Where the process has no
+     * pcntl support, or the watchdog is switched off, nothing is installed.
+     * @return void
+     */
+    protected function installWatchdog()
+    {
+        if (self::WATCHDOG_SECONDS <= 0 ||
+            !function_exists("pcntl_async_signals")) {
+            return;
+        }
+        pcntl_async_signals(true);
+        pcntl_signal(SIGALRM, function () {
+            $stalled = microtime(true) - $this->loop_tick;
+            if ($stalled >= self::WATCHDOG_SECONDS) {
+                $trace = "";
+                foreach (debug_backtrace(
+                    DEBUG_BACKTRACE_IGNORE_ARGS, 15) as $frame) {
+                    $trace .= " " . ($frame["class"] ?? "") .
+                        ($frame["type"] ?? "") .
+                        ($frame["function"] ?? "?") . ":" .
+                        ($frame["line"] ?? "?");
+                }
+                $this->emitLog("MailSite watchdog: event loop stuck in " .
+                    $this->loop_activity . " for " . (int) $stalled .
+                    "s, backtrace:" . $trace);
+            }
+            pcntl_alarm(self::WATCHDOG_SECONDS);
+        });
+        pcntl_alarm(self::WATCHDOG_SECONDS);
+    }
+    /**
      * Binds the SMTP and IMAP listening sockets and runs the
      * event loop forever. The $config array overrides the
      * built-in defaults. If the SERVER_CONTEXT.ssl key is set
@@ -6178,7 +6258,10 @@ class MailSite implements MailVocabulary
             echo "AttoMail listening: $listener\n";
         }
         $excepts = null;
+        $this->installWatchdog();
         while (true) {
+            $this->loop_tick = microtime(true);
+            $this->loop_activity = "select";
             $reads = $this->in_streams[self::CONNECTION];
             $writes = $this->out_streams[self::CONNECTION];
             /*
@@ -6235,6 +6318,7 @@ class MailSite implements MailVocabulary
                     }
                 }
                 foreach (array_keys($driven) as $key) {
+                    $this->loop_activity = "handshake key=" . $key;
                     $this->driveHandshake($key);
                 }
                 foreach ($reads as $stream) {
@@ -6243,9 +6327,11 @@ class MailSite implements MailVocabulary
                         continue;
                     }
                     if (isset($listeners[$key])) {
+                        $this->loop_activity = "accept key=" . $key;
                         $this->acceptConnection($stream,
                             $listeners[$key]);
                     } else {
+                        $this->loop_activity = "read key=" . $key;
                         $this->readClient($stream);
                     }
                 }
@@ -6254,11 +6340,15 @@ class MailSite implements MailVocabulary
                     if (isset($driven[$key])) {
                         continue;
                     }
+                    $this->loop_activity = "write key=" . $key;
                     $this->writeClient($stream);
                 }
             }
+            $this->loop_activity = "fibers";
             $this->resumePendingFibers();
+            $this->loop_activity = "idle";
             $this->processIdleNotifications();
+            $this->loop_activity = "cull";
             $this->cullDeadStreams();
         }
     }
@@ -6773,7 +6863,23 @@ class MailSite implements MailVocabulary
             return;
         }
         $fiber = new \Fiber(function () use ($key) {
-            while ($this->processOne($key)) {
+            while (true) {
+                $before = isset($this->in_streams[self::DATA][$key]) ?
+                    strlen($this->in_streams[self::DATA][$key]) : 0;
+                if (!$this->processOne($key)) {
+                    break;
+                }
+                $after = isset($this->in_streams[self::DATA][$key]) ?
+                    strlen($this->in_streams[self::DATA][$key]) : 0;
+                if ($after >= $before) {
+                    /* processOne reported progress but left the input
+                       buffer no smaller, which would loop forever; log it
+                       and drop the connection rather than wedge the loop */
+                    $this->emitLog("MailSite: command loop made no progress" .
+                        " on key " . $key . "; dropping connection");
+                    $this->shutdownStream($key);
+                    break;
+                }
             }
         });
         $fiber->start();
@@ -10651,7 +10757,13 @@ class MailSite implements MailVocabulary
                 $r = true;
                 while ($cursor < count($tokens) &&
                     $tokens[$cursor][0] !== ')') {
-                    $r = $r && $eval_one();
+                    /* Evaluate first, then fold into the running
+                       result. Writing $r = $r && $eval_one() would let
+                       PHP short-circuit once $r is false and never call
+                       $eval_one() again, so the cursor would stop
+                       advancing and this loop would spin forever. */
+                    $term = $eval_one();
+                    $r = $r && $term;
                 }
                 if ($cursor < count($tokens)) {
                     $cursor++;
@@ -10794,7 +10906,11 @@ class MailSite implements MailVocabulary
         };
         $r = true;
         while ($cursor < count($tokens)) {
-            $r = $r && $eval_one();
+            /* Same short-circuit guard as the grouped case above: call
+               $eval_one() unconditionally so the cursor advances even
+               after $r turns false, otherwise the loop never ends. */
+            $term = $eval_one();
+            $r = $r && $term;
         }
         return $r;
     }

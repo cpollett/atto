@@ -153,6 +153,7 @@ class CardDav
             "GET" => "handleGet",
             "PUT" => "handlePut",
             "DELETE" => "handleDelete",
+            "REPORT" => "handleReport",
         ];
         foreach ($verbs as $verb => $method) {
             $this->site->addRoute($verb, $prefix, [$this, $method]);
@@ -408,7 +409,7 @@ class CardDav
         $this->status(200, "OK");
         $this->site->header("DAV: 1, addressbook-access, extended-mkcol");
         $this->site->header("Allow: OPTIONS, PROPFIND, MKCOL, GET, " .
-            "PUT, DELETE");
+            "PUT, DELETE, REPORT");
         $this->site->header("Content-Length: 0");
     }
 
@@ -741,5 +742,343 @@ class CardDav
             return;
         }
         unlink($path);
+    }
+
+    /**
+     * Answers REPORT: runs one of the two address-book reports a
+     * client uses to read contacts. addressbook-multiget returns a
+     * named set of contacts; addressbook-query returns the contacts
+     * matching a property filter. Both answer a 207 multi-status. An
+     * unrecognized report answers 400.
+     */
+    public function handleReport()
+    {
+        if (!$this->authenticate()) {
+            return;
+        }
+        $body = $_SERVER['CONTENT'] ?? "";
+        if (stripos($body, "addressbook-multiget") !== false) {
+            $this->reportMultiget($body);
+            return;
+        }
+        if (stripos($body, "addressbook-query") !== false) {
+            $this->reportQuery($body);
+            return;
+        }
+        $this->status(400, "Bad Request");
+    }
+
+    /**
+     * Runs an addressbook-multiget report: the body lists contact
+     * hrefs, and the reply returns each named contact's ETag and
+     * vCard data, or a not-found entry for one that is missing, so a
+     * client fetches many contacts in a single round trip.
+     *
+     * @param string $body the REPORT request body
+     */
+    protected function reportMultiget($body)
+    {
+        $responses = "";
+        foreach ($this->parseHrefs($body) as $href) {
+            $disk_path = $this->containedPath($this->resourceForUri($href));
+            if ($disk_path === false || !is_file($disk_path)) {
+                $responses .= $this->notFoundResponse($href);
+                continue;
+            }
+            $bytes = $this->site->fileGetContents($disk_path);
+            $responses .= $this->addressDataResponse($href, $bytes);
+        }
+        $this->emitMultistatus($responses);
+    }
+
+    /**
+     * Runs an addressbook-query report: the body filters by vCard
+     * properties, and the reply returns each stored contact that
+     * matches. Each contact is read only far enough to decide
+     * whether it belongs; the returned bytes are the stored bytes.
+     *
+     * @param string $body the REPORT request body
+     */
+    protected function reportQuery($body)
+    {
+        $resource = $this->resourceForUri();
+        $disk_path = $this->containedPath($resource);
+        if ($disk_path === false || !is_dir($disk_path)) {
+            $this->status(404, "Not Found");
+            return;
+        }
+        list($test, $filters) = $this->parseQuery($body);
+        $responses = "";
+        foreach (scandir($disk_path) as $entry) {
+            if (!$this->isResourceName($entry)) {
+                continue;
+            }
+            $bytes = $this->site->fileGetContents($disk_path . "/" . $entry);
+            if (!$this->contactMatches($bytes, $filters, $test)) {
+                continue;
+            }
+            $child_rel = ltrim($resource . "/" . $entry, "/");
+            $href = $this->hrefFor($child_rel, false);
+            $responses .= $this->addressDataResponse($href, $bytes);
+        }
+        $this->emitMultistatus($responses);
+    }
+
+    /**
+     * Wraps a set of response elements in a 207 multi-status
+     * document with the DAV, CardDAV, and calendar-server
+     * namespaces, and sends it.
+     *
+     * @param string $responses the response elements to wrap
+     */
+    protected function emitMultistatus($responses)
+    {
+        $body = '<?xml version="1.0" encoding="utf-8"?>' .
+            '<D:multistatus xmlns:D="' . self::NS_DAV . '" xmlns:CARD="' .
+            self::NS_CARDDAV . '" xmlns:CS="' . self::NS_CALSERVER . '">' .
+            $responses . "</D:multistatus>";
+        $this->status(207, "Multi-Status");
+        $this->site->header("Content-Type: application/xml; charset=utf-8");
+        echo $body;
+    }
+
+    /**
+     * Builds a response element carrying a contact's ETag and its
+     * vCard data, as the two address-book reports return for a
+     * matched contact. The contact's bytes are XML-escaped so they
+     * nest safely inside the reply.
+     *
+     * @param string $href the contact's href
+     * @param string $bytes the contact's stored bytes
+     * @return string the response element
+     */
+    protected function addressDataResponse($href, $bytes)
+    {
+        $prop = "<D:getetag>" . $this->computeETag($bytes) .
+            "</D:getetag><CARD:address-data>" . htmlspecialchars($bytes) .
+            "</CARD:address-data>";
+        return $this->wrapResponse($href, $prop);
+    }
+
+    /**
+     * Builds a response element marking an href not found, as an
+     * addressbook-multiget reply does for a contact the client
+     * named that is not there. The status here is response-document
+     * content the client reads, not the transport status line.
+     *
+     * @param string $href the href that was not found
+     * @return string the response element
+     */
+    protected function notFoundResponse($href)
+    {
+        return "<D:response><D:href>" . htmlspecialchars($href) .
+            "</D:href><D:status>HTTP/1.1 404 Not Found</D:status>" .
+            "</D:response>";
+    }
+
+    /**
+     * Reads the href list out of an addressbook-multiget body. Only
+     * the fixed vocabulary is looked for, so each href element's
+     * text is taken directly.
+     *
+     * @param string $body the REPORT request body
+     * @return array the hrefs the body named
+     */
+    public function parseHrefs($body)
+    {
+        $pattern = "/<(?:[\\w.-]+:)?href[^>]*>(.*?)" .
+            "<\\/(?:[\\w.-]+:)?href>/si";
+        $hrefs = [];
+        if (preg_match_all($pattern, $body, $matches)) {
+            foreach ($matches[1] as $href) {
+                $hrefs[] = trim(html_entity_decode($href));
+            }
+        }
+        return $hrefs;
+    }
+
+    /**
+     * Reads an addressbook-query filter into the test that joins
+     * its parts and a list of property filters. The filter's test
+     * attribute is anyof or allof (anyof when absent, per
+     * RFC 6352). Each prop-filter carries the property it names and
+     * how to judge it: a text-match with a match type, or a bare
+     * present/absent test (is-not-defined asks for absent, and a
+     * prop-filter with neither asks the property be present).
+     *
+     * @param string $body the REPORT request body
+     * @return array a pair of the test name and the filter list,
+     *      each filter an array of name, mode, match type, and text
+     */
+    public function parseQuery($body)
+    {
+        $test = "anyof";
+        if (preg_match('/<(?:[\\w.-]+:)?filter\\b[^>]*\\btest=' .
+            '"([^"]+)"/i', $body, $found)) {
+            $test = strtolower($found[1]);
+        }
+        $filters = [];
+        $pattern = '/<(?:[\\w.-]+:)?prop-filter\\b[^>]*\\bname=' .
+            '"([^"]+)"[^>]*>(.*?)<\\/(?:[\\w.-]+:)?prop-filter>/si';
+        if (preg_match_all($pattern, $body, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $match) {
+                $filters[] = $this->readPropFilter($match[1], $match[2]);
+            }
+        }
+        return [$test, $filters];
+    }
+
+    /**
+     * Reads one prop-filter's inner content into a filter record.
+     * An is-not-defined asks the property be absent; a text-match
+     * asks its value match, with the match type read from the
+     * element (contains when absent); neither asks it be present.
+     *
+     * @param string $name the property the filter names
+     * @param string $inner the prop-filter's inner XML
+     * @return array the filter record: name, mode, match type, text
+     */
+    protected function readPropFilter($name, $inner)
+    {
+        if (preg_match('/<(?:[\\w.-]+:)?is-not-defined\\b/i', $inner)) {
+            return ["name" => $name, "mode" => "absent",
+                "match" => "", "text" => ""];
+        }
+        $pattern = '/<(?:[\\w.-]+:)?text-match\\b([^>]*)>(.*?)' .
+            '<\\/(?:[\\w.-]+:)?text-match>/si';
+        if (preg_match($pattern, $inner, $found)) {
+            $match_type = "contains";
+            if (preg_match('/\\bmatch-type="([^"]+)"/i', $found[1],
+                $type_found)) {
+                $match_type = strtolower($type_found[1]);
+            }
+            return ["name" => $name, "mode" => "text",
+                "match" => $match_type,
+                "text" => trim(html_entity_decode($found[2]))];
+        }
+        return ["name" => $name, "mode" => "present",
+            "match" => "", "text" => ""];
+    }
+
+    /**
+     * Judges a contact against the parsed filters. With no filters
+     * every contact matches; otherwise each filter is judged and
+     * the results joined by the test, allof requiring all to hold
+     * and anyof requiring one.
+     *
+     * @param string $vcard the contact's vCard bytes
+     * @param array $filters the parsed prop-filter records
+     * @param string $test the joining test, anyof or allof
+     * @return bool whether the contact matches
+     */
+    public function contactMatches($vcard, $filters, $test)
+    {
+        if (empty($filters)) {
+            return true;
+        }
+        foreach ($filters as $filter) {
+            $held = $this->filterMatches($vcard, $filter);
+            if ($test === "allof" && !$held) {
+                return false;
+            }
+            if ($test !== "allof" && $held) {
+                return true;
+            }
+        }
+        return $test === "allof";
+    }
+
+    /**
+     * Judges one filter against a contact: an absent filter holds
+     * when the named property is missing, a present filter when it
+     * is there, and a text filter when any of the property's values
+     * satisfies the text match.
+     *
+     * @param string $vcard the contact's vCard bytes
+     * @param array $filter one parsed prop-filter record
+     * @return bool whether the filter holds for the contact
+     */
+    protected function filterMatches($vcard, $filter)
+    {
+        $values = $this->vcardProperty($vcard, $filter["name"]);
+        if ($filter["mode"] === "absent") {
+            return empty($values);
+        }
+        if ($filter["mode"] === "present") {
+            return !empty($values);
+        }
+        foreach ($values as $value) {
+            if ($this->textMatches($value, $filter["match"],
+                $filter["text"])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Tests one property value against a match text under a match
+     * type, case-insensitively: equals compares the whole value,
+     * starts-with and ends-with anchor at an end, and contains (the
+     * default) looks anywhere. An empty match text matches any
+     * value.
+     *
+     * @param string $value the property value to test
+     * @param string $match_type equals, starts-with, ends-with, or
+     *      contains
+     * @param string $text the match text
+     * @return bool whether the value matches
+     */
+    public function textMatches($value, $match_type, $text)
+    {
+        if ($text === "") {
+            return true;
+        }
+        $value = strtolower($value);
+        $text = strtolower($text);
+        $text_len = strlen($text);
+        if ($match_type === "equals") {
+            return $value === $text;
+        }
+        if ($match_type === "starts-with") {
+            return strncmp($value, $text, $text_len) === 0;
+        }
+        if ($match_type === "ends-with") {
+            return $text_len <= strlen($value) &&
+                substr($value, -$text_len) === $text;
+        }
+        return strpos($value, $text) !== false;
+    }
+
+    /**
+     * Collects the values of a named vCard property from a contact.
+     * A line is read as the property name up to the first ";" or
+     * ":", so parameters after a ";" are skipped, and the value is
+     * what follows the first ":". A property may appear more than
+     * once (several EMAIL lines, say), so a list is returned. This
+     * reads the common unfolded form; folded continuation lines are
+     * out of scope for this first cut.
+     *
+     * @param string $vcard the contact's vCard bytes
+     * @param string $name the property name to collect
+     * @return array the property's values, in file order
+     */
+    public function vcardProperty($vcard, $name)
+    {
+        $wanted = strtoupper($name);
+        $values = [];
+        foreach (preg_split('/\\r\\n|\\r|\\n/', $vcard) as $line) {
+            $colon = strpos($line, ":");
+            if ($colon === false) {
+                continue;
+            }
+            $left = substr($line, 0, $colon);
+            $semi = strpos($left, ";");
+            $property = $semi === false ? $left : substr($left, 0, $semi);
+            if (strtoupper(trim($property)) === $wanted) {
+                $values[] = trim(substr($line, $colon + 1));
+            }
+        }
+        return $values;
     }
 }

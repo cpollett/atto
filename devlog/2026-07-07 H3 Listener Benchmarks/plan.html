@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>atto &mdash; H3 Listener Hotpath Benchmarks</title>
+<style>
+body { font-family: system-ui, sans-serif; max-width: 760px;
+    margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+    color: #1a1a1a; }
+ol { margin: 0.4rem 0; }
+ol ol { margin: 0.3rem 0 0.8rem; }
+li { margin: 0.3rem 0; }
+.check { color: #1a7f37; font-weight: bold; }
+.next { color: #b35900; font-weight: bold; }
+.note { color: #555; font-size: 0.92em; margin: 0.6rem 0 1.2rem; }
+code { background: #f2f2f2; padding: 0 0.2em; border-radius: 3px; }
+table { border-collapse: collapse; margin: 0.8rem 0; }
+td, th { border: 1px solid #ddd; padding: 0.2rem 0.6rem;
+    text-align: left; }
+</style>
+</head>
+<body>
+<h1>atto &mdash; H3 Listener Hotpath Benchmarks</h1>
+<p class="note">Started 07-Jul-2026. The Post v2 note
+<code>h3-status-and-bottlenecks.html</code> lists, per method, where the
+pure-PHP HTTP/3 listener spends its time on a 1&nbsp;MiB response, but it
+reported those numbers without a test anyone can run to reproduce or
+inspect them. This arc builds that missing measurement: for each hotpath
+method the note names, a benchmark that calls that one method in isolation
+over many iterations and reports its per-call cost. The point is twofold:
+reproduce the note's per-method figures so they can be inspected directly,
+and give each method a stable baseline so a later code tweak can be
+measured against it &mdash; run the benchmark, change the method, run it
+again, and read the difference. These are benchmarks, not the pass/fail
+tests: they stand up no H3 website and open no socket, they exercise a
+single method with representative inputs, and they are timed rather than
+asserted.</p>
+
+<h2>The hotpath methods to benchmark</h2>
+<p class="note">Taken from the note's per-method list, ordered by the total
+cost it attributes to each on a <code>/big</code> response. All live in
+<code>src/H3Listener.php</code>.</p>
+<table>
+<tr><th>Method</th><th>Note's figure</th><th>Isolation</th></tr>
+<tr><td><code>QuicPacketKeys::seal</code></td><td>~4.2 us/call, ~21 ms
+  total</td><td>pure</td></tr>
+<tr><td><code>QuicPacketKeys::headerProtectionMask</code></td>
+  <td>~2.6 us/call, ~13 ms</td><td>pure</td></tr>
+<tr><td><code>QuicPacketKeys::open</code></td><td>~8 us/call, ~2 ms</td>
+  <td>pure</td></tr>
+<tr><td><code>QuicFrame::encode</code> / <code>encodeStream</code></td>
+  <td>~1 us/call, ~5&ndash;8 ms</td><td>pure</td></tr>
+<tr><td><code>QuicFrame::decodeAll</code></td><td>part of ~5&ndash;8 ms</td>
+  <td>pure</td></tr>
+<tr><td><code>QuicPacket::encodeShort</code> /
+  <code>decodeShort</code></td><td>part of emit / inbound</td>
+  <td>needs keys</td></tr>
+<tr><td><code>QuicStream::takeForFrame</code></td><td>~8&ndash;12 ms
+  (chunking)</td><td>needs a stream</td></tr>
+<tr><td><code>QuicConnection::emit</code></td><td>~10&ndash;15 ms</td>
+  <td>needs a connection</td></tr>
+<tr><td><code>QuicConnection::flushStreams</code></td><td>~8&ndash;12 ms
+  </td><td>needs a connection</td></tr>
+<tr><td><code>QuicConnection::setLossDetectionTimer</code></td>
+  <td>~2&ndash;3 ms</td><td>needs a connection</td></tr>
+<tr><td><code>QuicConnection::processAck</code></td><td>part of
+  ~3&ndash;5 ms</td><td>needs a connection</td></tr>
+</table>
+<p class="note">Two things already noticed while reading the code, worth
+carrying into the work rather than trusting the note blindly. The
+substr-chunking fix the note lists as a future win is already in place:
+<code>QuicStream</code> advances a <code>send_buf_off</code> offset instead
+of mutating the buffer, so <code>takeForFrame</code>'s benchmark will
+measure the current offset-based cost, not the old O(n^2) shift. And the
+<code>QuicConnection</code> constructor takes a certificate and key, so the
+connection-stateful methods need a throwaway cert plus a representative
+response queued before they can be called; that set-up is the bulk of the
+work for the last two items.</p>
+
+<ol>
+  <li><span class="next">&rarr;</span> The benchmark runner and the AEAD
+    benchmarks &mdash; the largest single cost (~36 ms, about a third of a
+    <code>/big</code> response) and the cleanest to isolate.
+    <ul>
+      <li>A small bench helper that warms a method up, times a fixed number
+        of calls with <code>hrtime</code>, takes the median over a few
+        repetitions to smooth noise, and reports nanoseconds per call and
+        calls per second. A <code>bench_all.php</code> that runs the
+        benchmarks and prints one table.</li>
+      <li>Benchmarks for <code>seal</code>, <code>open</code>, and
+        <code>headerProtectionMask</code> on a real key set built from
+        <code>QuicPacketKeys::fromInitialDcid</code> (AES-128-GCM, the
+        cipher the note measured), with a ~1100-byte payload and a 16-byte
+        header-protection sample, the sizes the note used.</li>
+      <li>Confirm the per-call figures land near the note's ~4.2, ~8, and
+        ~2.6 us; where they differ, say so plainly, since the box and the
+        openssl build both move these numbers.</li>
+    </ul>
+  </li>
+
+  <li>Frame and packet encode/decode benchmarks.
+    <ul>
+      <li><code>QuicFrame::encode</code> on a STREAM frame (its hot case,
+        which dispatches into <code>encodeStream</code>), and
+        <code>decodeAll</code> over a buffer of the frames a response and
+        its ACKs carry.</li>
+      <li><code>QuicPacket::encodeShort</code> and
+        <code>decodeShort</code> over a short-header packet, using the
+        key set from item 1 so the AEAD and header-protection steps they
+        call are exercised as they are in the real path.</li>
+    </ul>
+  </li>
+
+  <li>Stream-chunking and emit-loop benchmarks, the first that need
+    object state stood up.
+    <ul>
+      <li><code>QuicStream::takeForFrame</code> over a 1&nbsp;MiB
+        <code>send_buf</code>, drained in the frame-sized chunks a
+        <code>/big</code> response uses, to measure the current
+        offset-based cost.</li>
+      <li><code>QuicConnection::emit</code> and
+        <code>flushStreams</code> over a connection built with a throwaway
+        self-signed cert and a 1&nbsp;MiB response queued on a stream, so
+        the per-packet bookkeeping the note flags is measured on a
+        realistic queue.</li>
+    </ul>
+  </li>
+
+  <li>Loss-timer and ACK benchmarks.
+    <ul>
+      <li><code>QuicConnection::setLossDetectionTimer</code> against a
+        <code>sent_packets</code> set of the size a <code>/big</code>
+        response leaves in flight, to measure the walk the note says could
+        be cached.</li>
+      <li><code>QuicConnection::processAck</code> over a representative ACK
+        frame, the inbound cost that dominates the datagram path for
+        <code>/big</code>.</li>
+    </ul>
+  </li>
+</ol>
+
+<h2>Open decisions to settle before coding</h2>
+<ul>
+  <li><b>Where the benchmarks live and how they run.</b> They are timed,
+    not asserted, and slow by design, so they must stay out of
+    <code>tests/run_all.php</code>, which globs <code>test_*.php</code> and
+    flags anything over 0.01&nbsp;s as unintended I/O. The plan puts them in
+    <code>tests/h3bench/</code> as <code>bench_*.php</code> (the
+    <code>bench_</code> prefix keeps the runner from picking them up), with
+    a <code>bench_all.php</code> that runs them and prints a table; each is
+    also runnable on its own. If you would rather they sat outside
+    <code>tests/</code> entirely (a top-level <code>bench/</code>), say so.
+    </li>
+  <li><b>How the connection-stateful methods are set up.</b> The last two
+    items need a <code>QuicConnection</code>, which the constructor builds
+    from a certificate and key and which then needs a response queued and
+    some packets recorded as in flight. The plan stands up one throwaway
+    self-signed cert at benchmark start and a shared helper that builds a
+    representative connection (a 1&nbsp;MiB stream queued, keys installed),
+    reaching internal fields through reflection only where the class does
+    not expose them. The open question is how faithfully to reproduce the
+    real <code>/big</code> state versus keeping the set-up small; the plan
+    leans toward the smallest set-up that exercises the same code, and will
+    say in each benchmark what state it stood up.</li>
+  <li><b>Protected methods.</b> <code>encodeStream</code> and
+    <code>processAck</code> are protected. The plan reaches them with
+    reflection to time the one method in isolation, and, where it is cheap,
+    also times the public caller (<code>encode</code>, the datagram path)
+    so the dispatch overhead the note mentions is visible too. Say if you
+    would rather only ever go through the public entry points.</li>
+  <li><b>Baselines now, tweaks after.</b> This arc's deliverable is the
+    benchmarks and the baseline numbers, not the optimizations. Once the
+    baselines are in, the note's candidate wins (batching header-protection
+    masks, caching the loss-timer earliest deadline, pooling per-packet
+    allocations) can each be tried and measured against its baseline, as a
+    follow-on. If you would rather fold the tweak-and-measure for a given
+    method into the same item that benchmarks it, say which methods.</li>
+</ul>
+</body>
+</html>

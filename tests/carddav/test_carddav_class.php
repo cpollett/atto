@@ -352,6 +352,38 @@ $_SERVER['SERVER_PROTOCOL'] = "HTTP/1.1";
 ok("the status line carries the request's protocol",
     strncmp($line_two, "HTTP/2.0 404 ", 13) === 0);
 
+/*
+    -----------------------------------------------------------
+    Autodiscovery: bootstrap redirect and principal properties
+    -----------------------------------------------------------
+ */
+
+/* Test 19: the well-known bootstrap redirects to the service root. */
+$site->reset();
+request("/.well-known/carddav");
+$dav->handleWellKnown();
+ok("the well-known path redirects to the service root",
+    $site->status() === 301 &&
+    $site->headerValue("Location") === "$prefix/");
+
+/* Test 20: PROPFIND on a book reports the discovery properties. */
+$site->reset();
+request("$prefix/work", "", ["HTTP_DEPTH" => "0"]);
+$disco_book = capture([$dav, "handlePropfind"]);
+$principal = "<D:current-user-principal><D:href>$prefix/</D:href>";
+$home = "<CARD:addressbook-home-set><D:href>$prefix/</D:href>";
+ok("PROPFIND on a book reports the discovery properties",
+    strpos($disco_book, $principal) !== false &&
+    strpos($disco_book, $home) !== false);
+
+/* Test 21: PROPFIND on the plain home collection reports them too. */
+$site->reset();
+request("$prefix", "", ["HTTP_DEPTH" => "0"]);
+$disco_home = capture([$dav, "handlePropfind"]);
+ok("PROPFIND on the address-book home reports the discovery properties",
+    strpos($disco_home, $principal) !== false &&
+    strpos($disco_home, $home) !== false);
+
 /**
  * Removes a file, or a folder and everything under it, so the
  * test leaves nothing behind on disk.

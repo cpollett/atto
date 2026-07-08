@@ -78,6 +78,14 @@ class CardDav
      * @var string
      */
     const NS_CALSERVER = "http://calendarserver.org/ns/";
+    /**
+     * The bootstrap path a contacts client probes when given only a
+     * base URL, fixed by RFC 6764. A request here is redirected to
+     * the address-book service so the client can read the principal
+     * and address-book-home properties from there.
+     * @var string
+     */
+    const WELL_KNOWN_PATH = "/.well-known/carddav";
 
     /**
      * The WebSite (or subclass) this address book attaches to.
@@ -141,9 +149,16 @@ class CardDav
      * Adds every address-book route to the site. Both the bare
      * prefix (the list of books) and any path beneath it are
      * routed, so a handler can address a book or a contact any
-     * number of folders deep. Call this once after construction.
+     * number of folders deep. When $with_well_known is left on, the
+     * RFC 6764 bootstrap path is routed too, so a client given only
+     * the base URL can find the service; a project that manages
+     * <code>/.well-known</code> itself can pass false to skip it.
+     * Call this once after construction.
+     *
+     * @param bool $with_well_known whether to route the
+     *      /.well-known/carddav bootstrap redirect
      */
-    public function register()
+    public function register($with_well_known = true)
     {
         $prefix = $this->route_prefix;
         $verbs = [
@@ -158,6 +173,12 @@ class CardDav
         foreach ($verbs as $verb => $method) {
             $this->site->addRoute($verb, $prefix, [$this, $method]);
             $this->site->addRoute($verb, $prefix . "/*", [$this, $method]);
+        }
+        if ($with_well_known) {
+            $this->site->addRoute("GET", self::WELL_KNOWN_PATH,
+                [$this, "handleWellKnown"]);
+            $this->site->addRoute("PROPFIND", self::WELL_KNOWN_PATH,
+                [$this, "handleWellKnown"]);
         }
     }
 
@@ -414,6 +435,21 @@ class CardDav
     }
 
     /**
+     * Answers the /.well-known/carddav bootstrap: redirects a
+     * probing client to the address-book service root, from which it
+     * reads the principal and address-book-home properties and then
+     * the books. The redirect carries nothing sensitive, so it is
+     * not gated on log-in; the properties it points at are.
+     * (RFC 6764.)
+     */
+    public function handleWellKnown()
+    {
+        $this->status(301, "Moved Permanently");
+        $this->site->header("Location: " . $this->route_prefix . "/");
+        $this->site->header("Content-Length: 0");
+    }
+
+    /**
      * Answers MKCOL: makes a new folder. When the request body asks
      * for an address book, the folder is marked as one by writing
      * its metadata (the display name from the body); otherwise a
@@ -535,6 +571,27 @@ class CardDav
     }
 
     /**
+     * Builds the two discovery properties a client reads to find
+     * its address books from the base URL alone:
+     * current-user-principal names the principal, and
+     * addressbook-home-set names the folder the books live under.
+     * This server keeps one home for everyone, so both point at the
+     * route prefix; a project with per-user homes (for instance
+     * Yioop) overrides this to return per-user hrefs. (RFC 5397,
+     * RFC 6352.)
+     *
+     * @return string the property elements
+     */
+    protected function principalProps()
+    {
+        $home = htmlspecialchars($this->route_prefix . "/");
+        return "<D:current-user-principal><D:href>" . $home .
+            "</D:href></D:current-user-principal>" .
+            "<CARD:addressbook-home-set><D:href>" . $home .
+            "</D:href></CARD:addressbook-home-set>";
+    }
+
+    /**
      * Builds the response element for an address-book folder: it is
      * a collection and an address book, and it carries a display
      * name, the vCard media types it holds, and its change tag.
@@ -557,21 +614,23 @@ class CardDav
             'version="4.0"/>' .
             "</CARD:supported-address-data>" .
             "<CS:getctag>" . $this->computeCTag($disk_path) .
-            "</CS:getctag>";
+            "</CS:getctag>" . $this->principalProps();
         return $this->wrapResponse($href, $prop);
     }
 
     /**
      * Builds the response element for a plain folder, such as the
-     * folder that holds the address books: it is a collection and
-     * nothing more.
+     * folder that holds the address books: it is a collection, and
+     * it carries the discovery properties so a client that lands
+     * here can walk on to the books.
      *
      * @param string $href the href to report for it
      * @return string the response element
      */
     protected function collectionResponse($href)
     {
-        $prop = "<D:resourcetype><D:collection/></D:resourcetype>";
+        $prop = "<D:resourcetype><D:collection/></D:resourcetype>" .
+            $this->principalProps();
         return $this->wrapResponse($href, $prop);
     }
 

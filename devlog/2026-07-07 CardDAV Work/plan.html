@@ -106,7 +106,7 @@ core already exists.</p>
     <code>text/vcard</code>, PROPFIND list it, and DELETE remove it.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> The <code>REPORT</code> verb and the
+  <li><span class="check">&#10003;</span> The <code>REPORT</code> verb and the
     vCard reading it needs. Multiget
     carries over from CalDAV almost verbatim; the query is the new work.
     <ul>
@@ -145,7 +145,8 @@ core already exists.</p>
     and a multiget returns the named contacts with a not-found for a gap.</p>
   </li>
 
-  <li>Client autodiscovery, so a real client needs only the base URL.
+  <li><span class="next">&rarr;</span> Client autodiscovery, so a real
+    client needs only the base URL.
     <ul>
       <li>Redirect <code>/.well-known/carddav</code> to the service root,
         the analogue of the CalDAV well-known path.</li>
@@ -156,6 +157,20 @@ core already exists.</p>
       <li>Tests: the redirect's status and location, and the discovery
         properties present in a PROPFIND.</li>
     </ul>
+    <p class="note">Done: <code>handleWellKnown</code> answers
+    <code>/.well-known/carddav</code> with a 301 to the service root (routed
+    by <code>register()</code> for GET and PROPFIND, ungated), and
+    <code>register()</code> gained a <code>$with_well_known</code> toggle
+    (on by default) so a project that owns <code>/.well-known</code> can
+    skip it. PROPFIND on a book or on the folder that holds the books now
+    carries <code>current-user-principal</code> and
+    <code>addressbook-home-set</code> through a <code>principalProps</code>
+    method, both pointing at the route prefix and overridable for a project
+    (such as Yioop) with per-user homes. Discovery tests added to
+    <code>tests/carddav/test_carddav_class.php</code> (now 21 checks).
+    Verified live: the well-known path redirects to
+    <code>/addressbooks/</code>, and PROPFIND reports both discovery
+    properties.</p>
   </li>
 
   <li>Documentation and a runnable example: a file header docblock on the

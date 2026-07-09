@@ -78,7 +78,7 @@ response queued before they can be called; that set-up is the bulk of the
 work for the last two items.</p>
 
 <ol>
-  <li><span class="next">&rarr;</span> The benchmark runner and the AEAD
+  <li><span class="check">&#10003;</span> The benchmark runner and the AEAD
     benchmarks &mdash; the largest single cost (~36 ms, about a third of a
     <code>/big</code> response) and the cleanest to isolate.
     <ul>
@@ -96,9 +96,32 @@ work for the last two items.</p>
         ~2.6 us; where they differ, say so plainly, since the box and the
         openssl build both move these numbers.</li>
     </ul>
+    <p class="note">Done: <code>tests/h3bench/</code> holds the benchmarks.
+    <code>measure.php</code> is the shared helper &mdash; it warms a call,
+    times a fixed number of iterations with <code>hrtime</code>, reports
+    the median per-call time over several repetitions, and prints a row in
+    microseconds per call and calls per second.
+    <code>bench_aead.php</code> builds a real AES-128-GCM key set through
+    <code>QuicPacketKeys::fromInitialDcid</code>, checks the inputs form a
+    valid seal/open pair and a five-byte mask before timing, then benchmarks
+    <code>seal</code>, <code>open</code>, and
+    <code>headerProtectionMask</code> on a 1100-byte payload, with an
+    empty-closure row so the wrapper overhead is visible.
+    <code>bench_all.php</code> runs each <code>bench_*.php</code> in its own
+    process. The <code>bench_</code> prefix and the <code>measure.php</code>
+    name both stay clear of <code>test_*.php</code>, so
+    <code>tests/run_all.php</code> does not pick them up; it stays 16 files
+    green. Measured on this box: seal ~3.0 us/call, open ~3.0 us/call,
+    headerProtectionMask ~1.1 us/call, empty-closure overhead ~0.02 us. Same
+    order as the note's ~4.2, ~8, and ~2.6 us; faster here, since this is a
+    different CPU and openssl build, and open sits level with seal rather
+    than above it (the note's open figure came from a small sample). Run
+    with <code>php tests/h3bench/bench_aead.php</code> or
+    <code>php tests/h3bench/bench_all.php</code>.</p>
   </li>
 
-  <li>Frame and packet encode/decode benchmarks.
+  <li><span class="next">&rarr;</span> Frame and packet encode/decode
+    benchmarks.
     <ul>
       <li><code>QuicFrame::encode</code> on a STREAM frame (its hot case,
         which dispatches into <code>encodeStream</code>), and

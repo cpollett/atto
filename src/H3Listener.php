@@ -4236,6 +4236,35 @@ class QuicConnection
      */
     public $loss_detection_timer = null;
     /**
+     * @var float|null cached earliest send time among the
+     *      ack-eliciting packets in flight, across all
+     *      packet-number spaces. setLossDetectionTimer reads
+     *      this instead of walking sent_packets on every
+     *      call. Recording a packet updates it in O(1) (a
+     *      new packet is never older than the current
+     *      earliest, so it only fills a null cache);
+     *      removing a packet cannot cheaply know whether it
+     *      was the earliest, so it marks the cache stale via
+     *      $loss_timer_cache_dirty rather than updating this.
+     */
+    public $earliest_eliciting_send = null;
+    /**
+     * @var bool set when a packet is removed from
+     *      sent_packets (acked or declared lost), meaning
+     *      $earliest_eliciting_send may no longer be the true
+     *      earliest and must be recomputed on the next
+     *      setLossDetectionTimer call. Recording a packet
+     *      does not set this, which is what keeps the emit
+     *      loop's per-packet timer updates O(1) overall
+     *      rather than O(n^2) over a large response.
+     *      Defaults to true so a connection built without the
+     *      normal record path (freshly constructed, or one a
+     *      test populates directly) recomputes from
+     *      sent_packets on its first setLossDetectionTimer
+     *      call rather than trusting an unbuilt cache.
+     */
+    public $loss_timer_cache_dirty = true;
+    /**
      * @var array level => float|null. Earliest microtime
      *      at which a still-in-flight packet at this level
      *      will cross the RFC 9002 sec 6.1.2 time-
@@ -5680,6 +5709,7 @@ class QuicConnection
                     }
                     unset(
                         $this->sent_packets[$level][$pn]);
+                    $this->loss_timer_cache_dirty = true;
                     $newly_acked_count++;
                 }
             }
@@ -5772,6 +5802,7 @@ class QuicConnection
                         $entry['sent_bytes']);
                 }
                 unset($this->sent_packets[$level][$pn]);
+                $this->loss_timer_cache_dirty = true;
                 continue;
             }
             /*
@@ -6112,20 +6143,12 @@ class QuicConnection
                 $earliest_loss_time;
             return;
         }
-        $oldest_eliciting_send = null;
-        foreach ($this->sent_packets as $level => $pkts) {
-            foreach ($pkts as $entry) {
-                if (!$entry['ack_eliciting']) {
-                    continue;
-                }
-                if ($oldest_eliciting_send === null ||
-                    $entry['time_sent'] <
-                        $oldest_eliciting_send) {
-                    $oldest_eliciting_send =
-                        $entry['time_sent'];
-                }
-            }
+        if ($this->loss_timer_cache_dirty) {
+            $this->earliest_eliciting_send =
+                $this->computeEarliestElicitingSend();
+            $this->loss_timer_cache_dirty = false;
         }
+        $oldest_eliciting_send = $this->earliest_eliciting_send;
         if ($oldest_eliciting_send === null) {
             $this->loss_detection_timer = null;
             return;
@@ -6134,6 +6157,61 @@ class QuicConnection
             (1 << $this->pto_count);
         $this->loss_detection_timer =
             $oldest_eliciting_send + $pto;
+    }
+    /**
+     * Walks the in-flight packets across all packet-number
+     * spaces and returns the earliest send time among those
+     * that are ack-eliciting, or null if there are none.
+     * This is the O(n) scan setLossDetectionTimer used to
+     * run on every call; it now runs only when the cached
+     * value has been marked stale by a removal, so the
+     * common case of recording a packet keeps the timer
+     * update O(1). See the $earliest_eliciting_send and
+     * $loss_timer_cache_dirty property docblocks.
+     *
+     * @return float|null earliest ack-eliciting send time,
+     *      or null when nothing ack-eliciting is in flight
+     */
+    protected function computeEarliestElicitingSend()
+    {
+        $earliest = null;
+        foreach ($this->sent_packets as $level => $pkts) {
+            foreach ($pkts as $entry) {
+                if (!$entry['ack_eliciting']) {
+                    continue;
+                }
+                if ($earliest === null ||
+                    $entry['time_sent'] < $earliest) {
+                    $earliest = $entry['time_sent'];
+                }
+            }
+        }
+        return $earliest;
+    }
+    /**
+     * Folds a just-recorded sent packet into the loss-timer
+     * cache. An ack-eliciting packet's send time lowers the
+     * cached earliest when the cache is empty or the packet
+     * is older; a non-eliciting packet is ignored. This is
+     * O(1), so recording each packet as a response ships
+     * does not turn the emit loop's per-packet timer updates
+     * into an O(n^2) rescan. A removal cannot know in O(1)
+     * whether it took the earliest, so removals mark the
+     * cache stale instead of calling this.
+     *
+     * @param array $entry the sent-packet record just stored
+     */
+    protected function noteSentForLossTimer($entry)
+    {
+        if (empty($entry['ack_eliciting'])) {
+            return;
+        }
+        if ($this->earliest_eliciting_send === null
+            || $entry['time_sent']
+                < $this->earliest_eliciting_send) {
+            $this->earliest_eliciting_send =
+                $entry['time_sent'];
+        }
     }
     /**
      * Called by the listener tick loop when the loss-
@@ -6238,6 +6316,8 @@ class QuicConnection
                 'sent_bytes' => strlen($wire),
                 'frames' => $pkt_frames,
             ];
+            $this->noteSentForLossTimer(
+                $this->sent_packets[$level][$pn]);
             $this->addToBytesInFlight(strlen($wire));
             if ($pkt_ack_eliciting) {
                 $this->setLossDetectionTimer();
@@ -6487,6 +6567,8 @@ class QuicConnection
                             'sent_bytes' => strlen($bytes),
                             'frames' => $pkt_frames,
                         ];
+                        $this->noteSentForLossTimer(
+                            $this->sent_packets[$level][$pn]);
                         $this->addToBytesInFlight(
                             strlen($bytes));
                         if ($pkt_ack_eliciting) {
@@ -6531,6 +6613,8 @@ class QuicConnection
                         'sent_bytes' => strlen($bytes),
                         'frames' => $pkt_frames,
                     ];
+                    $this->noteSentForLossTimer(
+                        $this->sent_packets[$level][$pn]);
                     $this->addToBytesInFlight(
                         strlen($bytes));
                     if ($pkt_ack_eliciting) {

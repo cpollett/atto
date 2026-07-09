@@ -217,12 +217,19 @@ $emit_median = runBenchmark("QuicConnection::emit 1 MiB (seal loop)",
         $emit_conn->next_pn[$app_level] = 0;
         $emit_conn->bytes_in_flight = 0;
         $emit_conn->sent_packets[$app_level] = [];
+        $emit_conn->earliest_eliciting_send = null;
+        $emit_conn->loss_timer_cache_dirty = true;
         $emit_conn->emit();
     }, EMIT_HEAVY_ITERATIONS, BENCH_DEFAULT_REPEATS,
     BENCH_HEAVY_WARMUP_ITERATIONS);
 printf("    %d packets per emit; %.3f us/packet\n", $packets_per_emit,
     $emit_median / $packets_per_emit / BENCH_NS_PER_US);
-runBenchmark("QuicConnection::setLossDetectionTimer",
+runBenchmark("setLossDetectionTimer (cold walk, 950)",
+    function () use ($timer_conn) {
+        $timer_conn->loss_timer_cache_dirty = true;
+        $timer_conn->setLossDetectionTimer();
+    });
+runBenchmark("setLossDetectionTimer (cached)",
     function () use ($timer_conn) {
         $timer_conn->setLossDetectionTimer();
     });
@@ -230,6 +237,7 @@ runBenchmark("QuicConnection::processAck (950 acked)",
     function () use ($process_ack, $ack_conn, $ack_sent, $ack_frame,
         $app_level) {
         $ack_conn->sent_packets[$app_level] = $ack_sent;
+        $ack_conn->loss_timer_cache_dirty = true;
         $process_ack->invokeArgs($ack_conn,
             [$app_level, $ack_frame]);
     });

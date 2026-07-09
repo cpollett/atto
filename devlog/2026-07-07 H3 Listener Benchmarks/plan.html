@@ -292,5 +292,46 @@ work for the last two items.</p>
     loss-timer earliest deadline as the one clear remaining win, left as a
     follow-on.</li>
 </ul>
+
+<h2>Follow-on: caching the loss-detection timer</h2>
+<p class="note">The one clear win the baselines pointed at, now
+implemented. <code>setLossDetectionTimer</code> used to walk every
+in-flight packet across all packet-number spaces to find the earliest
+ack-eliciting send time, and <code>emit</code> called it once per packet as
+a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
+~20.6 us/packet. That walk is now cached.</p>
+<ol>
+  <li><span class="check">&#10003;</span> A cached earliest ack-eliciting
+    send time on the connection, kept current incrementally.
+    <ul>
+      <li>Recording a sent packet folds it into the cache in O(1): a new
+        packet is never older than the current earliest, so it only fills
+        an empty cache (<code>noteSentForLossTimer</code>, called at the
+        three points <code>emit</code> records a packet). This is what keeps
+        the emit loop's per-packet timer updates from rescanning.</li>
+      <li>Removing a packet (an ack in <code>processAck</code>, a loss in
+        <code>detectAndRemoveLostPackets</code>) cannot know in O(1) whether
+        it took the earliest, so it marks the cache stale.
+        <code>setLossDetectionTimer</code> recomputes the earliest &mdash;
+        the old walk, now <code>computeEarliestElicitingSend</code> &mdash;
+        only when the cache is stale, and reads it directly otherwise. The
+        stale flag defaults on, so a freshly built or directly-populated
+        connection recomputes on first use rather than trusting an unbuilt
+        cache.</li>
+    </ul>
+    <p class="note">Correctness gate: the whole test set stays 16 files
+    green, including the rtt/pto, loss-recovery, and ack-processing tests
+    that drive the timer directly. Results on this box, against item 4's
+    baselines: <code>setLossDetectionTimer</code> ~22 us on the cold walk of
+    950 in-flight versus ~0.08 us reading the warm cache; and
+    <code>emit</code> from ~20.6 to ~5.2 us/packet &mdash; ~19.6 ms down to
+    ~5.0 ms for the 1&nbsp;MiB response &mdash; since its ~950 per-packet
+    timer calls are now cache reads rather than O(n) walks. emit's
+    per-packet cost now sits near the ~6 us <code>encodeShort</code> seal
+    that is its real floor. <code>bench_emit.php</code> gained a cold-walk
+    row and a cached row so both are visible; run
+    <code>php tests/h3bench/bench_emit.php</code>.</p>
+  </li>
+</ol>
 </body>
 </html>

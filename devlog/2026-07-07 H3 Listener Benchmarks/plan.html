@@ -152,7 +152,7 @@ work for the last two items.</p>
     <code>php tests/h3bench/bench_codec.php</code>.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Stream-chunking and emit-loop
+  <li><span class="check">&#10003;</span> Stream-chunking and flush-loop
     benchmarks, the first that need
     object state stood up.
     <ul>
@@ -160,16 +160,46 @@ work for the last two items.</p>
         <code>send_buf</code>, drained in the frame-sized chunks a
         <code>/big</code> response uses, to measure the current
         offset-based cost.</li>
-      <li><code>QuicConnection::emit</code> and
-        <code>flushStreams</code> over a connection built with a throwaway
-        self-signed cert and a 1&nbsp;MiB response queued on a stream, so
-        the per-packet bookkeeping the note flags is measured on a
-        realistic queue.</li>
+      <li><code>QuicConnection::flushStreams</code> over a connection with a
+        1&nbsp;MiB response queued on a stream, so the flush loop's
+        per-frame chunk-encode-queue cost is measured on a realistic
+        response.</li>
     </ul>
+    <p class="note">Done: <code>tests/h3bench/bench_flush.php</code> times
+    <code>takeForFrame</code> both as one chunk and as a full 1&nbsp;MiB
+    drain, and <code>flushStreams</code> draining that response in one call.
+    The connection is built the way the http3 tests build one &mdash;
+    <code>ReflectionClass</code> without the constructor, with only the
+    application keys and the stream map set &mdash; so no certificate is
+    needed; that turned out cleaner than the throwaway-cert idea this item
+    first sketched. Measured on this box: takeForFrame ~0.29 us for one
+    chunk; the full 1&nbsp;MiB drain ~311 us total, ~0.33 us/frame across
+    ~954 frames; flushStreams ~1.4 ms for the whole response, ~1.45
+    us/frame. The drain being linear is the point: the note records the
+    send buffer once shifting on every drained frame, an O(n^2) ~47 ms cost
+    for a single 1&nbsp;MiB response; the offset-based buffer brings that
+    same drain to ~0.3 ms here, so that fix is in and working. flushStreams'
+    extra ~1.1 us/frame over the raw drain is the STREAM-frame encode and
+    the queue push. Run with
+    <code>php tests/h3bench/bench_flush.php</code>.</p>
+    <p class="note">Scope change carried into item 4:
+    <code>QuicConnection::emit</code> moved out of this item. emit reads far
+    more connection state than flushStreams &mdash; the send queue, the
+    per-space packet-number and sent-packet maps, congestion and RTT
+    fields, the peer CID &mdash; and it calls the loss-detection timer and
+    the sent-packet recorder, the same whole-connection machinery item 4's
+    <code>setLossDetectionTimer</code> and <code>processAck</code> need. So
+    emit belongs with them, sharing one connection set-up, rather than with
+    the stream-level chunking here.</p>
   </li>
 
-  <li>Loss-timer and ACK benchmarks.
+  <li><span class="next">&rarr;</span> Emit loop, loss-timer, and ACK
+    benchmarks, over one whole-connection set-up.
     <ul>
+      <li><code>QuicConnection::emit</code> draining a 1&nbsp;MiB response's
+        worth of queued 1-RTT frames into sealed packets, the per-packet
+        emit loop, on a connection in the established state with
+        application keys.</li>
       <li><code>QuicConnection::setLossDetectionTimer</code> against a
         <code>sent_packets</code> set of the size a <code>/big</code>
         response leaves in flight, to measure the walk the note says could

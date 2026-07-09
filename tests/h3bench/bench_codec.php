@@ -108,7 +108,6 @@ $stream_frame = [
  */
 $encode_stream_method = new \ReflectionMethod(
     QuicFrame::class, 'encodeStream');
-$encode_stream_method->setAccessible(true);
 $encode_stream = $encode_stream_method->getClosure();
 
 /*

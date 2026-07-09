@@ -193,7 +193,7 @@ work for the last two items.</p>
     the stream-level chunking here.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Emit loop, loss-timer, and ACK
+  <li><span class="check">&#10003;</span> Emit loop, loss-timer, and ACK
     benchmarks, over one whole-connection set-up.
     <ul>
       <li><code>QuicConnection::emit</code> draining a 1&nbsp;MiB response's
@@ -208,10 +208,41 @@ work for the last two items.</p>
         frame, the inbound cost that dominates the datagram path for
         <code>/big</code>.</li>
     </ul>
+    <p class="note">Done: <code>tests/h3bench/bench_emit.php</code> builds
+    one established connection the http3-test way &mdash;
+    <code>ReflectionClass</code> without the constructor, public fields set
+    directly, protected <code>processAck</code> reached by reflection with
+    no <code>setAccessible</code> (that call is a no-op since PHP 8.1 and
+    deprecated in 8.5) &mdash; and times all three. <code>emit</code> gets
+    a whole response queued via <code>flushStreams</code>, snapshotted, and
+    restored before each timed call; <code>processAck</code> likewise
+    restores its in-flight set each call, since both mutate the state they
+    run on. Measured on this box: emit ~19.6 ms for the 1&nbsp;MiB response,
+    ~20.6 us/packet across 954 packets; setLossDetectionTimer ~27 us over
+    950 in-flight; processAck ~216 us retiring 950. The finding: emit's
+    ~20.6 us/packet is far above the ~6 us <code>encodeShort</code> costs on
+    its own (item 2), and the gap is emit calling setLossDetectionTimer once
+    per packet over an in-flight set that grows as the response ships &mdash;
+    an O(n^2) walk over the send. setLossDetectionTimer measured alone at
+    ~27 us for 950 in-flight is the same walk; caching its earliest deadline
+    (the note's suggestion) would cut both it and the bulk of emit's
+    per-packet overhead, and these baselines are what a cache change would
+    be measured against. To keep the heavy emit call from paying the full
+    warm-up, <code>measure.php</code> gained an optional warm-up count. Run
+    with <code>php tests/h3bench/bench_emit.php</code>.</p>
+    <p class="note">Arc complete: every hotpath method the note names now
+    has a benchmark under <code>tests/h3bench/</code>, runnable alone or
+    together through <code>bench_all.php</code>, out of the pass/fail
+    <code>run_all.php</code>. Two of the note's proposed wins turned out
+    already done or not worth doing here &mdash; the send-buffer O(n^2)
+    drain is fixed (item 3), and skipping the frame-encode switch saves
+    nothing measurable (item 2); the one clear remaining win the numbers
+    point at is caching the loss-detection timer's earliest deadline, which
+    shows up in both setLossDetectionTimer and emit (item 4).</p>
   </li>
 </ol>
 
-<h2>Open decisions to settle before coding</h2>
+<h2>Decisions, as settled through the arc</h2>
 <ul>
   <li><b>Where the benchmarks live and how they run.</b> They are timed,
     not asserted, and slow by design, so they must stay out of
@@ -222,7 +253,9 @@ work for the last two items.</p>
     a <code>bench_all.php</code> that runs them and prints a table; each is
     also runnable on its own. If you would rather they sat outside
     <code>tests/</code> entirely (a top-level <code>bench/</code>), say so.
-    </li>
+    Resolved: kept in <code>tests/h3bench/</code> as
+    <code>bench_*.php</code> with <code>bench_all.php</code>; run_all stays
+    16 files green and never picks them up.</li>
   <li><b>How the connection-stateful methods are set up.</b> The last two
     items need a <code>QuicConnection</code>, which the constructor builds
     from a certificate and key and which then needs a response queued and
@@ -233,20 +266,31 @@ work for the last two items.</p>
     not expose them. The open question is how faithfully to reproduce the
     real <code>/big</code> state versus keeping the set-up small; the plan
     leans toward the smallest set-up that exercises the same code, and will
-    say in each benchmark what state it stood up.</li>
+    say in each benchmark what state it stood up. Resolved: no certificate
+    &mdash; the connection is built with <code>ReflectionClass</code>
+    without the constructor and only the read fields set, the way the http3
+    tests build one; each benchmark states the state it stands up.</li>
   <li><b>Protected methods.</b> <code>encodeStream</code> and
     <code>processAck</code> are protected. The plan reaches them with
     reflection to time the one method in isolation, and, where it is cheap,
     also times the public caller (<code>encode</code>, the datagram path)
     so the dispatch overhead the note mentions is visible too. Say if you
-    would rather only ever go through the public entry points.</li>
+    would rather only ever go through the public entry points. Resolved:
+    reflection reaches them (<code>getClosure</code> for encodeStream,
+    <code>invokeArgs</code> for processAck), with no
+    <code>setAccessible</code>, which PHP 8.5 deprecates; encode's public
+    switch path is timed alongside encodeStream so the dispatch cost is
+    visible.</li>
   <li><b>Baselines now, tweaks after.</b> This arc's deliverable is the
     benchmarks and the baseline numbers, not the optimizations. Once the
     baselines are in, the note's candidate wins (batching header-protection
     masks, caching the loss-timer earliest deadline, pooling per-packet
     allocations) can each be tried and measured against its baseline, as a
     follow-on. If you would rather fold the tweak-and-measure for a given
-    method into the same item that benchmarks it, say which methods.</li>
+    method into the same item that benchmarks it, say which methods.
+    Resolved: baselines only this arc; the numbers point at caching the
+    loss-timer earliest deadline as the one clear remaining win, left as a
+    follow-on.</li>
 </ul>
 </body>
 </html>

@@ -37,6 +37,12 @@ namespace seekquarry\atto;
  */
 const BENCH_WARMUP_ITERATIONS = 2000;
 /**
+ * @var int a smaller warm-up count for benchmarks whose one call is
+ *      already heavy (draining a whole response, say), where the full
+ *      warm-up would cost seconds for no added stability
+ */
+const BENCH_HEAVY_WARMUP_ITERATIONS = 50;
+/**
  * @var int timed calls per repetition; large enough that the
  *      per-call time is stable against the clock's resolution
  */
@@ -77,13 +83,16 @@ function benchHeader()
  * @param callable $call a closure that makes the one call to time
  * @param int $iterations timed calls per repetition
  * @param int $repeats repetitions whose median is reported
+ * @param int $warmup calls made before timing; pass a smaller count
+ *      for benchmarks whose single call is already heavy
  * @return float the median nanoseconds per call
  */
 function runBenchmark($name, callable $call,
     $iterations = BENCH_DEFAULT_ITERATIONS,
-    $repeats = BENCH_DEFAULT_REPEATS)
+    $repeats = BENCH_DEFAULT_REPEATS,
+    $warmup = BENCH_WARMUP_ITERATIONS)
 {
-    for ($i = 0; $i < BENCH_WARMUP_ITERATIONS; $i++) {
+    for ($i = 0; $i < $warmup; $i++) {
         $call();
     }
     $per_call = [];

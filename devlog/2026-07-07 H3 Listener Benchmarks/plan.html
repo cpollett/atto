@@ -120,7 +120,7 @@ work for the last two items.</p>
     <code>php tests/h3bench/bench_all.php</code>.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Frame and packet encode/decode
+  <li><span class="check">&#10003;</span> Frame and packet encode/decode
     benchmarks.
     <ul>
       <li><code>QuicFrame::encode</code> on a STREAM frame (its hot case,
@@ -132,9 +132,28 @@ work for the last two items.</p>
         key set from item 1 so the AEAD and header-protection steps they
         call are exercised as they are in the real path.</li>
     </ul>
+    <p class="note">Done: <code>tests/h3bench/bench_codec.php</code>
+    benchmarks <code>QuicFrame::encode</code> on a 1100-byte STREAM frame,
+    the same frame through <code>encodeStream</code> reached by a reflection
+    closure (so the two differ only by the type switch),
+    <code>decodeAll</code> on the ACK-plus-PING buffer an ACK packet
+    carries, and the short-header pair <code>encodeShort</code> and
+    <code>decodeShort</code> on the item-1 key set, checking each input is
+    valid before timing. Measured on this box: encode ~0.42 us/call,
+    encodeStream ~0.42 us/call, decodeAll ~1.9 us/call, encodeShort
+    ~6.0 us/call, decodeShort ~6.5 us/call. The one result worth flagging:
+    encode and encodeStream come out the same to within noise, so the
+    note's idea that inlining <code>encodeStream</code> to skip the switch
+    saves about a microsecond does not hold here &mdash; the switch costs
+    nothing measurable, and that ~0.42 us is the varint writes, the concat,
+    and the payload copy. <code>encodeShort</code> and
+    <code>decodeShort</code> land near their AEAD parts (~3 us seal or open
+    plus ~1.1 us mask) plus the header assembly. Run with
+    <code>php tests/h3bench/bench_codec.php</code>.</p>
   </li>
 
-  <li>Stream-chunking and emit-loop benchmarks, the first that need
+  <li><span class="next">&rarr;</span> Stream-chunking and emit-loop
+    benchmarks, the first that need
     object state stood up.
     <ul>
       <li><code>QuicStream::takeForFrame</code> over a 1&nbsp;MiB

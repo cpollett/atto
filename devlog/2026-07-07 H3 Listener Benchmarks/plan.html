@@ -360,6 +360,28 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     safe win rather than the timer's large one, which is the honest result
     of the check.</p>
   </li>
+  <li><span class="check">&#10003;</span> A plain-English pass over the
+    docblocks and comments of <code>src/H3Listener.php</code>, so the
+    file the benchmarks exercise reads on its own terms.
+    <p class="note">One documentation pass across all thirteen classes
+    and the two stream-state enums, changing no behavior. Removed the
+    development-phase references ("Phase 4", "Phase 11b", and the like)
+    that meant nothing to a later reader, keeping the real "key-phase"
+    protocol term. Gave each RFC a one-line gloss of what it covers on
+    first mention (9000 transport, 9001 packet protection, 9002 loss and
+    congestion, 8446 TLS 1.3, 5869 HKDF, 8017 RSA signatures, 8439
+    ChaCha20/Poly1305, 9114 HTTP/3, 9204 QPACK, 7541 HPACK) and expanded
+    acronyms on first use. Corrected the many <code>@param</code> and
+    <code>@return</code> lines that disagreed with the real signatures
+    &mdash; returns that claimed <code>void</code>, <code>int</code>, or
+    <code>QuicPacket</code> where the method returned a bool, a string, or
+    an array, plus every <code>@param mixed</code> placeholder left by an
+    earlier stub pass. Converted the last <code>//</code> comments to block
+    form and wrapped every pre-existing over-80-column line. All 16 test
+    files stay green, and the file now has zero phase references, zero
+    <code>@param mixed</code>, zero <code>//</code> comments, and zero
+    lines over 80 columns.</p>
+  </li>
 </ol>
 </body>
 </html>

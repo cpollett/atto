@@ -5784,9 +5784,13 @@ class QuicConnection
         foreach ($this->sent_packets[$level] as $pn => $entry) {
             if ($pn > $largest_acked) {
                 /* This packet is newer than anything the
-                   peer has acknowledged; cannot yet be
-                   declared lost. */
-                continue;
+                   peer has acknowledged, so it cannot yet
+                   be declared lost. sent_packets is keyed
+                   in increasing packet-number order (each
+                   send takes the next number), so every
+                   later entry is newer still; stop here
+                   rather than skipping each one in turn. */
+                break;
             }
             $time_threshold_lost =
                 $entry['time_sent'] <=

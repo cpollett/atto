@@ -80,6 +80,18 @@ const EMIT_HEAVY_ITERATIONS = 80;
  *      benchmarks, the number a 1 MiB response leaves outstanding
  */
 const EMIT_INFLIGHT_PACKETS = 950;
+/**
+ * @var int largest acknowledged packet number for the loss-scan
+ *      benchmark, set low so only a few packets sit at or below it
+ *      and the scan breaks past the rest of the in-flight set
+ */
+const SCAN_LARGEST_ACKED = 2;
+/**
+ * @var float seconds to place the loss-scan packets' send time in
+ *      the future, so they never age past the loss threshold while
+ *      the benchmark runs and the scan removes nothing
+ */
+const SCAN_FUTURE_OFFSET_SEC = 3600.0;
 
 /**
  * Builds a QuicConnection in the established state with just the
@@ -134,16 +146,20 @@ function buildEmitConnection($keys, $stream)
  * processAck and setLossDetectionTimer read, numbered 0 upward.
  *
  * @param int $count how many records to build
+ * @param float|null $time_sent send time to stamp on each record,
+ *      or null to use the current time
  * @return array packet-number => record
  */
-function buildSentPackets($count)
+function buildSentPackets($count, $time_sent = null)
 {
-    $now = microtime(true);
+    if ($time_sent === null) {
+        $time_sent = microtime(true);
+    }
     $sent = [];
     for ($i = 0; $i < $count; $i++) {
         $sent[$i] = [
             'pn' => $i,
-            'time_sent' => $now,
+            'time_sent' => $time_sent,
             'ack_eliciting' => true,
             'in_flight' => true,
             'sent_bytes' => QuicConnection::CC_MAX_DATAGRAM_BYTES,
@@ -240,4 +256,40 @@ runBenchmark("QuicConnection::processAck (950 acked)",
         $ack_conn->loss_timer_cache_dirty = true;
         $process_ack->invokeArgs($ack_conn,
             [$app_level, $ack_frame]);
+    });
+
+/*
+    Loss-scan set-up. detectAndRemoveLostPackets walks the in-flight
+    packets to declare losses, skipping any whose packet number is
+    above largest_acked. Because sent_packets is in packet-number
+    order, it now breaks at the first such packet rather than scanning
+    the rest of the tail. With a full in-flight set and a low
+    largest_acked, only a handful of packets sit at or below it, so
+    the scan does little; computeEarliestElicitingSend over the same
+    set is the cost of walking all of it, the reference for what the
+    break skips. Send times are placed in the future so no packet
+    ages into a loss and the scan stays side-effect-free.
+ */
+$scan_conn = buildEmitConnection($keys, new QuicStream(EMIT_STREAM_ID));
+$scan_conn->sent_packets[$app_level] = buildSentPackets(
+    EMIT_INFLIGHT_PACKETS,
+    microtime(true) + SCAN_FUTURE_OFFSET_SEC);
+$scan_conn->largest_acked_pn[$app_level] = SCAN_LARGEST_ACKED;
+$detect_lost = new \ReflectionMethod(
+    QuicConnection::class, 'detectAndRemoveLostPackets');
+$full_walk = new \ReflectionMethod(
+    QuicConnection::class, 'computeEarliestElicitingSend');
+$detect_lost->invokeArgs($scan_conn, [$app_level]);
+if (count($scan_conn->sent_packets[$app_level])
+    !== EMIT_INFLIGHT_PACKETS) {
+    fwrite(STDERR, "loss scan removed packets; aborting\n");
+    exit(1);
+}
+runBenchmark("detectAndRemoveLostPackets (break)",
+    function () use ($detect_lost, $scan_conn, $app_level) {
+        $detect_lost->invokeArgs($scan_conn, [$app_level]);
+    });
+runBenchmark("full in-flight walk (reference)",
+    function () use ($full_walk, $scan_conn) {
+        $full_walk->invoke($scan_conn);
     });

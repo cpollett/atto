@@ -332,6 +332,34 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     row and a cached row so both are visible; run
     <code>php tests/h3bench/bench_emit.php</code>.</p>
   </li>
+  <li><span class="check">&#10003;</span> A cache-versus-walk check of the
+    <code>processAck</code> path, to see whether it hides a rescan like the
+    timer did.
+    <p class="note">It does not, mostly. <code>processAck</code>'s cost is
+    the per-acked-packet removal loop, and each packet's work
+    (<code>removeFromBytesInFlight</code>,
+    <code>onPacketAckedForCwnd</code>, the unset) is O(1), so retiring 950
+    packets at ~216 us is inherent, not a redundant walk to cache. The
+    <code>setLossDetectionTimer</code> call it ends with is short-circuited
+    by <code>loss_time</code> (a three-entry check) in the common case where
+    packets remain below largest_acked, so it does not re-walk the
+    in-flight set either.</p>
+    <p class="note">The one thing the check did turn up is in
+    <code>detectAndRemoveLostPackets</code>, which <code>processAck</code>
+    calls: it walked the whole in-flight set, skipping past every packet
+    newer than largest_acked with a <code>continue</code>. Since
+    <code>sent_packets</code> is in packet-number order, once the scan
+    reaches one newer than largest_acked every later entry is newer too, so
+    that is now a <code>break</code> &mdash; the recent in-flight tail above
+    largest_acked is no longer scanned. All 16 test files stay green,
+    including the loss-recovery tests that drive this method. Measured with
+    a full 950-packet in-flight set and a low largest_acked, the scan runs
+    in ~0.5 us versus ~26 us to walk the whole set; in steady state the
+    saving is proportional to how many in-flight packets sit above
+    largest_acked (the recently sent, not-yet-acked ones). It is a small,
+    safe win rather than the timer's large one, which is the honest result
+    of the check.</p>
+  </li>
 </ol>
 </body>
 </html>

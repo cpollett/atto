@@ -273,11 +273,9 @@ function countingKeysFrom($real)
         CountingQuicPacketKeys::class);
     $copy = $target_class->newInstanceWithoutConstructor();
     foreach ($source->getProperties() as $property) {
-        $property->setAccessible(true);
         $value = $property->getValue($real);
         $target_property = new \ReflectionProperty($copy,
             $property->getName());
-        $target_property->setAccessible(true);
         $target_property->setValue($copy, $value);
     }
     return $copy;

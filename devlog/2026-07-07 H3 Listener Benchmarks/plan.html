@@ -419,6 +419,11 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     <code>QuicFrame::encode</code> contains encodeStream. All 16 test
     files stay green; the new scripts live under the bench_ name the
     test runner skips.</p>
+    <p class="note">Follow-up: the counting keys were copied with
+    ReflectionProperty::setAccessible, which PHP 8.5 deprecates because
+    it has had no effect since 8.1; the reflection get and set work
+    without it, so the two calls were dropped and the run is quiet
+    again on 8.5.</p>
   </li>
 </ol>
 </body>

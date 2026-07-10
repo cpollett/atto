@@ -381,6 +381,44 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     files stay green, and the file now has zero phase references, zero
     <code>@param mixed</code>, zero <code>//</code> comments, and zero
     lines over 80 columns.</p>
+  <li><span class="check">&#10003;</span> Tie the per-method timings to
+    real request shapes: for each case of the example-21 HTTP
+    benchmark, count how many times each benchmarked method runs while
+    the pure-PHP listener serves it, and multiply by that method's
+    single-call cost.
+    <p class="note">Two files under <code>tests/h3bench/</code>. The
+    counting is done without adding anything to the shipping
+    <code>src/H3Listener.php</code>: <code>counting.php</code> holds
+    reusable subclasses of the QUIC connection, stream, and packet-key
+    classes that override the timed methods to tally a call and then
+    run the real one through <code>parent</code>. Because the real code
+    reaches those methods through the object it holds
+    (<code>$this-&gt;emit()</code>, <code>$keys-&gt;seal()</code>,
+    <code>$stream-&gt;takeForFrame()</code>), a driver built from these
+    subclasses counts every call, including the ones the code makes to
+    itself. It is kept as a shared helper so a later test or benchmark
+    can reuse it. The methods the code calls statically (encodeShort,
+    decodeShort, <code>QuicFrame::encode</code>, encodeStream,
+    decodeAll) cannot be overridden, so their counts are derived
+    one-to-one from the counted ones and marked as derived.</p>
+    <p class="note"><code>bench_workload.php</code> builds each case's
+    real HTTP/3 response bytes, drives them out through the paced
+    flush-and-emit loop, and drives the request and the client's
+    acknowledgements back in as decoded short packets, then reads the
+    single-call microsecond figures from the other bench_ scripts'
+    output and multiplies. It reports, per case: the response and
+    inbound packet counts; the per-primitive call counts; the estimated
+    microseconds (single-call cost times count) for the primitive
+    methods; and, separately, the call counts of the whole-operation
+    methods (emit, flushStreams, drain, processAck, the loss timer,
+    the lost-packet scan), which are not multiplied because their timed
+    cost is a whole-1-MiB or 950-acked figure that already sums the
+    primitives. The estimate rows are each one method's own cost and
+    are not added together, since encodeShort contains seal and
+    header-protection, decodeShort contains open, and
+    <code>QuicFrame::encode</code> contains encodeStream. All 16 test
+    files stay green; the new scripts live under the bench_ name the
+    test runner skips.</p>
   </li>
 </ol>
 </body>

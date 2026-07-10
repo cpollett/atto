@@ -424,6 +424,26 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     it has had no effect since 8.1; the reflection get and set work
     without it, so the two calls were dropped and the run is quiet
     again on 8.5.</p>
+  <li><span class="check">&#10003;</span> Speed up the per-packet nonce
+    build, which runs once per seal and once per open. The old build
+    exclusive-or'd the 64-bit packet number into the initialization
+    vector one byte at a time in a twelve-step loop; the new one leaves
+    the top four bytes alone and exclusive-ors the low eight in a
+    single bulk string operation, which PHP runs in C.
+    <p class="note">Measured with a new <code>bench_nonce.php</code>
+    under <code>tests/h3bench/</code>, which also keeps the byte-loop
+    form so the comparison stays reproducible after the source moved
+    on, and checks every candidate against the shipping method across
+    two thousand random vector-and-number pairs before timing. On this
+    machine the byte loop ran near 1.1 us per build and the new bulk
+    exclusive-or near 0.25 us through the real method call, about four
+    and a half times quicker. A further variant that caches the
+    vector's tail as an integer measured near 0.13 us, but it needs two
+    stored fields and, across a whole 1 MiB response's worth of nonce
+    builds, saves only about a tenth of a millisecond more than the
+    bulk exclusive-or, so it was left as a documented alternative in
+    the benchmark rather than shipped. All 16 test files, including the
+    ones that drive real seal and open, stay green.</p>
   </li>
 </ol>
 </body>

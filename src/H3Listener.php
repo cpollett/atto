@@ -2507,14 +2507,18 @@ class QuicPacketKeys
      */
     public function packetNonce($packet_number)
     {
-        $padded = str_repeat("\x00", 4) .
-            pack('J', (int) $packet_number);
-        $out = '';
-        for ($i = 0; $i < 12; $i++) {
-            $out .= chr(ord($this->iv[$i]) ^
-                ord($padded[$i]));
-        }
-        return $out;
+        /*
+            The nonce is the initialization vector with the 64-bit
+            packet number exclusive-or'd into its low 8 bytes; the
+            top 4 bytes are left as they are, since the number is
+            only 64 bits wide. PHP's exclusive-or on two binary
+            strings of equal length runs in C across all 8 bytes at
+            once, so this replaces the byte-at-a-time loop with one
+            bulk operation.
+         */
+        return substr($this->iv, 0, 4)
+            . (substr($this->iv, 4, 8)
+                ^ pack('J', (int) $packet_number));
     }
     /**
      * Encrypts a packet payload. It derives the nonce from the

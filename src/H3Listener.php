@@ -11,7 +11,9 @@
  * 'protocol' => 'h3-quiche'.
  *
  * Implements: RFC 8446 TLS 1.3 server-side (no resumption, no
- * 0-RTT, no PSK; suites TLS_AES_128_GCM_SHA256 and
+ * 0-RTT, no PSK; suites TLS_AES_128_GCM_SHA256,
+ * TLS_AES_256_GCM_SHA384 (offered only where libsodium's
+ * hardware AES-256-GCM is available), and
  * TLS_CHACHA20_POLY1305_SHA256; ecdsa_secp256r1_sha256 always
  * and rsa_pss_rsae_sha256 when ext-gmp is loaded; x25519 key
  * share). RFC 9000 QUIC v1 -- Initial / Handshake / 1-RTT
@@ -108,10 +110,12 @@ class Tls13Engine
      */
     const EXT_QUIC_TRANSPORT_PARAMETERS = 0x39;
     /*
-        The two cipher suites this engine supports, from
-        RFC 8446, appendix B.4.
+        The cipher suites this engine supports, from RFC 8446,
+        appendix B.4. AES-256-GCM keys its schedule on SHA-384;
+        the other two use SHA-256.
      */
     const CIPHER_AES_128_GCM_SHA256 = 0x1301;
+    const CIPHER_AES_256_GCM_SHA384 = 0x1302;
     const CIPHER_CHACHA20_POLY1305_SHA256 = 0x1303;
     /*
         Named groups (the elliptic curves) offered for the
@@ -222,9 +226,16 @@ class Tls13Engine
     protected $cipher = 0;
     /**
      * @var int hash output length in bytes for the negotiated
-     *      cipher suite (32 for SHA-256, all current suites).
+     *      cipher suite's hash: 32 for the SHA-256 suites, 48
+     *      for the SHA-384 suite
      */
     protected $hash_len = 32;
+    /**
+     * @var string the hash algorithm the negotiated cipher
+     *      suite keys its whole key schedule on, "sha256" or
+     *      "sha384"; set when the suite is chosen
+     */
+    protected $hash_alg = 'sha256';
     /**
      * @var string our 32-byte X25519 ephemeral secret (kept
      *      only until shared-secret derivation completes;
@@ -787,25 +798,51 @@ class Tls13Engine
             return false;
         }
         /*
-            Pick our cipher: scan the client's offered list
-            in their priority order and take the first one
-            we support. Both supported suites use SHA-256, so
-            $this->hash_len stays at 32.
+            Pick our cipher. Server preference: choose
+            AES-256-GCM when the client offers it and libsodium
+            can do hardware AES-256-GCM, because that seal and
+            open path is about twice as quick as the OpenSSL
+            AES-128-GCM one at QUIC packet sizes. Otherwise take
+            the first suite we support in the client's own
+            priority order.
          */
-        $this->cipher = 0;
-        for ($i = 0; $i < strlen($cipher_bytes); $i += 2) {
-            $code = (ord($cipher_bytes[$i]) << 8) |
+        $offered = [];
+        for ($i = 0; $i + 1 < strlen($cipher_bytes); $i += 2) {
+            $offered[] = (ord($cipher_bytes[$i]) << 8) |
                 ord($cipher_bytes[$i + 1]);
-            if ($code === self::CIPHER_AES_128_GCM_SHA256 ||
-                $code ===
-                self::CIPHER_CHACHA20_POLY1305_SHA256) {
-                $this->cipher = $code;
-                break;
+        }
+        $aes256_ready = function_exists(
+            'sodium_crypto_aead_aes256gcm_is_available') &&
+            sodium_crypto_aead_aes256gcm_is_available();
+        $this->cipher = 0;
+        if ($aes256_ready && in_array(
+                self::CIPHER_AES_256_GCM_SHA384, $offered, true)) {
+            $this->cipher = self::CIPHER_AES_256_GCM_SHA384;
+        } else {
+            foreach ($offered as $code) {
+                if ($code === self::CIPHER_AES_128_GCM_SHA256 ||
+                    $code ===
+                    self::CIPHER_CHACHA20_POLY1305_SHA256) {
+                    $this->cipher = $code;
+                    break;
+                }
             }
         }
         if ($this->cipher === 0) {
             $this->fail("no shared cipher suite");
             return false;
+        }
+        /*
+            Set the hash the chosen suite keys its whole schedule
+            on. AES-256-GCM uses SHA-384 (48-byte secrets); the
+            other two use SHA-256 (32-byte).
+         */
+        if ($this->cipher === self::CIPHER_AES_256_GCM_SHA384) {
+            $this->hash_alg = 'sha384';
+            $this->hash_len = 48;
+        } else {
+            $this->hash_alg = 'sha256';
+            $this->hash_len = 32;
         }
         if (!$this->parseClientHelloExtensions($ext_blob)) {
             return false;
@@ -1050,17 +1087,18 @@ class Tls13Engine
      * The "extract" step of HKDF, the HMAC-based key
      * derivation function of RFC 5869 (a standard way to turn
      * one secret into others). It mixes a salt into some input
-     * key material and always returns 32 bytes.
+     * key material and returns one hash block, whose length
+     * (32 or 48 bytes) depends on the negotiated suite's hash.
      * @param string $salt non-secret salt value
      * @param string $ikm input key material to derive from
-     * @return string the 32-byte extracted secret
+     * @return string the extracted secret, one hash block long
      */
     protected function hkdfExtract($salt, $ikm)
     {
         if ($salt === '') {
             $salt = str_repeat("\x00", $this->hash_len);
         }
-        return hash_hmac('sha256', $ikm, $salt, true);
+        return hash_hmac($this->hash_alg, $ikm, $salt, true);
     }
     /**
      * Derives a named piece of key material from a secret, in
@@ -1084,8 +1122,8 @@ class Tls13Engine
     }
     /**
      * The "expand" step of HKDF (RFC 5869). Here it never needs
-     * more than 32 bytes (one hash block), so the loop stays
-     * simple.
+     * more than one hash block (32 or 48 bytes, by the suite's
+     * hash), so the loop stays simple.
      * @param string $prk the extracted secret to expand
      * @param string $info the info string (label and context)
      * @param int $length how many bytes to produce
@@ -1097,8 +1135,8 @@ class Tls13Engine
         $t = '';
         $ctr = 1;
         while (strlen($out) < $length) {
-            $t = hash_hmac('sha256', $t . $info . chr($ctr),
-                $prk, true);
+            $t = hash_hmac($this->hash_alg,
+                $t . $info . chr($ctr), $prk, true);
             $out .= $t;
             $ctr++;
         }
@@ -1116,19 +1154,20 @@ class Tls13Engine
         $messages)
     {
         return $this->hkdfExpandLabel($secret, $label,
-            hash('sha256', $messages, true),
+            hash($this->hash_alg, $messages, true),
             $this->hash_len);
     }
     /**
-     * Returns the SHA-256 of the running transcript buffer,
-     * which by spec is the concatenation of all handshake
-     * messages exchanged so far (each as
-     * type || uint24-length || body).
+     * Returns the running hash of the transcript buffer, which
+     * by spec is the concatenation of all handshake messages
+     * exchanged so far (each as type || uint24-length || body).
+     * The hash is the negotiated suite's, SHA-256 or SHA-384.
      * @return string current handshake transcript hash digest
      */
     protected function transcriptHash()
     {
-        return hash('sha256', $this->transcript_buf, true);
+        return hash($this->hash_alg, $this->transcript_buf,
+            true);
     }
     /**
      * Runs the TLS 1.3 key schedule as far as the handshake
@@ -1280,9 +1319,9 @@ class Tls13Engine
      * Derives the encryption key and initialization vector (IV)
      * that protect records under a given traffic secret. The
      * labels and lengths are from RFC 8446 (the TLS 1.3
-     * standard), section 7.3: 16-byte key for AES-128-GCM or
-     * 32-byte for ChaCha20-Poly1305, and a 12-byte IV either
-     * way.
+     * standard), section 7.3: a 16-byte key for AES-128-GCM or
+     * a 32-byte key for AES-256-GCM and ChaCha20-Poly1305, and
+     * a 12-byte IV in every case.
      * @param string $secret the traffic secret to derive from
      * @return array ['key' => string, 'iv' => string]
      */
@@ -1335,6 +1374,14 @@ class Tls13Engine
                 $nonce, $tag, $aad);
             return $ct . $tag;
         }
+        if ($this->cipher === self::CIPHER_AES_256_GCM_SHA384) {
+            $tag = '';
+            $ct = openssl_encrypt($plaintext, 'aes-256-gcm',
+                $key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
+                $nonce, $tag, $aad);
+            return $ct . $tag;
+        }
         return sodium_crypto_aead_chacha20poly1305_ietf_encrypt(
             $plaintext, $aad, $nonce, $key);
     }
@@ -1361,6 +1408,16 @@ class Tls13Engine
             $ct = substr($ciphertext, 0, -16);
             $tag = substr($ciphertext, -16);
             return openssl_decrypt($ct, 'aes-128-gcm', $key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
+                $nonce, $tag, $aad);
+        }
+        if ($this->cipher === self::CIPHER_AES_256_GCM_SHA384) {
+            if (strlen($ciphertext) < 16) {
+                return false;
+            }
+            $ct = substr($ciphertext, 0, -16);
+            $tag = substr($ciphertext, -16);
+            return openssl_decrypt($ct, 'aes-256-gcm', $key,
                 OPENSSL_RAW_DATA | OPENSSL_NO_PADDING,
                 $nonce, $tag, $aad);
         }
@@ -1810,8 +1867,8 @@ class Tls13Engine
         $finished_key = $this->hkdfExpandLabel(
             $traffic_secret, 'finished', '',
             $this->hash_len);
-        return hash_hmac('sha256', $this->transcriptHash(),
-            $finished_key, true);
+        return hash_hmac($this->hash_alg,
+            $this->transcriptHash(), $finished_key, true);
     }
     /*
         Record layer (TLS-mode only).
@@ -1912,8 +1969,8 @@ class Tls13Engine
         $finished_key = $this->hkdfExpandLabel(
             $this->secrets['c_hs'], 'finished', '',
             $this->hash_len);
-        $expected = hash_hmac('sha256', $this->transcriptHash(),
-            $finished_key, true);
+        $expected = hash_hmac($this->hash_alg,
+            $this->transcriptHash(), $finished_key, true);
         if (!hash_equals($expected, $body)) {
             $this->fail("Finished HMAC did not verify");
             return false;
@@ -2214,14 +2271,23 @@ class QuicPacketKeys
     {
         $key_len = ($cipher ===
             Tls13Engine::CIPHER_AES_128_GCM_SHA256) ? 16 : 32;
+        /*
+            The packet keys derive from the traffic secret with
+            the negotiated suite's hash (RFC 9001, how QUIC uses
+            TLS, section 5.1): SHA-384 for AES-256-GCM, SHA-256
+            for the other two.
+         */
+        $hash_alg = ($cipher ===
+            Tls13Engine::CIPHER_AES_256_GCM_SHA384)
+            ? 'sha384' : 'sha256';
         $self = new self();
         $self->cipher = $cipher;
         $self->key = self::hkdfExpandLabel($secret,
-            'quic key', '', $key_len);
+            'quic key', '', $key_len, $hash_alg);
         $self->iv = self::hkdfExpandLabel($secret,
-            'quic iv', '', 12);
+            'quic iv', '', 12, $hash_alg);
         $self->hp_key = self::hkdfExpandLabel($secret,
-            'quic hp', '', $key_len);
+            'quic hp', '', $key_len, $hash_alg);
         return $self;
     }
     /**
@@ -2255,10 +2321,13 @@ class QuicPacketKeys
      * @param string $context extra context bytes mixed in,
      *      empty for all of the QUIC labels above
      * @param int $length how many bytes to produce
+     * @param string $hash_alg the HKDF hash: "sha256" for the
+     *      Initial keys and the SHA-256 suites, "sha384" for
+     *      the AES-256-GCM suite
      * @return string the derived key material, $length bytes
      */
     protected static function hkdfExpandLabel($secret,
-        $label, $context, $length)
+        $label, $context, $length, $hash_alg = 'sha256')
     {
         $full = "tls13 " . $label;
         $info = chr(($length >> 8) & 0xFF) .
@@ -2269,7 +2338,7 @@ class QuicPacketKeys
         $t = '';
         $ctr = 1;
         while (strlen($out) < $length) {
-            $t = hash_hmac('sha256',
+            $t = hash_hmac($hash_alg,
                 $t . $info . chr($ctr), $secret, true);
             $out .= $t;
             $ctr++;
@@ -2310,6 +2379,17 @@ class QuicPacketKeys
              */
             $block = openssl_encrypt(substr($sample, 0, 16),
                 'aes-128-ecb', $this->hp_key,
+                OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
+            return substr($block, 0, 5);
+        }
+        if ($this->cipher ===
+            Tls13Engine::CIPHER_AES_256_GCM_SHA384) {
+            /*
+                AES-256-ECB on the 16-byte sample; the 32-byte
+                header-protection key selects the 256-bit cipher.
+             */
+            $block = openssl_encrypt(substr($sample, 0, 16),
+                'aes-256-ecb', $this->hp_key,
                 OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
             return substr($block, 0, 5);
         }
@@ -2542,6 +2622,11 @@ class QuicPacketKeys
                 OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $nonce, $tag, $aad);
             return $ct . $tag;
         }
+        if ($this->cipher ===
+            Tls13Engine::CIPHER_AES_256_GCM_SHA384) {
+            return sodium_crypto_aead_aes256gcm_encrypt(
+                $plaintext, $aad, $nonce, $this->key);
+        }
         return sodium_crypto_aead_chacha20poly1305_ietf_encrypt(
             $plaintext, $aad, $nonce, $this->key);
     }
@@ -2570,6 +2655,14 @@ class QuicPacketKeys
             $tag = substr($ciphertext, -16);
             return openssl_decrypt($ct, 'aes-128-gcm', $this->key,
                 OPENSSL_RAW_DATA | OPENSSL_NO_PADDING, $nonce, $tag, $aad);
+        }
+        if ($this->cipher ===
+            Tls13Engine::CIPHER_AES_256_GCM_SHA384) {
+            if (strlen($ciphertext) < 16) {
+                return false;
+            }
+            return @sodium_crypto_aead_aes256gcm_decrypt(
+                $ciphertext, $aad, $nonce, $this->key);
         }
         return @sodium_crypto_aead_chacha20poly1305_ietf_decrypt(
             $ciphertext, $aad, $nonce, $this->key);

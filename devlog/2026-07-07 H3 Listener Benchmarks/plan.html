@@ -444,6 +444,50 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     bulk exclusive-or, so it was left as a documented alternative in
     the benchmark rather than shipped. All 16 test files, including the
     ones that drive real seal and open, stay green.</p>
+  <li><span class="check">&#10003;</span> Add the AES-256-GCM /
+    SHA-384 cipher suite (0x1302) so seal and open can run on
+    libsodium, which measured about twice as quick as the OpenSSL
+    AES-128-GCM path at packet sizes and, unlike sodium, has no
+    AES-128-GCM to substitute for the default suite.
+    <p class="note">The suite is offered and preferred only where
+    libsodium's hardware AES-256-GCM is available; otherwise
+    negotiation falls back to the client's order among the two SHA-256
+    suites as before. Supporting it meant making the TLS 1.3 key
+    schedule hash-agile: both prior suites are SHA-256, so
+    <code>hash('sha256', &hellip;)</code> and
+    <code>hash_hmac('sha256', &hellip;)</code> were literals in the
+    HKDF extract and expand, the transcript hash, the two key-schedule
+    derivations, and the Finished MAC; those now read a per-suite
+    <code>hash_alg</code> ("sha256" or "sha384") with
+    <code>hash_len</code> 32 or 48. The RSA and ECDSA signature hashes
+    stay SHA-256 (they are independent of the suite), and the Initial
+    keys stay AES-128-GCM-SHA256 per RFC 9001. The QUIC packet-key
+    derivation from the traffic secret also had a hardcoded SHA-256
+    HKDF; it now takes the suite hash, so AES-256-GCM keys derive under
+    SHA-384. seal/open gained an AES-256-GCM arm (sodium for the QUIC
+    packet path, OpenSSL for the larger TLS records), and
+    header-protection gained an AES-256-ECB arm.</p>
+    <p class="note">Verified by
+    <code>tests/http3/test_aes256_sha384.php</code>: the hash-agile
+    HKDF matches PHP's own <code>hash_hkdf</code> for both SHA-256 and
+    SHA-384; libsodium's AES-256-GCM output is byte-for-byte identical
+    to OpenSSL's and each opens the other's, which is the interop
+    evidence available without a live peer; and the QUIC packet keys
+    derive at the right lengths under SHA-384 and seal, open, reject a
+    tampered tag, and produce a five-byte header-protection mask. All
+    17 test files pass. <code>bench_aead.php</code> gained an
+    AES-256-GCM block so the win is visible next to the AES-128 rows;
+    it measured seal and open on the sodium path at close to twice the
+    speed of the OpenSSL AES-128 path at packet sizes (about 2.5 down
+    to 1.3 microseconds per call here). Note that the workload counts
+    and every other benchmark use AES-128-GCM Initial keys, so they do
+    not exercise or show the AES-256 path. Not covered here: a full
+    handshake with a real client negotiating 0x1302 end to end. An
+    attempt to drive one in the build sandbox with aioquic reached a
+    working client socket but could not hold the forking atto server
+    live beside it, so this still needs a run on a normal host (aioquic
+    forcing AES-256-GCM-SHA384, or a browser, or a curl built with
+    HTTP/3) before the suite is relied on in production.</p>
   </li>
 </ol>
 </body>

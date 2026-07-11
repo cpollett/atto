@@ -328,6 +328,7 @@ function readSingleCallMicros()
         'bench_flush.php'];
     $micros = [];
     foreach ($scripts as $script) {
+        fwrite(STDERR, "    " . $script . "...\n");
         $path = __DIR__ . '/' . $script;
         $lines = [];
         exec('php ' . escapeshellarg($path), $lines);
@@ -490,12 +491,23 @@ function printCaseHeader($cases, $first)
 
 $cases = buildCases();
 $counts_by_case = [];
+fwrite(STDERR, "counting per-case call counts " .
+    "(AES-128-GCM Initial keys)...\n");
 foreach ($cases as $case) {
+    fwrite(STDERR, "  case " . $case['key'] . " (" .
+        $case['label'] . ")...\n");
     $counts_by_case[$case['key']] = averageCase($case['res'],
         $case['body'], $case['req'], $case['req_body']);
 }
+fwrite(STDERR, "timing single calls: running the micro-benchmarks " .
+    "(this is the slow part)...\n");
 $micros = readSingleCallMicros();
+fwrite(STDERR, "done; writing tables.\n");
 
+echo "note: driven with AES-128-GCM Initial keys, so the seal, open,\n" .
+    "and header-protection rows are the OpenSSL AES-128 path; the\n" .
+    "AES-256-GCM (sodium) path is a different suite and is measured\n" .
+    "separately in bench_aead.php.\n\n";
 echo "example-21 cases: response packets and inbound packets\n";
 printCaseHeader($cases, 'quantity');
 foreach (['response_packets', 'inbound_packets'] as $quantity) {

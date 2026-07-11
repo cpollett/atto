@@ -18,13 +18,6 @@
  * connection or socket is stood up; this is one class's methods in
  * isolation.
  *
- * A second block repeats seal, open, and the mask on AES-256-GCM,
- * whose seal and open run through libsodium, where hardware
- * AES-256-GCM is available. That path measured close to twice as
- * quick as the AES-128-GCM one at packet sizes here, and it is the
- * only place the AES-256 cost appears: every other benchmark, and
- * the workload counts, use AES-128-GCM Initial keys.
- *
  * Run from the repo root:
  *     php tests/h3bench/bench_aead.php
  *
@@ -124,45 +117,3 @@ runBenchmark("QuicPacketKeys::headerProtectionMask",
     function () use ($keys, $sample) {
         $keys->headerProtectionMask($sample);
     });
-
-/*
-    The same hotpath on AES-256-GCM, which seals and opens through
-    libsodium rather than OpenSSL. That suite is only offered where
-    hardware AES-256-GCM is available, so skip these rows when it is
-    not. The keys derive from a 48-byte SHA-384 traffic secret, the
-    length that suite's key schedule produces. The default benchmarks
-    above use AES-128-GCM Initial keys, so this section is the only
-    place the AES-256 seal and open costs show up.
- */
-if (function_exists('sodium_crypto_aead_aes256gcm_is_available') &&
-    sodium_crypto_aead_aes256gcm_is_available()) {
-    $keys_256 = QuicPacketKeys::fromTrafficSecret(
-        random_bytes(48),
-        Tls13Engine::CIPHER_AES_256_GCM_SHA384);
-    $ciphertext_256 = $keys_256->seal(AEAD_PACKET_NUMBER, $aad,
-        $plaintext);
-    if ($keys_256->open(AEAD_PACKET_NUMBER, $aad, $ciphertext_256)
-            !== $plaintext) {
-        fwrite(STDERR,
-            "AES-256 seal/open did not round-trip; aborting\n");
-        exit(1);
-    }
-    echo "\nAEAD hotpath (AES-256-GCM), payload " .
-        AEAD_PAYLOAD_BYTES . " bytes\n";
-    benchHeader();
-    runBenchmark("QuicPacketKeys::seal",
-        function () use ($keys_256, $aad, $plaintext) {
-            $keys_256->seal(AEAD_PACKET_NUMBER, $aad, $plaintext);
-        });
-    runBenchmark("QuicPacketKeys::open",
-        function () use ($keys_256, $aad, $ciphertext_256) {
-            $keys_256->open(AEAD_PACKET_NUMBER, $aad,
-                $ciphertext_256);
-        });
-    runBenchmark("QuicPacketKeys::headerProtectionMask",
-        function () use ($keys_256, $sample) {
-            $keys_256->headerProtectionMask($sample);
-        });
-} else {
-    echo "\nAES-256-GCM rows skipped: no hardware AES-256-GCM here\n";
-}

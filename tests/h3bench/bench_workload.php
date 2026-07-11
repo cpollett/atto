@@ -23,17 +23,21 @@
  * driven out through the connection's real flush-and-emit loop, one
  * flush budget per pass the way the event loop paces it, so the seal,
  * header-protection, take-for-frame, flush, and emit counts are the
- * real ones for that many bytes. The request and the client's
- * acknowledgements are driven back in as real short packets decoded
- * with the matching keys, so the open, header-protection, and
- * process-ack counts are real too. The counting comes from the shared
- * subclasses in counting.php, which override the object methods; the
- * few methods the code calls statically (encodeShort, decodeShort,
- * QuicFrame::encode, encodeStream, decodeAll) cannot be overridden,
- * so their counts are derived from the counted ones by the one-to-one
- * relationships the code makes plain: one encodeShort per sealed
- * packet, one decodeShort and one frame decode per received packet,
- * one encodeStream per stream chunk framed.
+ * real ones for that many bytes. On the send side header protection
+ * is now one batched headerProtectionMasks call per emit rather than
+ * one mask per packet; the per-packet headerProtectionMask count is
+ * the receive side, one per inbound packet decoded. The request and
+ * the client's acknowledgements are driven back in as real short
+ * packets decoded with the matching keys, so the open,
+ * header-protection, and process-ack counts are real too. The
+ * counting comes from the shared subclasses in counting.php, which
+ * override the object methods; the few methods the code calls
+ * statically (encodeShortSealed, decodeShort, QuicFrame::encode,
+ * encodeStream, decodeAll) cannot be overridden, so their counts are
+ * derived from the counted ones by the one-to-one relationships the
+ * code makes plain: one encodeShortSealed per sealed packet, one
+ * decodeShort and one frame decode per received packet, one
+ * encodeStream per stream chunk framed.
  *
  * The single-call microsecond figures are read from the other bench_
  * scripts' own output, so the timings multiplied here are exactly the
@@ -424,7 +428,9 @@ const WL_PRIMITIVE_ROWS = [
     ['QuicPacketKeys::open', 'QuicPacketKeys::open', false],
     ['QuicPacketKeys::headerProtectionMask',
         'QuicPacketKeys::headerProtectionMask', false],
-    ['QuicPacket::encodeShort', 'QuicPacketKeys::seal', true],
+    ['QuicPacketKeys::headerProtectionMasks (batch)',
+        'QuicPacketKeys::headerProtectionMasks', false],
+    ['QuicPacket::encodeShortSealed', 'QuicPacketKeys::seal', true],
     ['QuicPacket::decodeShort', 'inbound_packets', true],
     ['QuicFrame::encode (STREAM, switch)', 'response_packets', true],
     ['QuicFrame::encodeStream (no switch)', 'response_packets', true],
@@ -547,10 +553,14 @@ foreach (WL_PRIMITIVE_ROWS as $row) {
 }
 
 echo "\nrows above are each one method's own time and are not " .
-    "additive:\nencodeShort seals and header-protects, decodeShort " .
-    "opens and\nheader-protects, and QuicFrame::encode frames, so " .
-    "those rows\nalready contain the seal, open, header-protection, " .
-    "and\nencodeStream rows.\n";
+    "additive:\nheaderProtectionMask is the receive side, one per " .
+    "inbound\npacket, while headerProtectionMasks (batch) is the " .
+    "send side, one\ncall per emit over that emit's packets. " .
+    "encodeShortSealed seals\nand builds the header, decodeShort " .
+    "opens and header-protects, and\nQuicFrame::encode frames, so " .
+    "encodeShortSealed already contains\nthe seal row and decodeShort " .
+    "already contains the open and\nper-packet header-protection " .
+    "rows.\n";
 echo "\nwhole-operation call counts per case (not multiplied; " .
     "their\ntimed cost is a whole-1-MiB / 950-acked figure that " .
     "already\nsums the primitives above)\n";
@@ -566,6 +576,6 @@ foreach (WL_WHOLE_ROWS as $row) {
 }
 echo "\n+ derived count: taken one-to-one from a counted method " .
     "because\nthe method itself is called statically and cannot be " .
-    "counted by\nsubclassing (encodeShort per sealed packet, " .
-    "decodeShort and frame\ndecode per received packet, encodeStream " .
+    "counted by\nsubclassing (encodeShortSealed per sealed packet, " .
+    "decodeShort and\nframe decode per received packet, encodeStream " .
     "per framed chunk).\n";

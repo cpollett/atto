@@ -5,7 +5,9 @@
  * Benchmarks for the frame and packet codec methods the bottlenecks
  * note calls out: QuicFrame::encode and its hot STREAM case
  * encodeStream, QuicFrame::decodeAll, and the short-header packet
- * pair QuicPacket::encodeShort and decodeShort. Each is timed on its
+ * pair QuicPacket::encodeShort and decodeShort, plus
+ * encodeShortSealed, the seal-only half of encodeShort that the
+ * batched-header-protection send path calls. Each is timed on its
  * own over many calls with representative inputs, so its per-call
  * cost can be inspected and a later tweak measured against it.
  *
@@ -174,6 +176,11 @@ runBenchmark("QuicFrame::decodeAll (ACK + PING)",
 runBenchmark("QuicPacket::encodeShort",
     function () use ($packet, $keys, $packet_payload) {
         $packet->encodeShort($keys, CODEC_PACKET_NUMBER,
+            $packet_payload);
+    });
+runBenchmark("QuicPacket::encodeShortSealed",
+    function () use ($packet, $keys, $packet_payload) {
+        $packet->encodeShortSealed($keys, CODEC_PACKET_NUMBER,
             $packet_payload);
     });
 runBenchmark("QuicPacket::decodeShort",

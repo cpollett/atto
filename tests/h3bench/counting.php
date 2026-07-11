@@ -20,7 +20,8 @@
  * the few benchmarked methods that are called statically (for
  * instance QuicFrame::encode) cannot be, and a driver derives those
  * counts from the ones counted here. What this helper does cover:
- * seal, open, and headerProtectionMask on the packet keys;
+ * seal, open, headerProtectionMask, and the batched
+ * headerProtectionMasks on the packet keys;
  * takeForFrame and consume on a stream; and emit, flushStreams,
  * processAck, setLossDetectionTimer, and detectAndRemoveLostPackets
  * on the connection.
@@ -145,6 +146,24 @@ class CountingQuicPacketKeys extends QuicPacketKeys
     {
         CallCounts::bump("QuicPacketKeys::headerProtectionMask");
         return parent::headerProtectionMask($sample);
+    }
+
+    /**
+     * Counts and forwards a batched header-protection call, run
+     * once per emit() over all that emit()'s sealed 1-RTT packets
+     * (the send hotpath's one call in place of one mask per
+     * packet). Receiving still masks per packet through
+     * headerProtectionMask, since datagrams arrive one at a time.
+     *
+     * @param array $samples the 16-byte ciphertext samples, one per
+     *      packet
+     * @return array the 5-byte masks in the same order, or false if
+     *      any sample is too short
+     */
+    public function headerProtectionMasks($samples)
+    {
+        CallCounts::bump("QuicPacketKeys::headerProtectionMasks");
+        return parent::headerProtectionMasks($samples);
     }
 }
 

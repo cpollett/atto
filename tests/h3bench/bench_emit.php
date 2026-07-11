@@ -8,7 +8,10 @@
  * setLossDetectionTimer, the walk over in-flight packets that arms
  * the loss timer; and processAck, the inbound cost of retiring
  * acknowledged packets. All three read the same whole-connection
- * state, so one set-up serves all three.
+ * state, so one set-up serves all three. Two smaller rows sit
+ * alongside them: header protection for one emit()'s worth of
+ * packets done per packet, and the same done in one batched
+ * headerProtectionMasks call, which is what emit() now uses.
  *
  * The connection is built the way the http3 tests build one, through
  * ReflectionClass without the constructor, with the fields each
@@ -240,6 +243,38 @@ $emit_median = runBenchmark("QuicConnection::emit 1 MiB (seal loop)",
     BENCH_HEAVY_WARMUP_ITERATIONS);
 printf("    %d packets per emit; %.3f us/packet\n", $packets_per_emit,
     $emit_median / $packets_per_emit / BENCH_NS_PER_US);
+/*
+    Header protection for one emit()'s worth of 1-RTT packets: the
+    per-packet way the send path used before, against the single
+    batched call it uses now. headerProtectionMasks concatenates the
+    samples into one aes-128-ecb call (ECB blocks are independent),
+    so a whole batch costs about one call rather than N. The batch
+    is sized to the packets one flush budget yields, since that is
+    what a single emit() masks in one call; the samples are the
+    16-byte ciphertext samples emit() takes from each sealed packet,
+    with random bytes standing in, as ECB timing does not depend on
+    their content.
+ */
+$hp_batch_size = (int) max(1, ceil(
+    QuicConnection::DEFAULT_FLUSH_BUDGET
+    / QuicConnection::MAX_STREAM_FRAME_BYTES));
+$hp_keys = QuicPacketKeys::fromTrafficSecret(random_bytes(32),
+    Tls13Engine::CIPHER_AES_128_GCM_SHA256);
+$hp_samples = [];
+for ($hp_i = 0; $hp_i < $hp_batch_size; $hp_i++) {
+    $hp_samples[] = random_bytes(16);
+}
+runBenchmark(
+    "header protection per packet ($hp_batch_size calls)",
+    function () use ($hp_keys, $hp_samples) {
+        foreach ($hp_samples as $hp_sample) {
+            $hp_keys->headerProtectionMask($hp_sample);
+        }
+    });
+runBenchmark("QuicPacketKeys::headerProtectionMasks (batch)",
+    function () use ($hp_keys, $hp_samples) {
+        $hp_keys->headerProtectionMasks($hp_samples);
+    });
 runBenchmark("setLossDetectionTimer (cold walk, 950)",
     function () use ($timer_conn) {
         $timer_conn->loss_timer_cache_dirty = true;

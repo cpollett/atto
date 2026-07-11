@@ -2352,6 +2352,58 @@ class QuicPacketKeys
         }
         return substr($block, 0, 5);
     }
+
+    /**
+     * Computes header-protection masks for many packets in one
+     * step, so a whole emit()'s worth of short-header packets pays
+     * a single openssl_encrypt call rather than one per packet. RFC
+     * 9001 sec 5.4: for the AES suites each mask is AES-ECB of a
+     * 16-byte ciphertext sample, and ECB encrypts each 16-byte
+     * block on its own -- so the samples concatenated and encrypted
+     * in one call give the masks back in the same order. The
+     * ChaCha20 suite derives each mask from a per-packet keystream
+     * nonce that cannot be concatenated this way, so that branch
+     * loops the single-sample method; it is only negotiated when
+     * the hardware has no AES acceleration.
+     *
+     * @param array $samples the 16-byte ciphertext samples, one per
+     *      packet, in the order the masks are wanted
+     * @return array the 5-byte masks in the same order, or false if
+     *      any sample is shorter than 16 bytes
+     */
+    public function headerProtectionMasks($samples)
+    {
+        if ($this->cipher !==
+            Tls13Engine::CIPHER_AES_128_GCM_SHA256) {
+            $masks = [];
+            foreach ($samples as $sample) {
+                $mask = $this->headerProtectionMask($sample);
+                if ($mask === false) {
+                    return false;
+                }
+                $masks[] = $mask;
+            }
+            return $masks;
+        }
+        $blob = "";
+        foreach ($samples as $sample) {
+            if (strlen($sample) < 16) {
+                return false;
+            }
+            $blob .= substr($sample, 0, 16);
+        }
+        $encrypted = openssl_encrypt($blob, 'aes-128-ecb',
+            $this->hp_key, OPENSSL_RAW_DATA | OPENSSL_NO_PADDING);
+        if ($encrypted === false) {
+            return false;
+        }
+        $masks = [];
+        $count = count($samples);
+        for ($i = 0; $i < $count; $i++) {
+            $masks[] = substr($encrypted, $i * 16, 5);
+        }
+        return $masks;
+    }
     /**
      * Reports whether the installed OpenSSL offers a raw
      * ChaCha20 cipher that lays out its 16-byte initialization
@@ -3062,18 +3114,22 @@ class QuicPacket
         return [$packet, $buf_len];
     }
     /**
-     * Encodes a short-header (1-RTT) data packet. It always
-     * writes the packet number as 4 bytes to keep things
-     * simple. The first byte is laid out per RFC 9000 (the core
-     * QUIC transport standard), section 17.3.
+     * Seals a short-header (1-RTT) packet but stops just before
+     * header protection, returning the unprotected wire bytes plus
+     * the sample and header length the mask step needs. emit() uses
+     * this to seal a whole batch first and then apply every mask in
+     * one openssl_encrypt call; encodeShort chains it with the
+     * single-packet mask step. Always writes the packet number as 4
+     * bytes; the first byte is laid out per RFC 9000 (the core QUIC
+     * transport standard), section 17.3.
      * @param QuicPacketKeys $keys the send keys for this level
      * @param int $packet_number the packet's number
      * @param string $payload_unprotected the frames to carry,
      *      before encryption
-     * @return string the finished packet bytes, or false if
-     *      header protection fails
+     * @return array [unprotected wire bytes, 16-byte sample,
+     *      header length]
      */
-    public function encodeShort($keys, $packet_number,
+    public function encodeShortSealed($keys, $packet_number,
         $payload_unprotected)
     {
         $pn_length = 4;
@@ -3091,17 +3147,27 @@ class QuicPacket
         $unprotected = $aad . $sealed;
         $hdr_len = strlen($hdr);
         $sample = substr($unprotected, $hdr_len + 4, 16);
-        $mask = $keys->headerProtectionMask($sample);
-        if ($mask === false) {
-            return false;
-        }
-        /*
-            Header protection: XOR the first byte's low bits
-            against the mask, and the 4 PN bytes against
-            mask[1..4]. PHP's binary-string ^ operates on
-            equal-length operands so we slice both sides to
-            $pn_length first.
-         */
+        return [$unprotected, $sample, $hdr_len];
+    }
+
+    /**
+     * Applies a header-protection mask to one sealed short-header
+     * packet. RFC 9001 sec 5.4: the low 5 bits of the first byte
+     * and the 4 packet-number bytes are XORed with the mask. The
+     * packet keeps its length, so this can run after all the
+     * length-sensitive send bookkeeping is done -- which is what
+     * lets emit() defer it and mask a whole batch at once.
+     * @param string $unprotected the sealed but unprotected bytes
+     *      from encodeShortSealed
+     * @param string $mask the 5-byte mask for this packet
+     * @param int $hdr_len the header length encodeShortSealed
+     *      returned
+     * @return string the finished, header-protected packet bytes
+     */
+    public static function applyShortHeaderProtection($unprotected,
+        $mask, $hdr_len)
+    {
+        $pn_length = 4;
         $protected_first = ord($unprotected[0]) ^
             (ord($mask[0]) & 0x1F);
         $protected_pn =
@@ -3111,6 +3177,35 @@ class QuicPacket
             . substr($unprotected, 1, $hdr_len - 1)
             . $protected_pn
             . substr($unprotected, $hdr_len + $pn_length);
+    }
+
+    /**
+     * Encodes a finished short-header (1-RTT) packet: seal, then
+     * header protection. This is encodeShortSealed chained with a
+     * single-packet mask; emit()'s bulk path instead seals the
+     * batch first and masks it in one call. The packet number given
+     * is the full number and is always written as 4 bytes, fine as
+     * long as fewer than about two billion packets are sent per
+     * number space -- always the case in practice.
+     * @param QuicPacketKeys $keys the send keys for this level
+     * @param int $packet_number the packet's full number
+     * @param string $payload_unprotected the frames to carry,
+     *      before encryption
+     * @return string the finished packet bytes, or false if header
+     *      protection fails
+     */
+    public function encodeShort($keys, $packet_number,
+        $payload_unprotected)
+    {
+        list($unprotected, $sample, $hdr_len) =
+            $this->encodeShortSealed($keys, $packet_number,
+                $payload_unprotected);
+        $mask = $keys->headerProtectionMask($sample);
+        if ($mask === false) {
+            return false;
+        }
+        return self::applyShortHeaderProtection($unprotected,
+            $mask, $hdr_len);
     }
     /**
      * Rebuilds a full 62-bit packet number from the few bytes
@@ -6441,6 +6536,15 @@ class QuicConnection
         $current = "";
         $pending_remaining = [];
         /*
+            Header-protection batch for the 1-RTT packets this
+            emit() seals. Each entry is [index into $out, 16-byte
+            sample, header length]; after the send loop the samples
+            are masked in one openssl_encrypt call and the masks
+            XORed back into the $out packets. See the batch step at
+            the end of emit() and headerProtectionMasks.
+         */
+        $hp_batch = [];
+        /*
             Anti-amplification budget per RFC 9000 sec 8.1.
             Before the path is validated (handshake-level
             packet authenticates -> ST_ESTABLISHED), the
@@ -6652,13 +6756,23 @@ class QuicConnection
                 }
                 $pn = $this->next_pn[$level]++;
                 if ($level === self::LEVEL_APPLICATION) {
-                    /* Short-header packet. */
+                    /*
+                        Short-header packet. Seal it now but defer
+                        header protection: the mask does not change
+                        the packet's length, so every length-based
+                        gate and the sent_packets bookkeeping below
+                        run on the sealed bytes, and the mask is
+                        applied once for the whole batch after the
+                        loop. All 1-RTT packets in one emit() share
+                        these tx keys, so one batched call is exact.
+                     */
                     $packet = new QuicPacket();
                     $packet->destination_cid =
                         $this->peer_cid;
-                    $bytes = $packet->encodeShort(
-                        $this->keys[$level]['tx'],
-                        $pn, $bytes);
+                    list($bytes, $hp_sample, $hp_hdr_len) =
+                        $packet->encodeShortSealed(
+                            $this->keys[$level]['tx'],
+                            $pn, $bytes);
                     if ($pkt_in_flight) {
                         $this->sent_packets[$level][$pn] = [
                             'pn' => $pn,
@@ -6690,6 +6804,8 @@ class QuicConnection
                         $current = "";
                     }
                     $out[] = $bytes;
+                    $hp_batch[] = [count($out) - 1, $hp_sample,
+                        $hp_hdr_len];
                     $amp_budget -= strlen($bytes);
                     continue;
                 }
@@ -6729,6 +6845,36 @@ class QuicConnection
         }
         if ($current !== '') {
             $out[] = $current;
+        }
+        /*
+            Header protection for the 1-RTT packets sealed above,
+            done in one openssl_encrypt call for the whole emit()
+            instead of one per packet. headerProtectionMasks
+            concatenates the samples and, for the AES suites, masks
+            them in a single ECB call whose blocks are independent,
+            so the result is identical to masking each packet on its
+            own. The masks return in sample order, which is the
+            order the packets were pushed to $out. The mask does not
+            change a packet's length, so this runs after all the
+            send bookkeeping. A false return means a sample was too
+            short, which sealed packets never produce; leaving the
+            packets unmasked in that case matches the pre-batch
+            behaviour rather than aborting the datagram.
+         */
+        if (!empty($hp_batch)) {
+            $app_tx = $this->keys[self::LEVEL_APPLICATION]['tx'];
+            $samples = [];
+            foreach ($hp_batch as $item) {
+                $samples[] = $item[1];
+            }
+            $masks = $app_tx->headerProtectionMasks($samples);
+            if ($masks !== false) {
+                foreach ($hp_batch as $i => $item) {
+                    $out[$item[0]] =
+                        QuicPacket::applyShortHeaderProtection(
+                            $out[$item[0]], $masks[$i], $item[2]);
+                }
+            }
         }
         $this->send_queue = $pending_remaining;
         if (!empty($out)) {

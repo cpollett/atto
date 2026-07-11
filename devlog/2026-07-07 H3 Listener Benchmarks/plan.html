@@ -445,6 +445,55 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     the benchmark rather than shipped. All 16 test files, including the
     ones that drive real seal and open, stay green.</p>
   </li>
+  <li><span class="check">&#10003;</span> Cut the send path's
+    <code>openssl_encrypt</code> calls by batching header protection.
+    Each outgoing 1-RTT packet made two: an <code>aes-128-gcm</code>
+    seal, which has its own nonce, header, and tag and so cannot be
+    shared, and an <code>aes-128-ecb</code> header-protection mask over
+    a 16-byte sample. AES-ECB encrypts each 16-byte block on its own,
+    so a whole <code>emit()</code>'s worth of samples concatenated and
+    encrypted in one call give the masks back in order &mdash; one
+    call in place of one per packet. Header protection is a
+    length-preserving exclusive-or applied after sealing, so every
+    length-based send gate (anti-amplification, congestion window) and
+    the sent-packet bookkeeping run on the sealed bytes unchanged, and
+    only the final wire output needs the mask; that is what lets the
+    mask step move to the end of <code>emit()</code>.
+    <p class="note"><code>encodeShort</code> was split into
+    <code>encodeShortSealed</code>, which seals and builds the header
+    and returns the sample, and a static
+    <code>applyShortHeaderProtection</code>, which does the
+    exclusive-or; <code>encodeShort</code> now chains the two and
+    behaves exactly as before. <code>QuicPacketKeys</code> gained
+    <code>headerProtectionMasks</code>, which for the AES suites does
+    the single ECB call and for ChaCha20 loops the single-sample
+    method, since that suite derives each mask from a per-packet
+    keystream nonce that cannot be concatenated.
+    <code>emit()</code> seals each 1-RTT packet, keeps the existing
+    bookkeeping, records the sample, and after the send loop masks the
+    whole batch in one call. Long-header handshake packets keep their
+    inline per-packet masking, and the receive side keeps
+    <code>headerProtectionMask</code> per packet because datagrams
+    arrive one at a time. The batched masks were checked byte-for-byte
+    against the per-packet masks, the batched wire byte-for-byte
+    against one-shot <code>encodeShort</code>, and every batched packet
+    was decoded back to its payload, for AES and for ChaCha20, in a
+    new <code>tests/http3/test_hp_batch.php</code>. On this container a
+    30-packet batch's header protection dropped from about 24.3 us
+    done per packet to about 0.85 us batched, so a 30-packet
+    <code>emit()</code> goes from about 60 <code>openssl_encrypt</code>
+    calls to about 31; the 30 seals are untouched.
+    <code>bench_emit.php</code> gained a per-packet and a batched
+    header-protection row at the flush-budget batch size, and
+    <code>bench_codec.php</code> gained an
+    <code>encodeShortSealed</code> row. <code>bench_workload.php</code>
+    now models the batched send path: the batched call is counted once
+    per emit (33 for the 1 MiB case) and the per-packet
+    <code>headerProtectionMask</code> row is the receive-side count,
+    with <code>encodeShortSealed</code> replacing
+    <code>encodeShort</code> as the per-packet send primitive. All 17
+    test files stay green.</p>
+  </li>
 </ol>
 </body>
 </html>

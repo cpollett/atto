@@ -231,6 +231,26 @@ ok("sends one ACK_FREQUENCY with the policy",
 call($conn, 'maybeQueueAckFrequency');
 ok("ACK_FREQUENCY is sent only once",
     count($conn->send_queue) === 1);
+ok("the requested delay is recorded for observability",
+    $conn->af_sent_delay === 20000);
+
+/* stats() surfaces the negotiation and the peer's ack cadence. */
+$conn = makeConn();
+$conn->streams = [];
+$conn->peer_min_ack_delay = 1000;
+$conn->af_sent = true;
+$conn->af_sent_delay = 20000;
+$conn->stats_ack_packets_received = 5;
+$conn->stats_packets_sent = 50;
+$stats = $conn->stats();
+$af = $stats['ack_frequency'];
+ok("stats reports ack-frequency negotiation and cadence",
+    $af['peer_advertised'] === true
+    && $af['peer_min_ack_delay'] === 1000
+    && $af['sent'] === true
+    && $af['sent_threshold'] === QuicConnection::AF_SEND_THRESHOLD
+    && $af['sent_max_ack_delay'] === 20000
+    && $af['ack_packets_received'] === 5);
 
 echo "\n$pass / $tests passed\n";
 exit($pass === $tests ? 0 : 1);

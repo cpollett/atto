@@ -541,6 +541,21 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     support and sending exactly one frame with support. All 18 test
     files stay green.</p>
   </li>
+  <li><span class="check">&#10003;</span> Made the ack-frequency
+    negotiation observable, since its value can only be confirmed
+    against real clients over a delayed path, not the loopback
+    numbers. <code>stats()</code> gained an <code>ack_frequency</code>
+    block reporting whether the peer advertised the extension and its
+    min_ack_delay, whether this endpoint sent an ACK_FREQUENCY and
+    with what threshold and requested delay, and a count of received
+    packets that carried an acknowledgment. Divided by
+    <code>packets_sent</code> that count is the peer's acknowledgment
+    cadence: pointing a browser at a big response over an added-delay
+    path and reading this ratio shows directly whether the browser
+    honored the request. A new stats-block check and a recorded-delay
+    check were added to <code>test_ack_frequency.php</code>. All 18
+    test files stay green.</p>
+  </li>
 </ol>
 </body>
 </html>

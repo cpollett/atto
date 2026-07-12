@@ -4661,6 +4661,12 @@ class QuicConnection
      */
     public $af_sent = false;
     /**
+     * @var int|null the Requested Max Ack Delay, in microseconds,
+     *      of the ACK_FREQUENCY frame this endpoint sent, or null
+     *      if none was sent. Recorded for observability.
+     */
+    public $af_sent_delay = null;
+    /**
      * How far behind the newest acknowledged packet a packet
      * must fall before it is judged lost by ordering rather
      * than by time (RFC 9002, section 6.1.1). Three is the
@@ -4964,6 +4970,14 @@ class QuicConnection
      * @var int total packets sent.
      */
     public $stats_packets_sent = 0;
+    /**
+     * @var int count of received packets that carried an
+     *      acknowledgment. Divided by packets_sent it gives the
+     *      peer's acknowledgment cadence, which is what the
+     *      ack-frequency request is meant to thin; useful when
+     *      checking a real client against a delayed path.
+     */
+    public $stats_ack_packets_received = 0;
     /**
      * @var int how long the peer is willing to sit idle before
      *      dropping the connection, in milliseconds (its
@@ -5339,10 +5353,15 @@ class QuicConnection
             /* Partial decode -- still process what we got. */
         }
         $saw_ack_eliciting = false;
+        $saw_ack = false;
         foreach ($frames as $f) {
             if (self::isAckEliciting($f['type'])) {
                 $this->ack_pending[$level] = true;
                 $saw_ack_eliciting = true;
+            }
+            if ($f['type'] === QuicFrame::F_ACK
+                || $f['type'] === QuicFrame::F_ACK_ECN) {
+                $saw_ack = true;
             }
             switch ($f['type']) {
                 case QuicFrame::F_CRYPTO:
@@ -5528,6 +5547,9 @@ class QuicConnection
             application space defers acknowledgments; the handshake
             spaces still acknowledge promptly.
          */
+        if ($saw_ack) {
+            $this->stats_ack_packets_received++;
+        }
         if ($saw_ack_eliciting
             && $level === self::LEVEL_APPLICATION) {
             $this->af_ack_eliciting_since_ack++;
@@ -5637,6 +5659,7 @@ class QuicConnection
         ]);
         $this->af_send_seq++;
         $this->af_sent = true;
+        $this->af_sent_delay = $delay;
         $this->queue1Rtt($frame);
     }
     /**
@@ -7506,6 +7529,18 @@ class QuicConnection
                 $this->stats_packets_received,
             'packets_sent' => $this->stats_packets_sent,
             'streams_open' => count($this->streams),
+            'ack_frequency' => [
+                'peer_advertised' =>
+                    $this->peer_min_ack_delay !== null,
+                'peer_min_ack_delay' =>
+                    $this->peer_min_ack_delay,
+                'sent' => $this->af_sent,
+                'sent_threshold' => $this->af_sent
+                    ? self::AF_SEND_THRESHOLD : null,
+                'sent_max_ack_delay' => $this->af_sent_delay,
+                'ack_packets_received' =>
+                    $this->stats_ack_packets_received,
+            ],
         ];
     }
 }

@@ -3373,6 +3373,16 @@ class QuicFrame
     const F_CONNECTION_CLOSE = 0x1C;
     const F_CONNECTION_CLOSE_APP = 0x1D;
     const F_HANDSHAKE_DONE = 0x1E;
+    /*
+        draft-ietf-quic-ack-frequency: IMMEDIATE_ACK asks the
+        receiver to acknowledge at once; ACK_FREQUENCY asks it to
+        acknowledge less often. ACK_FREQUENCY's type is 0xaf, which
+        is a two-byte QUIC variable-length integer on the wire
+        (0x40 0xaf); the frame codec reads and writes the type as a
+        varint, so the value 0xaf is used directly.
+     */
+    const F_IMMEDIATE_ACK = 0x1F;
+    const F_ACK_FREQUENCY = 0xAF;
     /**
      * Decodes a sequence of frames from $buf starting at
      * $off through end of buffer. Returns
@@ -3456,6 +3466,26 @@ class QuicFrame
                 return [['type' => $type], $off, ''];
             case self::F_HANDSHAKE_DONE:
                 return [['type' => $type], $off, ''];
+            case self::F_IMMEDIATE_ACK:
+                return [['type' => $type], $off, ''];
+            case self::F_ACK_FREQUENCY:
+                list($seq, $off) = QuicVarint::read($buf, $off);
+                list($threshold, $off) = QuicVarint::read($buf,
+                    $off);
+                list($max_delay, $off) = QuicVarint::read($buf,
+                    $off);
+                list($reorder, $off) = QuicVarint::read($buf,
+                    $off);
+                if ($reorder === false) {
+                    return [null, $off,
+                        "ACK_FREQUENCY truncated"];
+                }
+                return [['type' => $type,
+                    'sequence' => $seq,
+                    'ack_eliciting_threshold' => $threshold,
+                    'requested_max_ack_delay' => $max_delay,
+                    'reordering_threshold' => $reorder],
+                    $off, ''];
             case self::F_ACK:
             case self::F_ACK_ECN:
                 return self::decodeAck($type, $buf, $off);
@@ -3756,6 +3786,17 @@ class QuicFrame
             case self::F_PING:
             case self::F_HANDSHAKE_DONE:
                 return chr($type);
+            case self::F_IMMEDIATE_ACK:
+                return QuicVarint::write($type);
+            case self::F_ACK_FREQUENCY:
+                return QuicVarint::write($type) .
+                    QuicVarint::write($frame['sequence']) .
+                    QuicVarint::write(
+                        $frame['ack_eliciting_threshold']) .
+                    QuicVarint::write(
+                        $frame['requested_max_ack_delay']) .
+                    QuicVarint::write(
+                        $frame['reordering_threshold']);
             case self::F_ACK:
             case self::F_ACK_ECN:
                 return self::encodeAck($frame);
@@ -4524,6 +4565,102 @@ class QuicConnection
      */
     const PEER_MAX_ACK_DELAY_SEC = 0.025;
     /**
+     * Microseconds this endpoint advertises as its min_ack_delay
+     * (draft-ietf-quic-ack-frequency, transport parameter
+     * 0xff04de1b): the smallest delay it can apply to an
+     * acknowledgment, and the signal that it accepts ACK_FREQUENCY
+     * and IMMEDIATE_ACK frames. 1000 stays well under the 25 ms
+     * max_ack_delay and reflects PHP's coarse timer granularity
+     * rather than claiming sub-millisecond precision.
+     */
+    const AF_LOCAL_MIN_ACK_DELAY = 1000;
+    /**
+     * The Ack-Eliciting Threshold this endpoint requests when it
+     * sends an ACK_FREQUENCY frame: the peer may receive up to this
+     * many ack-eliciting packets before acknowledging, so a bulk
+     * download produces roughly this factor fewer acknowledgment
+     * packets on the reverse path.
+     */
+    const AF_SEND_THRESHOLD = 10;
+    /**
+     * Ceiling, in microseconds, for the Requested Max Ack Delay
+     * this endpoint asks a peer to adopt. Matches the 25 ms QUIC
+     * default max_ack_delay so the request never exceeds it.
+     */
+    const AF_MAX_ACK_DELAY_CAP = 25000;
+    /**
+     * @var int|null peer's min_ack_delay in microseconds, or null
+     *      if the peer did not advertise the ack-frequency
+     *      extension. Non-null means this endpoint may send
+     *      ACK_FREQUENCY and IMMEDIATE_ACK frames to the peer.
+     */
+    public $peer_min_ack_delay = null;
+    /**
+     * @var int peer's max_ack_delay in milliseconds (RFC 9000 sec
+     *      18.2), default 25. Used to reject a peer min_ack_delay
+     *      that exceeds it.
+     */
+    public $peer_max_ack_delay = 25;
+    /**
+     * @var int largest ACK_FREQUENCY Sequence Number processed so
+     *      far, or -1 before any is received. The draft says an
+     *      ACK_FREQUENCY frame is ignored unless its sequence
+     *      exceeds this, so obsolete or reordered frames do not
+     *      change behavior.
+     */
+    public $af_recv_largest_seq = -1;
+    /**
+     * @var int Ack-Eliciting Threshold most recently requested by
+     *      the peer: the number of ack-eliciting packets this
+     *      endpoint may receive before it must acknowledge. Only
+     *      applied once af_max_ack_delay is set.
+     */
+    public $af_ack_eliciting_threshold = 1;
+    /**
+     * @var int|null max ack delay in microseconds most recently
+     *      requested by the peer via ACK_FREQUENCY, or null before
+     *      any frame is received. Null keeps this endpoint's
+     *      default behavior of acknowledging whenever something is
+     *      pending.
+     */
+    public $af_max_ack_delay = null;
+    /**
+     * @var int Reordering Threshold most recently requested by the
+     *      peer. Default 1 preserves an immediate acknowledgment
+     *      on any reorder.
+     */
+    public $af_reordering_threshold = 1;
+    /**
+     * @var bool set when an IMMEDIATE_ACK frame is received, so the
+     *      next emit() acknowledges at once regardless of the
+     *      threshold or delay; cleared when that acknowledgment is
+     *      sent.
+     */
+    public $af_immediate_ack = false;
+    /**
+     * @var int count of ack-eliciting application packets received
+     *      since the last acknowledgment this endpoint sent.
+     *      Compared against af_ack_eliciting_threshold.
+     */
+    public $af_ack_eliciting_since_ack = 0;
+    /**
+     * @var float|null microtime when the first ack-eliciting
+     *      application packet arrived after the last acknowledgment,
+     *      or null if none is waiting. With the delay request it
+     *      bounds how long an acknowledgment can be held.
+     */
+    public $af_first_unacked_at = null;
+    /**
+     * @var int Sequence Number for the next ACK_FREQUENCY frame
+     *      this endpoint sends, incremented after each is queued.
+     */
+    public $af_send_seq = 0;
+    /**
+     * @var bool whether this endpoint has queued an ACK_FREQUENCY
+     *      frame to the peer yet.
+     */
+    public $af_sent = false;
+    /**
      * How far behind the newest acknowledged packet a packet
      * must fall before it is judged lost by ordering rather
      * than by time (RFC 9002, section 6.1.1). Three is the
@@ -4963,6 +5100,21 @@ class QuicConnection
             headroom for a couple of NAT rebindings without
             re-handshaking.
          */
+        $tp .= self::tpVarint(0x0b, 25);
+        /*
+            max_ack_delay in milliseconds (RFC 9000 sec 18.2).
+            The default is 25; stating it explicitly gives the
+            min_ack_delay below a declared ceiling.
+         */
+        $tp .= self::tpVarint(0xff04de1b,
+            self::AF_LOCAL_MIN_ACK_DELAY);
+        /*
+            min_ack_delay in microseconds (draft-ietf-quic-ack-
+            frequency, transport parameter 0xff04de1b). Advertising
+            it tells the peer it may ask us to change our
+            acknowledgment cadence with ACK_FREQUENCY and
+            IMMEDIATE_ACK frames.
+         */
         return $tp;
     }
     /**
@@ -5186,9 +5338,11 @@ class QuicConnection
         if ($err !== '' && $err !== 'unknown frame type') {
             /* Partial decode -- still process what we got. */
         }
+        $saw_ack_eliciting = false;
         foreach ($frames as $f) {
             if (self::isAckEliciting($f['type'])) {
                 $this->ack_pending[$level] = true;
+                $saw_ack_eliciting = true;
             }
             switch ($f['type']) {
                 case QuicFrame::F_CRYPTO:
@@ -5200,6 +5354,17 @@ class QuicConnection
                 case QuicFrame::F_ACK:
                 case QuicFrame::F_ACK_ECN:
                     $this->processAck($level, $f);
+                    break;
+                case QuicFrame::F_ACK_FREQUENCY:
+                    $this->onAckFrequency($f);
+                    break;
+                case QuicFrame::F_IMMEDIATE_ACK:
+                    /*
+                        Draft sec 5: acknowledge as soon as
+                        possible. The next emit() honors this
+                        regardless of the current threshold.
+                     */
+                    $this->af_immediate_ack = true;
                     break;
                 case QuicFrame::F_PING:
                 case QuicFrame::F_PADDING:
@@ -5355,6 +5520,124 @@ class QuicConnection
                 $this->peer_cid = $pkt->source_cid;
             }
         }
+        /*
+            Count this packet once (not once per frame) toward the
+            ack-frequency threshold, and note when the first
+            still-unacknowledged ack-eliciting packet arrived so the
+            requested max ack delay can bound the wait. Only the
+            application space defers acknowledgments; the handshake
+            spaces still acknowledge promptly.
+         */
+        if ($saw_ack_eliciting
+            && $level === self::LEVEL_APPLICATION) {
+            $this->af_ack_eliciting_since_ack++;
+            if ($this->af_first_unacked_at === null) {
+                $this->af_first_unacked_at = microtime(true);
+            }
+        }
+    }
+
+    /**
+     * Applies a received ACK_FREQUENCY frame (draft-ietf-quic-ack-
+     * frequency sec 4). The frame is ignored unless its Sequence
+     * Number is newer than any processed before, so obsolete or
+     * reordered frames do not change behavior. A Requested Max Ack
+     * Delay below this endpoint's own min_ack_delay is raised to
+     * that floor rather than treated as a connection error.
+     * @param array $frame the decoded ACK_FREQUENCY frame
+     */
+    protected function onAckFrequency($frame)
+    {
+        if ($frame['sequence'] <= $this->af_recv_largest_seq) {
+            return;
+        }
+        $this->af_recv_largest_seq = (int) $frame['sequence'];
+        $this->af_ack_eliciting_threshold =
+            (int) $frame['ack_eliciting_threshold'];
+        $delay = (int) $frame['requested_max_ack_delay'];
+        if ($delay < self::AF_LOCAL_MIN_ACK_DELAY) {
+            $delay = self::AF_LOCAL_MIN_ACK_DELAY;
+        }
+        $this->af_max_ack_delay = $delay;
+        $this->af_reordering_threshold =
+            (int) $frame['reordering_threshold'];
+    }
+
+    /**
+     * Decides whether emit() should send an application-space
+     * acknowledgment now. Before any ACK_FREQUENCY frame is
+     * received (af_max_ack_delay is null) this keeps the
+     * listener's default of acknowledging whenever one is pending.
+     * After a frame is received it applies the peer's request:
+     * acknowledge on an IMMEDIATE_ACK, once more than the threshold
+     * of ack-eliciting packets have arrived, or once the requested
+     * delay has passed with at least one waiting.
+     * @return bool true to send an acknowledgment on this emit()
+     */
+    protected function shouldSendAppAck()
+    {
+        if (!$this->ack_pending[self::LEVEL_APPLICATION]) {
+            return false;
+        }
+        if ($this->af_immediate_ack) {
+            return true;
+        }
+        if ($this->af_max_ack_delay === null) {
+            return true;
+        }
+        if ($this->af_ack_eliciting_since_ack >
+            $this->af_ack_eliciting_threshold) {
+            return true;
+        }
+        if ($this->af_first_unacked_at !== null) {
+            $elapsed = microtime(true)
+                - $this->af_first_unacked_at;
+            if ($elapsed >=
+                $this->af_max_ack_delay / 1000000.0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Queues an ACK_FREQUENCY frame to the peer once, after the
+     * connection is established, if the peer advertised the
+     * ack-frequency extension. The frame asks the peer to
+     * acknowledge after AF_SEND_THRESHOLD ack-eliciting packets,
+     * with a max ack delay drawn from the smoothed round-trip time
+     * (draft sec 8.1), bounded by AF_MAX_ACK_DELAY_CAP above and
+     * the peer's advertised min_ack_delay below, and a reordering
+     * threshold of 1 so loss detection stays prompt.
+     */
+    protected function maybeQueueAckFrequency()
+    {
+        if ($this->af_sent
+            || $this->peer_min_ack_delay === null
+            || !isset($this->keys[self::LEVEL_APPLICATION])) {
+            return;
+        }
+        $delay = self::AF_MAX_ACK_DELAY_CAP;
+        if ($this->smoothed_rtt !== null) {
+            $delay = (int) round($this->smoothed_rtt
+                * 1000000.0);
+            if ($delay > self::AF_MAX_ACK_DELAY_CAP) {
+                $delay = self::AF_MAX_ACK_DELAY_CAP;
+            }
+        }
+        if ($delay < $this->peer_min_ack_delay) {
+            $delay = $this->peer_min_ack_delay;
+        }
+        $frame = QuicFrame::encode([
+            'type' => QuicFrame::F_ACK_FREQUENCY,
+            'sequence' => $this->af_send_seq,
+            'ack_eliciting_threshold' => self::AF_SEND_THRESHOLD,
+            'requested_max_ack_delay' => $delay,
+            'reordering_threshold' => 1,
+        ]);
+        $this->af_send_seq++;
+        $this->af_sent = true;
+        $this->queue1Rtt($frame);
     }
     /**
      * CRYPTO frame handler: append the bytes to the
@@ -5661,7 +5944,35 @@ class QuicConnection
                             (int) $v;
                     }
                     break;
+                case 0x0b:
+                    /* max_ack_delay in milliseconds (RFC 9000
+                       sec 18.2). */
+                    $this->peer_max_ack_delay = (int) $v;
+                    break;
+                case 0xff04de1b:
+                    /*
+                        min_ack_delay in microseconds (ack-
+                        frequency draft, sec 3). Its presence means
+                        the peer accepts ACK_FREQUENCY and
+                        IMMEDIATE_ACK frames. Validated against the
+                        peer's max_ack_delay after the loop, once
+                        both values are known.
+                     */
+                    $this->peer_min_ack_delay = (int) $v;
+                    break;
             }
+        }
+        /*
+            Draft sec 3: a peer's min_ack_delay must not exceed its
+            own max_ack_delay. The draft calls for a connection
+            error; this listener instead declines the extension for
+            this connection, leaving acknowledgment behavior at the
+            default, which keeps an otherwise sound connection up.
+         */
+        if ($this->peer_min_ack_delay !== null
+            && $this->peer_min_ack_delay >
+            $this->peer_max_ack_delay * 1000) {
+            $this->peer_min_ack_delay = null;
         }
     }
     /**
@@ -6590,6 +6901,8 @@ class QuicConnection
             $this->handshake_done_sent = true;
             $this->ack_pending[self::LEVEL_APPLICATION] =
                 false;
+            $this->af_ack_eliciting_since_ack = 0;
+            $this->af_first_unacked_at = null;
             /*
                 Now that we're established and the peer has
                 advertised its active_connection_id_limit,
@@ -6599,6 +6912,13 @@ class QuicConnection
                 or migrate without re-handshaking.
              */
             $this->fillCidPool();
+            /*
+                If the peer advertised the ack-frequency
+                extension, ask it to acknowledge less often.
+                This is the send side that thins the reverse-
+                path ACK stream on bulk responses.
+             */
+            $this->maybeQueueAckFrequency();
         }
         /*
             Drain queued NEW_CONNECTION_ID frames into 1-RTT
@@ -6660,7 +6980,7 @@ class QuicConnection
             $ack_pending property docblock for context on
             why this is required.
          */
-        if ($this->ack_pending[self::LEVEL_APPLICATION] &&
+        if ($this->shouldSendAppAck() &&
             isset($this->keys[self::LEVEL_APPLICATION])) {
             $ack_payload = $this->ackFrameBytes(
                 self::LEVEL_APPLICATION);
@@ -6684,6 +7004,9 @@ class QuicConnection
             }
             $this->ack_pending[self::LEVEL_APPLICATION] =
                 false;
+            $this->af_ack_eliciting_since_ack = 0;
+            $this->af_first_unacked_at = null;
+            $this->af_immediate_ack = false;
         }
         foreach ($this->send_queue as $entry) {
             $level = $entry[0];

@@ -494,6 +494,53 @@ a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
     <code>encodeShort</code> as the per-packet send primitive. All 17
     test files stay green.</p>
   </li>
+  <li><span class="check">&#10003;</span> Implemented the QUIC
+    ACK-Frequency extension (draft-ietf-quic-ack-frequency-14), which
+    lets a data sender ask its peer to acknowledge less often. The
+    reverse-path acknowledgment stream is what the benchmark exposed
+    as the inbound <code>decodeShort</code> cost, but the reason to
+    carry it is real browser traffic: on asymmetric and mobile links
+    the acknowledgment volume constrains forward throughput, and on
+    any high-rate connection it burns processing on both ends. None of
+    that shows on a near-zero-RTT loopback run, so this is measured
+    against real clients over a delayed path, not the localhost
+    numbers.
+    <p class="note">The listener advertises the min_ack_delay
+    transport parameter (0xff04de1b, 1000 microseconds) and an
+    explicit max_ack_delay (25 ms) so the draft's min-not-greater-
+    than-max constraint holds. It parses both from the peer; a peer
+    min_ack_delay above its own max_ack_delay declines the extension
+    for that connection rather than closing it, which keeps a sound
+    connection up. The ACK_FREQUENCY frame (type 0xaf, a two-byte
+    variable-length integer on the wire) and IMMEDIATE_ACK frame
+    (type 0x1f) are added to the frame codec; both are already
+    ack-eliciting under the existing rule. On the honor side, a
+    received ACK_FREQUENCY updates the threshold, requested max ack
+    delay, and reordering threshold, ignoring any frame whose sequence
+    number is not newer; a received IMMEDIATE_ACK forces the next
+    acknowledgment. The acknowledgment decision moved into
+    shouldSendAppAck, which keeps the previous behavior of
+    acknowledging whenever one is pending until an ACK_FREQUENCY frame
+    is received, so existing client interoperability is unchanged, and
+    afterward acknowledges once more than the requested threshold of
+    ack-eliciting packets have arrived, once the requested delay has
+    passed, or on an IMMEDIATE_ACK. On the send side, once established
+    and only if the peer advertised the extension, the listener sends
+    one ACK_FREQUENCY frame asking for an Ack-Eliciting Threshold of
+    10, a Requested Max Ack Delay taken from the smoothed round-trip
+    time bounded by 25 ms above and the peer's min_ack_delay below,
+    and a Reordering Threshold of 1 so loss detection stays prompt. A
+    requested delay below this endpoint's own min_ack_delay is raised
+    to that floor rather than treated as an error. A new
+    <code>tests/http3/test_ack_frequency.php</code> covers the
+    transport-parameter advertisement and parse, the min-above-max
+    decline, the frame codec round-trip and the two-byte wire type,
+    the newer-sequence and floor handling in the honor path, the
+    shouldSendAppAck decision across default, threshold, delay, and
+    immediate cases, and the send gate staying silent without peer
+    support and sending exactly one frame with support. All 18 test
+    files stay green.</p>
+  </li>
 </ol>
 </body>
 </html>

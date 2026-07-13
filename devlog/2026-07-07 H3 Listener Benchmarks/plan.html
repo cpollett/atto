@@ -111,15 +111,33 @@ out of <code>tests/run_all.php</code>.</p>
     is the peer's ack cadence. Suite green.</p>
   </li>
 
-  <li><span class="next">&rarr;</span> Confirm ACK-Frequency against real
-    browsers over a delayed path.
+  <li><span class="check">&#10003;</span> Add a browser-driven benchmark to
+    Example 21 that reports the protocol it used.
     <ol type="A">
-      <li>Add ~40&nbsp;ms path delay locally, then serve <code>/big</code> to
-        Firefox, Chrome, and Safari in turn.</li>
-      <li>Read <code>stats()</code> per browser: did it send
-        <code>min_ack_delay</code>, and did
-        <code>ack_packets_received</code>/<code>packets_sent</code> fall
-        toward 0.1.</li>
+      <li><span class="check">&#10003;</span> Relabel the existing runner as
+        the curl benchmark (client: curl).</li>
+      <li><span class="check">&#10003;</span> Add a browser benchmark timing
+        this browser's own fetches, labeling each with
+        <code>nextHopProtocol</code> from Resource Timing.</li>
+      <li><span class="check">&#10003;</span> Add per-browser steps for
+        trusting the self-signed cert so HTTP/3 engages, and read the
+        browser connection's ack cadence from <code>/h3stats</code>.</li>
+    </ol>
+    <p class="note">Changes are in
+    <code>examples/21 HTTP Benchmarks/index.php</code> only; no
+    <code>src/</code> change. Latency for the browser rows is not yet wired
+    through <code>proxy.php</code>; the dropdown still controls the curl
+    run.</p>
+  </li>
+
+  <li><span class="next">&rarr;</span> Confirm ACK-Frequency against real
+    browsers with the Example 21 browser benchmark.
+    <ol type="A">
+      <li>Open Example 21 over <code>https://localhost:8443/</code> in
+        Firefox, Chrome, and Safari with the cert trusted per the page's
+        steps, and run the browser benchmark in each.</li>
+      <li>Read the Protocol column (is it <code>h3</code>) and the ack
+        cadence line (near 0.1 honored, near 1.0 ignored).</li>
       <li>Record per browser whether it negotiated and honored the
         request.</li>
     </ol>

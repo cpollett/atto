@@ -184,8 +184,17 @@ $test->get('/', function () {
             traffic and watch /h3stats update.</li>
     </ul>
 </details>
+<h2 style="margin-bottom: 0.2em;">Curl benchmark
+    <span style="font-weight: normal; font-size: 0.65em;
+        color: #666;">client: curl</span></h2>
+<p class="meta" style="margin-bottom: 0.8em;">
+    Runs the suite from the server with the <code>curl</code> command
+    over each protocol, delaying curl's own connection by the chosen
+    latency. Good for a repeatable bot-style baseline. For your actual
+    browser's numbers, use the browser benchmark below.
+</p>
 <div id="controls">
-    <button id="start_btn">Run benchmark</button>
+    <button id="start_btn">Run curl benchmark</button>
     <label style="margin-left: 1em; font-size: 0.9em;
         color: #555;">
         Simulate network latency:
@@ -217,6 +226,56 @@ $test->get('/', function () {
 </p>
 <pre class="raw" id="raw_block" style="display: none;"></pre>
 
+<hr style="margin: 2.5em 0 1.5em;">
+<h2 style="margin-bottom: 0.2em;">Browser benchmark
+    <span style="font-weight: normal; font-size: 0.65em;
+        color: #666;">client: this browser</span></h2>
+<p class="meta" style="margin-bottom: 0.8em;">
+    Times fetches your browser makes to this same origin and reports,
+    per case, which protocol it used. Load this page over
+    <a href="http://localhost:8080/">http://localhost:8080/</a> to
+    measure HTTP/1.1, or over
+    <a href="https://localhost:8443/">https://localhost:8443/</a> to
+    measure HTTP/2 or HTTP/3. The <b>Protocol</b> column shows what the
+    browser really did &mdash; if it reads <code>h2</code> where you
+    wanted <code>h3</code>, HTTP/3 did not engage; see below.
+</p>
+<details class="endpoints">
+    <summary>Getting your browser onto HTTP/3 (self-signed cert)</summary>
+    <ul>
+        <li>Browsers refuse HTTP/3 to a certificate they do not trust,
+            so a plain self-signed cert leaves them on HTTP/2. The
+            simplest fix is a locally-trusted cert from
+            <code>mkcert</code> for <code>localhost</code>, which
+            Firefox and Safari will then trust.</li>
+        <li><b>Chrome / Edge:</b> will not use a custom CA for QUIC at
+            all, so launch it with flags:
+            <code>chrome --origin-to-force-quic-on=localhost:8443
+            --ignore-certificate-errors</code> (testing only; use a
+            fresh <code>--user-data-dir</code>).</li>
+        <li><b>Firefox:</b> visit
+            <a href="https://localhost:8443/">https://localhost:8443/</a>
+            once and accept the cert. Then in
+            <code>about:config</code> set
+            <code>network.http.http3.disable_when_third_party_roots_found</code>
+            to <code>false</code>. Reload and the Protocol column should
+            read <code>h3</code>.</li>
+        <li><b>Safari:</b> add the cert to the login keychain and mark
+            it Always Trust, then reload. Recent Safari does HTTP/3 by
+            default; older versions need it enabled under Develop &rarr;
+            Experimental Features.</li>
+        <li>atto already sends an <code>Alt-Svc: h3</code> header, so
+            once the cert is trusted the browser upgrades to HTTP/3 on
+            its own after the first request.</li>
+    </ul>
+</details>
+<div id="browser_controls" style="margin: 0.5em 0 0.5em;">
+    <button id="browser_btn">Run browser benchmark</button>
+</div>
+<div id="browser_status" style="font-weight: bold;
+    margin: 1em 0;"></div>
+<div id="browser_results"></div>
+
 <script>
 /*
     The dashboard kicks off bench.php with POST /run, then polls
@@ -229,7 +288,7 @@ $test->get('/', function () {
     they're running, and bench.php hits this same server.
  */
 
-// Seed cards in display order so they appear immediately.
+/* Seed cards in display order so they appear immediately. */
 var KNOWN_CASES = [
     {key: 'SMALL',     label: '/small (per-request overhead)'},
     {key: 'BIG',       label: '/big (1 MiB throughput)'},
@@ -240,47 +299,51 @@ var KNOWN_CASES = [
     {key: 'POST',      label: '/echo-post (round-trip body)'},
     {key: 'DEFER',     label: '/defer (cooperative overlap)'},
 ];
-var raw_el = document.getElementById('raw_block');
-var results_el = document.getElementById('results');
-var status_el = document.getElementById('global_status');
-var btn = document.getElementById('start_btn');
+var raw_output = document.getElementById('raw_block');
+var results_area = document.getElementById('results');
+var status_line = document.getElementById('global_status');
+var button = document.getElementById('start_btn');
 
-function seedCards() {
-    results_el.innerHTML = '';
-    KNOWN_CASES.forEach(function (c) {
+function seedCards()
+{
+    results_area.innerHTML = '';
+    KNOWN_CASES.forEach(function (case_info) {
         var card = document.createElement('div');
         card.className = 'case';
-        card.id = 'case_' + c.key;
+        card.id = 'case_' + case_info.key;
         card.innerHTML =
-            '<span class="status pending" id="status_' + c.key +
-            '">pending</span>' +
-            '<h2>' + c.key + '</h2>' +
-            '<div class="desc" id="desc_' + c.key + '">' + c.label +
-            '</div>' +
-            '<div id="body_' + c.key + '"></div>';
-        results_el.appendChild(card);
+            '<span class="status pending" id="status_'
+            + case_info.key + '">pending</span>'
+            + '<h2>' + case_info.key + '</h2>'
+            + '<div class="desc" id="desc_' + case_info.key
+            + '">' + case_info.label + '</div>'
+            + '<div id="body_' + case_info.key + '"></div>';
+        results_area.appendChild(card);
     });
 }
 
-function setStatus(case_key, status) {
-    var s = document.getElementById('status_' + case_key);
-    if (s) {
-        s.className = 'status ' + status;
-        s.textContent = status;
+function setStatus(case_key, status)
+{
+    var indicator = document.getElementById('status_' + case_key);
+    if (indicator) {
+        indicator.className = 'status ' + status;
+        indicator.textContent = status;
     }
 }
 
-function renderCase(case_key, desc, header_cols, rows) {
-    document.getElementById('desc_' + case_key).textContent = desc;
+function renderCase(case_key, description, header_columns, rows)
+{
+    document.getElementById('desc_' + case_key).textContent =
+        description;
     var html = '<table><thead><tr>';
-    header_cols.forEach(function (h) {
-        html += '<th>' + h + '</th>';
+    header_columns.forEach(function (header) {
+        html += '<th>' + header + '</th>';
     });
     html += '</tr></thead><tbody>';
-    rows.forEach(function (r) {
+    rows.forEach(function (row) {
         html += '<tr>';
-        r.forEach(function (c) {
-            html += '<td>' + c + '</td>';
+        row.forEach(function (cell) {
+            html += '<td>' + cell + '</td>';
         });
         html += '</tr>';
     });
@@ -304,33 +367,38 @@ function renderCase(case_key, desc, header_cols, rows) {
     A case is "done" when we've seen the trailing blank line
     after its rows.
  */
-function parse(text) {
+function parse(text)
+{
     var lines = text.split('\n');
     var cases = {};
     var current = null;
-    var case_keys = KNOWN_CASES.map(function (c) { return c.key; });
+    var case_keys = KNOWN_CASES.map(function (case_info) {
+        return case_info.key;
+    });
     for (var i = 0; i < lines.length; i++) {
         var line = lines[i];
         var stripped = line.trim();
         if (case_keys.indexOf(stripped) >= 0) {
             current = stripped;
-            cases[current] = {desc: '', cols: [], rows: [],
-                done: false};
+            cases[current] = {description: '', columns: [],
+                rows: [], done: false};
             continue;
         }
-        if (current === null) continue;
+        if (current === null) {
+            continue;
+        }
         if (stripped === '') {
             cases[current].done = true;
             current = null;
             continue;
         }
-        var c = cases[current];
-        if (c.desc === '') {
-            c.desc = stripped;
-        } else if (c.cols.length === 0) {
-            c.cols = stripped.split(/\s+/);
+        var entry = cases[current];
+        if (entry.description === '') {
+            entry.description = stripped;
+        } else if (entry.columns.length === 0) {
+            entry.columns = stripped.split(/\s+/);
         } else {
-            c.rows.push(stripped.split(/\s+/));
+            entry.rows.push(stripped.split(/\s+/));
         }
     }
     return cases;
@@ -338,55 +406,57 @@ function parse(text) {
 
 var poll_handle = null;
 
-function poll() {
-    fetch('/status').then(function (r) { return r.json(); })
-        .then(function (s) {
-            raw_el.textContent = s.text;
-            var cases = parse(s.text);
-            // Update each known-case card.
-            var any_running = false;
-            for (var i = 0; i < KNOWN_CASES.length; i++) {
-                var key = KNOWN_CASES[i].key;
-                var c = cases[key];
-                if (!c) {
-                    setStatus(key, 'pending');
-                    continue;
-                }
-                if (c.done) {
-                    setStatus(key, 'done');
-                } else {
-                    setStatus(key, 'running');
-                    any_running = true;
-                }
-                if (c.cols.length > 0) {
-                    renderCase(key, c.desc, c.cols, c.rows);
-                }
+function poll()
+{
+    fetch('/status').then(function (response) {
+        return response.json();
+    }).then(function (progress) {
+        raw_output.textContent = progress.text;
+        var cases = parse(progress.text);
+        /* Update each known-case card. */
+        for (var i = 0; i < KNOWN_CASES.length; i++) {
+            var key = KNOWN_CASES[i].key;
+            var entry = cases[key];
+            if (!entry) {
+                setStatus(key, 'pending');
+                continue;
             }
-            if (s.done) {
-                clearInterval(poll_handle);
-                poll_handle = null;
-                status_el.textContent = 'Benchmark complete.';
-                btn.disabled = false;
-                btn.textContent = 'Run again';
+            if (entry.done) {
+                setStatus(key, 'done');
             } else {
-                status_el.textContent =
-                    'Benchmark in progress \u2026';
+                setStatus(key, 'running');
             }
-        })
-        .catch(function (e) {
-            status_el.textContent = 'Status error: ' + e;
-        });
+            if (entry.columns.length > 0) {
+                renderCase(key, entry.description,
+                    entry.columns, entry.rows);
+            }
+        }
+        if (progress.done) {
+            clearInterval(poll_handle);
+            poll_handle = null;
+            status_line.textContent = 'Benchmark complete.';
+            button.disabled = false;
+            button.textContent = 'Run curl benchmark again';
+        } else {
+            status_line.textContent =
+                'Benchmark in progress \u2026';
+        }
+    }).catch(function (error) {
+        status_line.textContent = 'Status error: ' + error;
+    });
 }
 
-btn.addEventListener('click', function () {
-    btn.disabled = true;
-    status_el.textContent = 'Starting benchmark \u2026';
+button.addEventListener('click', function () {
+    button.disabled = true;
+    status_line.textContent = 'Starting benchmark \u2026';
     seedCards();
-    raw_el.textContent = '';
-    var latency = document.getElementById('latency_sel').value;
+    raw_output.textContent = '';
+    var latency =
+        document.getElementById('latency_sel').value;
     var body = 'latency_ms=' + encodeURIComponent(latency);
-    var quiche_cb = document.getElementById('include_quiche');
-    if (quiche_cb && quiche_cb.checked) {
+    var quiche_checkbox =
+        document.getElementById('include_quiche');
+    if (quiche_checkbox && quiche_checkbox.checked) {
         body += '&include_quiche=1';
     }
     fetch('/run', {
@@ -397,11 +467,238 @@ btn.addEventListener('click', function () {
     }).then(function () {
         poll();
         poll_handle = setInterval(poll, 400);
-    }).catch(function (e) {
-        status_el.textContent = 'Failed to start: ' + e;
-        btn.disabled = false;
+    }).catch(function (error) {
+        status_line.textContent = 'Failed to start: ' + error;
+        button.disabled = false;
     });
 });
+
+/*
+    Browser benchmark: time this browser's own fetches to this
+    origin and report which protocol it used, read from the
+    Resource Timing entry's nextHopProtocol. Separate from the curl
+    benchmark above, which the server runs.
+ */
+var browser_button = document.getElementById('browser_btn');
+var browser_results_area =
+    document.getElementById('browser_results');
+var browser_status_line =
+    document.getElementById('browser_status');
+
+var BROWSER_CASES = [
+    {key: 'small', path: '/small',
+        label: 'per-request overhead', iterations: 5},
+    {key: 'big', path: '/big',
+        label: '1 MiB throughput', iterations: 3},
+    {key: 'post', path: '/echo-post',
+        label: '64 KiB round-trip', iterations: 5, post: true}
+];
+
+function median(values)
+{
+    var sorted = values.slice().sort(function (left, right) {
+        return left - right;
+    });
+    var middle = Math.floor(sorted.length / 2);
+    if (sorted.length % 2) {
+        return sorted[middle];
+    }
+    return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/*
+    Fetch one URL from this origin, consume the whole body, and
+    return the elapsed milliseconds, the byte count, and the
+    protocol the browser used. A unique query string gives each
+    call its own Resource Timing entry to read nextHopProtocol
+    from.
+ */
+function timeFetch(path, is_post)
+{
+    var separator = path.indexOf('?') < 0 ? '?' : '&';
+    var url = location.origin + path + separator + 'nocache='
+        + Date.now() + '_' + Math.random().toString(36).slice(2);
+    var options = {cache: 'no-store'};
+    if (is_post) {
+        options.method = 'POST';
+        options.body = new Uint8Array(65536);
+    }
+    var started = performance.now();
+    return fetch(url, options).then(function (response) {
+        return response.arrayBuffer().then(function (body) {
+            var elapsed = performance.now() - started;
+            var protocol = '?';
+            var entries = performance.getEntriesByName(url);
+            if (entries.length > 0) {
+                protocol = entries[entries.length - 1]
+                    .nextHopProtocol || '?';
+            }
+            return {elapsed: elapsed, bytes: body.byteLength,
+                protocol: protocol};
+        });
+    });
+}
+
+/*
+    Run one case's iterations in sequence so they do not contend,
+    and return the median time, the last protocol seen, and the
+    body size.
+ */
+function runBrowserCase(item)
+{
+    var times = [];
+    var protocol = '?';
+    var bytes = 0;
+    var i = 0;
+    function step()
+    {
+        if (i >= item.iterations) {
+            return Promise.resolve();
+        }
+        i++;
+        return timeFetch(item.path, item.post)
+            .then(function (result) {
+                times.push(result.elapsed);
+                protocol = result.protocol;
+                bytes = result.bytes;
+                return step();
+            });
+    }
+    return step().then(function () {
+        return {key: item.key, label: item.label,
+            protocol: protocol, median: median(times),
+            bytes: bytes};
+    });
+}
+
+function formatRate(bytes, elapsed)
+{
+    if (elapsed <= 0) {
+        return '-';
+    }
+    var kilobytes_per_second =
+        (bytes / 1024) / (elapsed / 1000);
+    return kilobytes_per_second.toFixed(0) + ' kB/s';
+}
+
+function renderBrowserResults(results)
+{
+    var html = '<table><thead><tr>'
+        + '<th>Case</th><th>Protocol</th><th>Median ms</th>'
+        + '<th>Throughput</th></tr></thead><tbody>';
+    results.forEach(function (row) {
+        html += '<tr><td>' + row.label + '</td><td>'
+            + row.protocol + '</td><td>' + row.median.toFixed(2)
+            + '</td><td>' + formatRate(row.bytes, row.median)
+            + '</td></tr>';
+    });
+    html += '</tbody></table>';
+    browser_results_area.innerHTML = html;
+}
+
+/*
+    After the fetches, read /h3stats and show, for the busiest H3
+    connection (this browser's, if it ran over H3), whether
+    ack-frequency was negotiated and how often the browser
+    acknowledged.
+ */
+function showBrowserAckFrequency()
+{
+    return fetch('/h3stats').then(function (response) {
+        return response.json();
+    }).then(function (data) {
+        var best = null;
+        (data.stats || []).forEach(function (stat) {
+            if (!best
+                || stat.packets_sent > best.packets_sent) {
+                best = stat;
+            }
+        });
+        var note = document.createElement('p');
+        note.className = 'meta';
+        if (!best || !best.ack_frequency) {
+            note.innerHTML = 'No H3 connection seen. The Protocol '
+                + 'column shows what your browser used; if it is '
+                + 'not h3, follow the cert steps above.';
+        } else {
+            var ack_frequency = best.ack_frequency;
+            var cadence = '-';
+            if (best.packets_sent > 0) {
+                cadence = (ack_frequency.ack_packets_received
+                    / best.packets_sent).toFixed(2);
+            }
+            note.innerHTML = 'H3 ack-frequency &mdash; browser '
+                + 'advertised min_ack_delay: <b>'
+                + (ack_frequency.peer_advertised ? 'yes' : 'no')
+                + '</b>; asked to ack every '
+                + (ack_frequency.sent_threshold || '-')
+                + '; browser sent '
+                + ack_frequency.ack_packets_received
+                + ' acks over ' + best.packets_sent
+                + ' packets (<b>' + cadence + '</b> per packet). '
+                + 'Near 0.1 means it honored the request; near '
+                + '1.0 means it ignored it.';
+        }
+        browser_results_area.appendChild(note);
+    }).catch(function () {
+        /* /h3stats not reachable or no H3 listener; skip. */
+    });
+}
+
+function runBrowserBench()
+{
+    browser_button.disabled = true;
+    browser_status_line.textContent =
+        'Running in your browser \u2026';
+    browser_results_area.innerHTML = '';
+    var results = [];
+    /*
+        Warm-up request so the browser can act on the Alt-Svc
+        header and move to HTTP/3 before the timed fetches.
+     */
+    fetch(location.origin + '/small?warm=' + Date.now(),
+        {cache: 'no-store'})
+        .then(function (response) {
+            return response.arrayBuffer();
+        })
+        .then(function () {
+            var i = 0;
+            function next()
+            {
+                if (i >= BROWSER_CASES.length) {
+                    return Promise.resolve();
+                }
+                var item = BROWSER_CASES[i];
+                i++;
+                browser_status_line.textContent =
+                    'Running ' + item.label + ' \u2026';
+                return runBrowserCase(item)
+                    .then(function (result) {
+                        results.push(result);
+                        renderBrowserResults(results);
+                        return next();
+                    });
+            }
+            return next();
+        })
+        .then(function () {
+            return showBrowserAckFrequency();
+        })
+        .then(function () {
+            browser_status_line.textContent =
+                'Browser benchmark complete.';
+            browser_button.disabled = false;
+            browser_button.textContent =
+                'Run browser benchmark again';
+        })
+        .catch(function (error) {
+            browser_status_line.textContent =
+                'Browser benchmark error: ' + error;
+            browser_button.disabled = false;
+        });
+}
+
+browser_button.addEventListener('click', runBrowserBench);
 </script>
 </body>
 </html><?php
@@ -559,9 +856,9 @@ $test->get('/asset/{n}', function () use ($test) {
         in $_GET['n'] so each asset has a distinct body the
         caller can verify.
      */
-    $n = $_GET['n'] ?? '0';
+    $number = $_GET['n'] ?? '0';
     $test->header("Content-Type: text/plain");
-    echo "asset {$n}: " . str_repeat("a", 200);
+    echo "asset {$number}: " . str_repeat("a", 200);
 });
 $test->get('/headers', function () use ($test) {
     /*

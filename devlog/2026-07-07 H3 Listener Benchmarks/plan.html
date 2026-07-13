@@ -2,559 +2,136 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>atto &mdash; H3 Listener Hotpath Benchmarks</title>
+<title>atto &mdash; H3 Listener Hotpath</title>
 <style>
 body { font-family: system-ui, sans-serif; max-width: 760px;
     margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
     color: #1a1a1a; }
 ol { margin: 0.4rem 0; }
-ol ol { margin: 0.3rem 0 0.8rem; }
+ol ol { margin: 0.2rem 0 0.5rem; }
 li { margin: 0.3rem 0; }
 .check { color: #1a7f37; font-weight: bold; }
 .next { color: #b35900; font-weight: bold; }
-.note { color: #555; font-size: 0.92em; margin: 0.6rem 0 1.2rem; }
+.note { color: #555; font-size: 0.92em; margin: 0.15rem 0 0.4rem; }
 code { background: #f2f2f2; padding: 0 0.2em; border-radius: 3px; }
-table { border-collapse: collapse; margin: 0.8rem 0; }
-td, th { border: 1px solid #ddd; padding: 0.2rem 0.6rem;
-    text-align: left; }
 </style>
 </head>
 <body>
-<h1>atto &mdash; H3 Listener Hotpath Benchmarks</h1>
-<p class="note">Started 07-Jul-2026. The Post v2 note
-<code>h3-status-and-bottlenecks.html</code> lists, per method, where the
-pure-PHP HTTP/3 listener spends its time on a 1&nbsp;MiB response, but it
-reported those numbers without a test anyone can run to reproduce or
-inspect them. This arc builds that missing measurement: for each hotpath
-method the note names, a benchmark that calls that one method in isolation
-over many iterations and reports its per-call cost. The point is twofold:
-reproduce the note's per-method figures so they can be inspected directly,
-and give each method a stable baseline so a later code tweak can be
-measured against it &mdash; run the benchmark, change the method, run it
-again, and read the difference. These are benchmarks, not the pass/fail
-tests: they stand up no H3 website and open no socket, they exercise a
-single method with representative inputs, and they are timed rather than
-asserted.</p>
+<h1>atto &mdash; H3 Listener Hotpath</h1>
+<p class="note">Started 07-Jul-2026. Measure where the pure-PHP HTTP/3
+listener spends its time on a 1&nbsp;MiB response, then act on what the
+numbers show. Benchmarks live under <code>tests/h3bench/</code> and stay
+out of <code>tests/run_all.php</code>.</p>
 
-<h2>The hotpath methods to benchmark</h2>
-<p class="note">Taken from the note's per-method list, ordered by the total
-cost it attributes to each on a <code>/big</code> response. All live in
-<code>src/H3Listener.php</code>.</p>
-<table>
-<tr><th>Method</th><th>Note's figure</th><th>Isolation</th></tr>
-<tr><td><code>QuicPacketKeys::seal</code></td><td>~4.2 us/call, ~21 ms
-  total</td><td>pure</td></tr>
-<tr><td><code>QuicPacketKeys::headerProtectionMask</code></td>
-  <td>~2.6 us/call, ~13 ms</td><td>pure</td></tr>
-<tr><td><code>QuicPacketKeys::open</code></td><td>~8 us/call, ~2 ms</td>
-  <td>pure</td></tr>
-<tr><td><code>QuicFrame::encode</code> / <code>encodeStream</code></td>
-  <td>~1 us/call, ~5&ndash;8 ms</td><td>pure</td></tr>
-<tr><td><code>QuicFrame::decodeAll</code></td><td>part of ~5&ndash;8 ms</td>
-  <td>pure</td></tr>
-<tr><td><code>QuicPacket::encodeShort</code> /
-  <code>decodeShort</code></td><td>part of emit / inbound</td>
-  <td>needs keys</td></tr>
-<tr><td><code>QuicStream::takeForFrame</code></td><td>~8&ndash;12 ms
-  (chunking)</td><td>needs a stream</td></tr>
-<tr><td><code>QuicConnection::emit</code></td><td>~10&ndash;15 ms</td>
-  <td>needs a connection</td></tr>
-<tr><td><code>QuicConnection::flushStreams</code></td><td>~8&ndash;12 ms
-  </td><td>needs a connection</td></tr>
-<tr><td><code>QuicConnection::setLossDetectionTimer</code></td>
-  <td>~2&ndash;3 ms</td><td>needs a connection</td></tr>
-<tr><td><code>QuicConnection::processAck</code></td><td>part of
-  ~3&ndash;5 ms</td><td>needs a connection</td></tr>
-</table>
-<p class="note">Two things already noticed while reading the code, worth
-carrying into the work rather than trusting the note blindly. The
-substr-chunking fix the note lists as a future win is already in place:
-<code>QuicStream</code> advances a <code>send_buf_off</code> offset instead
-of mutating the buffer, so <code>takeForFrame</code>'s benchmark will
-measure the current offset-based cost, not the old O(n^2) shift. And the
-<code>QuicConnection</code> constructor takes a certificate and key, so the
-connection-stateful methods need a throwaway cert plus a representative
-response queued before they can be called; that set-up is the bulk of the
-work for the last two items.</p>
-
-<ol>
-  <li><span class="check">&#10003;</span> The benchmark runner and the AEAD
-    benchmarks &mdash; the largest single cost (~36 ms, about a third of a
-    <code>/big</code> response) and the cleanest to isolate.
-    <ul>
-      <li>A small bench helper that warms a method up, times a fixed number
-        of calls with <code>hrtime</code>, takes the median over a few
-        repetitions to smooth noise, and reports nanoseconds per call and
-        calls per second. A <code>bench_all.php</code> that runs the
-        benchmarks and prints one table.</li>
-      <li>Benchmarks for <code>seal</code>, <code>open</code>, and
-        <code>headerProtectionMask</code> on a real key set built from
-        <code>QuicPacketKeys::fromInitialDcid</code> (AES-128-GCM, the
-        cipher the note measured), with a ~1100-byte payload and a 16-byte
-        header-protection sample, the sizes the note used.</li>
-      <li>Confirm the per-call figures land near the note's ~4.2, ~8, and
-        ~2.6 us; where they differ, say so plainly, since the box and the
-        openssl build both move these numbers.</li>
-    </ul>
-    <p class="note">Done: <code>tests/h3bench/</code> holds the benchmarks.
-    <code>measure.php</code> is the shared helper &mdash; it warms a call,
-    times a fixed number of iterations with <code>hrtime</code>, reports
-    the median per-call time over several repetitions, and prints a row in
-    microseconds per call and calls per second.
-    <code>bench_aead.php</code> builds a real AES-128-GCM key set through
-    <code>QuicPacketKeys::fromInitialDcid</code>, checks the inputs form a
-    valid seal/open pair and a five-byte mask before timing, then benchmarks
-    <code>seal</code>, <code>open</code>, and
-    <code>headerProtectionMask</code> on a 1100-byte payload, with an
-    empty-closure row so the wrapper overhead is visible.
-    <code>bench_all.php</code> runs each <code>bench_*.php</code> in its own
-    process. The <code>bench_</code> prefix and the <code>measure.php</code>
-    name both stay clear of <code>test_*.php</code>, so
-    <code>tests/run_all.php</code> does not pick them up; it stays 16 files
-    green. Measured on this box: seal ~3.0 us/call, open ~3.0 us/call,
-    headerProtectionMask ~1.1 us/call, empty-closure overhead ~0.02 us. Same
-    order as the note's ~4.2, ~8, and ~2.6 us; faster here, since this is a
-    different CPU and openssl build, and open sits level with seal rather
-    than above it (the note's open figure came from a small sample). Run
-    with <code>php tests/h3bench/bench_aead.php</code> or
-    <code>php tests/h3bench/bench_all.php</code>.</p>
+<ol type="I">
+  <li><span class="check">&#10003;</span> Build a per-method hotpath
+    benchmark set under <code>tests/h3bench/</code>.
+    <ol type="A">
+      <li><span class="check">&#10003;</span> Add the <code>measure.php</code>
+        timing helper, <code>bench_all.php</code>, and the AEAD benchmarks
+        (<code>seal</code>, <code>open</code>,
+        <code>headerProtectionMask</code>).</li>
+      <li><span class="check">&#10003;</span> Add codec benchmarks
+        (<code>encode</code>, <code>encodeStream</code>,
+        <code>decodeAll</code>, <code>encodeShort</code>,
+        <code>decodeShort</code>).</li>
+      <li><span class="check">&#10003;</span> Add stream-chunking and flush
+        benchmarks (<code>takeForFrame</code>,
+        <code>flushStreams</code>).</li>
+      <li><span class="check">&#10003;</span> Add emit, loss-timer, and
+        <code>processAck</code> benchmarks over one connection set-up.</li>
+      <li><span class="check">&#10003;</span> Add the workload estimate
+        (<code>counting.php</code>, <code>bench_workload.php</code>):
+        single-call cost times per-case call counts.</li>
+    </ol>
+    <p class="note">Every method the Post-v2 bottleneck note lists now has a
+    runnable benchmark; <code>run_all.php</code> stays green.</p>
   </li>
 
-  <li><span class="check">&#10003;</span> Frame and packet encode/decode
-    benchmarks.
-    <ul>
-      <li><code>QuicFrame::encode</code> on a STREAM frame (its hot case,
-        which dispatches into <code>encodeStream</code>), and
-        <code>decodeAll</code> over a buffer of the frames a response and
-        its ACKs carry.</li>
-      <li><code>QuicPacket::encodeShort</code> and
-        <code>decodeShort</code> over a short-header packet, using the
-        key set from item 1 so the AEAD and header-protection steps they
-        call are exercised as they are in the real path.</li>
-    </ul>
-    <p class="note">Done: <code>tests/h3bench/bench_codec.php</code>
-    benchmarks <code>QuicFrame::encode</code> on a 1100-byte STREAM frame,
-    the same frame through <code>encodeStream</code> reached by a reflection
-    closure (so the two differ only by the type switch),
-    <code>decodeAll</code> on the ACK-plus-PING buffer an ACK packet
-    carries, and the short-header pair <code>encodeShort</code> and
-    <code>decodeShort</code> on the item-1 key set, checking each input is
-    valid before timing. Measured on this box: encode ~0.42 us/call,
-    encodeStream ~0.42 us/call, decodeAll ~1.9 us/call, encodeShort
-    ~6.0 us/call, decodeShort ~6.5 us/call. The one result worth flagging:
-    encode and encodeStream come out the same to within noise, so the
-    note's idea that inlining <code>encodeStream</code> to skip the switch
-    saves about a microsecond does not hold here &mdash; the switch costs
-    nothing measurable, and that ~0.42 us is the varint writes, the concat,
-    and the payload copy. <code>encodeShort</code> and
-    <code>decodeShort</code> land near their AEAD parts (~3 us seal or open
-    plus ~1.1 us mask) plus the header assembly. Run with
-    <code>php tests/h3bench/bench_codec.php</code>.</p>
+  <li><span class="check">&#10003;</span> Cache the loss-detection timer's
+    earliest ack-eliciting send time.
+    <ol type="A">
+      <li><span class="check">&#10003;</span> Fold a recorded packet into the
+        cache in O(1); mark stale and recompute on removal.</li>
+      <li><span class="check">&#10003;</span> Break the lost-packet scan at
+        the first packet above <code>largest_acked</code>.</li>
+    </ol>
+    <p class="note"><code>emit</code> ~20.6 to ~5.2&nbsp;us/packet; timer
+    ~22&nbsp;us cold walk to ~0.08&nbsp;us warm read. Suite green.</p>
   </li>
 
-  <li><span class="check">&#10003;</span> Stream-chunking and flush-loop
-    benchmarks, the first that need
-    object state stood up.
-    <ul>
-      <li><code>QuicStream::takeForFrame</code> over a 1&nbsp;MiB
-        <code>send_buf</code>, drained in the frame-sized chunks a
-        <code>/big</code> response uses, to measure the current
-        offset-based cost.</li>
-      <li><code>QuicConnection::flushStreams</code> over a connection with a
-        1&nbsp;MiB response queued on a stream, so the flush loop's
-        per-frame chunk-encode-queue cost is measured on a realistic
-        response.</li>
-    </ul>
-    <p class="note">Done: <code>tests/h3bench/bench_flush.php</code> times
-    <code>takeForFrame</code> both as one chunk and as a full 1&nbsp;MiB
-    drain, and <code>flushStreams</code> draining that response in one call.
-    The connection is built the way the http3 tests build one &mdash;
-    <code>ReflectionClass</code> without the constructor, with only the
-    application keys and the stream map set &mdash; so no certificate is
-    needed; that turned out cleaner than the throwaway-cert idea this item
-    first sketched. Measured on this box: takeForFrame ~0.29 us for one
-    chunk; the full 1&nbsp;MiB drain ~311 us total, ~0.33 us/frame across
-    ~954 frames; flushStreams ~1.4 ms for the whole response, ~1.45
-    us/frame. The drain being linear is the point: the note records the
-    send buffer once shifting on every drained frame, an O(n^2) ~47 ms cost
-    for a single 1&nbsp;MiB response; the offset-based buffer brings that
-    same drain to ~0.3 ms here, so that fix is in and working. flushStreams'
-    extra ~1.1 us/frame over the raw drain is the STREAM-frame encode and
-    the queue push. Run with
-    <code>php tests/h3bench/bench_flush.php</code>.</p>
-    <p class="note">Scope change carried into item 4:
-    <code>QuicConnection::emit</code> moved out of this item. emit reads far
-    more connection state than flushStreams &mdash; the send queue, the
-    per-space packet-number and sent-packet maps, congestion and RTT
-    fields, the peer CID &mdash; and it calls the loss-detection timer and
-    the sent-packet recorder, the same whole-connection machinery item 4's
-    <code>setLossDetectionTimer</code> and <code>processAck</code> need. So
-    emit belongs with them, sharing one connection set-up, rather than with
-    the stream-level chunking here.</p>
+  <li><span class="check">&#10003;</span> Rewrite the per-packet nonce build
+    as a single bulk exclusive-or.
+    <p class="note">~1.1 to ~0.25&nbsp;us/build, verified against the old
+    byte loop over 2000 pairs. Suite green.</p>
   </li>
 
-  <li><span class="check">&#10003;</span> Emit loop, loss-timer, and ACK
-    benchmarks, over one whole-connection set-up.
-    <ul>
-      <li><code>QuicConnection::emit</code> draining a 1&nbsp;MiB response's
-        worth of queued 1-RTT frames into sealed packets, the per-packet
-        emit loop, on a connection in the established state with
-        application keys.</li>
-      <li><code>QuicConnection::setLossDetectionTimer</code> against a
-        <code>sent_packets</code> set of the size a <code>/big</code>
-        response leaves in flight, to measure the walk the note says could
-        be cached.</li>
-      <li><code>QuicConnection::processAck</code> over a representative ACK
-        frame, the inbound cost that dominates the datagram path for
-        <code>/big</code>.</li>
-    </ul>
-    <p class="note">Done: <code>tests/h3bench/bench_emit.php</code> builds
-    one established connection the http3-test way &mdash;
-    <code>ReflectionClass</code> without the constructor, public fields set
-    directly, protected <code>processAck</code> reached by reflection with
-    no <code>setAccessible</code> (that call is a no-op since PHP 8.1 and
-    deprecated in 8.5) &mdash; and times all three. <code>emit</code> gets
-    a whole response queued via <code>flushStreams</code>, snapshotted, and
-    restored before each timed call; <code>processAck</code> likewise
-    restores its in-flight set each call, since both mutate the state they
-    run on. Measured on this box: emit ~19.6 ms for the 1&nbsp;MiB response,
-    ~20.6 us/packet across 954 packets; setLossDetectionTimer ~27 us over
-    950 in-flight; processAck ~216 us retiring 950. The finding: emit's
-    ~20.6 us/packet is far above the ~6 us <code>encodeShort</code> costs on
-    its own (item 2), and the gap is emit calling setLossDetectionTimer once
-    per packet over an in-flight set that grows as the response ships &mdash;
-    an O(n^2) walk over the send. setLossDetectionTimer measured alone at
-    ~27 us for 950 in-flight is the same walk; caching its earliest deadline
-    (the note's suggestion) would cut both it and the bulk of emit's
-    per-packet overhead, and these baselines are what a cache change would
-    be measured against. To keep the heavy emit call from paying the full
-    warm-up, <code>measure.php</code> gained an optional warm-up count. Run
-    with <code>php tests/h3bench/bench_emit.php</code>.</p>
-    <p class="note">Arc complete: every hotpath method the note names now
-    has a benchmark under <code>tests/h3bench/</code>, runnable alone or
-    together through <code>bench_all.php</code>, out of the pass/fail
-    <code>run_all.php</code>. Two of the note's proposed wins turned out
-    already done or not worth doing here &mdash; the send-buffer O(n^2)
-    drain is fixed (item 3), and skipping the frame-encode switch saves
-    nothing measurable (item 2); the one clear remaining win the numbers
-    point at is caching the loss-detection timer's earliest deadline, which
-    shows up in both setLossDetectionTimer and emit (item 4).</p>
+  <li><span class="check">&#10003;</span> Do a plain-English docblock and
+    comment pass over <code>src/H3Listener.php</code>.
+    <p class="note">Dropped phase references, glossed each RFC, fixed wrong
+    <code>@param</code>/<code>@return</code> lines; zero <code>//</code>
+    comments and zero over-80 lines left. Suite green.</p>
   </li>
-</ol>
 
-<h2>Decisions, as settled through the arc</h2>
-<ul>
-  <li><b>Where the benchmarks live and how they run.</b> They are timed,
-    not asserted, and slow by design, so they must stay out of
-    <code>tests/run_all.php</code>, which globs <code>test_*.php</code> and
-    flags anything over 0.01&nbsp;s as unintended I/O. The plan puts them in
-    <code>tests/h3bench/</code> as <code>bench_*.php</code> (the
-    <code>bench_</code> prefix keeps the runner from picking them up), with
-    a <code>bench_all.php</code> that runs them and prints a table; each is
-    also runnable on its own. If you would rather they sat outside
-    <code>tests/</code> entirely (a top-level <code>bench/</code>), say so.
-    Resolved: kept in <code>tests/h3bench/</code> as
-    <code>bench_*.php</code> with <code>bench_all.php</code>; run_all stays
-    16 files green and never picks them up.</li>
-  <li><b>How the connection-stateful methods are set up.</b> The last two
-    items need a <code>QuicConnection</code>, which the constructor builds
-    from a certificate and key and which then needs a response queued and
-    some packets recorded as in flight. The plan stands up one throwaway
-    self-signed cert at benchmark start and a shared helper that builds a
-    representative connection (a 1&nbsp;MiB stream queued, keys installed),
-    reaching internal fields through reflection only where the class does
-    not expose them. The open question is how faithfully to reproduce the
-    real <code>/big</code> state versus keeping the set-up small; the plan
-    leans toward the smallest set-up that exercises the same code, and will
-    say in each benchmark what state it stood up. Resolved: no certificate
-    &mdash; the connection is built with <code>ReflectionClass</code>
-    without the constructor and only the read fields set, the way the http3
-    tests build one; each benchmark states the state it stands up.</li>
-  <li><b>Protected methods.</b> <code>encodeStream</code> and
-    <code>processAck</code> are protected. The plan reaches them with
-    reflection to time the one method in isolation, and, where it is cheap,
-    also times the public caller (<code>encode</code>, the datagram path)
-    so the dispatch overhead the note mentions is visible too. Say if you
-    would rather only ever go through the public entry points. Resolved:
-    reflection reaches them (<code>getClosure</code> for encodeStream,
-    <code>invokeArgs</code> for processAck), with no
-    <code>setAccessible</code>, which PHP 8.5 deprecates; encode's public
-    switch path is timed alongside encodeStream so the dispatch cost is
-    visible.</li>
-  <li><b>Baselines now, tweaks after.</b> This arc's deliverable is the
-    benchmarks and the baseline numbers, not the optimizations. Once the
-    baselines are in, the note's candidate wins (batching header-protection
-    masks, caching the loss-timer earliest deadline, pooling per-packet
-    allocations) can each be tried and measured against its baseline, as a
-    follow-on. If you would rather fold the tweak-and-measure for a given
-    method into the same item that benchmarks it, say which methods.
-    Resolved: baselines only this arc; the numbers point at caching the
-    loss-timer earliest deadline as the one clear remaining win, left as a
-    follow-on.</li>
-</ul>
+  <li><span class="check">&#10003;</span> Batch header protection into one
+    <code>openssl_encrypt</code> call per emit.
+    <ol type="A">
+      <li><span class="check">&#10003;</span> Split <code>encodeShort</code>
+        into <code>encodeShortSealed</code> and
+        <code>applyShortHeaderProtection</code>.</li>
+      <li><span class="check">&#10003;</span> Add
+        <code>headerProtectionMasks</code> (one ECB call for AES; loop for
+        ChaCha20) and mask the batch after the emit send loop.</li>
+    </ol>
+    <p class="note">A 30-packet emit's mask calls go 30 to 1;
+    <code>test_hp_batch.php</code> checks batched wire equals one-shot.
+    Suite green.</p>
+  </li>
 
-<h2>Follow-on: caching the loss-detection timer</h2>
-<p class="note">The one clear win the baselines pointed at, now
-implemented. <code>setLossDetectionTimer</code> used to walk every
-in-flight packet across all packet-number spaces to find the earliest
-ack-eliciting send time, and <code>emit</code> called it once per packet as
-a response shipped &mdash; an O(n^2) rescan over a 1&nbsp;MiB send, item 4's
-~20.6 us/packet. That walk is now cached.</p>
-<ol>
-  <li><span class="check">&#10003;</span> A cached earliest ack-eliciting
-    send time on the connection, kept current incrementally.
-    <ul>
-      <li>Recording a sent packet folds it into the cache in O(1): a new
-        packet is never older than the current earliest, so it only fills
-        an empty cache (<code>noteSentForLossTimer</code>, called at the
-        three points <code>emit</code> records a packet). This is what keeps
-        the emit loop's per-packet timer updates from rescanning.</li>
-      <li>Removing a packet (an ack in <code>processAck</code>, a loss in
-        <code>detectAndRemoveLostPackets</code>) cannot know in O(1) whether
-        it took the earliest, so it marks the cache stale.
-        <code>setLossDetectionTimer</code> recomputes the earliest &mdash;
-        the old walk, now <code>computeEarliestElicitingSend</code> &mdash;
-        only when the cache is stale, and reads it directly otherwise. The
-        stale flag defaults on, so a freshly built or directly-populated
-        connection recomputes on first use rather than trusting an unbuilt
-        cache.</li>
-    </ul>
-    <p class="note">Correctness gate: the whole test set stays 16 files
-    green, including the rtt/pto, loss-recovery, and ack-processing tests
-    that drive the timer directly. Results on this box, against item 4's
-    baselines: <code>setLossDetectionTimer</code> ~22 us on the cold walk of
-    950 in-flight versus ~0.08 us reading the warm cache; and
-    <code>emit</code> from ~20.6 to ~5.2 us/packet &mdash; ~19.6 ms down to
-    ~5.0 ms for the 1&nbsp;MiB response &mdash; since its ~950 per-packet
-    timer calls are now cache reads rather than O(n) walks. emit's
-    per-packet cost now sits near the ~6 us <code>encodeShort</code> seal
-    that is its real floor. <code>bench_emit.php</code> gained a cold-walk
-    row and a cached row so both are visible; run
-    <code>php tests/h3bench/bench_emit.php</code>.</p>
+  <li><span class="check">&#10003;</span> Implement the QUIC ACK-Frequency
+    extension (draft-ietf-quic-ack-frequency-14).
+    <ol type="A">
+      <li><span class="check">&#10003;</span> Advertise and parse
+        <code>min_ack_delay</code>; add the ACK_FREQUENCY and IMMEDIATE_ACK
+        frames.</li>
+      <li><span class="check">&#10003;</span> Honor a received frame through
+        <code>shouldSendAppAck</code>; default cadence unchanged until
+        asked.</li>
+      <li><span class="check">&#10003;</span> Send one ACK_FREQUENCY at
+        establishment when the peer advertised it (threshold 10).</li>
+    </ol>
+    <p class="note"><code>test_ack_frequency.php</code> covers negotiate,
+    honor, and send. Suite green.</p>
   </li>
-  <li><span class="check">&#10003;</span> A cache-versus-walk check of the
-    <code>processAck</code> path, to see whether it hides a rescan like the
-    timer did.
-    <p class="note">It does not, mostly. <code>processAck</code>'s cost is
-    the per-acked-packet removal loop, and each packet's work
-    (<code>removeFromBytesInFlight</code>,
-    <code>onPacketAckedForCwnd</code>, the unset) is O(1), so retiring 950
-    packets at ~216 us is inherent, not a redundant walk to cache. The
-    <code>setLossDetectionTimer</code> call it ends with is short-circuited
-    by <code>loss_time</code> (a three-entry check) in the common case where
-    packets remain below largest_acked, so it does not re-walk the
-    in-flight set either.</p>
-    <p class="note">The one thing the check did turn up is in
-    <code>detectAndRemoveLostPackets</code>, which <code>processAck</code>
-    calls: it walked the whole in-flight set, skipping past every packet
-    newer than largest_acked with a <code>continue</code>. Since
-    <code>sent_packets</code> is in packet-number order, once the scan
-    reaches one newer than largest_acked every later entry is newer too, so
-    that is now a <code>break</code> &mdash; the recent in-flight tail above
-    largest_acked is no longer scanned. All 16 test files stay green,
-    including the loss-recovery tests that drive this method. Measured with
-    a full 950-packet in-flight set and a low largest_acked, the scan runs
-    in ~0.5 us versus ~26 us to walk the whole set; in steady state the
-    saving is proportional to how many in-flight packets sit above
-    largest_acked (the recently sent, not-yet-acked ones). It is a small,
-    safe win rather than the timer's large one, which is the honest result
-    of the check.</p>
+
+  <li><span class="check">&#10003;</span> Make the ack-frequency negotiation
+    observable through <code>stats()</code>.
+    <p class="note"><code>ack_frequency</code> block reports negotiation and
+    the received-ack-packet count; that count over <code>packets_sent</code>
+    is the peer's ack cadence. Suite green.</p>
   </li>
-  <li><span class="check">&#10003;</span> A plain-English pass over the
-    docblocks and comments of <code>src/H3Listener.php</code>, so the
-    file the benchmarks exercise reads on its own terms.
-    <p class="note">One documentation pass across all thirteen classes
-    and the two stream-state enums, changing no behavior. Removed the
-    development-phase references ("Phase 4", "Phase 11b", and the like)
-    that meant nothing to a later reader, keeping the real "key-phase"
-    protocol term. Gave each RFC a one-line gloss of what it covers on
-    first mention (9000 transport, 9001 packet protection, 9002 loss and
-    congestion, 8446 TLS 1.3, 5869 HKDF, 8017 RSA signatures, 8439
-    ChaCha20/Poly1305, 9114 HTTP/3, 9204 QPACK, 7541 HPACK) and expanded
-    acronyms on first use. Corrected the many <code>@param</code> and
-    <code>@return</code> lines that disagreed with the real signatures
-    &mdash; returns that claimed <code>void</code>, <code>int</code>, or
-    <code>QuicPacket</code> where the method returned a bool, a string, or
-    an array, plus every <code>@param mixed</code> placeholder left by an
-    earlier stub pass. Converted the last <code>//</code> comments to block
-    form and wrapped every pre-existing over-80-column line. All 16 test
-    files stay green, and the file now has zero phase references, zero
-    <code>@param mixed</code>, zero <code>//</code> comments, and zero
-    lines over 80 columns.</p>
-  <li><span class="check">&#10003;</span> Tie the per-method timings to
-    real request shapes: for each case of the example-21 HTTP
-    benchmark, count how many times each benchmarked method runs while
-    the pure-PHP listener serves it, and multiply by that method's
-    single-call cost.
-    <p class="note">Two files under <code>tests/h3bench/</code>. The
-    counting is done without adding anything to the shipping
-    <code>src/H3Listener.php</code>: <code>counting.php</code> holds
-    reusable subclasses of the QUIC connection, stream, and packet-key
-    classes that override the timed methods to tally a call and then
-    run the real one through <code>parent</code>. Because the real code
-    reaches those methods through the object it holds
-    (<code>$this-&gt;emit()</code>, <code>$keys-&gt;seal()</code>,
-    <code>$stream-&gt;takeForFrame()</code>), a driver built from these
-    subclasses counts every call, including the ones the code makes to
-    itself. It is kept as a shared helper so a later test or benchmark
-    can reuse it. The methods the code calls statically (encodeShort,
-    decodeShort, <code>QuicFrame::encode</code>, encodeStream,
-    decodeAll) cannot be overridden, so their counts are derived
-    one-to-one from the counted ones and marked as derived.</p>
-    <p class="note"><code>bench_workload.php</code> builds each case's
-    real HTTP/3 response bytes, drives them out through the paced
-    flush-and-emit loop, and drives the request and the client's
-    acknowledgements back in as decoded short packets, then reads the
-    single-call microsecond figures from the other bench_ scripts'
-    output and multiplies. It reports, per case: the response and
-    inbound packet counts; the per-primitive call counts; the estimated
-    microseconds (single-call cost times count) for the primitive
-    methods; and, separately, the call counts of the whole-operation
-    methods (emit, flushStreams, drain, processAck, the loss timer,
-    the lost-packet scan), which are not multiplied because their timed
-    cost is a whole-1-MiB or 950-acked figure that already sums the
-    primitives. The estimate rows are each one method's own cost and
-    are not added together, since encodeShort contains seal and
-    header-protection, decodeShort contains open, and
-    <code>QuicFrame::encode</code> contains encodeStream. All 16 test
-    files stay green; the new scripts live under the bench_ name the
-    test runner skips.</p>
-    <p class="note">Follow-up: the counting keys were copied with
-    ReflectionProperty::setAccessible, which PHP 8.5 deprecates because
-    it has had no effect since 8.1; the reflection get and set work
-    without it, so the two calls were dropped and the run is quiet
-    again on 8.5.</p>
-  <li><span class="check">&#10003;</span> Speed up the per-packet nonce
-    build, which runs once per seal and once per open. The old build
-    exclusive-or'd the 64-bit packet number into the initialization
-    vector one byte at a time in a twelve-step loop; the new one leaves
-    the top four bytes alone and exclusive-ors the low eight in a
-    single bulk string operation, which PHP runs in C.
-    <p class="note">Measured with a new <code>bench_nonce.php</code>
-    under <code>tests/h3bench/</code>, which also keeps the byte-loop
-    form so the comparison stays reproducible after the source moved
-    on, and checks every candidate against the shipping method across
-    two thousand random vector-and-number pairs before timing. On this
-    machine the byte loop ran near 1.1 us per build and the new bulk
-    exclusive-or near 0.25 us through the real method call, about four
-    and a half times quicker. A further variant that caches the
-    vector's tail as an integer measured near 0.13 us, but it needs two
-    stored fields and, across a whole 1 MiB response's worth of nonce
-    builds, saves only about a tenth of a millisecond more than the
-    bulk exclusive-or, so it was left as a documented alternative in
-    the benchmark rather than shipped. All 16 test files, including the
-    ones that drive real seal and open, stay green.</p>
+
+  <li><span class="next">&rarr;</span> Confirm ACK-Frequency against real
+    browsers over a delayed path.
+    <ol type="A">
+      <li>Add ~40&nbsp;ms path delay locally, then serve <code>/big</code> to
+        Firefox, Chrome, and Safari in turn.</li>
+      <li>Read <code>stats()</code> per browser: did it send
+        <code>min_ack_delay</code>, and did
+        <code>ack_packets_received</code>/<code>packets_sent</code> fall
+        toward 0.1.</li>
+      <li>Record per browser whether it negotiated and honored the
+        request.</li>
+    </ol>
   </li>
-  <li><span class="check">&#10003;</span> Cut the send path's
-    <code>openssl_encrypt</code> calls by batching header protection.
-    Each outgoing 1-RTT packet made two: an <code>aes-128-gcm</code>
-    seal, which has its own nonce, header, and tag and so cannot be
-    shared, and an <code>aes-128-ecb</code> header-protection mask over
-    a 16-byte sample. AES-ECB encrypts each 16-byte block on its own,
-    so a whole <code>emit()</code>'s worth of samples concatenated and
-    encrypted in one call give the masks back in order &mdash; one
-    call in place of one per packet. Header protection is a
-    length-preserving exclusive-or applied after sealing, so every
-    length-based send gate (anti-amplification, congestion window) and
-    the sent-packet bookkeeping run on the sealed bytes unchanged, and
-    only the final wire output needs the mask; that is what lets the
-    mask step move to the end of <code>emit()</code>.
-    <p class="note"><code>encodeShort</code> was split into
-    <code>encodeShortSealed</code>, which seals and builds the header
-    and returns the sample, and a static
-    <code>applyShortHeaderProtection</code>, which does the
-    exclusive-or; <code>encodeShort</code> now chains the two and
-    behaves exactly as before. <code>QuicPacketKeys</code> gained
-    <code>headerProtectionMasks</code>, which for the AES suites does
-    the single ECB call and for ChaCha20 loops the single-sample
-    method, since that suite derives each mask from a per-packet
-    keystream nonce that cannot be concatenated.
-    <code>emit()</code> seals each 1-RTT packet, keeps the existing
-    bookkeeping, records the sample, and after the send loop masks the
-    whole batch in one call. Long-header handshake packets keep their
-    inline per-packet masking, and the receive side keeps
-    <code>headerProtectionMask</code> per packet because datagrams
-    arrive one at a time. The batched masks were checked byte-for-byte
-    against the per-packet masks, the batched wire byte-for-byte
-    against one-shot <code>encodeShort</code>, and every batched packet
-    was decoded back to its payload, for AES and for ChaCha20, in a
-    new <code>tests/http3/test_hp_batch.php</code>. On this container a
-    30-packet batch's header protection dropped from about 24.3 us
-    done per packet to about 0.85 us batched, so a 30-packet
-    <code>emit()</code> goes from about 60 <code>openssl_encrypt</code>
-    calls to about 31; the 30 seals are untouched.
-    <code>bench_emit.php</code> gained a per-packet and a batched
-    header-protection row at the flush-budget batch size, and
-    <code>bench_codec.php</code> gained an
-    <code>encodeShortSealed</code> row. <code>bench_workload.php</code>
-    now models the batched send path: the batched call is counted once
-    per emit (33 for the 1 MiB case) and the per-packet
-    <code>headerProtectionMask</code> row is the receive-side count,
-    with <code>encodeShortSealed</code> replacing
-    <code>encodeShort</code> as the per-packet send primitive. All 17
-    test files stay green.</p>
-  </li>
-  <li><span class="check">&#10003;</span> Implemented the QUIC
-    ACK-Frequency extension (draft-ietf-quic-ack-frequency-14), which
-    lets a data sender ask its peer to acknowledge less often. The
-    reverse-path acknowledgment stream is what the benchmark exposed
-    as the inbound <code>decodeShort</code> cost, but the reason to
-    carry it is real browser traffic: on asymmetric and mobile links
-    the acknowledgment volume constrains forward throughput, and on
-    any high-rate connection it burns processing on both ends. None of
-    that shows on a near-zero-RTT loopback run, so this is measured
-    against real clients over a delayed path, not the localhost
-    numbers.
-    <p class="note">The listener advertises the min_ack_delay
-    transport parameter (0xff04de1b, 1000 microseconds) and an
-    explicit max_ack_delay (25 ms) so the draft's min-not-greater-
-    than-max constraint holds. It parses both from the peer; a peer
-    min_ack_delay above its own max_ack_delay declines the extension
-    for that connection rather than closing it, which keeps a sound
-    connection up. The ACK_FREQUENCY frame (type 0xaf, a two-byte
-    variable-length integer on the wire) and IMMEDIATE_ACK frame
-    (type 0x1f) are added to the frame codec; both are already
-    ack-eliciting under the existing rule. On the honor side, a
-    received ACK_FREQUENCY updates the threshold, requested max ack
-    delay, and reordering threshold, ignoring any frame whose sequence
-    number is not newer; a received IMMEDIATE_ACK forces the next
-    acknowledgment. The acknowledgment decision moved into
-    shouldSendAppAck, which keeps the previous behavior of
-    acknowledging whenever one is pending until an ACK_FREQUENCY frame
-    is received, so existing client interoperability is unchanged, and
-    afterward acknowledges once more than the requested threshold of
-    ack-eliciting packets have arrived, once the requested delay has
-    passed, or on an IMMEDIATE_ACK. On the send side, once established
-    and only if the peer advertised the extension, the listener sends
-    one ACK_FREQUENCY frame asking for an Ack-Eliciting Threshold of
-    10, a Requested Max Ack Delay taken from the smoothed round-trip
-    time bounded by 25 ms above and the peer's min_ack_delay below,
-    and a Reordering Threshold of 1 so loss detection stays prompt. A
-    requested delay below this endpoint's own min_ack_delay is raised
-    to that floor rather than treated as an error. A new
-    <code>tests/http3/test_ack_frequency.php</code> covers the
-    transport-parameter advertisement and parse, the min-above-max
-    decline, the frame codec round-trip and the two-byte wire type,
-    the newer-sequence and floor handling in the honor path, the
-    shouldSendAppAck decision across default, threshold, delay, and
-    immediate cases, and the send gate staying silent without peer
-    support and sending exactly one frame with support. All 18 test
-    files stay green.</p>
-  </li>
-  <li><span class="check">&#10003;</span> Made the ack-frequency
-    negotiation observable, since its value can only be confirmed
-    against real clients over a delayed path, not the loopback
-    numbers. <code>stats()</code> gained an <code>ack_frequency</code>
-    block reporting whether the peer advertised the extension and its
-    min_ack_delay, whether this endpoint sent an ACK_FREQUENCY and
-    with what threshold and requested delay, and a count of received
-    packets that carried an acknowledgment. Divided by
-    <code>packets_sent</code> that count is the peer's acknowledgment
-    cadence: pointing a browser at a big response over an added-delay
-    path and reading this ratio shows directly whether the browser
-    honored the request. A new stats-block check and a recorded-delay
-    check were added to <code>test_ack_frequency.php</code>. All 18
-    test files stay green.</p>
+
+  <li><span class="next">&rarr;</span> Act on the browser result.
+    <ol type="A">
+      <li>If browsers honor it: take the next method from the workload
+        estimate.</li>
+      <li>If they do not: reduce atto's own ack cadence to the RFC
+        every-other default, browser-independent, on Chris's go.</li>
+    </ol>
   </li>
 </ol>
 </body>

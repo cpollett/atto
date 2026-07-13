@@ -232,13 +232,18 @@ $test->get('/', function () {
         color: #666;">client: this browser</span></h2>
 <p class="meta" style="margin-bottom: 0.8em;">
     Times fetches your browser makes to this same origin and reports,
-    per case, which protocol it used. Load this page over
+    per case, which protocol it used, in the same columns as the curl
+    benchmark above. Load this page over
     <a href="http://localhost:8080/">http://localhost:8080/</a> to
     measure HTTP/1.1, or over
-    <a href="https://localhost:8443/">https://localhost:8443/</a> to
-    measure HTTP/2 or HTTP/3. The <b>Protocol</b> column shows what the
-    browser really did &mdash; if it reads <code>h2</code> where you
-    wanted <code>h3</code>, HTTP/3 did not engage; see below.
+    <a href="https://localhost:8443/">https://localhost:8443/</a> for
+    HTTP/2. atto runs as a single process and serves its own
+    from-scratch HTTP/3 on UDP 8444; it advertises that port with an
+    <code>Alt-Svc</code> header, so once the cert is trusted the
+    browser moves to <code>h3</code> on 8444 by itself. The
+    <b>Protocol</b> column shows what the browser really did &mdash; if
+    it reads <code>h2</code> where you wanted <code>h3</code>, HTTP/3
+    did not engage; see below.
 </p>
 <details class="endpoints">
     <summary>Getting your browser onto HTTP/3 (self-signed cert)</summary>
@@ -249,10 +254,13 @@ $test->get('/', function () {
             <code>mkcert</code> for <code>localhost</code>, which
             Firefox and Safari will then trust.</li>
         <li><b>Chrome / Edge:</b> will not use a custom CA for QUIC at
-            all, so launch it with flags:
-            <code>chrome --origin-to-force-quic-on=localhost:8443
-            --ignore-certificate-errors</code> (testing only; use a
-            fresh <code>--user-data-dir</code>).</li>
+            all, so launch it forcing QUIC at atto's HTTP/3 port and
+            open that port directly:
+            <code>chrome --origin-to-force-quic-on=localhost:8444
+            --ignore-certificate-errors</code>, then load
+            <a href="https://localhost:8444/">https://localhost:8444/</a>
+            (testing only; use a fresh
+            <code>--user-data-dir</code>).</li>
         <li><b>Firefox:</b> visit
             <a href="https://localhost:8443/">https://localhost:8443/</a>
             once and accept the cert. Then in
@@ -264,9 +272,11 @@ $test->get('/', function () {
             it Always Trust, then reload. Recent Safari does HTTP/3 by
             default; older versions need it enabled under Develop &rarr;
             Experimental Features.</li>
-        <li>atto already sends an <code>Alt-Svc: h3</code> header, so
-            once the cert is trusted the browser upgrades to HTTP/3 on
-            its own after the first request.</li>
+        <li>atto sends an <code>Alt-Svc: h3=":8444"</code> header, so
+            on the trusted-cert path (Firefox / Safari) loading
+            <a href="https://localhost:8443/">https://localhost:8443/</a>
+            is enough &mdash; the browser moves to atto's HTTP/3 on
+            8444 by itself after the first request.</li>
     </ul>
 </details>
 <div id="browser_controls" style="margin: 0.5em 0 0.5em;">
@@ -507,6 +517,40 @@ function median(values)
 }
 
 /*
+    Smallest value in a list. The list is never empty here: a case
+    always runs at least one iteration.
+ */
+function minimum(values)
+{
+    var smallest = values[0];
+    for (var i = 1; i < values.length; i++) {
+        if (values[i] < smallest) {
+            smallest = values[i];
+        }
+    }
+    return smallest;
+}
+
+/*
+    Value at the given fraction (0..1) of the sorted list, e.g.
+    0.95 for the 95th percentile, by nearest-rank.
+ */
+function percentile(values, fraction)
+{
+    var sorted = values.slice().sort(function (left, right) {
+        return left - right;
+    });
+    var rank = Math.ceil(fraction * sorted.length) - 1;
+    if (rank < 0) {
+        rank = 0;
+    }
+    if (rank >= sorted.length) {
+        rank = sorted.length - 1;
+    }
+    return sorted[rank];
+}
+
+/*
     Fetch one URL from this origin, consume the whole body, and
     return the elapsed milliseconds, the byte count, and the
     protocol the browser used. A unique query string gives each
@@ -566,11 +610,16 @@ function runBrowserCase(item)
     }
     return step().then(function () {
         return {key: item.key, label: item.label,
-            protocol: protocol, median: median(times),
-            bytes: bytes};
+            protocol: protocol, iters: times.length,
+            min: minimum(times), median: median(times),
+            p95: percentile(times, 0.95), bytes: bytes};
     });
 }
 
+/*
+    Throughput in kilobytes per second as a bare number for the
+    kB/s column, or '-' when there is no measurable time.
+ */
 function formatRate(bytes, elapsed)
 {
     if (elapsed <= 0) {
@@ -578,37 +627,64 @@ function formatRate(bytes, elapsed)
     }
     var kilobytes_per_second =
         (bytes / 1024) / (elapsed / 1000);
-    return kilobytes_per_second.toFixed(0) + ' kB/s';
+    return kilobytes_per_second.toFixed(0);
 }
 
+/*
+    Render each browser case as its own card using the same column
+    header the curl benchmark shows (protocol, iters, min(ms),
+    median, p95, req/s, kB/s), with one row for the single
+    protocol the browser negotiated, so the two benchmarks read
+    the same way.
+ */
 function renderBrowserResults(results)
 {
-    var html = '<table><thead><tr>'
-        + '<th>Case</th><th>Protocol</th><th>Median ms</th>'
-        + '<th>Throughput</th></tr></thead><tbody>';
+    var html = '';
     results.forEach(function (row) {
-        html += '<tr><td>' + row.label + '</td><td>'
-            + row.protocol + '</td><td>' + row.median.toFixed(2)
-            + '</td><td>' + formatRate(row.bytes, row.median)
-            + '</td></tr>';
+        var requests_per_second = row.median > 0
+            ? (1000 / row.median).toFixed(2) : '-';
+        html += '<div class="case"><h2>' + row.key + '</h2>'
+            + '<div class="desc">' + row.label + '</div>'
+            + '<table><thead><tr><th>protocol</th><th>iters</th>'
+            + '<th>min(ms)</th><th>median</th><th>p95</th>'
+            + '<th>req/s</th><th>kB/s</th></tr></thead><tbody>'
+            + '<tr><td>' + row.protocol + '</td><td>' + row.iters
+            + '</td><td>' + row.min.toFixed(2) + '</td><td>'
+            + row.median.toFixed(2) + '</td><td>'
+            + row.p95.toFixed(2) + '</td><td>'
+            + requests_per_second + '</td><td>'
+            + formatRate(row.bytes, row.median)
+            + '</td></tr></tbody></table></div>';
     });
-    html += '</tbody></table>';
     browser_results_area.innerHTML = html;
 }
 
 /*
-    After the fetches, read /h3stats and show, for the busiest H3
-    connection (this browser's, if it ran over H3), whether
-    ack-frequency was negotiated and how often the browser
-    acknowledged.
+    After the fetches, read /h3stats and show atto's ack-frequency
+    for this browser's connection. keep=1 includes the just-closed
+    ring, because a browser often tears down its h3 connection the
+    moment the fetches finish; without it a read landing a moment
+    later would see nothing. Among live and just-closed
+    connections, pick the busiest one carrying an ack_frequency
+    block (only atto's own h3 listener reports it). The results
+    array carries the protocol each case used, so the fallback
+    message can tell an h3 run apart from a non-h3 one.
  */
-function showBrowserAckFrequency()
+function showBrowserAckFrequency(results)
 {
-    return fetch('/h3stats').then(function (response) {
+    var used_h3 = (results || []).some(function (row) {
+        return row.protocol === 'h3';
+    });
+    return fetch('/h3stats?keep=1').then(function (response) {
         return response.json();
     }).then(function (data) {
+        var candidates = (data.stats || [])
+            .concat(data.reaped || []);
         var best = null;
-        (data.stats || []).forEach(function (stat) {
+        candidates.forEach(function (stat) {
+            if (!stat.ack_frequency) {
+                return;
+            }
             if (!best
                 || stat.packets_sent > best.packets_sent) {
                 best = stat;
@@ -616,11 +692,7 @@ function showBrowserAckFrequency()
         });
         var note = document.createElement('p');
         note.className = 'meta';
-        if (!best || !best.ack_frequency) {
-            note.innerHTML = 'No H3 connection seen. The Protocol '
-                + 'column shows what your browser used; if it is '
-                + 'not h3, follow the cert steps above.';
-        } else {
+        if (best) {
             var ack_frequency = best.ack_frequency;
             var cadence = '-';
             if (best.packets_sent > 0) {
@@ -638,10 +710,20 @@ function showBrowserAckFrequency()
                 + ' packets (<b>' + cadence + '</b> per packet). '
                 + 'Near 0.1 means it honored the request; near '
                 + '1.0 means it ignored it.';
+        } else if (used_h3) {
+            note.innerHTML = 'Your browser reported h3, but atto '
+                + 'had no matching h3 connection to report on when '
+                + 'this read landed. Re-run the benchmark; the '
+                + 'just-closed connection is kept briefly, so a '
+                + 'second run usually shows the cadence.';
+        } else {
+            note.innerHTML = 'No h3 connection was used. The '
+                + 'Protocol column shows what your browser did; '
+                + 'if it is not h3, follow the cert steps above.';
         }
         browser_results_area.appendChild(note);
     }).catch(function () {
-        /* /h3stats not reachable or no H3 listener; skip. */
+        /* /h3stats not reachable or no h3 listener; skip. */
     });
 }
 
@@ -682,7 +764,7 @@ function runBrowserBench()
             return next();
         })
         .then(function () {
-            return showBrowserAckFrequency();
+            return showBrowserAckFrequency(results);
         })
         .then(function () {
             browser_status_line.textContent =

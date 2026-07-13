@@ -8471,6 +8471,26 @@ class H3Listener extends Listener
      */
     public $last_activity = [];
     /**
+     * How many recently-closed connections to remember in
+     * $reaped_stats. Kept small: this is a diagnostic aid so a
+     * read that lands just after a connection closed can still
+     * see it, not a durable log.
+     */
+    const REAPED_STATS_RING = 16;
+    /**
+     * A short ring of stats from connections that have already
+     * left $connections. A browser or /h3stats?keep=1 read often
+     * lands a moment after the peer closed its QUIC connection;
+     * without this the connection's counters (including its
+     * ack-frequency cadence) would be gone, so the reader would
+     * see nothing even though h3 was used. Each entry is the
+     * connection's stats() array plus a 'reaped_at' microtime
+     * float and a 'reason' string. Bounded by REAPED_STATS_RING,
+     * oldest first.
+     * @var array list of stats arrays for closed connections.
+     */
+    public $reaped_stats = [];
+    /**
      * @var array cid-hex => primary key in $connections.
      *      Every active local CID for every connection has
      *      an entry here. The first CID a connection mints
@@ -8930,6 +8950,8 @@ class H3Listener extends Listener
             $this->stats_path_migrations++;
         }
         if (!$ok || $h3->isClosed()) {
+            $this->captureReapedStats($h3,
+                $h3->isClosed() ? 'closed' : 'error');
             unset($this->connections[$key_h]);
             unset($this->last_activity[$key_h]);
             /*
@@ -9145,6 +9167,7 @@ class H3Listener extends Listener
         $now = microtime(true);
         foreach ($this->connections as $kh => $h3) {
             if ($h3->isClosed()) {
+                $this->captureReapedStats($h3, 'closed');
                 unset($this->connections[$kh]);
                 unset($this->last_activity[$kh]);
                 continue;
@@ -9224,6 +9247,7 @@ class H3Listener extends Listener
                     timer.
                  */
                 $h3->quic->markClosedSilently();
+                $this->captureReapedStats($h3, 'idle_timeout');
                 unset($this->connections[$kh]);
                 unset($this->last_activity[$kh]);
                 continue;
@@ -9238,6 +9262,7 @@ class H3Listener extends Listener
                     connection from the table.
                  */
                 $this->flushConnectionOnce($h3);
+                $this->captureReapedStats($h3, 'closed');
                 unset($this->connections[$kh]);
                 unset($this->last_activity[$kh]);
             }
@@ -9288,17 +9313,43 @@ class H3Listener extends Listener
         /* no-op; see method docblock */
     }
     /**
-     * Returns stats for connections that have been reaped
-     * since the last snapshot. The pure-PHP listener does
-     * not currently retain a reaped-connection history
-     * (it just drops entries on close), so this returns an
-     * empty list for now. A later revision could keep a small
-     * ring of recent closures.
-     * @return array the reaped-connection stats (empty for now)
+     * Remembers a closing connection's final stats so a read that
+     * arrives just after the peer went away can still see it.
+     * Copies the connection's stats() snapshot into the
+     * $reaped_stats ring, tagged with when and why it closed, and
+     * trims the ring to REAPED_STATS_RING entries (oldest first).
+     * Call this immediately before dropping the connection from
+     * $connections.
+     *
+     * @param object $h3 the H3Connection about to be dropped
+     * @param string $reason why it closed: 'closed', 'error', or
+     *      'idle_timeout'
+     */
+    public function captureReapedStats($h3, $reason)
+    {
+        $stats = $h3->quic->stats();
+        $stats['reaped_at'] = microtime(true);
+        $stats['reason'] = $reason;
+        $this->reaped_stats[] = $stats;
+        $overflow = count($this->reaped_stats)
+            - self::REAPED_STATS_RING;
+        if ($overflow > 0) {
+            $this->reaped_stats = array_slice(
+                $this->reaped_stats, $overflow);
+        }
+    }
+    /**
+     * Returns stats for connections reaped recently, newest
+     * activity last. The listener keeps a short ring
+     * (REAPED_STATS_RING) of connections that have left
+     * $connections so /h3stats?keep=1 and the browser benchmark
+     * can read a connection's final ack-frequency cadence even
+     * when the peer closed it a moment earlier.
+     * @return array the reaped-connection stats, oldest first
      */
     public function snapshotReapedStats()
     {
-        return [];
+        return $this->reaped_stats;
     }
 }
 /**

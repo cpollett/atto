@@ -139,6 +139,26 @@ out of <code>tests/run_all.php</code>.</p>
     exiting with a manual command.</p>
   </li>
 
+  <li><span class="next">&rarr;</span> Make the browser benchmark show
+    atto's h3 ack-frequency and share the curl benchmark's columns.
+    <ol type="A">
+      <li>Keep a short ring of just-closed connections in
+        <code>H3Listener</code> (<code>captureReapedStats</code> /
+        <code>REAPED_STATS_RING</code>) so <code>/h3stats?keep=1</code>
+        still reports a connection the browser tore down the moment its
+        fetches finished.</li>
+      <li>Read that ring in the benchmark and show the busiest
+        connection carrying an ack_frequency block.</li>
+      <li>Render browser rows in the curl columns: protocol, iters,
+        min(ms), median, p95, req/s, kB/s.</li>
+      <li>Point the browser steps at atto's own h3 on 8444; single
+        process.</li>
+    </ol>
+    <p class="note">Delivered for review; the ring is covered by
+    <code>tests/http3/test_reaped_stats.php</code>, but the browser read
+    path is not exercised here (no h3 client in this environment).</p>
+  </li>
+
   <li><span class="next">&rarr;</span> Confirm ACK-Frequency against real
     browsers with the Example 21 browser benchmark.
     <ol type="A">

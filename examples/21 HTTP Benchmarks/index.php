@@ -1016,6 +1016,69 @@ $test->get('/h3stats', function () use ($test) {
     }
     echo json_encode($out, JSON_PRETTY_PRINT);
 });
+
+/**
+ * Makes sure the shared self-signed TLS certificate the examples
+ * use is present and current, regenerating it when it is missing
+ * or has expired. The certificate and its key live in the
+ * repository's security/ directory and cover localhost with the
+ * subject-alternative-name entries in san.cnf, so a browser can
+ * reach the TLS and HTTP/3 listeners. Generation shells out to
+ * openssl to write a self-signed RSA certificate valid for a
+ * year, the same command security/san.cnf documents. Returns
+ * true when a usable certificate and key are in place.
+ *
+ * @param string $certificate path to the certificate file
+ * @param string $key path to the private-key file
+ * @param string $configuration_path path to the openssl config
+ *      (san.cnf) that carries the localhost names
+ * @return bool true when the pair is present and current
+ */
+function ensureBenchmarkCertificate($certificate, $key,
+    $configuration_path)
+{
+    $present = file_exists($certificate) && file_exists($key);
+    $current = false;
+    if ($present) {
+        /*
+            openssl x509 -checkend 0 exits non-zero once the
+            certificate has expired, so a zero exit means it is
+            still inside its validity window.
+         */
+        $check = "openssl x509 -in "
+            . escapeshellarg($certificate) . " -noout -checkend 0";
+        exec($check . " 2>/dev/null", $unused, $status);
+        $current = ($status === 0);
+    }
+    if ($present && $current) {
+        return true;
+    }
+    echo "  TLS certificate "
+        . ($present ? "expired" : "missing")
+        . "; regenerating in security/.\n";
+    /*
+        A 4096-bit RSA key, self-signed and valid for one year.
+        The length is measured in bits and the lifetime in days,
+        as the openssl flags below expect.
+     */
+    $rsa_key_length = 4096;
+    $certificate_lifetime = 365;
+    $generate = "openssl req -x509 -nodes -newkey rsa:"
+        . $rsa_key_length . " -keyout " . escapeshellarg($key)
+        . " -out " . escapeshellarg($certificate) . " -days "
+        . $certificate_lifetime . " -config "
+        . escapeshellarg($configuration_path);
+    exec($generate . " 2>&1", $output, $status);
+    if ($status !== 0 || !file_exists($certificate)
+        || !file_exists($key)) {
+        echo "  Could not generate a certificate. Is openssl on "
+            . "the PATH?\n";
+        return false;
+    }
+    echo "  Wrote a fresh certificate and key to security/.\n";
+    return true;
+}
+
 if ($test->isCli()) {
     /*
         Optional --trace=path flag: when present, the H3 listener
@@ -1056,20 +1119,18 @@ if ($test->isCli()) {
         }
     }
     /*
-        Reuse the repository's self-signed cert (security/) so
-        every example with a TLS listener picks up the same
-        SAN-enabled localhost+127.0.0.1 certificate. Generated
-        once with security/san.cnf rather than per-run, which
-        also avoids the openssl progress dots polluting the
-        startup output.
+        Use the repository's shared self-signed cert (security/)
+        so every example with a TLS listener picks up the same
+        SAN-enabled localhost+127.0.0.1 certificate.
+        ensureBenchmarkCertificate regenerates it from
+        security/san.cnf when it is missing or has expired, so a
+        fresh checkout or a stale cert still starts cleanly.
      */
-    $cert = __DIR__ . "/../../security/server.crt";
+    $certificate = __DIR__ . "/../../security/server.crt";
     $key = __DIR__ . "/../../security/server.key";
-    if (!file_exists($cert) || !file_exists($key)) {
-        echo "Cert not found at $cert / $key.\n";
-        echo "Run: cd security && openssl req -x509 -nodes " .
-            "-newkey rsa:4096 -keyout server.key -out " .
-            "server.crt -days 365 -config san.cnf\n";
+    $configuration_path = __DIR__ . "/../../security/san.cnf";
+    if (!ensureBenchmarkCertificate($certificate, $key,
+        $configuration_path)) {
         exit(1);
     }
     echo "\n";
@@ -1091,7 +1152,7 @@ if ($test->isCli()) {
     $listen_specs = [
         8080,
         ['address' => 8443, 'context' => ['ssl' => [
-            'local_cert' => $cert,
+            'local_cert' => $certificate,
             'local_pk' => $key,
             'allow_self_signed' => true,
             'verify_peer' => false,
@@ -1099,7 +1160,7 @@ if ($test->isCli()) {
         ]]],
         ['address' => 8444, 'protocol' => 'h3',
             'context' => ['ssl' => [
-                'local_cert' => $cert,
+                'local_cert' => $certificate,
                 'local_pk' => $key,
             ]]],
     ];
@@ -1124,7 +1185,7 @@ if ($test->isCli()) {
         $listen_specs[] = ['address' => 8443,
             'protocol' => 'h3-quiche',
             'context' => ['ssl' => [
-                'local_cert' => $cert,
+                'local_cert' => $certificate,
                 'local_pk' => $key,
             ]]];
     }

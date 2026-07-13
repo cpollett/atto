@@ -130,6 +130,15 @@ out of <code>tests/run_all.php</code>.</p>
     run.</p>
   </li>
 
+  <li><span class="check">&#10003;</span> Regenerate Example 21's
+    <code>security/</code> TLS certificate when it is missing or expired.
+    <p class="note"><code>ensureBenchmarkCertificate</code> checks
+    <code>openssl x509 -checkend</code> and, on a missing or expired pair,
+    writes a fresh self-signed RSA cert from <code>san.cnf</code>, so the
+    8443/8444 listeners always start with a valid certificate instead of
+    exiting with a manual command.</p>
+  </li>
+
   <li><span class="next">&rarr;</span> Confirm ACK-Frequency against real
     browsers with the Example 21 browser benchmark.
     <ol type="A">

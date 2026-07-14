@@ -43,6 +43,15 @@
  * scripts' own output, so the timings multiplied here are exactly the
  * ones those scripts report, measured on this machine.
  *
+ * How the tables read. The methods are printed as a call tree rather
+ * than a flat list, because several of them invoke others in the
+ * list: emit seals through encodeShortSealed, which calls seal;
+ * decodeShort opens and header-protects; and QuicFrame::encode's
+ * switch dispatches to encodeStream. An indented row is called by the
+ * row above it, so its time is part of that row's; only the
+ * un-indented rows are free of overlap, and those are the ones the
+ * total sums.
+ *
  * These are benchmarks, not the pass/fail tests: they are timed and
  * estimated rather than asserted, and live under the bench_ name the
  * test runner skips.
@@ -66,12 +75,12 @@ namespace seekquarry\atto;
 class Connection {}
 class Listener
 {
-    public function __construct(...$a) {}
+    public function __construct(...$arguments) {}
     public function close() {}
 }
 abstract class Transport
 {
-    public function __construct($s) {}
+    public function __construct($site) {}
 }
 
 require __DIR__ . '/../../src/H3Listener.php';
@@ -245,9 +254,9 @@ function driveCase($response_pairs, $response_body, $request_pairs,
         does.
      */
     $request = buildResponseBytes($request_pairs, $request_body);
-    $frame_bytes = QuicConnection::MAX_STREAM_FRAME_BYTES;
+    $frame_limit = QuicConnection::MAX_STREAM_FRAME_BYTES;
     $request_packets = (int) max(1,
-        ceil(strlen($request) / $frame_bytes));
+        ceil(strlen($request) / $frame_limit));
     for ($i = 0; $i < $request_packets; $i++) {
         driveInboundPacket($key_pair['client'], $rx_keys, $dcid, $i,
             chr(QuicFrame::F_PING));
@@ -416,29 +425,74 @@ function buildCases()
 }
 
 /**
- * @var array the per-primitive rows: each is [bench label, counts
- *      key, derived]. Their single-call cost times their per-case
- *      call count is a meaningful time estimate, so these are the
- *      rows the estimate table multiplies. "derived" marks a count
- *      taken from a counted method by a one-to-one relationship
- *      because the method itself is called statically.
+ * @var int width of the first column, wide enough for the deepest
+ *      indented label in WL_CALL_TREE
  */
-const WL_PRIMITIVE_ROWS = [
-    ['QuicPacketKeys::seal', 'QuicPacketKeys::seal', false],
-    ['QuicPacketKeys::open', 'QuicPacketKeys::open', false],
-    ['QuicPacketKeys::headerProtectionMask',
-        'QuicPacketKeys::headerProtectionMask', false],
-    ['QuicPacketKeys::headerProtectionMasks (batch)',
-        'QuicPacketKeys::headerProtectionMasks', false],
-    ['QuicPacket::encodeShortSealed', 'QuicPacketKeys::seal', true],
-    ['QuicPacket::decodeShort', 'inbound_packets', true],
-    ['QuicFrame::encode (STREAM, switch)', 'response_packets', true],
-    ['QuicFrame::encodeStream (no switch)', 'response_packets', true],
-    ['QuicFrame::decodeAll (ACK + PING)', 'inbound_packets', true],
-    ['QuicStream::takeForFrame (one chunk)',
-        'QuicStream::takeForFrame', false],
-    ['setLossDetectionTimer (cached)', 'setLossDetectionTimer',
-        false],
+const WL_LABEL_WIDTH = 48;
+/**
+ * @var array the call tree the count and estimate tables print, in
+ *      the order the rows appear. Each node is:
+ *        label   what to print. For a timed row this is the label the
+ *                bench_ script prints, so its single-call
+ *                microseconds can be looked up by it; for a subtotal
+ *                row it is just the method name.
+ *        key     the counts key holding this row's per-case call
+ *                count
+ *        depth   0 for a row that nothing else in the tree calls;
+ *                deeper for a row its parent invokes, so the row's
+ *                time is part of its parent's
+ *        derived true when the count is taken one-to-one from a
+ *                counted method because this one is called
+ *                statically and so cannot be counted by subclassing
+ *        timed   true when the bench_ scripts report a per-call cost,
+ *                so cost times count is a meaningful estimate. False
+ *                for a row whose only benchmarked figure is a whole
+ *                1 MiB response: multiplying that by a paced call
+ *                count would double count, so the row's estimate is
+ *                the sum of the rows beneath it instead, which leaves
+ *                out the row's own loop overhead.
+ *      Depth-0 rows do not overlap, so their estimates add up to the
+ *      case total. setLossDetectionTimer and decodeAll sit at depth 0
+ *      rather than under emit because emit, processAck, and
+ *      queuePacket all call them, and nesting them under one caller
+ *      would attribute the other callers' time to it.
+ */
+const WL_CALL_TREE = [
+    ['label' => 'QuicConnection::flushStreams',
+        'key' => 'QuicConnection::flushStreams', 'depth' => 0,
+        'derived' => false, 'timed' => false],
+    ['label' => 'QuicStream::takeForFrame (one chunk)',
+        'key' => 'QuicStream::takeForFrame', 'depth' => 1,
+        'derived' => false, 'timed' => true],
+    ['label' => 'QuicFrame::encode (STREAM, switch)',
+        'key' => 'response_packets', 'depth' => 1,
+        'derived' => true, 'timed' => true],
+    ['label' => 'QuicFrame::encodeStream (no switch)',
+        'key' => 'response_packets', 'depth' => 2,
+        'derived' => true, 'timed' => true],
+    ['label' => 'QuicConnection::emit', 'key' => 'QuicConnection::emit',
+        'depth' => 0, 'derived' => false, 'timed' => false],
+    ['label' => 'QuicPacket::encodeShortSealed',
+        'key' => 'QuicPacketKeys::seal', 'depth' => 1,
+        'derived' => true, 'timed' => true],
+    ['label' => 'QuicPacketKeys::seal', 'key' => 'QuicPacketKeys::seal',
+        'depth' => 2, 'derived' => false, 'timed' => true],
+    ['label' => 'QuicPacketKeys::headerProtectionMasks (batch)',
+        'key' => 'QuicPacketKeys::headerProtectionMasks', 'depth' => 1,
+        'derived' => false, 'timed' => true],
+    ['label' => 'QuicPacket::decodeShort', 'key' => 'inbound_packets',
+        'depth' => 0, 'derived' => true, 'timed' => true],
+    ['label' => 'QuicPacketKeys::headerProtectionMask',
+        'key' => 'QuicPacketKeys::headerProtectionMask', 'depth' => 1,
+        'derived' => false, 'timed' => true],
+    ['label' => 'QuicPacketKeys::open', 'key' => 'QuicPacketKeys::open',
+        'depth' => 1, 'derived' => false, 'timed' => true],
+    ['label' => 'QuicFrame::decodeAll (ACK + PING)',
+        'key' => 'inbound_packets', 'depth' => 0,
+        'derived' => true, 'timed' => true],
+    ['label' => 'setLossDetectionTimer (cached)',
+        'key' => 'setLossDetectionTimer', 'depth' => 0,
+        'derived' => false, 'timed' => true],
 ];
 /**
  * @var array the whole-operation rows: [bench label, counts key].
@@ -475,6 +529,78 @@ function caseCount($counts, $key)
 }
 
 /**
+ * Returns the printable first-column text for a tree node: indented
+ * by its depth, and marked with a plus when its count is derived.
+ *
+ * @param array $node one WL_CALL_TREE node
+ * @return string the label to print
+ */
+function treeLabel($node)
+{
+    return str_repeat('  ', $node['depth']) . $node['label']
+        . ($node['derived'] ? ' +' : '');
+}
+
+/**
+ * Returns the positions of a node's direct children: the rows below
+ * it that sit exactly one level deeper, stopping at the next row at
+ * the node's own level or shallower. Grandchildren are left out
+ * because their time is already inside a child's.
+ *
+ * @param array $tree the whole call tree
+ * @param int $index the position of the parent node
+ * @return array list of positions of the direct children
+ */
+function childIndexes($tree, $index)
+{
+    $depth = $tree[$index]['depth'];
+    $children = [];
+    $total = count($tree);
+    for ($i = $index + 1; $i < $total; $i++) {
+        if ($tree[$i]['depth'] <= $depth) {
+            break;
+        }
+        if ($tree[$i]['depth'] === $depth + 1) {
+            $children[] = $i;
+        }
+    }
+    return $children;
+}
+
+/**
+ * Estimates the microseconds one case spends in each tree row. A
+ * timed row is its single-call cost times its call count for the
+ * case; a row with no per-call cost is the sum of its direct
+ * children, which leaves out that row's own loop overhead. Walks
+ * from the bottom up so a parent's children are already estimated
+ * when it is reached.
+ *
+ * @param array $tree the call tree
+ * @param array $counts one case's averaged call counts
+ * @param array $micros bench label => microseconds per single call
+ * @return array tree position => estimated microseconds
+ */
+function treeEstimates($tree, $counts, $micros)
+{
+    $estimates = [];
+    for ($i = count($tree) - 1; $i >= 0; $i--) {
+        $node = $tree[$i];
+        if ($node['timed']) {
+            $us = isset($micros[$node['label']])
+                ? $micros[$node['label']] : 0.0;
+            $estimates[$i] = $us * caseCount($counts, $node['key']);
+            continue;
+        }
+        $sum = 0.0;
+        foreach (childIndexes($tree, $i) as $child) {
+            $sum += $estimates[$child];
+        }
+        $estimates[$i] = $sum;
+    }
+    return $estimates;
+}
+
+/**
  * Prints a header row of case labels for a table whose first column
  * is a method name.
  *
@@ -483,12 +609,13 @@ function caseCount($counts, $key)
  */
 function printCaseHeader($cases, $first)
 {
-    printf("  %-38s", $first);
+    printf("  %-" . WL_LABEL_WIDTH . "s", $first);
     foreach ($cases as $case) {
         printf(" %9s", $case['key']);
     }
     echo "\n";
-    printf("  %-38s", str_repeat('-', 38));
+    printf("  %-" . WL_LABEL_WIDTH . "s",
+        str_repeat('-', WL_LABEL_WIDTH));
     foreach ($cases as $case) {
         printf(" %9s", str_repeat('-', 9));
     }
@@ -517,7 +644,7 @@ echo "note: driven with AES-128-GCM Initial keys, so the seal, open,\n" .
 echo "example-21 cases: response packets and inbound packets\n";
 printCaseHeader($cases, 'quantity');
 foreach (['response_packets', 'inbound_packets'] as $quantity) {
-    printf("  %-38s", $quantity);
+    printf("  %-" . WL_LABEL_WIDTH . "s", $quantity);
     foreach ($cases as $case) {
         printf(" %9s", number_format(
             caseCount($counts_by_case[$case['key']], $quantity)));
@@ -527,12 +654,12 @@ foreach (['response_packets', 'inbound_packets'] as $quantity) {
 
 echo "\nper-primitive call counts per case\n";
 printCaseHeader($cases, 'method (+ = derived count)');
-foreach (WL_PRIMITIVE_ROWS as $row) {
-    list($label, $key, $derived) = $row;
-    printf("  %-38s", $label . ($derived ? ' +' : ''));
+foreach (WL_CALL_TREE as $node) {
+    printf("  %-" . WL_LABEL_WIDTH . "s", treeLabel($node));
     foreach ($cases as $case) {
         printf(" %9s", number_format(
-            caseCount($counts_by_case[$case['key']], $key)));
+            caseCount($counts_by_case[$case['key']],
+                $node['key'])));
     }
     echo "\n";
 }
@@ -540,34 +667,47 @@ foreach (WL_PRIMITIVE_ROWS as $row) {
 echo "\nestimated microseconds per case " .
     "(single-call us times call count)\n";
 printCaseHeader($cases, 'method');
-foreach (WL_PRIMITIVE_ROWS as $row) {
-    list($label, $key, $derived) = $row;
-    $us = isset($micros[$label]) ? $micros[$label] : 0.0;
-    printf("  %-38s", $label);
+$estimates_by_case = [];
+foreach ($cases as $case) {
+    $estimates_by_case[$case['key']] = treeEstimates(WL_CALL_TREE,
+        $counts_by_case[$case['key']], $micros);
+}
+foreach (WL_CALL_TREE as $index => $node) {
+    printf("  %-" . WL_LABEL_WIDTH . "s", treeLabel($node));
     foreach ($cases as $case) {
-        $estimate = $us
-            * caseCount($counts_by_case[$case['key']], $key);
-        printf(" %9.1f", $estimate);
+        printf(" %9.1f", $estimates_by_case[$case['key']][$index]);
     }
     echo "\n";
 }
+printf("  %-" . WL_LABEL_WIDTH . "s", 'total (un-indented rows)');
+foreach ($cases as $case) {
+    $total = 0.0;
+    foreach (WL_CALL_TREE as $index => $node) {
+        if ($node['depth'] === 0) {
+            $total += $estimates_by_case[$case['key']][$index];
+        }
+    }
+    printf(" %9.1f", $total);
+}
+echo "\n";
 
-echo "\nrows above are each one method's own time and are not " .
-    "additive:\nheaderProtectionMask is the receive side, one per " .
-    "inbound\npacket, while headerProtectionMasks (batch) is the " .
-    "send side, one\ncall per emit over that emit's packets. " .
-    "encodeShortSealed seals\nand builds the header, decodeShort " .
-    "opens and header-protects, and\nQuicFrame::encode frames, so " .
-    "encodeShortSealed already contains\nthe seal row and decodeShort " .
-    "already contains the open and\nper-packet header-protection " .
-    "rows.\n";
+echo "\nreading the tree: an indented row is called by the row above " .
+    "it, and\nits time is part of that row's, so only the un-indented " .
+    "rows add up.\nA row with no time of its own listed " .
+    "(flushStreams, emit) has only a\nwhole-1-MiB benchmark, which " .
+    "cannot be multiplied by a paced call\ncount without double " .
+    "counting; its figure is the sum of the rows\nbeneath it, so it " .
+    "leaves out its own loop overhead and is a floor.\n" .
+    "setLossDetectionTimer and decodeAll are un-indented because emit,\n" .
+    "processAck, and queuePacket all call them, so nesting them under " .
+    "one\ncaller would charge that caller for the others' calls.\n";
 echo "\nwhole-operation call counts per case (not multiplied; " .
     "their\ntimed cost is a whole-1-MiB / 950-acked figure that " .
     "already\nsums the primitives above)\n";
 printCaseHeader($cases, 'method');
 foreach (WL_WHOLE_ROWS as $row) {
     list($label, $key) = $row;
-    printf("  %-38s", $label);
+    printf("  %-" . WL_LABEL_WIDTH . "s", $label);
     foreach ($cases as $case) {
         printf(" %9s", number_format(
             caseCount($counts_by_case[$case['key']], $key)));

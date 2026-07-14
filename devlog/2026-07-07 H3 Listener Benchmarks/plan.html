@@ -180,6 +180,24 @@ out of <code>tests/run_all.php</code>.</p>
         every-other default, browser-independent, on Chris's go.</li>
     </ol>
   </li>
+
+  <li><span class="check">&#10003;</span> Print bench_workload's estimate
+    as a call tree.
+    <p class="note">Rows are nested by who calls whom (emit &rarr;
+    encodeShortSealed &rarr; seal; decodeShort &rarr; open and header
+    protection; QuicFrame::encode &rarr; encodeStream), so an indented
+    row's time is part of its parent's and only the un-indented rows
+    add up; a total row sums them. Rows with several callers
+    (setLossDetectionTimer, decodeAll) stay un-indented.</p>
+  </li>
+
+  <li><span class="next">&rarr;</span> Re-check WL_ACK_EVERY against the
+    measured browser ack cadence.
+    <p class="note">It models an ack every 2 response packets, but
+    Firefox and Safari ack about every 9-10, so the tree's inbound rows
+    (decodeShort, decodeAll) are modelled about five times too heavy.
+    Fix the constant before reading the send/receive split.</p>
+  </li>
 </ol>
 </body>
 </html>

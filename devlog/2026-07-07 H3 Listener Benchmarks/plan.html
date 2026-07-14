@@ -153,10 +153,19 @@ out of <code>tests/run_all.php</code>.</p>
         min(ms), median, p95, req/s, kB/s.</li>
       <li>Point the browser steps at atto's own h3 on 8444; single
         process.</li>
+      <li>State the cadence plainly: call it honored/ignored only
+        when atto actually sent an ACK_FREQUENCY request; otherwise
+        report it as the browser's own cadence.</li>
+      <li>Drive both benchmarks from one iteration count
+        (<code>$bench_iterations</code>) so their rows are
+        comparable: passed to bench.php as <code>--iterations</code>
+        and injected into the browser JavaScript.</li>
     </ol>
-    <p class="note">Delivered for review; the ring is covered by
-    <code>tests/http3/test_reaped_stats.php</code>, but the browser read
-    path is not exercised here (no h3 client in this environment).</p>
+    <p class="note">Confirmed in Firefox and Safari: neither
+    advertises min_ack_delay, so atto sends no request and each acks
+    about every tenth packet on its own (0.10&ndash;0.11 per packet).
+    The ring is covered by
+    <code>tests/http3/test_reaped_stats.php</code>.</p>
   </li>
 
   <li><span class="next">&rarr;</span> Confirm ACK-Frequency against real
@@ -193,10 +202,12 @@ out of <code>tests/run_all.php</code>.</p>
 
   <li><span class="next">&rarr;</span> Re-check WL_ACK_EVERY against the
     measured browser ack cadence.
-    <p class="note">It models an ack every 2 response packets, but
-    Firefox and Safari ack about every 9-10, so the tree's inbound rows
-    (decodeShort, decodeAll) are modelled about five times too heavy.
-    Fix the constant before reading the send/receive split.</p>
+    <p class="note">Delivered for review: was 2 (the RFC's every-other
+    cadence); Firefox and Safari were measured at one ack per 8.8 and
+    10.0 packets, so it is now 10. For /big this takes inbound packets
+    from 482 to 98 and the receive rows (decodeShort, decodeAll) from
+    about 2,200 us to about 460, leaving seal at roughly half the case
+    total.</p>
   </li>
 </ol>
 </body>

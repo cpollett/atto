@@ -19,6 +19,16 @@ if (php_sapi_name() !== 'cli'
 $test = new WebSite();
 
 /*
+    One iteration count drives both benchmarks so their rows are
+    directly comparable. The curl runner (bench.php) takes it as
+    --iterations and derives per-case counts from it; the browser
+    benchmark mirrors that derivation from the same value injected
+    into its JavaScript. bench.php's own default is 100; keep this
+    in step with it.
+ */
+$bench_iterations = 100;
+
+/*
     Atto benchmark dashboard. Pair with bench.php in the same
     folder, which is the runner that hits the test endpoints
     over each available HTTP protocol.
@@ -71,7 +81,7 @@ $test = new WebSite();
 $bench_out_file = sys_get_temp_dir() . "/atto_bench_dashboard_" .
     getmypid() . ".out";
 
-$test->get('/', function () {
+$test->get('/', function () use ($bench_iterations) {
     /*
         Pre-load H3QuicheListener so we can probe for libquiche
         availability and conditionally render the opt-in
@@ -495,13 +505,23 @@ var browser_results_area =
 var browser_status_line =
     document.getElementById('browser_status');
 
+/*
+    Iteration counts injected from PHP so they equal the curl
+    benchmark's. bench.php runs the full count for /small and
+    /echo-post and a tenth of it (at least ten) for the 1 MiB
+    /big case; mirror that here.
+ */
+var BENCH_ITERATIONS = <?php echo (int) $bench_iterations; ?>;
+var BIG_ITERATIONS = Math.max(10, Math.floor(BENCH_ITERATIONS / 10));
+
 var BROWSER_CASES = [
     {key: 'small', path: '/small',
-        label: 'per-request overhead', iterations: 5},
+        label: 'per-request overhead',
+        iterations: BENCH_ITERATIONS},
     {key: 'big', path: '/big',
-        label: '1 MiB throughput', iterations: 3},
-    {key: 'post', path: '/echo-post',
-        label: '64 KiB round-trip', iterations: 5, post: true}
+        label: '1 MiB throughput', iterations: BIG_ITERATIONS},
+    {key: 'post', path: '/echo-post', label: '64 KiB round-trip',
+        iterations: BENCH_ITERATIONS, post: true}
 ];
 
 function median(values)
@@ -699,17 +719,28 @@ function showBrowserAckFrequency(results)
                 cadence = (ack_frequency.ack_packets_received
                     / best.packets_sent).toFixed(2);
             }
-            note.innerHTML = 'H3 ack-frequency &mdash; browser '
+            var header = 'H3 ack-frequency &mdash; browser '
                 + 'advertised min_ack_delay: <b>'
                 + (ack_frequency.peer_advertised ? 'yes' : 'no')
-                + '</b>; asked to ack every '
-                + (ack_frequency.sent_threshold || '-')
-                + '; browser sent '
+                + '</b>. It sent '
                 + ack_frequency.ack_packets_received
                 + ' acks over ' + best.packets_sent
-                + ' packets (<b>' + cadence + '</b> per packet). '
-                + 'Near 0.1 means it honored the request; near '
-                + '1.0 means it ignored it.';
+                + ' packets (<b>' + cadence + '</b> per packet). ';
+            if (ack_frequency.sent
+                && ack_frequency.sent_threshold) {
+                var honored = (1 / ack_frequency.sent_threshold)
+                    .toFixed(2);
+                note.innerHTML = header + 'atto asked it to ack '
+                    + 'about every ' + ack_frequency.sent_threshold
+                    + ' packets, so near ' + honored + ' means it '
+                    + 'honored the request and near 1.0 means it '
+                    + 'ignored it.';
+            } else {
+                note.innerHTML = header + 'atto sent no '
+                    + 'ACK_FREQUENCY request (the browser did not '
+                    + 'advertise support), so this is the browser '
+                    + 'acking on its own, not a response to atto.';
+            }
         } else if (used_h3) {
             note.innerHTML = 'Your browser reported h3, but atto '
                 + 'had no matching h3 connection to report on when '
@@ -794,7 +825,7 @@ browser_button.addEventListener('click', runBrowserBench);
     redirected into the shared temp file the /status route tails.
  */
 $test->post('/run', function () use (
-    $test, $bench_out_file) {
+    $test, $bench_out_file, $bench_iterations) {
     /*
         is_file check before unlink so we don't poison the
         process-wide error_get_last() with a "No such file"
@@ -821,11 +852,11 @@ $test->post('/run', function () use (
         include_quiche=1 to add the libquiche-FFI row to the
         run; off by default.
      */
-    $extra = '';
+    $extra = ' --iterations=' . (int) $bench_iterations;
     $latency = $_POST['latency_ms'] ?? '0';
     if (is_numeric($latency) && (float) $latency > 0) {
         $latency_arg = (float) $latency;
-        $extra = ' --latency-ms=' . escapeshellarg(
+        $extra .= ' --latency-ms=' . escapeshellarg(
             (string) $latency_arg);
     }
     if (!empty($_POST['include_quiche'])) {

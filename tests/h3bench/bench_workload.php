@@ -93,11 +93,16 @@ require __DIR__ . '/counting.php';
 const WL_DCID_BYTES = 8;
 /**
  * @var int acknowledgements arrive for every this-many response
- *      packets, the usual delayed-acknowledgement cadence, so the
- *      inbound ACK-packet count is the response packet count divided
- *      by this
+ *      packets, so the inbound ACK-packet count is the response
+ *      packet count divided by this. RFC 9000 has a receiver
+ *      acknowledge every other ack-eliciting packet, but a real
+ *      browser on a fast path batches far more than that: the
+ *      example-21 browser benchmark measured Firefox sending 393
+ *      acks over 3,476 packets (one per 8.8) and Safari 355 over
+ *      3,554 (one per 10.0), so ten is what the measurement
+ *      supports. Set this to 2 to model the RFC cadence instead.
  */
-const WL_ACK_EVERY = 2;
+const WL_ACK_EVERY = 10;
 /**
  * @var int how many times each case is driven, whose per-method
  *      counts are averaged; the counts are near-deterministic, so a
@@ -266,7 +271,7 @@ function driveCase($response_pairs, $response_body, $request_pairs,
     $recv_stream->consume();
 
     /*
-        Bring the client's acknowledgements in at the usual delayed
+        Bring the client's acknowledgements in at the measured
         cadence, one ACK packet per WL_ACK_EVERY response packets.
         Each is a real decoded short packet, and each is fed to
         processAck against the response still in flight, so the

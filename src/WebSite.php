@@ -2388,8 +2388,19 @@ class WebSite
         if (!$use_extension && !file_exists($file_name)) {
             return $mime_type;
         }
-        if (!$use_extension && class_exists("\finfo")) {
-            $finfo = new \finfo(FILEINFO_MIME);
+        /* the class is named without a leading backslash here: inside a
+           double-quoted string a backslash-f is a form feed, so asking for
+           "\finfo" asked whether a class whose name begins with a form feed
+           existed, which none does, and the reading of a file's own bytes
+           below was never once reached. */
+        if (!$use_extension && class_exists("finfo")) {
+            /* the type alone is asked for, not the type and the character
+               set it is written in, so that reading a file's own bytes and
+               reading its name give an answer of the same shape; callers
+               compare the answer against types such as application/zip
+               whole, and a character set tacked onto the end fails such a
+               comparison. */
+            $finfo = new \finfo(FILEINFO_MIME_TYPE);
             $mime_type = $finfo->file($file_name);
         } else {
             $last_chars = strtolower(substr($file_name,
@@ -2400,6 +2411,7 @@ class WebSite
                 ".aiff" => "audio/aiff",
                 ".aifc" => "audio/aiff",
                 ".avi" => "video/x-msvideo",
+                ".avif" => "image/avif",
                 ".bmp" => "image/bmp",
                 ".bz" => "application/bzip",
                 ".ico" => "image/x-icon",
@@ -2422,10 +2434,14 @@ class WebSite
                 ".m4v" => "video/mp4",
                 ".pdf" => "application/pdf",
                 ".png" => "image/png",
+                ".svg" => "image/svg+xml",
                 ".tex" => "text/plain",
                 ".txt" => "text/plain",
                 ".wav" => "audio/vnd.wave",
+                ".tif" => "image/tiff",
+                ".tiff" => "image/tiff",
                 ".webm" => "video/webm",
+                ".webp" => "image/webp",
                 ".zip" => "application/zip",
                 ".Z" => "application/x-compress",
             ];

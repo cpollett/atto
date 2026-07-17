@@ -447,6 +447,13 @@ class WebSite
      */
     protected $current_session = "";
     /**
+     * Cookie options last used to emit the session cookie, kept so the
+     * session cookie can be re-issued under a new name without signing
+     * the current user out.
+     * @var array
+     */
+    protected $session_cookie_options = [];
+    /**
      * List of HTTP methods for which routes have been declared
      * @var array
      */
@@ -556,6 +563,18 @@ class WebSite
      * while staying well above any ordinary page.
      */
     const LARGE_RESPONSE_LOG_LEN_DEFAULT = 50 * self::BYTES_PER_MEGABYTE;
+    /**
+     * How much the memory claimed from the system has to grow across a
+     * single request before that request is named in the error log, when
+     * the server config does not set REQUEST_MEMORY_GROWTH_LOG_LEN. PHP
+     * hands memory back to the system rarely, so this figure only moves
+     * when a request asks for more than every request before it did, and
+     * a server that has been up a while writes nothing. Two megabytes is
+     * the smallest step worth watching, being the size of the block PHP
+     * claims at a time.
+     */
+    const REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT =
+        2 * self::BYTES_PER_MEGABYTE;
     /**
      * Connection resource for the in-flight request, set by
      * processRequestStreams (H1) or dispatchH2Request (H2)
@@ -840,6 +859,50 @@ class WebSite
             "status={$status} {$method} {$remote} {$uri}");
     }
     /**
+     * Records when a single request makes the server claim more memory
+     * from the system than it ever had, naming the request that did it.
+     * The periodic memory sample says the server is holding a lot but
+     * not what asked for it: PHP hands memory back to the system rarely,
+     * so a figure that only climbs says nothing about which request did
+     * the climbing, and by the time anyone reads the sample that request
+     * is long finished. Checking the figure either side of a request
+     * turns that into a line naming the request the moment it happens.
+     * It is two subtractions per request and writes nothing once the
+     * server has settled, since by then requests are being served out of
+     * memory already claimed; a threshold of zero or less turns it off.
+     *
+     * @param int $before_used memory in bytes claimed from the system
+     *      before the request was handled
+     * @param int $before_peak the most memory in bytes ever claimed from
+     *      the system, read before the request was handled
+     */
+    protected function logRequestMemoryGrowth($before_used, $before_peak)
+    {
+        $threshold =
+            $this->default_server_globals['REQUEST_MEMORY_GROWTH_LOG_LEN']
+            ?? self::REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT;
+        if ($threshold <= 0) {
+            return;
+        }
+        $used_growth = memory_get_usage(true) - $before_used;
+        $peak_growth = memory_get_peak_usage(true) - $before_peak;
+        if ($used_growth < $threshold && $peak_growth < $threshold) {
+            return;
+        }
+        $method = $_SERVER['REQUEST_METHOD'] ?? "?";
+        $uri = $_SERVER['REQUEST_URI'] ?? "?";
+        $remote = $_SERVER['REMOTE_ADDR'] ?? "?";
+        $used_megabytes = round($used_growth /
+            self::BYTES_PER_MEGABYTE, 1);
+        $peak_megabytes = round($peak_growth /
+            self::BYTES_PER_MEGABYTE, 1);
+        $now_used = round(memory_get_usage(true) /
+            self::BYTES_PER_MEGABYTE, 1);
+        error_log("[website-request-memory] grew={$used_megabytes}MB " .
+            "peak_grew={$peak_megabytes}MB now={$now_used}MB " .
+            "{$method} {$remote} {$uri}");
+    }
+    /**
      * Records, once, when a single connection's outbound buffer first grows
      * past the large-response threshold. Each response body is already
      * checked on its own, but under HTTP/2 many stream responses are
@@ -1055,6 +1118,20 @@ class WebSite
      */
     public function process()
     {
+        $before_used = memory_get_usage(true);
+        $before_peak = memory_get_peak_usage(true);
+        $this->processRequest();
+        $this->logRequestMemoryGrowth($before_used, $before_peak);
+    }
+    /**
+     * Cause all the current HTTP request to be processed according to the
+     * middleware callbacks and routes currently set on this WebSite object.
+     * Kept apart from process() so that the memory a request costs can be
+     * read either side of it without every way out of here having to
+     * remember to do the reading.
+     */
+    protected function processRequest()
+    {
         if (empty($_SERVER['REQUEST_URI'])) {
             $_SERVER['REQUEST_URI'] = $_SERVER['SCRIPT_NAME'];
         }
@@ -1210,16 +1287,19 @@ class WebSite
     /**
      * Registers a generator that produces the response body lazily,
      * one yielded string chunk at a time, for the in-flight request.
-     * Over HTTP/2 the body is then produced and sent incrementally,
-     * paced by the peer's flow-control window, so an arbitrarily
-     * large response (a full video range, say) never has to be held
-     * in memory at once and other streams on the connection keep
+     * Run from the command line the body is then produced and sent
+     * incrementally: HTTP/2 and HTTP/3 pace it by the peer's
+     * flow-control window and HTTP/1 writes it as chunked-transfer
+     * blocks, so an arbitrarily large response (a full video range,
+     * say) never has to be held in memory at once and, on the
+     * multiplexed protocols, other streams on the connection keep
      * being served. A route calls this and returns immediately; it
      * must not also echo a body. Headers set before the call (status,
      * content-type, content-length, content-range) are sent as the
-     * response HEADERS. Outside CLI HTTP/2 there is no incremental
-     * path, so the generator is drained into the normal buffered
-     * response instead, which still produces the correct body.
+     * response HEADERS. Under a SAPI, and for a request whose protocol
+     * was never recorded, there is no incremental path, so the
+     * generator is drained into the normal buffered response instead,
+     * which still produces the correct body.
      *
      * @param callable|\Generator $producer a generator, or a
      *      callable returning one, that yields body chunks
@@ -1249,9 +1329,11 @@ class WebSite
                 }
             }
         } else {
-            /* no incremental path here (SAPI and H3 buffer whole);
-               produce the body now so the result is still correct,
-               just not memory-bounded */
+            /* Nothing to pace against here: the SAPI hands the body to
+               the web server rather than to a socket this code owns, and
+               a CLI request whose protocol was never recorded has no
+               stream to write chunks to. Produce the body now so the
+               result is still correct, just not memory-bounded. */
             foreach ($generator as $chunk) {
                 if ($chunk !== null && $chunk !== "") {
                     echo $chunk;
@@ -1909,6 +1991,49 @@ class WebSite
         }
     }
     /**
+     * Re-issues the session cookie under a new name carrying the current
+     * session id, so changing the configured session name does not sign
+     * the current user out. The session store keys on the id rather than
+     * the cookie name, so the same id under the new name continues the
+     * session. The cookie under the old name is expired.
+     *
+     * @param string $old_name session cookie name in use for this request
+     * @param string $new_name session cookie name to switch to
+     */
+    public function renameSessionCookie($old_name, $new_name)
+    {
+        if ($new_name === "" || $old_name === $new_name ||
+            empty($_COOKIE[$old_name])) {
+            return;
+        }
+        $session_id = $_COOKIE[$old_name];
+        if ($this->isCli()) {
+            $options = $this->session_cookie_options;
+            $this->setCookie($new_name, $session_id,
+                $options['expires'] ?? 0, $options['cookie_path'] ?? "",
+                $options['cookie_domain'] ?? "",
+                !empty($options['cookie_secure']),
+                !empty($options['cookie_httponly']),
+                $options['cookie_samesite'] ?? "");
+            $this->setCookie($old_name, "", time() - 3600,
+                $options['cookie_path'] ?? "");
+        } else {
+            $params = session_get_cookie_params();
+            setcookie($new_name, $session_id, ['expires' => 0,
+                'path' => $params['path'], 'domain' => $params['domain'],
+                'secure' => $params['secure'],
+                'httponly' => $params['httponly'],
+                'samesite' => $params['samesite']]);
+            setcookie($old_name, "", ['expires' => time() - 3600,
+                'path' => $params['path']]);
+        }
+        $_COOKIE[$new_name] = $session_id;
+        unset($_COOKIE[$old_name]);
+        if ($this->current_session === $old_name) {
+            $this->current_session = $new_name;
+        }
+    }
+    /**
      * Starts a web session by sending a cookie with a unique ID.
      * When the client returns the cookie, session data is looked
      * up. CLI mode stores session data in RAM; under another web
@@ -2026,6 +2151,8 @@ class WebSite
                 $options['cookie_samesite'] ?? "");
             $_COOKIE[$cookie_name] = $session_id;
             $this->current_session = $cookie_name;
+            $this->session_cookie_options = $options;
+            $this->session_cookie_options['expires'] = $expires;
         } else {
             if (empty($options['cookie_lifetime']) ||
             $options['cookie_lifetime'] >= 0) {
@@ -2449,6 +2576,8 @@ class WebSite
             "SESSION_IDLE_TIMEOUT" => self::SESSION_IDLE_TIMEOUT_DEFAULT,
             "LARGE_RESPONSE_LOG_LEN" =>
                 self::LARGE_RESPONSE_LOG_LEN_DEFAULT,
+            "REQUEST_MEMORY_GROWTH_LOG_LEN" =>
+                self::REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT,
             "MAX_INPUT_VARS" => 1000,
             "PATH" => $path,  "PHP_PATH" => "",
             "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
@@ -3366,6 +3495,33 @@ class WebSite
         $this->deferrable_h3 = null;
     }
     /**
+     * The status line for a response whose code set headers but never said
+     * what the status was. Sending a Location says the thing asked for is
+     * somewhere else, and sending a Refresh says the reader is to be sent
+     * on shortly, so those are answered 301 and 302; anything else was a
+     * reply to what was asked, and is answered 200.
+     *
+     * Only a line beginning a header of that name counts. Looking for the
+     * word anywhere in the headers read whatever a header happened to be
+     * carrying as though it were a header itself, so a file whose name
+     * merely contained "location" was announced as having moved, and a
+     * browser handed a redirect with a picture inside it showed nothing.
+     *
+     * @return string the status line, ready to stand in front of the
+     *      headers already gathered
+     */
+    private function statusLineForHeaders()
+    {
+        $protocol = $_SERVER['SERVER_PROTOCOL'] ?? "HTTP/1.1";
+        if (preg_match('/^Location:/mi', $this->header_data)) {
+            return $protocol . " 301 Moved Permanently\x0D\x0A";
+        }
+        if (preg_match('/^Refresh:/mi', $this->header_data)) {
+            return $protocol . " 302 Found\x0D\x0A";
+        }
+        return $protocol . " 200 OK\x0D\x0A";
+    }
+    /**
      * Finishes off a deferred response the same way getResponseData()
      * finishes a normal one: saves the session, adds a status line and a
      * default content type if the route set none, advertises HTTP/3 when
@@ -3387,16 +3543,8 @@ class WebSite
             $this->sessions[$session_id]['DATA'] = $_SESSION;
         }
         if (!str_starts_with($this->header_data, "HTTP/")) {
-            if (stristr($this->header_data, "Location") != false) {
-                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                    " 301 Moved Permanently\x0D\x0A" . $this->header_data;
-            } else if (stristr($this->header_data, "Refresh") != false) {
-                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                    " 302 Found\x0D\x0A" . $this->header_data;
-            } else {
-                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                    " 200 OK\x0D\x0A" . $this->header_data;
-            }
+            $this->header_data = $this->statusLineForHeaders() .
+                $this->header_data;
         }
         if (!$this->content_type) {
             $this->header_data .= "Content-Type: text/html\x0D\x0A";
@@ -3599,19 +3747,8 @@ class WebSite
         }
         $redirect = false;
         if (!str_starts_with($this->header_data, "HTTP/")) {
-            if (stristr($this->header_data, "Location") != false) {
-                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                    " 301 Moved Permanently\x0D\x0A" .
+            $this->header_data = $this->statusLineForHeaders() .
                 $this->header_data;
-            } else if (
-                stristr($this->header_data, "Refresh") != false) {
-                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                    " 302 Found\x0D\x0A" .
-                $this->header_data;
-            } else {
-                $this->header_data = $_SERVER['SERVER_PROTOCOL'] .
-                    " 200 OK\x0D\x0A". $this->header_data;
-            }
         }
         if (!$this->content_type && !$redirect) {
             $this->header_data .= "Content-Type: text/html\x0D\x0A";

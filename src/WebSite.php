@@ -108,6 +108,13 @@ class WebSite
      */
     const MAX_SESSIONS_DEFAULT = 10000;
     /**
+     * How many kept sessions are measured when working out about how much
+     * memory the sessions hold between them. Enough for a fair average,
+     * few enough that the reckoning stays cheap on a busy server.
+     * @var int
+     */
+    const SESSION_SAMPLE_COUNT = 20;
+    /**
      * How long in seconds a session may sit untouched before the
      * periodic sweep drops it from memory, used when the server config
      * does not set SESSION_IDLE_TIMEOUT. Stops one-shot visitors and
@@ -334,6 +341,26 @@ class WebSite
      * @var array
      */
     protected $out_streams = [];
+    /**
+     * A short description of the request currently being handled, set
+     * just before each request runs. If the process dies of a memory
+     * fatal mid-request, the shutdown handler reads this to name the
+     * request that was in flight, which the after-the-request memory log
+     * cannot do because it never gets to run. Empty when no request is
+     * being handled.
+     * @var string
+     */
+    protected $in_flight_request = "";
+    /**
+     * A block of memory claimed up front and freed at the very start of
+     * the memory-fatal handler, so that after the allocator has refused
+     * the request that pushed it over the limit there is still room to
+     * build and write the log line naming that request. Without it the
+     * handler could itself fail to allocate and the fatal would leave no
+     * diagnostic.
+     * @var string
+     */
+    protected $oom_log_reserve = "";
     /**
      * Live Connection objects, keyed by (int)$resource. Created in
      * processServerRequest after a successful accept and torn down
@@ -576,6 +603,14 @@ class WebSite
     const REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT =
         2 * self::BYTES_PER_MEGABYTE;
     /**
+     * Bytes of memory held in reserve and released at the start of the
+     * memory-fatal handler, so the handler still has room to name the
+     * request that was in flight when the limit was hit. One megabyte is
+     * plenty to build and write a short log line and small next to any
+     * limit the always-on server runs under.
+     */
+    const OOM_LOG_RESERVE_LEN = self::BYTES_PER_MEGABYTE;
+    /**
      * Connection resource for the in-flight request, set by
      * processRequestStreams (H1) or dispatchH2Request (H2)
      * before calling the route. Used by flush() to write
@@ -615,7 +650,8 @@ class WebSite
      * fileGetContents or filePutContents
      * @var array
      */
-    protected $file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
+    protected $file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => [],
+        'HASH' => []];
     /**
      * Whether this object is being run from the command line with a listen()
      * call or if it is being run under a web server and so only used for
@@ -705,8 +741,10 @@ class WebSite
      */
     public function __construct(public $base_path = "")
     {
-        $this->default_server_globals = ["MAX_CACHE_FILESIZE" => 2000000,
-            "MAX_IO_LEN" => self::MAX_IO_LEN_DEFAULT];
+        /* Every setting starts out here, not just the two the constructor
+           used to name: a read of one before listen begins would otherwise
+           find nothing there. */
+        $this->default_server_globals = self::defaultServerGlobals();
         $this->http_methods = array_keys($this->routes);
         if (empty($this->base_path)) {
             $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
@@ -721,6 +759,37 @@ class WebSite
         ini_set('precision', 16);
         $this->timer_alarms = new \SplMinHeap();
         $this->session_lru = new \SplMinHeap();
+        $this->oom_log_reserve = str_repeat(" ",
+            self::OOM_LOG_RESERVE_LEN);
+        register_shutdown_function([$this, "logMemoryFatal"]);
+    }
+    /**
+     * Names, in the error log, the request that was being handled when the
+     * process died of a memory-limit fatal. The ordinary per-request memory
+     * log runs after a request returns, so a request that never returns
+     * because it exhausted memory leaves no line of its own; this fills that
+     * gap. It first frees the reserve so there is room to work, then checks
+     * whether the process is ending on an out-of-memory fatal and, if so,
+     * writes the in-flight request together with the peak memory reached.
+     * It does nothing for an ordinary shutdown or any other kind of fatal.
+     */
+    public function logMemoryFatal()
+    {
+        $this->oom_log_reserve = "";
+        $error = error_get_last();
+        if ($error === null || ($error["type"] ?? 0) !== E_ERROR) {
+            return;
+        }
+        if (stripos($error["message"] ?? "", "allowed memory size") ===
+            false) {
+            return;
+        }
+        $peak = round(memory_get_peak_usage(true) /
+            self::BYTES_PER_MEGABYTE, 1);
+        $request = $this->in_flight_request !== "" ?
+            $this->in_flight_request : "(none in flight)";
+        error_log("[website-memory-fatal] peak={$peak}MB " .
+            "request={$request} detail=" . ($error["message"] ?? ""));
     }
     /**
      * Decides whether enough time has gone by to write another
@@ -771,9 +840,58 @@ class WebSite
         $writing = count($this->out_streams[self::CONNECTION] ?? []);
         $sessions = count($this->sessions);
         $timers = count($this->timers);
+        $buffered = round($this->bufferedBytes() /
+            self::BYTES_PER_MEGABYTE, 1);
+        $session_megabytes = round($this->sessionBytes() /
+            self::BYTES_PER_MEGABYTE, 1);
         error_log("[website-memory] used={$used}MB peak={$peak}MB " .
             "connections={$connections} reading={$reading} " .
-            "writing={$writing} sessions={$sessions} timers={$timers}");
+            "writing={$writing} sessions={$sessions} " .
+            "session_data={$session_megabytes}MB " .
+            "buffered={$buffered}MB timers={$timers}");
+    }
+    /**
+     * Bytes currently held in the read and write buffers of every open
+     * connection. Reported alongside total memory so a server sitting near
+     * its limit shows whether what it is holding is traffic in flight.
+     *
+     * @return int bytes buffered across all connections
+     */
+    protected function bufferedBytes()
+    {
+        $total = 0;
+        foreach (($this->in_streams[self::DATA] ?? []) as $data) {
+            $total += strlen($data);
+        }
+        foreach (($this->out_streams[self::DATA] ?? []) as $data) {
+            $total += strlen($data);
+        }
+        return $total;
+    }
+    /**
+     * About how many bytes the kept sessions hold between them. A handful
+     * are measured and the result scaled to the number kept, rather than
+     * measuring every one, so reporting this costs the same whether ten
+     * sessions are held or ten thousand.
+     *
+     * @return int estimated bytes held by all kept sessions
+     */
+    protected function sessionBytes()
+    {
+        $kept = count($this->sessions);
+        if ($kept == 0) {
+            return 0;
+        }
+        $sampled = 0;
+        $sampled_bytes = 0;
+        foreach ($this->sessions as $session) {
+            $sampled_bytes += strlen(serialize($session));
+            $sampled++;
+            if ($sampled >= self::SESSION_SAMPLE_COUNT) {
+                break;
+            }
+        }
+        return (int)round(($sampled_bytes / $sampled) * $kept);
     }
     /**
      * Returns whether enough time has passed since the last idle-session
@@ -1120,7 +1238,12 @@ class WebSite
     {
         $before_used = memory_get_usage(true);
         $before_peak = memory_get_peak_usage(true);
+        $method = $_SERVER['REQUEST_METHOD'] ?? "?";
+        $remote = $_SERVER['REMOTE_ADDR'] ?? "?";
+        $uri = $_SERVER['REQUEST_URI'] ?? "?";
+        $this->in_flight_request = "{$method} {$remote} {$uri}";
         $this->processRequest();
+        $this->in_flight_request = "";
         $this->logRequestMemoryGrowth($before_used, $before_peak);
     }
     /**
@@ -2086,7 +2209,7 @@ class WebSite
                 '}$/', $cookie_value)) {
                 if (!empty($this->sessions[$cookie_value])) {
                     $session_id = $cookie_value;
-                    $_SESSION = $this->sessions[$session_id]['DATA'];
+                    $_SESSION = $this->sessionData($session_id);
                 } else {
                     $this->rehydrate_candidate = $cookie_value;
                 }
@@ -2094,7 +2217,7 @@ class WebSite
             if ($session_id === "") {
                 $session_id = bin2hex(
                     random_bytes(self::SESSION_ID_BYTE_LEN));
-                $this->sessions[$session_id] = ['DATA' => []];
+                $this->sessions[$session_id] = [];
                 $_SESSION = [];
             }
             $this->sessions[$session_id]['TIME'] = $time;
@@ -2143,7 +2266,7 @@ class WebSite
                     break;
                 }
                 $this->session_lru->extract();
-                unset($this->sessions[$drop_id]);
+                $this->forgetSession($drop_id);
             }
             $this->setCookie($cookie_name, $session_id, $expires,
                 $options['cookie_path'], $options['cookie_domain'],
@@ -2195,6 +2318,81 @@ class WebSite
         return $this->rehydrate_candidate;
     }
     /**
+     * Where a session's contents are kept. Each session is a file of its
+     * own rather than a value held in memory, so the server holds only as
+     * much of them as the request it is serving needs.
+     *
+     * @param string $session_id the session to name a file for
+     * @return string absolute path of that session's file
+     */
+    protected function sessionFilePath($session_id)
+    {
+        return $this->default_server_globals['SESSION_DIR'] .
+            "/atto_session_" . $session_id;
+    }
+    /**
+     * Reads a session's contents back from its file. A session the server
+     * knows of but whose file is gone, or whose file no longer reads as a
+     * session, comes back empty rather than as an error, which is what a
+     * visitor whose session was swept would see anyway.
+     *
+     * @param string $session_id the session to read
+     * @return array the session contents, empty when there are none
+     */
+    public function sessionData($session_id)
+    {
+        $path = $this->sessionFilePath($session_id);
+        if (!file_exists($path)) {
+            return [];
+        }
+        $written = $this->fileGetContents($path);
+        if ($written === false || $written === "") {
+            return [];
+        }
+        $data = @unserialize($written);
+        return is_array($data) ? $data : [];
+    }
+    /**
+     * Writes a session's contents to its file, refusing one that has grown
+     * past what the server will accept as a request body. A session that
+     * large is a defect rather than a person's work, and holding it would
+     * cost the memory that limit exists to bound.
+     *
+     * The write itself goes through filePutContents, which leaves the file
+     * alone when its contents already match, so a request that reads a
+     * session without changing it costs nothing on disk.
+     *
+     * @param string $session_id the session to write
+     * @param array $session_data the contents to write
+     * @return bool whether the contents were written
+     */
+    protected function writeSessionData($session_id, $session_data)
+    {
+        $written = serialize($session_data);
+        if (strlen($written) >
+            $this->default_server_globals['MAX_REQUEST_LEN']) {
+            return false;
+        }
+        $this->filePutContents($this->sessionFilePath($session_id),
+            $written);
+        return true;
+    }
+    /**
+     * Drops a session, both what the server remembers of it and the file
+     * its contents were kept in, so a session evicted for being least
+     * recently used leaves nothing behind on disk.
+     *
+     * @param string $session_id the session to drop
+     */
+    protected function forgetSession($session_id)
+    {
+        $path = $this->sessionFilePath($session_id);
+        if (file_exists($path)) {
+            @unlink($path);
+        }
+        unset($this->sessions[$session_id]);
+    }
+    /**
      * Restores a session under a session id the current request already
      * carries, putting back the given data and switching the request to
      * use that id. Used to sign a person back in from a saved session
@@ -2206,8 +2404,8 @@ class WebSite
      */
     public function adoptSession($session_id, $session_data)
     {
-        $this->sessions[$session_id] = ['DATA' => $session_data,
-            'TIME' => time()];
+        $this->sessions[$session_id] = ['TIME' => time()];
+        $this->writeSessionData($session_id, $session_data);
         $this->session_sequence++;
         $this->sessions[$session_id]['SEQ'] = $this->session_sequence;
         if ($this->session_lru === null) {
@@ -2267,6 +2465,7 @@ class WebSite
                 return $this->file_cache['MARKED'][$path];
             }
             $data = file_get_contents($path);
+            $this->file_cache['HASH'][$path] = md5($data);
             if (strlen($data) < $this->default_server_globals[
                 'MAX_CACHE_FILESIZE']) {
                 if (count($this->file_cache['MARKED']) +
@@ -2336,7 +2535,19 @@ class WebSite
                     $this->file_cache['PATH'][$filename]);
             }
         }
+        /* A file whose contents already match what is about to be written
+           is left alone. The hash of what was last read or written from
+           each path is remembered, so a page saved unchanged, or a session
+           whose values did not move, costs no disk write at all. */
+        $hash_path = $this->file_cache['PATH'][$filename] ?? $filename;
+        $hash = md5($data);
+        if (isset($this->file_cache['HASH'][$hash_path]) &&
+            $this->file_cache['HASH'][$hash_path] === $hash &&
+            file_exists($filename)) {
+            return $num_bytes;
+        }
         $num_bytes = file_put_contents($filename, $data);
+        $this->file_cache['HASH'][$hash_path] = $hash;
         @chmod($filename, 0777);
         return $num_bytes;
     }
@@ -2345,7 +2556,8 @@ class WebSite
      */
     public function clearFileCache()
     {
-        $this->file_cache = ['MARKED' => [], 'UNMARKED' => [], 'PATH' => []];
+        $this->file_cache = ['MARKED' => [], 'UNMARKED' => [],
+            'PATH' => [], 'HASH' => []];
     }
     /**
      * Used to move a file that was uploaded from a form on the client to the
@@ -2358,7 +2570,7 @@ class WebSite
      *      tmp_name was found in $_FILES; in non-CLI mode the
      *      return value of move_uploaded_file is propagated
      */
-    public function moveUploadedFile($filename , $destination)
+    public function moveUploadedFile($filename, $destination)
     {
         if ($this->isCli()) {
             foreach ($_FILES as $key => $file_array) {
@@ -2372,82 +2584,68 @@ class WebSite
         return move_uploaded_file($filename, $destination);
     }
     /**
-     * Returns the mime type of the provided file name if it can be determined.
+     * Returns the mime type of the provided file name if it can be
+     * determined from the file's name. The type is read from the name's
+     * extension rather than the file's bytes, so it costs no file read.
      * (This function is from the seekquarry/yioop project)
      *
-     * @param string $file_name (name of file including path to figure out
-     *      mime type for)
-     * @param bool $use_extension whether to just try to guess from the file
-     *      extension rather than looking at the file
+     * @param string $file_name name of file, including path, to figure out
+     *      the mime type for
      * @return string mime type or unknown if can't be determined
      */
-    public static function mimeType($file_name, $use_extension = false)
+    public static function mimeType($file_name)
     {
         $mime_type = "unknown";
         $last_chars = "-1";
-        if (!$use_extension && !file_exists($file_name)) {
-            return $mime_type;
-        }
-        /* the class is named without a leading backslash here: inside a
-           double-quoted string a backslash-f is a form feed, so asking for
-           "\finfo" asked whether a class whose name begins with a form feed
-           existed, which none does, and the reading of a file's own bytes
-           below was never once reached. */
-        if (!$use_extension && class_exists("finfo")) {
-            /* the type alone is asked for, not the type and the character
-               set it is written in, so that reading a file's own bytes and
-               reading its name give an answer of the same shape; callers
-               compare the answer against types such as application/zip
-               whole, and a character set tacked onto the end fails such a
-               comparison. */
-            $finfo = new \finfo(FILEINFO_MIME_TYPE);
-            $mime_type = $finfo->file($file_name);
-        } else {
-            $last_chars = strtolower(substr($file_name,
-                strrpos($file_name, ".")));
-            $mime_types = [
-                ".aac" => "audio/aac",
-                ".aif" => "audio/aiff",
-                ".aiff" => "audio/aiff",
-                ".aifc" => "audio/aiff",
-                ".avi" => "video/x-msvideo",
-                ".avif" => "image/avif",
-                ".bmp" => "image/bmp",
-                ".bz" => "application/bzip",
-                ".ico" => "image/x-icon",
-                ".css" => "text/css",
-                ".csv" => "text/csv",
-                ".epub" => "application/epub+zip",
-                ".gif" => "image/gif",
-                ".gz" => "application/gzip",
-                ".html" => 'text/html',
-                ".jpeg" => "image/jpeg",
-                ".jpg" => "image/jpeg",
-                ".js" => "text/javascript",
-                ".oga" => "audio/ogg",
-                ".ogg" => "audio/ogg",
-                ".opus" => "audio/opus",
-                ".mov" => "video/quicktime",
-                ".mp3" => "audio/mpeg",
-                ".mp4" => "video/mp4",
-                ".m4a" => "audio/mp4",
-                ".m4v" => "video/mp4",
-                ".pdf" => "application/pdf",
-                ".png" => "image/png",
-                ".svg" => "image/svg+xml",
-                ".tex" => "text/plain",
-                ".txt" => "text/plain",
-                ".wav" => "audio/vnd.wave",
-                ".tif" => "image/tiff",
-                ".tiff" => "image/tiff",
-                ".webm" => "video/webm",
-                ".webp" => "image/webp",
-                ".zip" => "application/zip",
-                ".Z" => "application/x-compress",
-            ];
-            if (isset($mime_types[$last_chars])) {
-                $mime_type = $mime_types[$last_chars];
-            }
+        /* The type is read from the file's name, not from its bytes. Reading
+           the bytes (with finfo) opens and reads each file, which listing a
+           folder of a thousand or more resources did once per entry and so
+           took long enough to time the page out; the name is enough for the
+           types these callers compare against. */
+        $last_chars = strtolower(substr($file_name,
+            strrpos($file_name, ".")));
+        $mime_types = [
+            ".aac" => "audio/aac",
+            ".aif" => "audio/aiff",
+            ".aiff" => "audio/aiff",
+            ".aifc" => "audio/aiff",
+            ".avi" => "video/x-msvideo",
+            ".avif" => "image/avif",
+            ".bmp" => "image/bmp",
+            ".bz" => "application/bzip",
+            ".ico" => "image/x-icon",
+            ".css" => "text/css",
+            ".csv" => "text/csv",
+            ".epub" => "application/epub+zip",
+            ".gif" => "image/gif",
+            ".gz" => "application/gzip",
+            ".html" => 'text/html',
+            ".jpeg" => "image/jpeg",
+            ".jpg" => "image/jpeg",
+            ".js" => "text/javascript",
+            ".oga" => "audio/ogg",
+            ".ogg" => "audio/ogg",
+            ".opus" => "audio/opus",
+            ".mov" => "video/quicktime",
+            ".mp3" => "audio/mpeg",
+            ".mp4" => "video/mp4",
+            ".m4a" => "audio/mp4",
+            ".m4v" => "video/mp4",
+            ".pdf" => "application/pdf",
+            ".png" => "image/png",
+            ".svg" => "image/svg+xml",
+            ".tex" => "text/plain",
+            ".txt" => "text/plain",
+            ".wav" => "audio/vnd.wave",
+            ".tif" => "image/tiff",
+            ".tiff" => "image/tiff",
+            ".webm" => "video/webm",
+            ".webp" => "image/webp",
+            ".zip" => "application/zip",
+            ".Z" => "application/x-compress",
+        ];
+        if (isset($mime_types[$last_chars])) {
+            $mime_type = $mime_types[$last_chars];
         }
         $mime_type = str_replace('application/ogg', 'video/ogg', $mime_type);
         return $mime_type;
@@ -2555,6 +2753,38 @@ class WebSite
         return $refreshed;
     }
     /**
+     * The settings a server runs with before any configuration is read.
+     * These live here alone: the constructor starts a server with them, so
+     * anything reading one before listen begins finds a value rather than
+     * nothing, listen starts from them, and a caller making a context to
+     * hand in can ask for one instead of repeating its value.
+     *
+     * @return array the default server globals
+     */
+    public static function defaultServerGlobals()
+    {
+        $path = $_SERVER['PATH'] ?? $_SERVER['Path'] ?? ".";
+        return ["CONNECTION_TIMEOUT" => 20,
+            "CUSTOM_ERROR_HANDLER" => null,
+            "DOCUMENT_ROOT" => getcwd(),
+            "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
+            "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => self::MAX_IO_LEN_DEFAULT,
+            "MAX_REQUEST_LEN" => 10000000, "MAX_SESSIONS" => 10000,
+            "SESSION_IDLE_TIMEOUT" => self::SESSION_IDLE_TIMEOUT_DEFAULT,
+            "LARGE_RESPONSE_LOG_LEN" =>
+                self::LARGE_RESPONSE_LOG_LEN_DEFAULT,
+            "REQUEST_MEMORY_GROWTH_LOG_LEN" =>
+                self::REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT,
+            "MAX_INPUT_VARS" => 1000,
+            "SESSION_DIR" => sys_get_temp_dir(),
+            "PATH" => $path,  "PHP_PATH" => "",
+            "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
+            "SERVER_SIGNATURE" => "",
+            "USER" => $_SERVER['USER'] ?? "",
+            "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
+        ];
+    }
+    /**
      * Starts an Atto Web Server listening on one or more addresses,
      * then runs the event loop. Streams are non-blocking and traffic
      * detection uses stream_select (portable Unix select wrapper).
@@ -2582,50 +2812,11 @@ class WebSite
      */
     public function listen($address, $config_array_or_ini_filename = false)
     {
-        $path = $_SERVER['PATH'] ?? $_SERVER['Path'] ?? ".";
-        $default_server_globals = ["CONNECTION_TIMEOUT" => 20,
-            "CUSTOM_ERROR_HANDLER" => null,
-            "DOCUMENT_ROOT" => getcwd(),
-            "GATEWAY_INTERFACE" => "CGI/1.1",  "MAX_CACHE_FILESIZE" => 2000000,
-            "MAX_CACHE_FILES" => 250,  "MAX_IO_LEN" => self::MAX_IO_LEN_DEFAULT,
-            "MAX_REQUEST_LEN" => 10000000, "MAX_SESSIONS" => 10000,
-            "SESSION_IDLE_TIMEOUT" => self::SESSION_IDLE_TIMEOUT_DEFAULT,
-            "LARGE_RESPONSE_LOG_LEN" =>
-                self::LARGE_RESPONSE_LOG_LEN_DEFAULT,
-            "REQUEST_MEMORY_GROWTH_LOG_LEN" =>
-                self::REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT,
-            "MAX_INPUT_VARS" => 1000,
-            "PATH" => $path,  "PHP_PATH" => "",
-            "SERVER_ADMIN" => "you@example.com", "SERVER_NAME" => "localhost",
-            "SERVER_SIGNATURE" => "",
-            "USER" => $_SERVER['USER'] ?? "",
-            "SERVER_SOFTWARE" => "ATTO WEBSITE SERVER",
-        ];
+        $default_server_globals = self::defaultServerGlobals();
         $original_address = is_array($address) ? "multi" : $address;
         $shared_context = [];
         $shared_globals = [];
         if (is_array($config_array_or_ini_filename)) {
-            if (!empty($config_array_or_ini_filename['SESSION_INFO'])) {
-                $this->sessions =
-                    $config_array_or_ini_filename['SESSION_INFO'][
-                    'SESSIONS'] ?? [];
-                $this->session_sequence =
-                    $config_array_or_ini_filename['SESSION_INFO'][
-                    'SESSION_SEQUENCE'] ?? 0;
-                /* A min-heap does not keep its contents through
-                   serialize/unserialize, so it is rebuilt here from the
-                   restored sessions, each of which still carries the
-                   use-count it was stamped with. */
-                $this->session_lru = new \SplMinHeap();
-                foreach ($this->sessions as $restored_id =>
-                    $restored_session) {
-                    if (isset($restored_session['SEQ'])) {
-                        $this->session_lru->insert(
-                            [$restored_session['SEQ'], $restored_id]);
-                    }
-                }
-                unset($config_array_or_ini_filename['SESSION_INFO']);
-            }
             if (!empty($config_array_or_ini_filename['SERVER_CONTEXT'])) {
                 $shared_context =
                     $config_array_or_ini_filename['SERVER_CONTEXT'];
@@ -3440,6 +3631,24 @@ class WebSite
         return null;
     }
     /**
+     * The small HTML page sent with a 408 when a request ran past the time
+     * a request is allowed. It is plain and self-contained, holding no
+     * site content, since the timeout means the real page could not be
+     * finished; a person seeing it is told the request took too long and
+     * to try again.
+     *
+     * @return string a complete HTML document for the timeout response
+     */
+    protected function requestTimeoutPage()
+    {
+        return "<!DOCTYPE html>\n<html><head>" .
+            "<meta charset=\"utf-8\">" .
+            "<title>408 Request Timeout</title></head><body>" .
+            "<h1>Request Timeout</h1>" .
+            "<p>This request took too long to finish and was stopped. " .
+            "Please try again.</p></body></html>\n";
+    }
+    /**
      * Sends a deferred request's response once its fiber has finished,
      * over the same connection the request arrived on. On success the
      * accumulated page is finished off (status line, content type, length)
@@ -3456,12 +3665,27 @@ class WebSite
     {
         $this->applyRequestEnvironment($task->environment);
         if ($error !== null) {
-            error_log("Deferred request failed: " . $error->getMessage());
-            $body = "Internal Server Error";
-            $this->header_data =
-                ($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
-                " 500 Internal Server Error\x0D\x0A";
-            $this->content_type = "text/plain";
+            if ($error instanceof TaskBudgetExceededException) {
+                /* The request ran longer than a request is allowed to,
+                   rather than failing outright, so it is answered as a
+                   request timeout with a short page a person can read,
+                   not a bare server error. */
+                error_log("Deferred request timed out: " .
+                    $error->getMessage());
+                $body = $this->requestTimeoutPage();
+                $this->header_data =
+                    ($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
+                    " 408 Request Timeout\x0D\x0A";
+                $this->content_type = "text/html";
+            } else {
+                error_log("Deferred request failed: " .
+                    $error->getMessage());
+                $body = "Internal Server Error";
+                $this->header_data =
+                    ($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
+                    " 500 Internal Server Error\x0D\x0A";
+                $this->content_type = "text/plain";
+            }
         } else {
             $body = $task->body;
         }
@@ -3556,7 +3780,7 @@ class WebSite
         if ($this->current_session != "" &&
             !empty($_COOKIE[$this->current_session])) {
             $session_id = $_COOKIE[$this->current_session];
-            $this->sessions[$session_id]['DATA'] = $_SESSION;
+            $this->writeSessionData($session_id, $_SESSION);
         }
         if (!str_starts_with($this->header_data, "HTTP/")) {
             $this->header_data = $this->statusLineForHeaders() .
@@ -3759,7 +3983,7 @@ class WebSite
         if ($this->current_session != "" &&
             !empty($_COOKIE[$this->current_session])) {
             $session_id = $_COOKIE[$this->current_session];
-            $this->sessions[$session_id]['DATA'] = $_SESSION;
+            $this->writeSessionData($session_id, $_SESSION);
         }
         $redirect = false;
         if (!str_starts_with($this->header_data, "HTTP/")) {
@@ -5953,6 +6177,30 @@ class WebSite
             && $this->ws_keepalive_interval > 0) {
             $this->registerWsKeepalive();
         }
+        /*
+            Give the route the request that opened the socket the same way
+            an ordinary route sees it: through the request superglobals.
+            The upgrade is handled before the normal request path fills
+            them, so a route otherwise has no way to read the path and
+            query it was reached on or the cookies the client sent. Server
+            variables, the parsed query string, and the cookies are set
+            from the handshake context so a route can identify and
+            authenticate the connection with the usual PHP request array.
+         */
+        $_SERVER = array_merge($this->default_server_globals, $context);
+        $_GET = [];
+        parse_str($context['QUERY_STRING'] ?? '', $_GET);
+        $_REQUEST = array_merge($_REQUEST, $_GET);
+        $_COOKIE = [];
+        if (!empty($context['HTTP_COOKIE'])) {
+            foreach (explode(";", $context['HTTP_COOKIE']) as $sent_cookie) {
+                $cookie_parts = explode("=", $sent_cookie, 2);
+                if (count($cookie_parts) == 2) {
+                    $_COOKIE[trim($cookie_parts[0])] =
+                        trim($cookie_parts[1]);
+                }
+            }
+        }
         try {
             $callback($ws);
         } catch (\Exception $e) {
@@ -6990,12 +7238,56 @@ class WebSite
             $out_time = empty($this->out_streams[self::MODIFIED_TIME][$key]) ?
                 0 : $this->out_streams[self::MODIFIED_TIME][$key];
             $modified_time = max($in_time, $out_time);
+            if ($this->hasReplyInFlight($key)) {
+                /*
+                    A reply still being produced or sent is not an idle
+                    connection. While a client downloads it sends nothing,
+                    so the inbound time stays at the request's start; and
+                    each time the outbound buffer empties between slices
+                    the write stream is cleared, which takes the outbound
+                    time with it. Without this a long download is closed
+                    part way through however fast it is going.
+                 */
+                $modified_time = time();
+            }
             if ($meta['eof'] ||
                 time() - $modified_time > $this->default_server_globals[
                 'CONNECTION_TIMEOUT']) {
                 $this->shutdownHttpStream($key);
             }
         }
+    }
+    /**
+     * Reports whether a reply is still on its way out on this connection,
+     * either because a streamed body has more to produce or because bytes
+     * already produced have not all been sent. Used so the sweep for idle
+     * connections leaves a download alone: the peer sends nothing while it
+     * reads, so by the usual measure such a connection looks silent.
+     *
+     * @param int $key connection identifier
+     * @return bool true when something is still to be produced or sent
+     */
+    protected function hasReplyInFlight($key)
+    {
+        $unsent = strlen($this->out_streams[self::DATA][$key] ?? "") -
+            ($this->out_streams[self::DATA_OFFSET][$key] ?? 0);
+        if ($unsent > 0) {
+            return true;
+        }
+        $conn = $this->connection($key);
+        if ($conn === null) {
+            return false;
+        }
+        if (!empty($conn->protocol_state['streaming_gen'])) {
+            return true;
+        }
+        foreach ($conn->protocol_state['pending_send'] ?? [] as $pending) {
+            if (strlen($pending['data'] ?? "") -
+                ($pending['offset'] ?? 0) > 0) {
+                return true;
+            }
+        }
+        return false;
     }
     /**
      * Returns the live Connection object for the given stream key,
@@ -10336,7 +10628,7 @@ class CooperativeScheduler
             $task['work_time'] += microtime(true) - $slice_start;
             if (!$finished && $task['work_time'] > $this->budget) {
                 $finished = true;
-                $error = new \RuntimeException(
+                $error = new TaskBudgetExceededException(
                     'cooperative task exceeded its work-time budget');
             }
             if ($finished) {
@@ -10350,3 +10642,10 @@ class CooperativeScheduler
         $this->tasks = $still_running;
     }
 }
+/**
+ * Thrown when a cooperative task uses more total running time than its
+ * budget allows. It is its own type so the response layer can tell a task
+ * that ran too long, which is answered to the client as a request timeout,
+ * apart from a task that failed some other way, which is a server error.
+ */
+class TaskBudgetExceededException extends \Exception {}

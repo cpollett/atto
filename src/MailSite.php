@@ -342,6 +342,75 @@ interface MailVocabulary
 abstract class MailStorage implements MailVocabulary
 {
     /**
+     * The largest a single mail message may be, in bytes, when no size is
+     * configured. Twenty-five mebibytes is the size most mail providers
+     * settle on for an attachment-carrying message. Kept as a constant so
+     * the read paths can ask what a message may weigh without depending on
+     * a configured value being present.
+     */
+    const MAX_MESSAGE_LEN_DEFAULT = 26214400;
+    /**
+     * Where a storage class says something went wrong. A caller that wants
+     * these can hand in somewhere to put them; otherwise they go to the
+     * error log, where a reader looking into a failed fetch would already
+     * be looking. A test can pass a place of its own so a run reports only
+     * what the test itself says.
+     *
+     * @var callable|null
+     */
+    protected $storage_log_handler = null;
+    /**
+     * Says where a storage class should report a problem.
+     *
+     * @param callable|null $handler what to call with the message, or null
+     *      to go back to the error log
+     */
+    public function onStorageLog($handler)
+    {
+        $this->storage_log_handler = $handler;
+    }
+    /**
+     * Reports a problem with stored mail, through whatever was handed in
+     * or the error log when nothing was.
+     *
+     * @param string $message what went wrong, in words
+     */
+    protected function reportStorageProblem($message)
+    {
+        if ($this->storage_log_handler !== null) {
+            call_user_func($this->storage_log_handler, $message);
+            return;
+        }
+        error_log($message);
+    }
+    /**
+     * Reads a stored message into memory, refusing one larger than a
+     * message is allowed to be.
+     *
+     * A message file should never be bigger than MAX_MESSAGE_LEN, since
+     * that is the most the server will accept, but a file on disk can grow
+     * larger than the path that wrote it intended. Reading such a file
+     * whole is how a single command can take the memory the whole server
+     * shares, so its size is checked before rather than after it is in
+     * memory.
+     *
+     * @param string $path file holding the stored message
+     * @return string|bool the message's bytes, or false when it cannot be
+     *      read or is larger than a message may be
+     */
+    protected function readWholeMessageFile($path)
+    {
+        $size = @filesize($path);
+        $max = self::MAX_MESSAGE_LEN_DEFAULT;
+        if ($size !== false && $size > $max) {
+            $this->reportStorageProblem("MailStorage: stored message " .
+                $path . " is " . $size . " bytes, past the " . $max .
+                " bytes a message may be; refusing to read it whole");
+            return false;
+        }
+        return @file_get_contents($path);
+    }
+    /**
      * Provision storage for a user, creating the user's INBOX
      * and any per-user metadata. Idempotent: calling on an
      * existing user is a no-op and returns true.
@@ -1092,6 +1161,16 @@ class FileMailStorage extends MailStorage
      */
     const MAX_CACHED_FOLDER_INDEXES = 64;
     /**
+     * How many message records the cached folder indexes may hold between
+     * them. Counting folders alone bounds nothing that matters: one
+     * mailbox of a hundred thousand messages costs more than sixty small
+     * ones, and it was a bound on folders that let a large mailbox sit
+     * resident. Once this many records are held the least recently used
+     * folders are dropped until they fit, each simply re-read from disk
+     * the next time it is touched.
+     */
+    const MAX_CACHED_INDEX_RECORDS = 200000;
+    /**
      * Filesystem directory under which the per-user storage
      * tree is created. Set once by the constructor and never
      * changed.
@@ -1110,6 +1189,12 @@ class FileMailStorage extends MailStorage
      * @var array
      */
     protected $index_cache = [];
+    /**
+     * The hash of what was last written to each folder's index, so a
+     * rebuild producing the same snapshot again writes nothing.
+     * @var array
+     */
+    protected $index_snapshot_hash = [];
     /**
      * In-memory per-user folder listing, kept so a busy account is
      * not re-walked on every login. Each entry is
@@ -1659,7 +1744,7 @@ class FileMailStorage extends MailStorage
         if (!is_file($eml)) {
             return false;
         }
-        $bytes = @file_get_contents($eml);
+        $bytes = $this->readWholeMessageFile($eml);
         return ($bytes === false) ? false : $bytes;
     }
     /**
@@ -1891,7 +1976,7 @@ class FileMailStorage extends MailStorage
      * Takes an advisory lock on an open file without freezing the web
      * server while it waits. Outside the cooperative server (the ordinary
      * case for the mail daemon and command-line tools) this is a plain
-     * blocking lock, so behaviour there is unchanged. Inside the
+     * blocking lock, so behavior there is unchanged. Inside the
      * cooperative web server (a fiber), it asks for the lock without
      * blocking and, if another process holds it, hands the event loop a
      * turn and tries again, so reading a local mailbox cannot freeze every
@@ -2046,16 +2131,116 @@ class FileMailStorage extends MailStorage
      * @return void
      */
     protected function writeFlagsSnapshot($user, $folder, $records)
-    {        $buffer = "";
+    {
+        $handle = @fopen($this->flagsSnapshotPath($user, $folder), "cb");
+        if ($handle === false) {
+            return;
+        }
+        self::cooperativeFlock($handle, LOCK_EX);
+        ftruncate($handle, 0);
         foreach ($records as $uid => $record) {
             if (empty($record['flags'])) {
                 continue;
             }
-            $buffer .= (int) $uid . "\t" .
-                implode(" ", $record['flags']) . "\n";
+            /* Either shape of record is written: the uid may be the
+               key, as it is for a map built by uid, or a field of the
+               record, as it is for a plain list of them. */
+            $written_uid = isset($record['uid']) ? (int) $record['uid'] :
+                (int) $uid;
+            fwrite($handle, $written_uid . "\t" .
+                implode(" ", $record['flags']) . "\n");
         }
-        self::cooperativeFilePut(
-            $this->flagsSnapshotPath($user, $folder), $buffer);
+        fflush($handle);
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+    /**
+     * Writes a folder's index afresh, one present line per live
+     * message, a line at a time. Building the whole snapshot as a
+     * single string first would hold a copy of the folder's index in
+     * memory beside the records it was built from, and a string grown
+     * that far is doubled as it goes, so the last doubling on a large
+     * folder asked for more memory than was left.
+     *
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @param array $records the live messages, in the order to write
+     */
+    protected function writeIndexSnapshot($user, $folder, $records)
+    {
+        $path = $this->messageIndexPath($user, $folder);
+        /* What the snapshot would come to is hashed a line at a time, so
+           a rebuild that produces what the file already holds writes
+           nothing. On a mailbox whose index sits just over the line that
+           calls for compaction, that rebuild runs on every listing, and
+           without this each one rewrote the whole file. */
+        $reckoning = hash_init("md5");
+        foreach ($records as $record) {
+            hash_update($reckoning, $this->formatPresentRecord(
+                $record['uid'], $record['size'],
+                $record['internal_date'], $record['flags']));
+        }
+        $hash = hash_final($reckoning);
+        if (is_file($path) && isset($this->index_snapshot_hash[$path]) &&
+            $this->index_snapshot_hash[$path] === $hash) {
+            return;
+        }
+        $handle = @fopen($path, "cb");
+        if ($handle === false) {
+            return;
+        }
+        $this->index_snapshot_hash[$path] = $hash;
+        self::cooperativeFlock($handle, LOCK_EX);
+        ftruncate($handle, 0);
+        foreach ($records as $record) {
+            fwrite($handle, $this->formatPresentRecord($record['uid'],
+                $record['size'], $record['internal_date'],
+                $record['flags']));
+        }
+        fflush($handle);
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+    /**
+     * Reads a folder's index log for its flags alone, returning a map
+     * of flag lists by uid. This keeps none of the size or date a full
+     * record carries, so reconciling flags during a rebuild costs a
+     * fraction of what a second full read would, and it neither
+     * consults nor fills the index cache.
+     *
+     * @param string $user username (no @domain)
+     * @param string $folder folder name with full hierarchy path
+     * @return array map of flag lists by uid, empty when no index
+     */
+    protected function flagsFromIndex($user, $folder)
+    {
+        $flags_by_uid = [];
+        $path = $this->messageIndexPath($user, $folder);
+        if (!is_file($path)) {
+            return $flags_by_uid;
+        }
+        $handle = @fopen($path, "rb");
+        if ($handle === false) {
+            return $flags_by_uid;
+        }
+        self::cooperativeFlock($handle, LOCK_SH);
+        while (($line = fgets($handle)) !== false) {
+            $parts = explode(" ", rtrim($line, "\r\n"));
+            $uid = (int) ($parts[1] ?? 0);
+            if ($uid < 1) {
+                continue;
+            }
+            if ($parts[0] === self::INDEX_PRESENT_MARKER) {
+                $flags_by_uid[$uid] = array_slice($parts, 4);
+            } else if ($parts[0] === self::INDEX_FLAG_MARKER) {
+                $flags_by_uid[$uid] = array_slice($parts, 2);
+            } else if ($parts[0] === self::INDEX_REMOVE_MARKER) {
+                unset($flags_by_uid[$uid]);
+            }
+        }
+        @flock($handle, LOCK_UN);
+        fclose($handle);
+        return $flags_by_uid;
     }
     /**
      * Reads a folder's flags snapshot into a uid-keyed map of flag
@@ -2188,6 +2373,24 @@ class FileMailStorage extends MailStorage
             @unlink($path);
         }
         $this->invalidateIndexCache($user, $folder);
+    }
+    /**
+     * Says how many folder indexes are being held and how many message
+     * records they hold between them. The periodic memory line reports
+     * both, so a server whose memory is climbing says whether the climb
+     * is these or something else, rather than leaving it to be guessed
+     * at from the total alone.
+     *
+     * @return array the number of folders cached and the number of
+     *      records across them
+     */
+    public function indexCacheSize()
+    {
+        $records = 0;
+        foreach ($this->index_cache as $entry) {
+            $records += count($entry['sizes']);
+        }
+        return [count($this->index_cache), $records];
     }
     /**
      * Drops a folder's cached parsed index so the next read
@@ -2428,6 +2631,50 @@ class FileMailStorage extends MailStorage
         return $entry;
     }
     /**
+     * Turns a folder's records into the form they are held in: three lists
+     * of plain values beside each other rather than a small array for
+     * every message. The same information costs about a fifth as much this
+     * way, since what a record holds is four scalars and PHP spends more
+     * on the array around them than on the values inside it.
+     *
+     * @param array $records the records, keyed by uid
+     * @param int $line_count how many lines the index held
+     * @return array the compact form, with sizes, dates and flags keyed by
+     *      uid and the line count beside them
+     */
+    protected function compactFromRecords($records, $line_count)
+    {
+        $sizes = [];
+        $dates = [];
+        $flags = [];
+        foreach ($records as $uid => $record) {
+            $sizes[$uid] = (int)($record['size'] ?? 0);
+            $dates[$uid] = (int)($record['internal_date'] ?? 0);
+            $flags[$uid] = implode(" ", $record['flags'] ?? []);
+        }
+        return ['sizes' => $sizes, 'dates' => $dates, 'flags' => $flags,
+            'line_count' => $line_count];
+    }
+    /**
+     * Builds the records a caller expects back out of the compact form.
+     * This costs a third of what parsing the index file again would, so
+     * holding the compact form is still worth more than holding nothing.
+     *
+     * @param array $compact the compact form as stored
+     * @return array the records, keyed by uid
+     */
+    protected function recordsFromCompact($compact)
+    {
+        $records = [];
+        foreach ($compact['sizes'] as $uid => $size) {
+            $written = $compact['flags'][$uid];
+            $records[$uid] = ['uid' => $uid, 'size' => $size,
+                'internal_date' => $compact['dates'][$uid],
+                'flags' => ($written === "") ? [] : explode(" ", $written)];
+        }
+        return $records;
+    }
+    /**
      * Caches a folder's parsed index as the most recently used
      * entry, first dropping the least recently used folders until
      * the cache is back under its limit. Bounding the cache keeps a
@@ -2442,18 +2689,34 @@ class FileMailStorage extends MailStorage
         $line_count)
     {
         unset($this->index_cache[$cache_key]);
-        while (count($this->index_cache) >=
-            self::MAX_CACHED_FOLDER_INDEXES) {
+        /* Two ceilings, and the one on records is the one that matters:
+           folders alone say nothing about what is being held, since one
+           large mailbox outweighs sixty small ones. The least recently
+           used are dropped until both are satisfied, each re-read from
+           disk the next time it is touched. */
+        $held_records = 0;
+        foreach ($this->index_cache as $entry) {
+            $held_records += count($entry['sizes']);
+        }
+        $arriving = count($records);
+        while (!empty($this->index_cache) &&
+            (count($this->index_cache) >= self::MAX_CACHED_FOLDER_INDEXES ||
+            $held_records + $arriving > self::MAX_CACHED_INDEX_RECORDS)) {
             $oldest = array_key_first($this->index_cache);
             if ($oldest === null) {
                 break;
             }
+            $held_records -= count($this->index_cache[$oldest]['sizes']);
             unset($this->index_cache[$oldest]);
         }
-        $this->index_cache[$cache_key] = [
-            'records' => $records,
-            'line_count' => $line_count,
-        ];
+        /* A folder too large to sit inside the ceiling on its own is not
+           cached at all, rather than emptying the cache to make room for
+           something that still would not fit. */
+        if ($arriving > self::MAX_CACHED_INDEX_RECORDS) {
+            return;
+        }
+        $this->index_cache[$cache_key] =
+            $this->compactFromRecords($records, $line_count);
     }
     /**
      * Streams a folder's index log and returns the set of live
@@ -2472,11 +2735,9 @@ class FileMailStorage extends MailStorage
         $cache_key = $user . "\0" . $folder;
         $cached = $this->cachedFolderIndex($cache_key);
         if ($cached !== null) {
-            $live = [];
-            foreach ($cached['records'] as $uid => $record) {
-                $live[$uid] = true;
-            }
-            return $live;
+            /* The uids are the keys the compact form is already keyed
+               by, so this needs no record built at all. */
+            return array_fill_keys(array_keys($cached['sizes']), true);
         }
         $path = $this->messageIndexPath($user, $folder);
         if (!is_file($path)) {
@@ -2535,7 +2796,7 @@ class FileMailStorage extends MailStorage
         $cached = $this->cachedFolderIndex($cache_key);
         if ($cached !== null) {
             $line_count = $cached['line_count'];
-            return $cached['records'];
+            return $this->recordsFromCompact($cached);
         }
         $path = $this->messageIndexPath($user, $folder);
         if (!is_file($path)) {
@@ -2609,35 +2870,30 @@ class FileMailStorage extends MailStorage
             scanFolderMessages takes flags from the snapshot, which
             is the right source when the index was lost. When the
             index is still readable (the compaction case) it holds
-            fresher flags than the last snapshot, so prefer those
-            and let the refreshed snapshot below capture them.
+            fresher flags than the last snapshot, so prefer those.
+            Only the flags are taken from it, through a map of flags
+            by uid: reading it as whole records would build a second
+            copy of everything the folder holds, and on a folder of
+            a hundred thousand messages the two together were enough
+            to end the server.
          */
-        $line_count = 0;
-        $current = $this->readFolderIndex($user, $folder,
-            $line_count);
-        if ($current !== null) {
-            foreach ($records as $position => $record) {
-                $uid = (int) $record['uid'];
-                if (isset($current[$uid])) {
-                    $records[$position]['flags'] =
-                        $current[$uid]['flags'];
-                }
+        $flags_by_uid = $this->flagsFromIndex($user, $folder);
+        foreach ($records as $position => $record) {
+            $uid = (int) $record['uid'];
+            if (isset($flags_by_uid[$uid])) {
+                $records[$position]['flags'] = $flags_by_uid[$uid];
             }
         }
-        $snapshot = "";
-        foreach ($records as $record) {
-            $snapshot .= $this->formatPresentRecord(
-                $record['uid'], $record['size'],
-                $record['internal_date'], $record['flags']);
-        }
-        self::cooperativeFilePut(
-            $this->messageIndexPath($user, $folder),
-            $snapshot);
-        $by_uid = [];
-        foreach ($records as $record) {
-            $by_uid[(int) $record['uid']] = $record;
-        }
-        $this->writeFlagsSnapshot($user, $folder, $by_uid);
+        unset($flags_by_uid);
+        /*
+            Both files are written a line at a time rather than
+            built up as one string first. A folder of a hundred
+            thousand messages makes a snapshot of several megabytes,
+            and growing a string that far doubles it as it goes, so
+            the last doubling asked for more than was left.
+         */
+        $this->writeIndexSnapshot($user, $folder, $records);
+        $this->writeFlagsSnapshot($user, $folder, $records);
         $this->invalidateIndexCache($user, $folder);
         return $records;
     }
@@ -3137,7 +3393,7 @@ class FileMailStorage extends MailStorage
             return false;
         }
         $size = @filesize($eml);
-        $bytes = @file_get_contents($eml);
+        $bytes = $this->readWholeMessageFile($eml);
         $hash = $bytes === false ? null : hash('sha256', $bytes);
         return [
             'backend' => 'file',
@@ -4199,7 +4455,7 @@ class SqlMailStorage extends MailStorage
      * already present, the statement is silently a no-op
      * (rowCount() == 0) rather than raising a duplicate-key
      * error. Followed by a discriminating UPDATE this gives
-     * portable INSERT-or-UPDATE behaviour.
+     * portable INSERT-or-UPDATE behavior.
      *
      * Pattern follows Yioop's DatasourceManager::insertIgnore:
      * SQLite swaps "INSERT" for "INSERT OR IGNORE", MySQL uses
@@ -5117,7 +5373,7 @@ class SqlMailStorage extends MailStorage
         if (!is_file($eml_path)) {
             return false;
         }
-        return @file_get_contents($eml_path);
+        return $this->readWholeMessageFile($eml_path);
     }
     /**
      * Reads up to $max bytes from the head of a content-
@@ -5234,6 +5490,55 @@ class MailSite implements MailVocabulary
      * threshold. The unit is bytes.
      */
     const FETCH_FLUSH_THRESHOLD = 4194304;
+    /**
+     * When a single connection's queued output passes this many bytes the
+     * server logs a warning naming that connection, because no legitimate
+     * response reaches it: a fetch flushes at FETCH_FLUSH_THRESHOLD and a
+     * message cannot exceed MAX_MESSAGE_LEN, so a buffer an order of
+     * magnitude past the largest message means a response is being queued
+     * faster than a client will take it. That is the shape of the runaway
+     * that once exhausted memory before a thirty-second heartbeat could
+     * show it, so it is reported the moment it appears rather than waited
+     * for. The unit is bytes.
+     */
+    const OUTPUT_BUFFER_WARN_BYTES = 268435456;
+    /**
+     * The largest a LOGIN literal (a username sent as a counted {N}-byte
+     * block rather than a quoted string) may announce before the server
+     * refuses it, in bytes. A credential is small; without this cap the
+     * server would answer "+ Ready" and then read the announced count into
+     * memory, so a client announcing a huge count could exhaust memory one
+     * connection at a time, which is what took the mail server down. One
+     * kibibyte is far above any real username and far below harm.
+     */
+    const MAX_CREDENTIAL_LITERAL_BYTES = 1024;
+    /**
+     * The largest a connection's unconsumed input buffer may reach before
+     * the server drops the connection, in bytes. A legitimate connection
+     * holds at most one message here (a byte-counted APPEND body up to
+     * MAX_MESSAGE_LEN of 25 mebibytes) plus its command, so this sits a
+     * little above that: past it, bytes are arriving that no command will
+     * drain. It is the floor under every read path, in case one announces a
+     * counted block without its own size check the way the LOGIN literal
+     * once did.
+     *
+     * Kept close to the largest message rather than far above it because
+     * the buffer is grown by appending to a string, which needs room for
+     * the old and new copies at once: a connection allowed a quarter of
+     * the server's memory can therefore take half of it while growing, and
+     * a handful of connections doing so at once exhausts it, which is what
+     * a previous, much larger setting allowed.
+     */
+    const MAX_INPUT_BUFFER_BYTES = 33554432;
+    /**
+     * When a single connection's unconsumed input passes this many bytes
+     * the server logs a warning naming that connection, the read-side twin
+     * of OUTPUT_BUFFER_WARN_BYTES, so a client sending faster than its
+     * command drains shows in the log the moment it starts rather than as
+     * a later crash. It sits below the hard input limit so the warning
+     * precedes the drop. The unit is bytes.
+     */
+    const INPUT_BUFFER_WARN_BYTES = 134217728;
     const CONTEXT = 3;
     /** @var Authenticator */
     protected $authenticator;
@@ -5281,6 +5586,34 @@ class MailSite implements MailVocabulary
     protected $out_streams = [];
     /** @var array key => fiber for a connection paused on a lock wait */
     protected $pending_fibers = [];
+    /**
+     * Connection keys currently warned about for a runaway output buffer,
+     * so the warning is logged once per crossing rather than on every
+     * write while the buffer stays large.
+     * @var array
+     */
+    protected $output_buffer_warned = [];
+    /**
+     * The byte count at which a connection's queued output is warned
+     * about, defaulting to OUTPUT_BUFFER_WARN_BYTES. Held as a property so
+     * a test can lower it rather than having to queue the full amount.
+     * @var int
+     */
+    protected $output_buffer_warn_bytes = self::OUTPUT_BUFFER_WARN_BYTES;
+    /**
+     * Connection keys currently warned about for a runaway input buffer,
+     * so the warning is logged once per crossing rather than on every read
+     * while the buffer stays large.
+     * @var array
+     */
+    protected $input_buffer_warned = [];
+    /**
+     * The byte count at which a connection's unconsumed input is warned
+     * about, defaulting to INPUT_BUFFER_WARN_BYTES. Held as a property so a
+     * test can lower it rather than having to send the full amount.
+     * @var int
+     */
+    protected $input_buffer_warn_bytes = self::INPUT_BUFFER_WARN_BYTES;
     /** @var \SplPriorityQueue|null */
     protected $timer_alarms;
     /** @var array */
@@ -6099,6 +6432,79 @@ class MailSite implements MailVocabulary
         return count($this->pending_fibers);
     }
     /**
+     * Returns how many client connections are open right now. A count
+     * that climbs without falling, alongside parked fibers that never
+     * clear, is the mark of a loop that has stopped draining its work,
+     * so it is worth recording in the heartbeat and when the loop
+     * stalls.
+     * @return int the number of open connections
+     */
+    public function connectionCount()
+    {
+        if (!isset($this->in_streams[self::CONTEXT])) {
+            return 0;
+        }
+        return count($this->in_streams[self::CONTEXT]);
+    }
+    /**
+     * Returns the size in bytes of the largest queued output buffer across
+     * all connections, so the heartbeat log can carry a number that climbs
+     * when a response is being queued faster than its client will take it.
+     * A healthy server holds little here, since output drains each tick;
+     * a rising figure is the early sign of the runaway that the warning in
+     * queueWrite reports outright.
+     * @return int bytes in the largest connection's output buffer, or 0
+     */
+    public function largestOutputBuffer()
+    {
+        if (empty($this->out_streams[self::DATA])) {
+            return 0;
+        }
+        $largest = 0;
+        foreach ($this->out_streams[self::DATA] as $queued) {
+            $size = strlen($queued);
+            if ($size > $largest) {
+                $largest = $size;
+            }
+        }
+        return $largest;
+    }
+    /**
+     * Returns the size in bytes of the largest unconsumed input buffer
+     * across all connections, so the heartbeat log can carry a number that
+     * climbs when a client is sending faster than its command can be
+     * parsed and drained. A healthy connection holds at most one message
+     * here; a figure climbing toward the memory limit is the runaway that
+     * once took the server down from the read side, which the heartbeat's
+     * output figure alone could not see.
+     * @return int bytes in the largest connection's input buffer, or 0
+     */
+    public function largestInputBuffer()
+    {
+        if (empty($this->in_streams[self::DATA])) {
+            return 0;
+        }
+        $largest = 0;
+        foreach ($this->in_streams[self::DATA] as $buffered) {
+            $size = strlen($buffered);
+            if ($size > $largest) {
+                $largest = $size;
+            }
+        }
+        return $largest;
+    }
+    /**
+     * Returns a short label for what the event loop was last doing,
+     * such as reading a particular connection or running a handshake.
+     * A shutdown handler in the launching process reads it to record
+     * where the loop was when the process died.
+     * @return string the loop's most recent activity label
+     */
+    public function currentActivity()
+    {
+        return $this->loop_activity;
+    }
+    /**
      * Installs a watchdog that notices when a single pass through the event
      * loop runs far too long, the mark of a wedged loop, and logs what the
      * loop was doing together with a backtrace, so the stuck code can be
@@ -6130,7 +6536,11 @@ class MailSite implements MailVocabulary
                 }
                 $this->emitLog("MailSite watchdog: event loop stuck in " .
                     $this->loop_activity . " for " . (int) $stalled .
-                    "s, backtrace:" . $trace);
+                    "s, memory " . memory_get_usage(true) . " peak " .
+                    memory_get_peak_usage(true) . ", " .
+                    $this->pendingFiberCount() . " fibers parked, " .
+                    $this->connectionCount() . " connections, " .
+                    "backtrace:" . $trace);
             }
             pcntl_alarm(self::WATCHDOG_SECONDS);
         });
@@ -6163,7 +6573,7 @@ class MailSite implements MailVocabulary
             'CONNECTION_TIMEOUT' => 30 * 60,
             'TLS_HANDSHAKE_TIMEOUT' => 10,
             'MAX_COMMAND_LEN' => 2048,
-            'MAX_MESSAGE_LEN' => 25 * 1024 * 1024,
+            'MAX_MESSAGE_LEN' => MailStorage::MAX_MESSAGE_LEN_DEFAULT,
             /*
                 Accept AUTH PLAIN/LOGIN before TLS. Default
                 false; flip on for loopback dev where there
@@ -6761,6 +7171,67 @@ class MailSite implements MailVocabulary
         }
         $this->out_streams[self::DATA][$key] .= $bytes;
         $this->out_streams[self::MODIFIED_TIME][$key] = time();
+        $this->warnOnRunawayOutput($key);
+    }
+    /**
+     * Logs once when a connection's queued output first passes
+     * OUTPUT_BUFFER_WARN_BYTES, naming the connection, its protocol and
+     * state, and the size, so a response being queued faster than its
+     * client will take it shows up in the log the moment it starts rather
+     * than as a later crash. The warned flag is cleared once the buffer
+     * falls back under the threshold, so a connection that recovers and
+     * misbehaves again is reported each time rather than only once.
+     * @param int $key connection key in the out_streams map
+     * @return void
+     */
+    protected function warnOnRunawayOutput($key)
+    {
+        $size = strlen($this->out_streams[self::DATA][$key]);
+        if ($size < $this->output_buffer_warn_bytes) {
+            unset($this->output_buffer_warned[$key]);
+            return;
+        }
+        if (!empty($this->output_buffer_warned[$key])) {
+            return;
+        }
+        $this->output_buffer_warned[$key] = true;
+        $context = $this->in_streams[self::CONTEXT][$key] ?? [];
+        $protocol = $context['PROTOCOL'] ?? 'unknown';
+        $state = $context['STATE'] ?? 'unknown';
+        $this->emitLog("MailSite: connection $key ($protocol/$state) has " .
+            "queued $size bytes of output, past the " .
+            $this->output_buffer_warn_bytes . " byte warning line; a " .
+            "client " .
+            "is taking output slower than it is being produced");
+    }
+    /**
+     * Logs once when a connection's unconsumed input first passes
+     * INPUT_BUFFER_WARN_BYTES, the read-side twin of warnOnRunawayOutput,
+     * so a client sending faster than its command drains shows in the log
+     * the moment it starts rather than as a later crash. The warned flag is
+     * cleared once the buffer falls back under the threshold, so a
+     * connection that recovers and misbehaves again is reported each time.
+     * @param int $key connection key in the in_streams map
+     * @return void
+     */
+    protected function warnOnRunawayInput($key)
+    {
+        $size = strlen($this->in_streams[self::DATA][$key]);
+        if ($size < $this->input_buffer_warn_bytes) {
+            unset($this->input_buffer_warned[$key]);
+            return;
+        }
+        if (!empty($this->input_buffer_warned[$key])) {
+            return;
+        }
+        $this->input_buffer_warned[$key] = true;
+        $context = $this->in_streams[self::CONTEXT][$key] ?? [];
+        $protocol = $context['PROTOCOL'] ?? 'unknown';
+        $state = $context['STATE'] ?? 'unknown';
+        $this->emitLog("MailSite: connection $key ($protocol/$state) has " .
+            "buffered $size bytes of input, past the " .
+            $this->input_buffer_warn_bytes . " byte warning line; a " .
+            "client is sending faster than its command is drained");
     }
     /**
      * Queues a tagged IMAP response (OK, NO, or BAD).
@@ -6840,6 +7311,25 @@ class MailSite implements MailVocabulary
         }
         $this->in_streams[self::DATA][$key] .= $chunk;
         $this->in_streams[self::MODIFIED_TIME][$key] = time();
+        $this->warnOnRunawayInput($key);
+        if (strlen($this->in_streams[self::DATA][$key]) >
+            self::MAX_INPUT_BUFFER_BYTES) {
+            /*
+                The unconsumed input has passed the largest a legitimate
+                connection ever holds (one message plus its command), so
+                the peer is sending bytes no command will drain. Drop it
+                rather than let the buffer grow to the memory limit and
+                take every other connection down with it. Each command that
+                reads a counted block already refuses an oversized count up
+                front; this is the floor under any path that does not.
+             */
+            $this->emitLog("MailSite: connection $key input buffer reached " .
+                strlen($this->in_streams[self::DATA][$key]) .
+                " bytes, past the " . self::MAX_INPUT_BUFFER_BYTES .
+                " byte limit; dropping the connection");
+            $this->shutdownStream($key);
+            return;
+        }
         /*
             Process as many complete commands as the buffer
             holds. SMTP commands and the IMAP authentication
@@ -6871,10 +7361,13 @@ class MailSite implements MailVocabulary
                 }
                 $after = isset($this->in_streams[self::DATA][$key]) ?
                     strlen($this->in_streams[self::DATA][$key]) : 0;
-                if ($after >= $before) {
+                if ($before > 0 && $after >= $before) {
                     /* processOne reported progress but left the input
                        buffer no smaller, which would loop forever; log it
-                       and drop the connection rather than wedge the loop */
+                       and drop the connection rather than wedge the loop.
+                       Only checked when there was input: with an empty
+                       buffer there is nothing to shrink, so a command that
+                       needs no input is not mistaken for a stuck loop. */
                     $this->emitLog("MailSite: command loop made no progress" .
                         " on key " . $key . "; dropping connection");
                     $this->shutdownStream($key);
@@ -7436,6 +7929,7 @@ class MailSite implements MailVocabulary
      */
     protected function consumeSmtpDataPhase($key, &$buffer, &$context)
     {
+        $max = $this->default_server_globals['MAX_MESSAGE_LEN'];
         $marker = "\r\n.\r\n";
         $position = strpos($buffer, $marker);
         $marker_len = 5;
@@ -7443,6 +7937,20 @@ class MailSite implements MailVocabulary
             $alternative = "\n.\n";
             $alt_pos = strpos($buffer, $alternative);
             if ($alt_pos === false) {
+                if (strlen($buffer) > $max) {
+                    /* The DATA body has run past the size limit and its
+                       end-of-message marker has still not arrived. Every
+                       further read would grow this connection's buffer
+                       with no bound, so a sender that streams a body and
+                       never terminates it would drive the whole daemon to
+                       its memory ceiling and take every connection down
+                       with it (the observed crash). Drop the connection,
+                       the way an over-long command line is handled above.
+                       A message that ends within the limit, or whose
+                       terminator lands in the same read that carries it
+                       past the limit, still reaches the 552 reply below. */
+                    $this->shutdownStream($key);
+                }
                 return false;
             }
             $position = $alt_pos;
@@ -7452,7 +7960,6 @@ class MailSite implements MailVocabulary
         $buffer = substr($buffer, $position + $marker_len);
         $message = preg_replace('/(\r\n|\n)\.(\r\n|\n|\.)/',
             '$1$2', $message);
-        $max = $this->default_server_globals['MAX_MESSAGE_LEN'];
         if (strlen($message) > $max) {
             $this->queueWrite($key,
                 "552 5.3.4 Message exceeds size limit\r\n");
@@ -7685,6 +8192,21 @@ class MailSite implements MailVocabulary
         $arguments = ($verb_end === false) ? "" :
             substr($rest, $verb_end + 1);
         $V = strtoupper($verb);
+        /* Naming the command in the loop's activity is what lets a fatal
+           say which one was running, where "read key=N" alone cannot.
+           The account and the folder go in it too, and for UID the word
+           after it as well: a fatal reading "UID" on its own says neither
+           whose mail was being read nor whether it was a fetch, a search
+           or a store, which leaves the next reader of the log guessing. */
+        $said = $V;
+        if ($V === 'UID') {
+            $second_end = strpos($arguments, " ");
+            $said .= " " . strtoupper(($second_end === false) ? $arguments :
+                substr($arguments, 0, $second_end));
+        }
+        $this->loop_activity = "imap key=" . $key . " " . $said .
+            " user=" . ($context['AUTH_USER'] ?? "-") .
+            " folder=" . ($context['SELECTED'] ?? "-");
         /*
             Always-available commands: do not require any state.
          */
@@ -7929,9 +8451,24 @@ class MailSite implements MailVocabulary
                 in IMAP_LIT_BUFFER for the eventual full
                 command. This case is rare in practice; most
                 clients send LOGIN with quoted strings.
+
+                Refuse an oversized count here, before answering
+                "+ Ready", the way APPEND refuses one: a username
+                is small, and reading an announced count of any
+                size into memory is how a single connection could
+                exhaust the process. The count is rejected outright
+                rather than accepted-then-truncated so the client
+                does not send the body at all.
              */
+            $announced = (int) $tokens[0][1];
+            if ($announced < 0 ||
+                $announced > self::MAX_CREDENTIAL_LITERAL_BYTES) {
+                $this->imapResp($key, $tag, "NO",
+                    "[TOOBIG] LOGIN literal too large");
+                return;
+            }
             $context['IMAP_LIT_PENDING'] = [
-                'remaining' => $tokens[0][1],
+                'remaining' => $announced,
                 'collected' => [],
                 'continuation' => 'login',
                 'tag' => $tag,
@@ -10309,10 +10846,28 @@ class MailSite implements MailVocabulary
             $this->imapEmitFetch($key, $sequence_number, $meta, $body,
                 $items_str, $by_uid, $mark_seen);
             unset($body);
+            /*
+                Keep the queued response bounded. Draining does one
+                non-blocking write, which sends nothing when the client is
+                slow or its receive window is full; on a large range fetch
+                such as "1:* BODY[]" the loop would then queue every
+                message at once and exhaust memory (the observed crash).
+                So when a drain cannot get the buffer back under the
+                threshold, park the fiber until the socket is writable
+                again and the loop drains it, then carry on. Outside a
+                fiber (no cooperative loop) fall back to draining once.
+             */
             if (isset($this->out_streams[self::DATA][$key]) &&
                 strlen($this->out_streams[self::DATA][$key]) >=
                 self::FETCH_FLUSH_THRESHOLD) {
                 $this->drainWriteBuffer($key);
+                while (\Fiber::getCurrent() !== null &&
+                    isset($this->out_streams[self::DATA][$key]) &&
+                    strlen($this->out_streams[self::DATA][$key]) >=
+                    self::FETCH_FLUSH_THRESHOLD) {
+                    \Fiber::suspend();
+                    $this->drainWriteBuffer($key);
+                }
             }
             if ($mark_seen &&
                 empty($context['SELECTED_READONLY']) &&

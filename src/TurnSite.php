@@ -105,6 +105,55 @@ class StaticTurnAuthenticator extends TurnAuthenticator
     }
 }
 /**
+ * Recognizes a caller by a token rather than by a name written down
+ * beforehand. The name a caller gives is the moment the token stops
+ * being good, written as a count of seconds, and the secret is a hash
+ * over that name made with a key the caller and the relay share. A
+ * caller with the key can make itself a token whenever it needs one,
+ * and a token stops working on its own.
+ *
+ * This is the shape RFC 5766 describes for a relay whose users are not
+ * known in advance.
+ *
+ * @author Chris Pollett
+ */
+class TimeLimitedTurnAuthenticator extends TurnAuthenticator
+{
+    /**
+     * The key the relay and whoever hands out tokens share.
+     * @var string
+     */
+    protected $key;
+    /**
+     * Builds an authenticator that recognizes tokens made with a key.
+     *
+     * @param string $key shared with whoever hands out tokens
+     */
+    public function __construct($key)
+    {
+        $this->key = (string)$key;
+    }
+    /**
+     * Says whether a name is a token still good, and what secret goes
+     * with it. The name is the moment the token stops being good; the
+     * secret is that name hashed with the shared key.
+     *
+     * @param string $username the name a caller gave
+     * @return array|bool the password to expect, or false where the
+     *      name is not a moment or that moment has passed
+     */
+    public function lookupUser($username)
+    {
+        $parts = explode(":", (string)$username, 2);
+        $until = (int)$parts[0];
+        if ($until <= 0 || $until < time()) {
+            return false;
+        }
+        return ['password' => base64_encode(hash_hmac('sha1',
+            (string)$username, $this->key, true))];
+    }
+}
+/**
  * Per-allocation state. One instance per client 5-tuple,
  * created on a successful Allocate request and torn down
  * on Refresh(lifetime=0), expiry, or socket error. RFC
@@ -172,6 +221,14 @@ class TurnAllocation
      *      datagram arrives from a peer that has a channel
      */
     public $channels_by_peer = [];
+    /**
+     * @var string the relayed socket's own bound address as a
+     *      host:port key, which is the real local address rather than
+     *      the public one handed to the browser. The index that finds an
+     *      allocation for an inbound relayed datagram is keyed by this,
+     *      so the lookup reads the same address the socket reports.
+     */
+    public $relay_local_key = "";
 }
 /**
  * The STUN/TURN server. Accepts datagrams on a UDP listener,
@@ -293,10 +350,61 @@ class TurnSite
      */
     protected $relay_port_high = 60100;
     /**
+     * The address the relay binds each relayed socket on and hands a
+     * browser as the address to reach that socket at. A browser gives
+     * this address to the other browser, which then has to reach it, so
+     * it has to be an address that other browser can reach: the public
+     * address of the machine the relay runs on, not the loopback. Where
+     * a caller names none the relay falls back to the loopback, which
+     * serves only a browser on the same machine and is why a relay left
+     * at the default carried a call nowhere.
+     * @var string
+     */
+    protected $relay_address = "";
+    /**
      * @var array configuration from listen(): BIND,
      *      TURN_PORT, IDLE_TIMEOUT
      */
     protected $config = [];
+    /**
+     * Work to run between rounds of the listening loop, set by
+     * betweenRounds(). A caller uses it to notice whatever it watches
+     * for: a request to stop, a file that has changed, a count to
+     * write down.
+     * @var callable|null
+     */
+    protected $between_rounds = null;
+    /**
+     * How often the work set by betweenRounds() is run, in seconds. The
+     * loop wakes at least this often even where no datagram arrives.
+     * @var float
+     */
+    protected $between_seconds = 1.0;
+    /**
+     * The moment the between-rounds work last ran, as seconds with a
+     * fraction, read and moved by betweenWorkDue() so that work runs at
+     * the pace the caller set rather than once per datagram the loop
+     * wakes on.
+     * @var float
+     */
+    protected $between_last = 0.0;
+    /**
+     * A place to send a line about what the relay is doing, set by
+     * onLog(). The relay itself keeps no log and names no file, so a
+     * caller that wants to see each datagram arrive, each allocation
+     * made, and each request turned away hands a function here, and the
+     * relay calls it with a plain sentence at each of those moments.
+     * Where none is set the relay stays silent, as it did before.
+     * @var callable|null
+     */
+    protected $log_callback = null;
+    /**
+     * Whether the listening loop should end after this round. stop()
+     * sets it, and the work run between rounds is where a caller
+     * usually calls stop().
+     * @var bool
+     */
+    protected $stopping = false;
     /**
      * @var resource the UDP listener
      */
@@ -362,6 +470,130 @@ class TurnSite
         return $this;
     }
     /**
+     * Sets a piece of work to run between rounds of the listening loop,
+     * and how often the loop should wake to run it. A relay otherwise
+     * waits for a datagram and does nothing else, so a caller that has
+     * to notice something outside the relay has no moment in which to
+     * look. The work is run after each round, whether or not anything
+     * arrived.
+     *
+     * @param callable $work run between rounds of the loop
+     * @param float $seconds how long the loop waits for a datagram
+     *      before running the work anyway
+     * @return TurnSite this relay, so calls can be chained
+     */
+    public function betweenRounds(callable $work, $seconds = 1.0)
+    {
+        $this->between_rounds = $work;
+        $this->between_seconds = (float)$seconds;
+        return $this;
+    }
+    /**
+     * Sets where the relay sends a line about what it is doing: a
+     * datagram arriving, an allocation made or refreshed, and a request
+     * turned away. A relay that only ever writes an "I am up" line
+     * cannot show whether a browser reached it at all, so a caller that
+     * wants that detail hands a function here and the relay calls it
+     * with a plain sentence at each such moment. The relay keeps no log
+     * of its own and names no file, so all the function is handed is the
+     * words; the caller decides where they go.
+     *
+     * @param callable $work run with one string argument, the line to
+     *      record, each time the relay has something to say
+     * @return TurnSite this relay, so calls can be chained
+     */
+    public function onLog(callable $work)
+    {
+        $this->log_callback = $work;
+        return $this;
+    }
+    /**
+     * betweenWorkDue says whether enough time has passed that the work
+     * handed to betweenRounds(), and the sweep for expired allocations,
+     * should run again, and remembers the given time when it says yes.
+     * The listen loop wakes once per datagram when traffic is flowing,
+     * and running that work each wake made the relay do file writes for
+     * every packet it carried: the process check behind the work writes
+     * files each call, so each relayed packet paid a disk write and the
+     * checks a call's connection depends on crawled. The loop asks here
+     * instead, so the work runs at the pace the caller set and a packet
+     * pays nothing extra.
+     *
+     * @param float $now the present moment as seconds with a fraction
+     * @return bool whether the between-rounds work should run now
+     */
+    public function betweenWorkDue($now)
+    {
+        if (($now - $this->between_last) < $this->between_seconds) {
+            return false;
+        }
+        $this->between_last = $now;
+        return true;
+    }
+    /**
+     * Sends one line to whatever onLog() was given, or does nothing
+     * where a caller set no place to send it. Every place in the relay
+     * that has something worth recording calls this rather than writing
+     * anywhere itself, so the relay stays a piece of pure logic that
+     * names no log file.
+     *
+     * @param string $line the sentence to record
+     * @return void
+     */
+    protected function logLine($line)
+    {
+        if ($this->log_callback !== null) {
+            call_user_func($this->log_callback, $line);
+        }
+    }
+    /**
+     * Asks the listening loop to end after the round it is in. The
+     * relay closes the port it took and every port it handed out, and
+     * listen() gives back true, so a caller can tell being told to stop
+     * from failing to take the port at all.
+     *
+     * @return TurnSite this relay, so calls can be chained
+     */
+    /**
+     * The address the relay took, as the operating system reports it,
+     * or an empty string where it holds none. A caller writes this
+     * down rather than repeating what it asked for, since the two can
+     * differ: an address of 0.0.0.0 is reported as the port on every
+     * address the machine has.
+     *
+     * @return string the address held, or an empty string
+     */
+    public function boundAddress()
+    {
+        if ($this->listener === null) {
+            return "";
+        }
+        return (string)@stream_socket_get_name($this->listener, false);
+    }
+    /**
+     * How many calls the relay is carrying: one for each pair of
+     * clients it has handed a port to and has not yet let go.
+     *
+     * @return int the number of calls being carried
+     */
+    public function carrying()
+    {
+        return count($this->allocations);
+    }
+    /**
+     * Asks the listening loop to end after the round it is in. The
+     * relay closes the port it took and every port it handed out, and
+     * listen() gives back true, so a caller can tell being told to
+     * stop from failing to take the port at all.
+     *
+     * @return TurnSite this relay, so calls can be chained
+     */
+    public function stop()
+    {
+        $this->stopping = true;
+        return $this;
+    }
+    /**
      * Sets the relay-port range. Returns $this so calls
      * chain.
      *
@@ -374,6 +606,25 @@ class TurnSite
     {
         $this->relay_port_low = (int) $low;
         $this->relay_port_high = (int) $high;
+        return $this;
+    }
+    /**
+     * Sets the address the relay binds each relayed socket on and hands
+     * a browser as where to reach that socket. The address a browser is
+     * given here is passed on to the other browser, which has to reach
+     * it for the call to carry, so it has to be the machine's public
+     * address rather than the loopback. A caller that runs the relay for
+     * people outside the machine names that address here; where none is
+     * named the relay keeps to the loopback, reachable only on the
+     * machine itself.
+     *
+     * @param string $host public address of the machine the relay runs
+     *      on, the one the two browsers can both reach
+     * @return TurnSite this relay, so calls can be chained
+     */
+    public function relayAddress($host)
+    {
+        $this->relay_address = (string) $host;
         return $this;
     }
     /*
@@ -499,7 +750,12 @@ class TurnSite
     /**
      * Main dispatch loop. select()s across the listener
      * and every relay socket; routes incoming bytes to the
-     * right handler depending on which socket woke up.
+     * right handler depending on which socket woke up. Runs
+     * whatever work betweenRounds() was given after each
+     * round, and ends where that work has called stop().
+     *
+     * @return bool true once the loop has been asked to end,
+     *      which is the only way it comes back
      */
     protected function loop()
     {
@@ -512,8 +768,11 @@ class TurnSite
             }
             $writes = null;
             $excepts = null;
+            $wait = (int)floor($this->between_seconds);
+            $wait_micro = (int)round(($this->between_seconds - $wait) *
+                1000000);
             $n = @stream_select($reads, $writes, $excepts,
-                1, 0);
+                $wait, $wait_micro);
             if ($n === false) {
                 /*
                     EINTR or similar transient error. Loop
@@ -530,7 +789,40 @@ class TurnSite
                     }
                 }
             }
-            $this->reapExpired();
+            /* When traffic is flowing the select wakes once per
+               datagram, so the sweep and the caller's work are held to
+               the pace the caller set rather than run per packet; the
+               process check behind that work writes files each call,
+               and paying that for every packet slowed the relay path
+               enough that a call's connection checks crawled. */
+            if ($this->betweenWorkDue(microtime(true))) {
+                $this->reapExpired();
+                if ($this->between_rounds !== null) {
+                    call_user_func($this->between_rounds, $this);
+                }
+            }
+            if ($this->stopping) {
+                $this->closeEverything();
+                return true;
+            }
+        }
+        return true;
+    }
+    /**
+     * Closes the port the relay took and every port it handed out, so
+     * nothing is left holding an address after the loop ends.
+     */
+    protected function closeEverything()
+    {
+        foreach ($this->allocations as $alloc) {
+            if ($alloc->relay_socket !== null) {
+                @fclose($alloc->relay_socket);
+                $alloc->relay_socket = null;
+            }
+        }
+        if ($this->listener !== null) {
+            @fclose($this->listener);
+            $this->listener = null;
         }
     }
     /**
@@ -550,13 +842,22 @@ class TurnSite
             return;
         }
         if (strlen($buf) < 4) {
+            $this->logLine("datagram from " . $peer . " too short (" .
+                strlen($buf) . " bytes), ignored");
             return;
         }
         $first = ord($buf[0]);
         if (($first & 0xC0) === 0x00) {
+            $this->logLine("STUN/TURN datagram from " . $peer . " (" .
+                strlen($buf) . " bytes)");
             $this->handleStunMessage($buf, $peer);
         } else if (($first & 0xC0) === 0x40) {
+            $this->logLine("channel-data datagram from " . $peer . " (" .
+                strlen($buf) . " bytes)");
             $this->handleChannelData($buf, $peer);
+        } else {
+            $this->logLine("datagram from " . $peer .
+                " with reserved leading bits, ignored");
         }
         /*
             Other top-bit patterns are reserved by RFC 7983
@@ -575,6 +876,9 @@ class TurnSite
      */
     protected function onRelayReadable($sock)
     {
+        if (!is_resource($sock)) {
+            return;
+        }
         $peer = '';
         $buf = @stream_socket_recvfrom($sock, 65535, 0, $peer);
         if ($buf === false || $buf === '' || $peer === '') {
@@ -886,9 +1190,22 @@ class TurnSite
             $body .= $this->encodeAttr(
                 self::ATTR_MESSAGE_INTEGRITY, $hmac);
         }
+        /*
+            RFC 8489 sec 14.7: a message may end with a
+            FINGERPRINT, whose value is a checksum of
+            everything before it with a fixed number mixed
+            in. A browser puts one on what it sends and
+            drops an answer that comes back without one, so
+            every answer carries it. The length in the
+            header counts the fingerprint too.
+         */
+        $with_print = strlen($body) + 8;
         $hdr = pack('nnN',
             $this->encodeMessageType($method, $class),
-            strlen($body), self::MAGIC_COOKIE) . $tid;
+            $with_print, self::MAGIC_COOKIE) . $tid;
+        $sum = (crc32($hdr . $body) ^ 0x5354554e) & 0xFFFFFFFF;
+        $body .= $this->encodeAttr(self::ATTR_FINGERPRINT,
+            pack('N', $sum));
         return $hdr . $body;
     }
     /**
@@ -995,6 +1312,8 @@ class TurnSite
     {
         $msg = $this->parseStun($buf);
         if ($msg === false) {
+            $this->logLine("datagram from " . $peer .
+                " was not a STUN message the relay could read");
             return;
         }
         if ($msg['class'] !== self::CLASS_REQUEST &&
@@ -1005,6 +1324,16 @@ class TurnSite
              */
             return;
         }
+        $method_names = [
+            self::METHOD_BINDING => "Binding",
+            self::METHOD_ALLOCATE => "Allocate",
+            self::METHOD_REFRESH => "Refresh",
+            self::METHOD_CREATE_PERMISSION => "CreatePermission",
+            self::METHOD_CHANNEL_BIND => "ChannelBind",
+            self::METHOD_SEND => "Send"];
+        $method_name = $method_names[$msg['method']] ?? ("method 0x" .
+            dechex($msg['method']));
+        $this->logLine($method_name . " request from " . $peer);
         switch ($msg['method']) {
             case self::METHOD_BINDING:
                 $this->handleBinding($msg, $buf, $peer);
@@ -1062,6 +1391,8 @@ class TurnSite
             self::CLASS_SUCCESS, $msg['tid'], $attrs);
         @stream_socket_sendto($this->listener, $resp,
             0, $peer);
+        $this->logLine("told " . $peer . " its address is seen as " .
+            $host . ":" . $port);
     }
     /*
         --- Authentication helper ---
@@ -1214,6 +1545,8 @@ class TurnSite
             self::CLASS_ERROR, $msg['tid'], $blocks, $key);
         @stream_socket_sendto($this->listener, $resp, 0,
             $peer);
+        $this->logLine("answered " . $peer . " with " . $code . " " .
+            $reason);
     }
     /*
         --- TURN Allocate / Refresh ---
@@ -1304,8 +1637,17 @@ class TurnSite
         $alloc->username = $cred['username'];
         $alloc->expires = time() + $lifetime;
         $this->allocations[$key5] = $alloc;
-        $this->relay_index[$relay_host . ':' . $relay_port] =
-            $alloc;
+        /*
+            The reverse lookup when a datagram arrives on the relayed
+            socket reads that socket's own bound address, which is the
+            real local one and not the public address handed to the
+            browser; key the index by that same local address so an
+            inbound datagram finds its allocation. Where the two are the
+            same, as on the loopback, this is the address either way.
+         */
+        $relay_local = stream_socket_get_name($relay_sock, false);
+        $alloc->relay_local_key = $this->relayKey($relay_local);
+        $this->relay_index[$alloc->relay_local_key] = $alloc;
         $blocks = [
             $this->encodeAttr(
                 self::ATTR_XOR_RELAYED_ADDRESS,
@@ -1325,6 +1667,9 @@ class TurnSite
             $cred['key']);
         @stream_socket_sendto($this->listener, $resp, 0,
             $peer);
+        $this->logLine("gave " . $peer . " a relay address of " .
+            $relay_host . ":" . $relay_port . " for " . $lifetime .
+            "s");
     }
     /**
      * Picks a free port in the configured relay range and
@@ -1342,26 +1687,35 @@ class TurnSite
     {
         $is_v6 = $this->looksLikeIPv6($client_host);
         /*
-            Bind on the same loopback family so the relayed
-            address is reachable. A production deployment
-            would use the public address of the server's
-            external interface; the demo runs everything
-            against loopback.
+            Where a public address was named, bind the relayed socket on
+            every address of that family so a peer out on the internet
+            can reach it, and hand the browser the named public address
+            to reach it at. A browser passes that address to the other
+            browser, so it has to be one the other browser can reach.
+            Where none was named, keep to the loopback as before, which
+            serves only a browser on the same machine.
          */
-        $relay_host = $is_v6 ? '::1' : '127.0.0.1';
+        $advertised = $this->relay_address;
+        if ($advertised !== "") {
+            $bind_host = $is_v6 ? '::' : '0.0.0.0';
+            $report_host = $advertised;
+        } else {
+            $bind_host = $is_v6 ? '::1' : '127.0.0.1';
+            $report_host = $bind_host;
+        }
         $tries = 0;
         $low = $this->relay_port_low;
         $high = $this->relay_port_high;
         $max_tries = max(8, ($high - $low + 1));
         while ($tries < $max_tries) {
             $port = random_int($low, $high);
-            $addr = $this->formatBindAddress($relay_host,
+            $addr = $this->formatBindAddress($bind_host,
                 $port);
             $sock = @stream_socket_server($addr,
                 $errno, $errstr, STREAM_SERVER_BIND);
             if ($sock !== false) {
                 stream_set_blocking($sock, 0);
-                return [$sock, $relay_host, $port];
+                return [$sock, $report_host, $port];
             }
             $tries++;
         }
@@ -1657,6 +2011,9 @@ class TurnSite
          */
         $sendto = $this->looksLikeIPv6($ph) ?
             "[$ph]:$pp" : "$ph:$pp";
+        if (!is_resource($alloc->relay_socket)) {
+            return;
+        }
         @stream_socket_sendto($alloc->relay_socket,
             $data_attr, 0, $sendto);
     }
@@ -1704,6 +2061,9 @@ class TurnSite
         }
         $sendto = $this->looksLikeIPv6($ph) ?
             "[$ph]:$pp" : "$ph:$pp";
+        if (!is_resource($alloc->relay_socket)) {
+            return;
+        }
         @stream_socket_sendto($alloc->relay_socket,
             $payload, 0, $sendto);
     }

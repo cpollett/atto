@@ -28,6 +28,9 @@
  * @filesource
  */
 namespace seekquarry\atto;
+/* The event-loop watchdog is a tick function, which PHP calls only in
+   code compiled with this line. */
+declare(ticks=1000);
 
 /**
  * Abstract base for password / identity backends used by MailSite.
@@ -296,6 +299,16 @@ interface MailVocabulary
      * watchdog treats it as wedged and logs where it is stuck.
      */
     const WATCHDOG_SECONDS = 60;
+    /**
+     * BIND_TRIES says how many times, once a second, a listening port
+     * is opened again before MailSite gives up on it. A port that
+     * another process has not finished closing refuses a bind for a
+     * moment, and one try would end this server over a condition that
+     * clears itself. Fifteen tries cover that without holding on to a
+     * port that is truly taken by something else.
+     * @var int
+     */
+    const BIND_TRIES = 15;
     /** Canonical name of the always-present base folder. */
     const FOLDER_INBOX = 'INBOX';
     /** Canonical Sent folder (RFC 6154 \Sent special-use). */
@@ -343,12 +356,13 @@ abstract class MailStorage implements MailVocabulary
 {
     /**
      * The largest a single mail message may be, in bytes, when no size is
-     * configured. Twenty-five mebibytes is the size most mail providers
-     * settle on for an attachment-carrying message. Kept as a constant so
-     * the read paths can ask what a message may weigh without depending on
-     * a configured value being present.
+     * configured. Fifty mebibytes: most mail providers settle around
+     * twenty-five for an attachment-carrying message, and the wide
+     * headroom lets the heavier messages real inboxes hold still be
+     * read. Kept as a constant so the read paths can ask what a message
+     * may weigh without depending on a configured value being present.
      */
-    const MAX_MESSAGE_LEN_DEFAULT = 26214400;
+    const MAX_MESSAGE_LEN_DEFAULT = 52428800;
     /**
      * Where a storage class says something went wrong. A caller that wants
      * these can hand in somewhere to put them; otherwise they go to the
@@ -947,9 +961,9 @@ abstract class MailStorage implements MailVocabulary
     }
     /**
      * Extracts the value of a single header from a header block,
-     * unfolding continuation lines. Self-contained (no dependency
-     * on the Yioop library) because this class is shared with the
-     * standalone atto project. Case-insensitive on the field name.
+     * unfolding continuation lines. Self-contained, since this class
+     * depends on no library outside this project. The field name
+     * is matched whatever its capitalization.
      * @param string $header_block the message header text
      * @param string $name header field name, e.g. "Subject"
      * @return string the header value with folding removed, or ""
@@ -4035,8 +4049,8 @@ class RamMailStorage extends MailStorage
  *
  * $dsn_or_pdo is either a PDO DSN string ("sqlite:/path/to.db",
  * "mysql:host=h;dbname=d", etc.) or an already-constructed PDO
- * instance (lets a host app like Yioop hand in its existing
- * pooled connection instead of opening a second one).
+ * instance, which lets a host application hand in a connection it
+ * already holds rather than opening a second one.
  *
  * $blobs_dir is the directory under which content-addressed
  * blobs are stored. For "sqlite:<path>" DSNs we default to
@@ -4194,8 +4208,8 @@ class SqlMailStorage extends MailStorage
                 /*
                     Per-dialect INSERT-or-ignore. See
                     insertIgnoreSql() for the rewrite logic
-                    (Yioop's DatasourceManager::insertIgnore
-                    is the design reference).
+                    See insertIgnoreSql() for how each backend
+                    spells it.
                  */
                 'insert_ignore_prefix' => 'INSERT OR IGNORE',
                 'insert_ignore_suffix' => '',
@@ -4457,7 +4471,7 @@ class SqlMailStorage extends MailStorage
      * error. Followed by a discriminating UPDATE this gives
      * portable INSERT-or-UPDATE behavior.
      *
-     * Pattern follows Yioop's DatasourceManager::insertIgnore:
+     * Each backend spells this differently:
      * SQLite swaps "INSERT" for "INSERT OR IGNORE", MySQL uses
      * "INSERT IGNORE", Postgres keeps the leading verb and
      * appends "ON CONFLICT DO NOTHING".
@@ -4911,7 +4925,7 @@ class SqlMailStorage extends MailStorage
      * they match literally rather than as wildcards. The backslash
      * escape character is itself escaped first; the search query
      * pairs this with an explicit ESCAPE '\' clause, which is
-     * standard SQL honored by every backend Yioop targets.
+     * standard SQL honored by every backend this server supports.
      * @param string $term raw search term
      * @return string term with backslash, percent, and underscore
      *      escaped
@@ -5469,15 +5483,14 @@ class MailSite implements MailVocabulary
      */
     const MAX_MIME_DEPTH = 20;
     /**
-     * Largest body, in bytes, that is split into its multipart
-     * parts for BODYSTRUCTURE. A multipart body larger than this
-     * (typically a message dominated by a big base64 attachment)
-     * is left as a single part rather than parsed apart, because
-     * the string-copying parser would peak at several times the
-     * body size and could exhaust memory on a large message. A
-     * client fetching BODYSTRUCTURE then sees a single-part
-     * structure, which is acceptable, and can still fetch the
-     * whole body; the cap is well above ordinary mail.
+     * Largest leaf body, in bytes, that is copied out of a message
+     * while its BODYSTRUCTURE is built. A leaf larger than this, such
+     * as a big base64 attachment, has its size and line count read
+     * from the message bytes in place rather than from a copy, since
+     * a copy would double the memory held for the message. A multipart
+     * body is split into its parts whatever its size, because a
+     * multipart reported with no parts leaves a mail reader unable to
+     * find the text to show.
      */
     const MAX_STRUCTURE_PARSE_BYTES = 8388608;
     /**
@@ -5490,6 +5503,15 @@ class MailSite implements MailVocabulary
      * threshold. The unit is bytes.
      */
     const FETCH_FLUSH_THRESHOLD = 4194304;
+    /**
+     * How many messages a SEARCH looks at before handing the event
+     * loop a turn. A folder can hold tens of thousands of messages
+     * and each one read and looked at is work the single process
+     * cannot do while it serves anybody else, so the search stops
+     * to let other connections be answered and carries on. The unit
+     * is messages.
+     */
+    const SEARCH_YIELD_MESSAGES = 50;
     /**
      * When a single connection's queued output passes this many bytes the
      * server logs a warning naming that connection, because no legitimate
@@ -5544,10 +5566,10 @@ class MailSite implements MailVocabulary
     protected $authenticator;
     /**
      * Optional callback that maps an alias local-part to the
-     * username of the Yioop user who owns it, or returns an empty
-     * string when the local-part is not a registered alias. It is
-     * injected (rather than the atto-namespace MailSite reaching
-     * into a Yioop model directly) so this server stays usable in
+     * username of the account that owns it, or returns an empty
+     * string when the local-part is not a registered alias. The
+     * callback is handed in rather than looked up here, so this
+     * server stays usable in
      * the standalone atto project where mail aliases do not exist.
      * @var callable|null
      */
@@ -5624,6 +5646,13 @@ class MailSite implements MailVocabulary
      * @var float
      */
     protected $loop_tick = 0.0;
+    /**
+     * Wall-clock time, as a float, of the watchdog's last report, so a
+     * stall is reported about once every WATCHDOG_SECONDS rather than on
+     * every tick while it lasts.
+     * @var float
+     */
+    protected $watchdog_reported = 0.0;
     /**
      * A short note of what the event loop is doing right now, such as
      * "read key=5" or "fibers", updated as the loop moves through its
@@ -5819,8 +5848,8 @@ class MailSite implements MailVocabulary
     /**
      * Sends a message to every registered log callback; a no-op
      * when none are registered. MailSite uses this rather than
-     * any external logger so the atto-namespace class stays free
-     * of Yioop-specific code.
+     * any external logger, so this class depends on nothing
+     * outside the project.
      *
      * @param string $message the text to log
      * @return void
@@ -5832,6 +5861,19 @@ class MailSite implements MailVocabulary
         }
     }
     /**
+     * Sends one already-formatted line through the same log fan-out
+     * MailSite's own events use, so a hook an embedding daemon wires
+     * up, such as connection or handshake logging, can write to the
+     * daemon's log rather than a file of its own. This is the public
+     * door to the log channel that emitLog drives from inside.
+     * @param string $message the line to log
+     * @return void
+     */
+    public function logEvent($message)
+    {
+        $this->emitLog($message);
+    }
+    /**
      * Registers a callback invoked at the end of a DATA command
      * for each recipient that is remote (not a local mailbox) on
      * an authenticated session whose envelope sender is a local
@@ -5840,9 +5882,8 @@ class MailSite implements MailVocabulary
      * complete RFC 5322 message). The callback is expected to queue
      * the message for background outbound delivery; its return
      * value is ignored. Outbound delivery is not done inside the
-     * server itself because the atto-namespace MailSite must stay
-     * free of Yioop-specific delivery and DNS code, which lives in
-     * the factory that registers this callback.
+     * server itself, since delivery and name lookup belong to the
+     * application that registers this callback.
      * @param callable $callback callback to invoke
      * @return object this MailSite, for chaining
      */
@@ -5969,6 +6010,23 @@ class MailSite implements MailVocabulary
            address the spam routing keyed on. */
         $return_path = ($from === "") ? "<>" : "<$from>";
         $bytes = "Return-Path: $return_path\r\n" . $bytes;
+        /* Record how the message reached this server, as the final
+           delivery server is meant to under RFC 5321 section 4.4. A
+           message handed straight to this method never crossed the
+           network: webmail composing to a local address delivers here
+           without going out through the submission listener and back.
+           Naming that transport LOCAL keeps the trace complete and
+           tells anything reading it that the message was never exposed
+           to be read in passing. Written last of the three because each
+           is prepended, so this ends up the topmost header. */
+        $local_name = $this->default_server_globals['SERVER_NAME'];
+        $local_software =
+            $this->default_server_globals['SERVER_SOFTWARE'];
+        $received_at = gmdate("D, d M Y H:i:s") . " +0000";
+        $received_for = ($to === "") ? "" : "for <$to>";
+        $bytes = "Received: by " . $local_name . " (" . $local_software .
+            ") with LOCAL " . $received_for . "; " . $received_at .
+            "\r\n" . $bytes;
         $this->mail_storage->ensureUser($local);
         $uid = $this->mail_storage->appendMessage($local, $folder,
             $bytes, $flags);
@@ -6432,6 +6490,23 @@ class MailSite implements MailVocabulary
         return count($this->pending_fibers);
     }
     /**
+     * Returns the storage index-cache size as a folders-and-records
+     * pair, read from the storage backend so the heartbeat can log it
+     * beside the fiber and connection counts. The number is the backend's
+     * own, since the folder index cache lives with the storage rather
+     * than the server. A backend that keeps no such cache, or none set
+     * yet, reads as a zero pair.
+     * @return array [cached folder count, cached record count]
+     */
+    public function indexCacheSize()
+    {
+        if ($this->mail_storage !== null &&
+            method_exists($this->mail_storage, "indexCacheSize")) {
+            return $this->mail_storage->indexCacheSize();
+        }
+        return [0, 0];
+    }
+    /**
      * Returns how many client connections are open right now. A count
      * that climbs without falling, alongside parked fibers that never
      * clear, is the mark of a loop that has stopped draining its work,
@@ -6505,46 +6580,77 @@ class MailSite implements MailVocabulary
         return $this->loop_activity;
     }
     /**
-     * Installs a watchdog that notices when a single pass through the event
-     * loop runs far too long, the mark of a wedged loop, and logs what the
-     * loop was doing together with a backtrace, so the stuck code can be
+     * installWatchdog watches for a pass through the event loop that runs
+     * far too long, the mark of a wedged loop. When it sees one, it logs
+     * what the loop was doing and a backtrace, so the stuck code can be
      * found even though the loop itself has stopped logging. It works
-     * through an asynchronous SIGALRM, which interrupts a running PHP loop,
-     * where an ordinary timer, driven by the same stuck loop, could not
-     * fire. The alarm re-arms itself, so a stall is reported roughly every
-     * WATCHDOG_SECONDS for as long as it lasts. Where the process has no
-     * pcntl support, or the watchdog is switched off, nothing is installed.
+     * through a tick function, which PHP calls about every thousand
+     * statements of any code compiled with declare(ticks), as this file
+     * is, on Linux, macOS and Windows alike. A stall in such code is
+     * caught; one in a file without ticks, or inside a single long call
+     * to a built-in function, is not, since no tick runs there. A stall
+     * is reported about once every WATCHDOG_SECONDS while it lasts. When
+     * WATCHDOG_SECONDS is not positive, nothing is installed. listen calls
+     * it once, before the event loop starts.
      * @return void
      */
     protected function installWatchdog()
     {
-        if (self::WATCHDOG_SECONDS <= 0 ||
-            !function_exists("pcntl_async_signals")) {
+        if (self::WATCHDOG_SECONDS <= 0) {
             return;
         }
-        pcntl_async_signals(true);
-        pcntl_signal(SIGALRM, function () {
-            $stalled = microtime(true) - $this->loop_tick;
-            if ($stalled >= self::WATCHDOG_SECONDS) {
-                $trace = "";
-                foreach (debug_backtrace(
-                    DEBUG_BACKTRACE_IGNORE_ARGS, 15) as $frame) {
-                    $trace .= " " . ($frame["class"] ?? "") .
-                        ($frame["type"] ?? "") .
-                        ($frame["function"] ?? "?") . ":" .
-                        ($frame["line"] ?? "?");
-                }
-                $this->emitLog("MailSite watchdog: event loop stuck in " .
-                    $this->loop_activity . " for " . (int) $stalled .
-                    "s, memory " . memory_get_usage(true) . " peak " .
-                    memory_get_peak_usage(true) . ", " .
-                    $this->pendingFiberCount() . " fibers parked, " .
-                    $this->connectionCount() . " connections, " .
-                    "backtrace:" . $trace);
+        register_tick_function(function () {
+            $now = microtime(true);
+            $stalled = $now - $this->loop_tick;
+            if ($this->loop_tick <= 0 ||
+                $stalled < self::WATCHDOG_SECONDS ||
+                $now - $this->watchdog_reported < self::WATCHDOG_SECONDS) {
+                return;
             }
-            pcntl_alarm(self::WATCHDOG_SECONDS);
+            $this->watchdog_reported = $now;
+            $trace = "";
+            foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS, 15) as
+                $frame) {
+                $trace .= " " . ($frame["class"] ?? "") .
+                    ($frame["type"] ?? "") .
+                    ($frame["function"] ?? "?") . ":" .
+                    ($frame["line"] ?? "?");
+            }
+            $this->emitLog("MailSite watchdog: event loop stuck in " .
+                $this->loop_activity . " for " . (int) $stalled .
+                "s, memory " . memory_get_usage(true) . " peak " .
+                memory_get_peak_usage(true) . ", " .
+                $this->pendingFiberCount() . " fibers parked, " .
+                $this->connectionCount() . " connections, " .
+                "backtrace:" . $trace);
         });
-        pcntl_alarm(self::WATCHDOG_SECONDS);
+    }
+    /**
+     * dropToUser gives up root once the mail ports are bound. SMTP, IMAP
+     * and submission sit below 1024, which only root may bind, so a mail
+     * server that must answer on them is started as root; it has no
+     * reason to keep those rights afterward, and the web server drops the
+     * same way after opening its own ports. listen calls this as soon as
+     * every listener is open. The user is the one named by listen's USER
+     * option. A process that is not root, or one given no USER, is left
+     * as it is. The change is reported through the log hooks.
+     */
+    public function dropToUser()
+    {
+        $user = $this->default_server_globals['USER'] ?? "";
+        if (!function_exists("posix_geteuid") || posix_geteuid() !== 0 ||
+            $user == "") {
+            return;
+        }
+        $user_info = posix_getpwnam($user);
+        if (empty($user_info['uid'])) {
+            return;
+        }
+        if (function_exists("posix_setgid") && !empty($user_info['gid'])) {
+            posix_setgid($user_info['gid']);
+        }
+        posix_setuid($user_info['uid']);
+        $this->emitLog("MailSite now running as $user");
     }
     /**
      * Binds the SMTP and IMAP listening sockets and runs the
@@ -6580,6 +6686,11 @@ class MailSite implements MailVocabulary
                 is no eavesdropper.
              */
             'ALLOW_PLAINTEXT_AUTH' => false,
+            /*
+                The user a server started as root runs as once its
+                ports are bound; empty keeps the user it started as.
+             */
+            'USER' => '',
         ];
         $context_array = [];
         if (isset($config['SERVER_CONTEXT'])) {
@@ -6612,11 +6723,30 @@ class MailSite implements MailVocabulary
             }
             $address = "tcp://$bind:" .
                 $this->default_server_globals[$port_key];
-            $stream = @stream_socket_server($address,
-                $errno, $errstr,
-                STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+            $stream = false;
+            $errstr = "";
+            /* A port another process has not finished closing refuses
+               a bind, and says so with the port being in use. One try
+               would end this server over a condition that clears itself
+               in a moment, so the bind is tried again for a while. */
+            for ($tries = 0; $tries < self::BIND_TRIES; $tries++) {
+                $errno = 0;
+                $stream = @stream_socket_server($address,
+                    $errno, $errstr,
+                    STREAM_SERVER_BIND | STREAM_SERVER_LISTEN);
+                if ($stream) {
+                    break;
+                }
+                if ($tries == 0) {
+                    $this->emitLog("Could not bind $label $address yet: " .
+                        $errstr . "; trying again for " . self::BIND_TRIES .
+                        " seconds");
+                }
+                sleep(1);
+            }
             if (!$stream) {
-                echo "Failed to bind $label $address: $errstr\n";
+                $this->emitLog("Failed to bind $label $address: " .
+                    $errstr);
                 return null;
             }
             stream_set_blocking($stream, 0);
@@ -6665,8 +6795,9 @@ class MailSite implements MailVocabulary
             self::MODIFIED_TIME => [],
         ];
         foreach ($announce as $listener) {
-            echo "AttoMail listening: $listener\n";
+            $this->emitLog("AttoMail listening: $listener");
         }
+        $this->dropToUser();
         $excepts = null;
         $this->installWatchdog();
         while (true) {
@@ -7722,15 +7853,10 @@ class MailSite implements MailVocabulary
     protected function verifyAndSetAuth($key, $user, $pass, &$context)
     {
         $ok = false;
-        $prof_start = microtime(true);
         if ($this->authenticator !== null) {
             $ok = $this->authenticator->verifyPassword($user,
                 $pass);
         }
-        /* TEMPORARY auth profiling; remove after measuring */
-        file_put_contents("/tmp/yioop_authprof.log", sprintf(
-            "SMTP %s verify=%.0fms\n", strtolower($user),
-            (microtime(true) - $prof_start) * 1000), FILE_APPEND);
         if ($ok) {
             $context['AUTH_USER'] = strtolower($user);
             $context['STATE'] = 'READY';
@@ -7933,6 +8059,7 @@ class MailSite implements MailVocabulary
         $marker = "\r\n.\r\n";
         $position = strpos($buffer, $marker);
         $marker_len = 5;
+        $line_end_len = 2;
         if ($position === false) {
             $alternative = "\n.\n";
             $alt_pos = strpos($buffer, $alternative);
@@ -7955,8 +8082,12 @@ class MailSite implements MailVocabulary
             }
             $position = $alt_pos;
             $marker_len = 3;
+            $line_end_len = 1;
         }
-        $message = substr($buffer, 0, $position + 2);
+        /* The message keeps its own last line ending, two bytes before a
+           CRLF marker and one before a bare LF one. Cutting two bytes for
+           both left the dot of a bare LF marker on the end of the message. */
+        $message = substr($buffer, 0, $position + $line_end_len);
         $buffer = substr($buffer, $position + $marker_len);
         $message = preg_replace('/(\r\n|\n)\.(\r\n|\n|\.)/',
             '$1$2', $message);
@@ -8110,7 +8241,7 @@ class MailSite implements MailVocabulary
             $this->default_server_globals['SERVER_SOFTWARE'];
         /* RFC 3848 with-protocol keyword: the S suffix marks a
            TLS-protected hop and the A suffix marks an
-           authenticated one, so a reader (and Yioop's own
+           authenticated one, so a reader (and the site's own
            insecure-arrival notice) can tell from the trace header
            whether this hop used TLS. */
         $secure = !empty($context['TLS_ACTIVE']);
@@ -8501,10 +8632,8 @@ class MailSite implements MailVocabulary
     protected function finishImapLogin($key, $tag, $user, $pass,
         &$context)
     {
-        $prof_start = microtime(true);
         $prof_ok = ($this->authenticator !== null &&
             $this->authenticator->verifyPassword($user, $pass));
-        $prof_verified = microtime(true);
         if (!$prof_ok) {
             $this->queueWrite($key,
                 "$tag NO [AUTHENTICATIONFAILED] " .
@@ -8514,16 +8643,8 @@ class MailSite implements MailVocabulary
         $context['AUTH_USER'] = strtolower($user);
         $context['STATE'] = 'AUTH';
         $this->mail_storage?->ensureUser($context['AUTH_USER']);
-        $prof_ensured = microtime(true);
         $consolidations = $this->mail_storage?->ensureStandardFolders(
             $context['AUTH_USER']) ?? [];
-        $prof_done = microtime(true);
-        /* TEMPORARY auth profiling; remove after measuring */
-        file_put_contents("/tmp/yioop_authprof.log", sprintf(
-            "IMAP %s verify=%.0fms ensureuser=%.0fms folders=%.0fms\n",
-            $context['AUTH_USER'], ($prof_verified - $prof_start) * 1000,
-            ($prof_ensured - $prof_verified) * 1000,
-            ($prof_done - $prof_ensured) * 1000), FILE_APPEND);
         foreach ($consolidations as $consolidation) {
             $outcome = $consolidation['deleted'] ?
                 "and removed \"" . $consolidation['from'] . "\"" :
@@ -10293,6 +10414,14 @@ class MailSite implements MailVocabulary
     protected function imapParseHeaders($message)
     {
         $sep_pos = strpos($message, "\r\n\r\n");
+        if ($sep_pos === false) {
+            /* A message whose lines end in a bare newline ends its
+               headers with one blank line all the same. Looking only
+               for the pair of carriage-return newlines left the whole
+               message standing as its header block, so every line of
+               the body was split apart and read for a colon. */
+            $sep_pos = strpos($message, "\n\n");
+        }
         $block = ($sep_pos === false) ? $message :
             substr($message, 0, $sep_pos);
         $lines = preg_split('/\r\n|\n/', $block);
@@ -10323,6 +10452,49 @@ class MailSite implements MailVocabulary
             $current = $name;
         }
         return $output;
+    }
+    /**
+     * Turns text written in some other character set into the one the
+     * rest of the mail server works in. A message may name a character
+     * set this build of PHP has never heard of, and asking it to convert
+     * from an unknown name raises an error rather than returning a
+     * failure, which stopped the server outright while a mailbox was
+     * being searched. The name is checked first, another way of
+     * converting is tried where one is at hand, and text that cannot be
+     * converted is handed back as it came rather than lost.
+     *
+     * @param string $text what the message carried
+     * @param string $charset what the message says it is written in
+     * @return string the same text as UTF-8 where that could be done
+     */
+    public function toUtf8FromCharset($text, $charset)
+    {
+        $named = strtoupper(trim($charset));
+        if ($named === "" || $named === 'UTF-8' || $named === 'UTF8' ||
+            $named === 'US-ASCII' || $named === 'ASCII') {
+            return $text;
+        }
+        if (function_exists('mb_convert_encoding')) {
+            try {
+                $converted = mb_convert_encoding($text, 'UTF-8', $named);
+                if (is_string($converted)) {
+                    return $converted;
+                }
+            } catch (\Throwable $problem) {
+                $converted = false;
+            }
+        }
+        if (function_exists('iconv')) {
+            set_error_handler(function () {
+                return true;
+            });
+            $converted = iconv($named, 'UTF-8//TRANSLIT', $text);
+            restore_error_handler();
+            if (is_string($converted)) {
+                return $converted;
+            }
+        }
+        return $text;
     }
     /**
      * Decodes RFC 2047 encoded-words in a header value back
@@ -10363,15 +10535,7 @@ class MailSite implements MailVocabulary
                     $text = str_replace('_', ' ', $text);
                     $decoded = quoted_printable_decode($text);
                 }
-                if ($charset !== 'UTF-8' &&
-                    $charset !== 'US-ASCII' &&
-                    function_exists('mb_convert_encoding')) {
-                    $converted = @mb_convert_encoding($decoded,
-                        'UTF-8', $charset);
-                    if ($converted !== false) {
-                        $decoded = $converted;
-                    }
-                }
+                $decoded = $this->toUtf8FromCharset($decoded, $charset);
                 return "\x01EW\x01" . $decoded . "\x01/EW\x01";
             }, $value);
         $value = preg_replace(
@@ -10622,9 +10786,18 @@ class MailSite implements MailVocabulary
             isset($params['boundary'])) {
             $boundary = (string) $params['boundary'];
             if (trim($boundary) !== '' &&
-                $depth < self::MAX_MIME_DEPTH &&
-                $body_size <= self::MAX_STRUCTURE_PARSE_BYTES) {
-                $entity['parts'] = $this->imapSplitMultipart($body,
+                $depth < self::MAX_MIME_DEPTH) {
+                /* A multipart is always split into its parts, whatever its
+                   size. Leaving a large one as a multipart with no parts
+                   gave a client a structure it cannot use: a mail reader
+                   that picks the text part by section number found none
+                   and showed the raw preamble as the whole message. The
+                   splitter walks the body by offset and copies each part
+                   once, so the cost is one copy of the largest part, which
+                   the size guard on a leaf body below already allows. */
+                $split_body = ($body === '') ?
+                    substr($bytes, $body_offset) : $body;
+                $entity['parts'] = $this->imapSplitMultipart($split_body,
                     $boundary, $depth + 1);
             }
         }
@@ -11195,11 +11368,22 @@ class MailSite implements MailVocabulary
         $last_uid = empty($messages) ? 0 :
             end($messages)['uid'];
         $hits = [];
+        $looked_at = 0;
         foreach ($messages as $index => $meta) {
             $sequence_number = $index + 1;
             if ($this->imapEvalSearch($tokens, $meta, $sequence_number,
                 $last_seq, $last_uid, $user, $folder)) {
                 $hits[] = $by_uid ? $meta['uid'] : $sequence_number;
+            }
+            $looked_at++;
+            /* Inside the cooperative loop the search hands its turn
+               back every so often, so a long one answers other
+               connections as it goes rather than stopping the server
+               until it finishes. Run from the command line there is no
+               fiber to hand back to and the search simply carries on. */
+            if ($looked_at % self::SEARCH_YIELD_MESSAGES === 0 &&
+                \Fiber::getCurrent() !== null) {
+                \Fiber::suspend();
             }
         }
         $verb = $by_uid ? 'UID SEARCH' : 'SEARCH';
@@ -11291,6 +11475,7 @@ class MailSite implements MailVocabulary
     {
         $cursor = 0;
         $body_cache = null;
+        $header_cache = null;
         $get_body = function () use (&$body_cache, $user,
             $folder, $meta) {
             if ($body_cache === null) {
@@ -11302,8 +11487,33 @@ class MailSite implements MailVocabulary
             }
             return $body_cache;
         };
+        /* A term about a header wants only the front of the message,
+           and the storage can read that much and stop. Reading the
+           whole message for it, as this did, meant a search over a
+           folder read every message in it off the disk end to end and
+           then split the whole of each into lines looking for a colon.
+           On a mailbox of any size that held the event loop for
+           minutes at a time. Where a term has already asked for the
+           body, that is used rather than reading twice. */
+        $get_headers = function () use (&$header_cache, &$body_cache,
+            $user, $folder, $meta) {
+            if ($header_cache === null) {
+                if ($body_cache !== null) {
+                    $header_cache = $body_cache;
+                } else {
+                    $header_cache = $this->mail_storage
+                        ->messageHeaderBytes($user, $folder,
+                        $meta['uid']);
+                    if ($header_cache === false) {
+                        $header_cache = '';
+                    }
+                }
+            }
+            return $header_cache;
+        };
         $eval_one = function () use (&$cursor, &$tokens, $meta,
-            $sequence_number, $last_seq, $last_uid, $get_body, &$eval_one) {
+            $sequence_number, $last_seq, $last_uid, $get_body,
+            $get_headers, &$eval_one) {
             if ($cursor >= count($tokens)) {
                 return null;
             }
@@ -11384,7 +11594,7 @@ class MailSite implements MailVocabulary
                 $keyword === 'SUBJECT') {
                 $argument = $tokens[$cursor++][1] ?? '';
                 $header_map = $this->imapParseHeaders(
-                    $get_body());
+                    $get_headers());
                 $header_key = strtolower($keyword);
                 $value = $header_map[$header_key] ?? '';
                 /*
@@ -11399,7 +11609,7 @@ class MailSite implements MailVocabulary
                 $name = $tokens[$cursor++][1] ?? '';
                 $argument = $tokens[$cursor++][1] ?? '';
                 $header_map = $this->imapParseHeaders(
-                    $get_body());
+                    $get_headers());
                 $value = $header_map[strtolower($name)] ?? '';
                 $value = $this->imapDecodeMimeHeader($value);
                 return $argument === '' ? $value !== '' :
@@ -11467,6 +11677,16 @@ class MailSite implements MailVocabulary
             $term = $eval_one();
             $r = $r && $term;
         }
+        /* The reader above names itself, so that it can call itself for
+           a group of terms, and a thing that names itself is not let go
+           when the count of what points at it drops: it points at
+           itself. It holds the reader of the message body, and that
+           holds the body, so searching a folder kept every message read
+           along the way. Letting go of the name here breaks the ring
+           and the message is released with the search of it. */
+        $eval_one = null;
+        $body_cache = null;
+        $header_cache = null;
         return $r;
     }
     /**

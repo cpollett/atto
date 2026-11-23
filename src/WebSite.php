@@ -53,11 +53,67 @@ use Exception;
 
 class WebSite
 {
+    /**
+     * Bytes the file write journal may reach before a write starts it
+     * again empty. A process that finds the journal shorter than where it
+     * last read drops its whole file cache, which is always safe.
+     */
+    const FILE_JOURNAL_MAX_BYTES = 1000000;
+    /**
+     * PAYLOAD_TOO_LARGE is the response code sent for a request whose
+     * length passes MAX_REQUEST_LEN, so a client such as git can say the
+     * request was too large rather than malformed. For example, a 24 MB
+     * push to a server whose MAX_REQUEST_LEN is 10 MB is answered 413.
+     */
+    const PAYLOAD_TOO_LARGE = 413;
+    /**
+     * Seconds a worker process has to start and connect back.
+     */
+    const WORKER_START_SECONDS = 30;
+    /**
+     * Seconds the front waits for a connection on the worker link to show
+     * the hash that proves it is the worker it started, before closing it.
+     */
+    const WORKER_PROOF_SECONDS = 0.5;
+    /**
+     * WORKER_ACCEPT_WAIT is how long, in seconds, startWorkers waits each
+     * time it looks for the first workers to connect back, the same as the
+     * front once waited between looks while a worker started.
+     */
+    const WORKER_ACCEPT_WAIT = 0.05;
+    /**
+     * Seconds before a worker that failed to start is started again, so a
+     * worker that cannot start does not cost every request a new process.
+     */
+    const WORKER_RETRY_SECONDS = 30;
+    /**
+     * Most connections refused on the worker link noted in the worker log
+     * in one minute; beyond it they are counted and the count is noted.
+     */
+    const WORKER_REFUSALS_NOTED_PER_MINUTE = 5;
+    /**
+     * Most bytes read from a worker's link in one go.
+     */
+    const WORKER_READ_BYTES = 1048576;
     /*
         Field component name constants used in input or output stream array
      */
+    /**
+     * What is added to a file's path to key its gzip compressed contents
+     * in the RAM file cache, beside the plain contents under the path
+     * itself. A path cannot end this way, so the two never collide.
+     */
+    const COMPRESSED_CACHE_SUFFIX = "#gzip";
     const CONNECTION = 0;
     const DATA = 1;
+    /**
+     * Seconds a stopping server keeps serving the connections it still
+     * has before it closes them and stops. A client that keeps its
+     * connection open, as a crawler does, would otherwise hold the
+     * server up for as long as it liked, and a restart waiting behind the
+     * loop would never run.
+     */
+    const STOP_DRAIN_LIMIT = 10;
     const MODIFIED_TIME = 2;
     const CONTEXT = 3;
     /**
@@ -75,6 +131,16 @@ class WebSite
      */
     const DATA_OFFSET = 4;
     /**
+     * Subkey for a file standing in for the rest of
+     * $out_streams[self::DATA][$key]. A reply that is a file on disk --
+     * a pack built for a git pull, an attachment -- is drained from the
+     * file a piece at a time rather than read into a string, so a reply
+     * far larger than the server's memory can be sent while the loop
+     * keeps serving everything else. Holds ["path" => where the file is,
+     * "handle" => the open file, "left" => bytes still to send].
+     */
+    const DATA_FILE = 5;
+    /**
      * Threshold for compacting the consumed prefix of
      * $out_streams[self::DATA][$key] when DATA_OFFSET
      * grows past this many bytes (and at least half the
@@ -84,6 +150,42 @@ class WebSite
      * connection.
      */
     const OUT_DATA_COMPACT_THRESHOLD = 65536;
+    /**
+     * How many bytes of a file-backed reply are read into the send buffer
+     * at a time. Small enough that a reply of any size costs little
+     * memory, large enough that a big file is not read a sliver at a
+     * time.
+     */
+    const OUT_FILE_STEP = 262144;
+    /**
+     * How long a timer's callback may run, in seconds, before the loop
+     * writes a line saying which callback held it and for how long. A
+     * request that arrives while a callback runs waits the whole of it,
+     * so a callback past this is what a slow reply that did no work
+     * itself was waiting on.
+     */
+    const SLOW_TIMER = 0.1;
+    /**
+     * Milliseconds in a second, for printing a callback's running time.
+     */
+    const MILLISECONDS_PER_SECOND = 1000;
+    /**
+     * How many bytes long an IPv4 address is. Used to tell an IPv4
+     * address from an IPv6 one, which is sixteen bytes long.
+     */
+    const IPV4_ADDRESS_BYTES = 4;
+    /**
+     * How many leading bytes of an IPv4 address say which block of IP
+     * addresses it belongs to. Three of its four, the smallest block an
+     * internet provider hands out as a unit.
+     */
+    const IPV4_BLOCK_BYTES = 3;
+    /**
+     * How many leading bytes of an IPv6 address say which block of IP
+     * addresses it belongs to. Eight of its sixteen, the smallest block
+     * an internet provider hands out as a unit.
+     */
+    const IPV6_BLOCK_BYTES = 8;
     /**
      * Largest number of bytes moved between a socket and memory in a
      * single read or write pass, 128 kibibytes, when the server is not
@@ -129,6 +231,40 @@ class WebSite
      * on every event-loop pass to keep its cost away.
      */
     const SESSION_REAP_INTERVAL = 60;
+    /**
+     * How many seconds to leave between walks of the session folder for
+     * session files no kept session owns. The first walk is made when the
+     * server starts, so files left by an earlier run go then.
+     */
+    const SESSION_FILE_SWEEP_INTERVAL = 3600;
+    /**
+     * What every session file's name starts with; the session id follows.
+     */
+    const SESSION_FILE_PREFIX = "atto_session_";
+    /**
+     * How old in seconds a session file no kept session owns must be
+     * before the walk of the session folder deletes it. Other servers may
+     * keep their session files in the same folder; a session of theirs
+     * left unchanged this long would have been dropped by their own idle
+     * sweep, unless they were set to keep sessions longer than this.
+     */
+    const SESSION_FILE_ORPHAN_AGE = 86400;
+    /**
+     * Most names of the session folder one event-loop pass looks at. The
+     * walk of the folder is spread over many passes, so a folder holding a
+     * great many files never keeps the server from taking connections.
+     */
+    const SESSION_FILE_SWEEP_BATCH = 500;
+    /**
+     * Most seconds one event-loop pass spends walking the session folder,
+     * whichever of this and SESSION_FILE_SWEEP_BATCH is reached first.
+     */
+    const SESSION_FILE_SWEEP_STEP_TIME = 0.01;
+    /**
+     * Most microseconds the event loop sleeps between steps of a walk of
+     * the session folder, so the walk goes on while no one connects.
+     */
+    const SESSION_FILE_SWEEP_PAUSE = 50000;
     /**
      * Number of times openListener retries a failed bind before
      * giving up. A restart spawns the replacement process while the
@@ -220,6 +356,14 @@ class WebSite
      */
     const H2_READ_CHUNK_SIZE = 65536;
     /**
+     * How many seconds a whole-frame control write waits for the
+     * socket to take more bytes after a partial write, before the
+     * connection is given up as past saving. Control frames are a
+     * few tens of bytes, so a peer that cannot take them inside
+     * this wait is gone or wedged.
+     */
+    const CONTROL_FRAME_WRITE_WAIT = 5;
+    /**
      * Most HTTP/2 streams the server keeps open at once on one
      * connection. A request that would open a stream past this is
      * refused with RST_STREAM rather than served, so a client that
@@ -293,10 +437,39 @@ class WebSite
      */
     public $restart;
     /**
+     * $listen_address holds the address this server was told to listen
+     * on, kept so that whatever starts a replacement server can be told
+     * the same address. A server told to listen on several addresses at
+     * once keeps the word "multi" here instead.
+     * @var string
+     */
+    public $listen_address = "";
+    /**
      * Used to signal stopping the website
      * @var boolean
      */
     public $stop;
+    /**
+     * $stop_started holds the time the loop first saw the stop signal, so
+     * it can give the connections still open STOP_DRAIN_LIMIT seconds and
+     * then close them; zero while the server is not stopping.
+     * @var float
+     */
+    public $stop_started = 0;
+    /**
+     * $stop_drain_limit is how many seconds a stopping server keeps serving
+     * the connections it still has, STOP_DRAIN_LIMIT unless whoever asked
+     * for the stop wants it shorter, as a restart that has to be over in a
+     * few seconds does.
+     * @var float
+     */
+    public $stop_drain_limit = self::STOP_DRAIN_LIMIT;
+    /**
+     * Most microseconds the event loop of a stopping server sleeps between
+     * passes, so it sees at once that its connections have closed or that
+     * its time to drain them is up, rather than at its next timer.
+     */
+    const STOP_PASS_PAUSE = 100000;
     /**
      * A WebSite instance-wide associative array that can be used by routes to
      * store things like bad ips without having deprecation notices for
@@ -336,6 +509,16 @@ class WebSite
      */
     protected $in_streams = [];
     /**
+     * Whether a failure while a request is handled is let out rather
+     * than caught. Caught, it is written down and only that one
+     * connection is let go, so the server carries on for everyone
+     * else; let out, it ends the server, which is what someone
+     * tracking such a failure down wants. The site sets this from its
+     * own settings; the server itself reads no settings.
+     * @var bool
+     */
+    public $no_wrap_requests = false;
+    /**
      * Array of all connection streams for which we are writing data to a
      * client together with associated stream info
      * @var array
@@ -351,6 +534,32 @@ class WebSite
      * @var string
      */
     protected $in_flight_request = "";
+    /**
+     * How many requests this server has handled since it started. The
+     * memory line reports it so a reader can tell memory that climbs
+     * with work done from memory that climbs with time.
+     * @var int
+     */
+    protected $requests_served = 0;
+    /**
+     * The time, in seconds since the epoch, the last memory line was
+     * written. Zero before the first one, which starts the clock rather
+     * than writing a line.
+     * @var int
+     */
+    protected $memory_line_written_at = 0;
+    /**
+     * How many requests had been served when the last memory line was
+     * written, so the next line can say how many came between them.
+     * @var int
+     */
+    protected $memory_line_requests = 0;
+    /**
+     * The memory in bytes the server held when the last memory line was
+     * written, so the next line can say how much it grew.
+     * @var int
+     */
+    protected $memory_line_used = 0;
     /**
      * A block of memory claimed up front and freed at the very start of
      * the memory-fatal handler, so that after the allocator has refused
@@ -443,6 +652,12 @@ class WebSite
      */
     protected $timers = [];
     /**
+     * How many timers setTimer has made, so each is given an id of its own
+     * that it keeps for as long as it repeats.
+     * @var int
+     */
+    protected $timers_made = 0;
+    /**
      * Priority queue of which timers are about to go off
      * @var \SplMinHeap
      */
@@ -455,6 +670,20 @@ class WebSite
      */
     protected $last_memory_sample_time = 0;
     /**
+     * Wall-clock time, in seconds with a fraction, of the last memory
+     * sample, from which sampleMemoryUsage measures how much processor
+     * time the server used since then. Zero before the first sample.
+     * @var float
+     */
+    protected $last_cpu_sample_wall = 0.0;
+    /**
+     * Processor seconds, user and system together, this process had used
+     * at the last memory sample. sampleMemoryUsage subtracts it from the
+     * current total to get the time used over the sample period.
+     * @var float
+     */
+    protected $last_cpu_sample_seconds = 0.0;
+    /**
      * How many seconds to leave between memory-usage samples, set from
      * the server config when the server starts, with zero meaning the
      * sampling is off. See sampleMemoryUsage.
@@ -462,12 +691,266 @@ class WebSite
      */
     protected $memory_sample_period = 0;
     /**
+     * Path of the file write journal that several server processes share,
+     * or "" when this server runs alone. filePutContents appends the path
+     * of each file it writes, and syncFileJournal reads what other
+     * processes appended, so no process serves a cached copy another has
+     * replaced. Set from FILE_JOURNAL when the server starts.
+     * @var string
+     */
+    protected $file_journal = "";
+    /**
+     * How many bytes of the file write journal this process has read.
+     * @var int
+     */
+    protected $file_journal_offset = 0;
+    /**
+     * Worker processes that run requests for this front process, when the
+     * WORKERS start option asks for more than one process. Each entry has
+     * the worker's proc_open handle, its loopback link, how many requests
+     * it is running and the bytes read from it not yet parsed. Empty when
+     * the server runs as one process, which is the default.
+     * @var array
+     */
+    protected $workers = [];
+    /**
+     * How many workers WORKERS asked for, so one that stops is replaced.
+     * @var int
+     */
+    protected $worker_count = 0;
+    /**
+     * By worker number, the time before which a worker that failed to
+     * start is not started again.
+     * @var array
+     */
+    protected $worker_retry_after = [];
+    /**
+     * $worker_starts holds, by worker number, each worker started and not
+     * yet connected back: its process, if this process started it with
+     * proc_open, the hash it must show to prove it is that worker, and the
+     * time past which the front stops waiting for it. finishWorkerStarts
+     * takes a worker from here into $workers once it has connected, so
+     * the front serves requests while a worker starts.
+     * @var array
+     */
+    protected $worker_starts = [];
+    /**
+     * $worker_pending_links holds the connections taken on the worker link
+     * that have not yet shown a hash: for each, the connection, what it has
+     * sent so far and when it was taken.
+     * @var array
+     */
+    protected $worker_pending_links = [];
+    /**
+     * The minute, refusals noted in it, and refusals counted but not noted,
+     * for connections refused on the worker link.
+     * @var array
+     */
+    protected $worker_refusals = ["minute" => 0, "noted" => 0,
+        "unnoted" => 0];
+    /**
+     * The command line that starts a worker: the PHP binary, the script
+     * that builds this site, and whatever tells that script to call
+     * serveAsWorker rather than listen. Set from WORKER_COMMAND.
+     * @var array
+     */
+    protected $worker_command = [];
+    /**
+     * $worker_start, where the site gives one with the WORKER_START start
+     * option, is the function that starts a worker in place of running
+     * $worker_command here. The site can then start workers the way it
+     * starts its other programs, which need not keep this process's
+     * listening sockets open in the worker. It is called with the
+     * worker's settings already in the environment, and the worker
+     * reports its process id over its link once it has proved itself.
+     * @var callable|null
+     */
+    protected $worker_start = null;
+    /**
+     * $worker_reserved, from the WORKER_RESERVED start option, is a
+     * function the front calls on each request it relays. When it returns
+     * true and there are two or more workers, the request goes to the last
+     * worker, which no other request uses, so that kind of request never
+     * waits behind the rest. An application can keep its own most urgent
+     * requests there.
+     * @var callable|null
+     */
+    protected $worker_reserved = null;
+    /**
+     * $worker_stop, from the WORKER_STOP start option, is a function the
+     * front calls with a worker's process id and true to ask the worker to
+     * stop, or false to end it at once. An application can pass one that
+     * works on Linux, macOS and Windows. Without it, a worker started with
+     * proc_open
+     * is ended through its process handle, and any other through
+     * posix_kill where PHP has it.
+     * @var callable|null
+     */
+    protected $worker_stop = null;
+    /**
+     * $front_work holds, since the last [website-front] line, how many
+     * requests of each kind the front handled and the processor time it
+     * spent on them: "relayed" for requests sent to a worker, counting
+     * only the front's own part, "kept" for requests the front ran itself
+     * while it has workers, and "served" when it has none. For kept and
+     * served requests it also counts each path, cut at its query, so the
+     * line can name the ones that cost the front most.
+     * "closed_before_first_byte" counts connections to a TLS port whose
+     * peer closed before sending anything.
+     * @var array
+     */
+    protected $front_work = [];
+    /**
+     * $front_work_since is the front's whole processor time, in seconds,
+     * when the last [website-front] line was written, so the next line
+     * can say how much went to work outside any one request: accepting
+     * connections, TLS, reading and writing sockets, and the loop itself.
+     * @var float
+     */
+    protected $front_work_since;
+    /**
+     * $relayed_by_connection maps a connection key to the ids of the
+     * requests from that connection now at a worker, each to its worker
+     * number. When the connection closes, relayToWorker's work is wasted,
+     * so cancelRelayedRequests tells the worker to drop them.
+     * @var array
+     */
+    protected $relayed_by_connection = [];
+    /**
+     * $cancelled_requests holds the ids of relayed requests whose
+     * connection closed before their reply came, so the request's fiber
+     * ends without writing anything.
+     * @var array
+     */
+    protected $cancelled_requests = [];
+    /**
+     * File a worker's standard output and errors go to, from WORKER_LOG.
+     * @var string
+     */
+    protected $worker_log = "";
+    /**
+     * Loopback listener workers connect back to at start.
+     * @var resource|null
+     */
+    protected $worker_listener = null;
+    /**
+     * Replies read from workers and not yet taken by the request waiting
+     * for them, keyed by request id.
+     * @var array
+     */
+    protected $worker_replies = [];
+    /**
+     * $worker_started holds, keyed by request id with the value true, the
+     * requests a worker has said it took up and whose relay has not yet
+     * finished. It outlasts the worker, so a request whose worker was
+     * ended while it ran is answered with a 502 rather than run a second
+     * time on another worker.
+     * @var array
+     */
+    protected $worker_started = [];
+    /**
+     * Id given to the last request sent to a worker.
+     * @var int
+     */
+    protected $worker_request_id = 0;
+    /**
+     * Says, for the request about to run, whether it must run in this
+     * process rather than a worker, from the FRONT_ONLY start option. A
+     * site gives it for requests whose reply is streamed, such as a video
+     * sent in ranges, since a stream is sent from here as it is made; a
+     * worker would have to finish it first. Null when none is given.
+     * @var callable|null
+     */
+    protected $front_only = null;
+    /**
+     * Path saveSessionsForRestart last wrote sessions to during the
+     * current request, so a worker can tell the front process, which
+     * holds every session, to write them all there instead.
+     * @var string
+     */
+    protected $saved_sessions_path = "";
+    /**
+     * $worker_reply_file is the file a worker's route handed over with
+     * deferBodyFromFile as its reply's body, which serveAsWorker sends to
+     * the front by name; "" while a worker runs a request that handed over
+     * no file, and null outside a worker
+     * @var string|null
+     */
+    protected $worker_reply_file = null;
+    /**
+     * $worker_remove_file says whether the front deletes
+     * $worker_reply_file once it has sent it
+     * @var bool
+     */
+    protected $worker_remove_file = false;
+    /**
+     * $worker_link is a worker's connection to its front process, kept by
+     * serveAsWorker so that deferBodyFromFile can name a growing file to
+     * the front while the route is still writing it; null outside a worker
+     * @var resource|null
+     */
+    protected $worker_link = null;
+    /**
+     * $worker_running_id is the id the front gave the request a worker is
+     * running, which a message about that request carries; 0 outside a
+     * worker
+     * @var int
+     */
+    protected $worker_running_id = 0;
+    /**
+     * $worker_grown_file is the growing file a worker's route named to the
+     * front during the request being run, or "" when it named none. The
+     * request's last reply names it again, so a front whose client went
+     * away before the file was sent can delete it.
+     * @var string
+     */
+    protected $worker_grown_file = "";
+    /**
+     * $worker_growing holds, by request id, the message a worker sends
+     * when its route starts a reply whose body is a file it is still
+     * writing. readWorkerReplies stores the message here, and the fiber
+     * relaying that request takes it and starts sending the file.
+     * @var array
+     */
+    protected $worker_growing = [];
+    /**
+     * $parked_files holds, by connection key, the socket of each HTTP/1.1
+     * connection whose reply is a growing file that has no unsent bytes
+     * yet. Such a connection is taken out of the write set, so the loop
+     * sleeps instead of going round with nothing to write;
+     * refillStreamingGenerators puts it back once the file has grown or
+     * its writer has finished.
+     * @var array
+     */
+    protected $parked_files = [];
+    /**
      * Unix time in seconds of the last idle-session sweep, used to keep
      * the sweep to the SESSION_REAP_INTERVAL cadence. See
      * reapIdleSessions.
      * @var int
      */
     protected $last_session_reap_time = 0;
+    /**
+     * Unix time in seconds of the last walk of the session folder, used to
+     * keep the walk to the SESSION_FILE_SWEEP_INTERVAL cadence. See
+     * sweepSessionFiles.
+     * @var int
+     */
+    protected $last_session_file_sweep_time = 0;
+    /**
+     * Directory handle of the session folder while a walk of it is under
+     * way, null between walks. See sweepSessionFiles.
+     * @var resource|null
+     */
+    protected $session_file_sweep_handle = null;
+    /**
+     * What the walk of the session folder under way has done so far: the
+     * names it has looked at (LOOKED), the files it has deleted (DELETED)
+     * and the time it began (BEGAN), for the log line written when it
+     * ends. See sweepSessionFiles.
+     * @var array
+     */
+    protected $session_file_sweep_counts = [];
     /**
      * Cookie name value of the currently active request's session
      * @var string
@@ -489,7 +972,7 @@ class WebSite
      * Holds the header portion so far of the HTTP response
      * @var string
      */
-    public $header_data;
+    public $header_data = "";
     /**
      * Whether the current response already has declared a Content-Type.
      * If not, WebSite will default to adding a text/html header
@@ -525,7 +1008,7 @@ class WebSite
      * flight.
      * @var \seekquarry\atto\CooperativeScheduler|null
      */
-    protected $cooperative_scheduler = null;
+    public $cooperative_scheduler = null;
     /**
      * Holds the in-flight request's cooperative task between the moment a
      * route calls deferResponse() and the moment getResponseData() notices
@@ -536,6 +1019,25 @@ class WebSite
      * @var object|null
      */
     protected $deferred_request = null;
+    /**
+     * Counts, for each connection, the deferred requests on it whose work
+     * has not finished. Such a connection carries no traffic while the
+     * work runs, since nothing has been made to send yet, and the sweep
+     * for idle connections must not close it then: a git clone of a large
+     * repository is silent for as long as its pack takes to build.
+     * @var array
+     */
+    protected $deferred_running = [];
+    /**
+     * The deferred task whose fiber is running right now, or null between
+     * fibers. deferBodyFromFile hands a route's file to this task. It is a
+     * field of its own, apart from $deferred_request, because that field
+     * is also how getResponseData tells that a route has just deferred:
+     * an internal request made inside a running fiber, such as a search
+     * asking its own machine for results, must not read as deferred.
+     * @var object|null
+     */
+    protected $running_task = null;
     /**
      * Set by the HTTP/3 listener for the duration of one request to the
      * details its deferred response would need to be sent later (the
@@ -556,6 +1058,44 @@ class WebSite
      */
     const RESPONSE_DEFERRED = "\x00__atto_response_deferred__\x00";
     /**
+     * WORKER_REQUEST_SECONDS is the most time, in seconds, a worker may
+     * spend on one request that is not a POST. The front measures it by
+     * the clock from the worker's word that it took the request up, so
+     * time queued or spent starting the worker is not counted, and a request
+     * that waits on a lock or on another server counts as much as one
+     * that computes. Past it, the front ends the worker and answers the
+     * request with a 502, and starts a new worker on the next request. A
+     * worker also gives each such request this many seconds of processor
+     * time. A POST, which may carry an upload, has no limit; a streamed
+     * reply never reaches a worker.
+     */
+    const WORKER_REQUEST_SECONDS = 5;
+    /**
+     * WORKER_WRITE_SIZE is the most bytes, past the start of a request,
+     * that writeToWorkers copies for one write to a worker's link.
+     */
+    const WORKER_WRITE_SIZE = 1048576;
+    /**
+     * WORKER_SILENT_SECONDS is how long, in seconds, a worker with requests
+     * queued to it may send the front nothing at all before
+     * endOverdueWorkers ends it. A worker sends a word as it takes up each
+     * request and a reply when it finishes, so one silent this long is
+     * stuck, wherever it is stuck, and every request queued to it would
+     * otherwise wait for good. A POST it has taken up is not counted, since
+     * an upload may run long.
+     */
+    const WORKER_SILENT_SECONDS = 30;
+    /**
+     * WORKER_STOP_SECONDS is how long, in seconds, endOverdueWorkers gives a
+     * worker it has asked to stop before it kills the worker outright.
+     */
+    const WORKER_STOP_SECONDS = 2;
+    /**
+     * WORKER_TRACE_STEPS is how many calls, innermost first, a worker
+     * names in its log line when it is asked to stop.
+     */
+    const WORKER_TRACE_STEPS = 12;
+    /**
      * How long, in microseconds, the event loop will sleep at most while
      * a cooperative task is in flight. The loop wakes at least this often
      * to give a fiber waiting on a slow socket a chance to make progress,
@@ -568,7 +1108,7 @@ class WebSite
      * Number of microseconds in a second. Used to compare a wanted
      * stream_select wake-up, which this loop tracks as whole seconds plus
      * microseconds, against the cooperative poll interval. atto is a
-     * self-contained server and does not read Yioop's configuration, so
+     * self-contained server and reads no application settings, so
      * this conversion factor is kept here rather than pulled from Config.
      */
     const MICROSECONDS_PER_SECOND = 1000000;
@@ -578,7 +1118,7 @@ class WebSite
      * megabyte (1024 times 1024) so the figures line up with the way
      * PHP itself reports its memory limit. As with the conversion
      * factor above, atto is self-contained and keeps this here rather
-     * than reading a Yioop constant.
+     * than reading an application constant.
      */
     const BYTES_PER_MEGABYTE = 1048576;
     /**
@@ -596,12 +1136,20 @@ class WebSite
      * the server config does not set REQUEST_MEMORY_GROWTH_LOG_LEN. PHP
      * hands memory back to the system rarely, so this figure only moves
      * when a request asks for more than every request before it did, and
-     * a server that has been up a while writes nothing. Two megabytes is
-     * the smallest step worth watching, being the size of the block PHP
-     * claims at a time.
+     * a server that has been up a while writes nothing. PHP claims memory
+     * two megabytes at a time, and a request that claims one such block
+     * and frees it is every request; four megabytes is the smallest step
+     * that says a request used more than the ones before it.
      */
     const REQUEST_MEMORY_GROWTH_LOG_LEN_DEFAULT =
-        2 * self::BYTES_PER_MEGABYTE;
+        4 * self::BYTES_PER_MEGABYTE;
+    /**
+     * Seconds left between two lines saying how much memory the server
+     * holds and how many requests it has served since the last such
+     * line. Five minutes is often enough to watch a climb over an
+     * afternoon without filling the log.
+     */
+    const SECONDS_BETWEEN_MEMORY_LINES = 300;
     /**
      * Bytes of memory held in reserve and released at the start of the
      * memory-fatal handler, so the handler still has room to name the
@@ -641,7 +1189,7 @@ class WebSite
      * readable while delivering nothing (a stalled or faulting peer) ages
      * out on the idle timeout instead of being kept alive forever. Reset
      * to true before each connection is handled and only the H1 read path
-     * lowers it, so other protocols keep their existing behaviour.
+     * lowers it, so other protocols keep their existing behavior.
      * @var bool
      */
     protected $read_made_progress = true;
@@ -747,8 +1295,10 @@ class WebSite
         $this->default_server_globals = self::defaultServerGlobals();
         $this->http_methods = array_keys($this->routes);
         if (empty($this->base_path)) {
-            $pathinfo = pathinfo($_SERVER['SCRIPT_NAME']);
-            $this->base_path = $pathinfo["dirname"];
+            /* A command-line run, such as a unit test, may have no
+               SCRIPT_NAME; the base path is then the site's root. */
+            $pathinfo = pathinfo($_SERVER['SCRIPT_NAME'] ?? "");
+            $this->base_path = $pathinfo["dirname"] ?? "";
         }
         if ($this->base_path == ".") {
             $this->base_path = "";
@@ -786,9 +1336,19 @@ class WebSite
         }
         $peak = round(memory_get_peak_usage(true) /
             self::BYTES_PER_MEGABYTE, 1);
+        /* What was really in use at the moment the limit was reached.
+           Close to the peak means the memory was being held; well under
+           it means the server was carrying many requests at once, each
+           of which would have let go. */
+        $held = round(memory_get_usage(false) /
+            self::BYTES_PER_MEGABYTE, 1);
+        $connections = count($this->connections);
+        $sessions = count($this->sessions);
         $request = $this->in_flight_request !== "" ?
             $this->in_flight_request : "(none in flight)";
         error_log("[website-memory-fatal] peak={$peak}MB " .
+            "held={$held}MB connections={$connections} " .
+            "sessions={$sessions} " .
             "request={$request} detail=" . ($error["message"] ?? ""));
     }
     /**
@@ -833,7 +1393,17 @@ class WebSite
         }
         $used = round(memory_get_usage(true) /
             self::BYTES_PER_MEGABYTE, 1);
+        /* What PHP has claimed from the system only ever climbs, so it
+           cannot tell a leak from a busy moment. What is really in use
+           falls back as soon as a request lets its memory go, so the two
+           read together say which is happening: both climbing means
+           something is being kept, while a climbing claim over a steady
+           real figure means many requests at once, each letting go. */
+        $held = round(memory_get_usage(false) /
+            self::BYTES_PER_MEGABYTE, 1);
         $peak = round(memory_get_peak_usage(true) /
+            self::BYTES_PER_MEGABYTE, 1);
+        $peak_held = round(memory_get_peak_usage(false) /
             self::BYTES_PER_MEGABYTE, 1);
         $connections = count($this->connections);
         $reading = count($this->in_streams[self::CONNECTION] ?? []);
@@ -844,11 +1414,84 @@ class WebSite
             self::BYTES_PER_MEGABYTE, 1);
         $session_megabytes = round($this->sessionBytes() /
             self::BYTES_PER_MEGABYTE, 1);
-        error_log("[website-memory] used={$used}MB peak={$peak}MB " .
+        $cpu = $this->cpuPercentSinceLastSample();
+        error_log("[website-memory] used={$used}MB held={$held}MB " .
+            "cpu={$cpu}% " .
+            "peak={$peak}MB peak_held={$peak_held}MB " .
             "connections={$connections} reading={$reading} " .
             "writing={$writing} sessions={$sessions} " .
             "session_data={$session_megabytes}MB " .
             "buffered={$buffered}MB timers={$timers}");
+        $front_line = "";
+        foreach (["relayed", "kept", "served"] as $kind) {
+            $count = $this->front_work[$kind]["count"] ?? 0;
+            $cpu = $this->front_work[$kind]["cpu"] ?? 0;
+            $front_line .= " $kind=$count cpu=" . round($cpu, 3) . "s" .
+                " each=" . ($count > 0 ? round(1000 * $cpu / $count, 2) : 0) .
+                "ms";
+        }
+        $usage = getrusage();
+        $total = $usage["ru_utime.tv_sec"] + $usage["ru_stime.tv_sec"] +
+            ($usage["ru_utime.tv_usec"] + $usage["ru_stime.tv_usec"]) /
+            self::MICROSECONDS_PER_SECOND;
+        if (isset($this->front_work_since)) {
+            $requests_cpu = ($this->front_work["relayed"]["cpu"] ?? 0) +
+                ($this->front_work["kept"]["cpu"] ?? 0) +
+                ($this->front_work["served"]["cpu"] ?? 0);
+            $front_line .= " outside_requests=" . round($total -
+                $this->front_work_since - $requests_cpu, 3) . "s";
+        }
+        $this->front_work_since = $total;
+        $front_line .= " closed_before_first_byte=" .
+            ($this->front_work["closed_before_first_byte"] ?? 0);
+        $paths = $this->front_work["paths"] ?? [];
+        arsort($paths);
+        foreach (array_slice($paths, 0, 3, true) as $path => $cpu) {
+            $front_line .= " $path:" . round($cpu, 3) . "s";
+        }
+        error_log("[website-front]" . $front_line);
+        $this->front_work = [];
+        foreach ($this->workers as $i => $worker) {
+            $waiting = $worker["waiting"] ?? [];
+            $running = reset($waiting);
+            if ($running !== false) {
+                error_log("[website-worker] worker " . ($i + 1) .
+                    " running " . $running[0] . " for " .
+                    (time() - $running[1]) . " s, with " .
+                    (count($waiting) - 1) . " more waiting");
+            }
+        }
+    }
+    /**
+     * cpuPercentSinceLastSample says how busy this server process was since
+     * the last memory sample, as its processor time, user and system
+     * together, over the wall time between the two samples. 100 means one
+     * core fully used; a single server process cannot go above that, so a
+     * reading near it says the server itself is what everything else is
+     * waiting on. sampleMemoryUsage calls it for each line it writes. It
+     * uses getrusage, which PHP provides on Linux, macOS and Windows.
+     *
+     * @return string the percentage to one decimal place, or "-" for the
+     *      first sample, which has nothing to compare against
+     */
+    protected function cpuPercentSinceLastSample()
+    {
+        $usage = getrusage();
+        $cpu_seconds = ($usage["ru_utime.tv_sec"] ?? 0) +
+            ($usage["ru_utime.tv_usec"] ?? 0) / 1000000 +
+            ($usage["ru_stime.tv_sec"] ?? 0) +
+            ($usage["ru_stime.tv_usec"] ?? 0) / 1000000;
+        $wall = microtime(true);
+        $percent = "-";
+        if ($this->last_cpu_sample_wall > 0 &&
+            $wall > $this->last_cpu_sample_wall) {
+            $percent = sprintf("%.1f", 100 * ($cpu_seconds -
+                $this->last_cpu_sample_seconds) /
+                ($wall - $this->last_cpu_sample_wall));
+        }
+        $this->last_cpu_sample_wall = $wall;
+        $this->last_cpu_sample_seconds = $cpu_seconds;
+        return $percent;
     }
     /**
      * Bytes currently held in the read and write buffers of every open
@@ -883,15 +1526,15 @@ class WebSite
             return 0;
         }
         $sampled = 0;
-        $sampled_bytes = 0;
+        $sampled_size = 0;
         foreach ($this->sessions as $session) {
-            $sampled_bytes += strlen(serialize($session));
+            $sampled_size += strlen(serialize($session));
             $sampled++;
             if ($sampled >= self::SESSION_SAMPLE_COUNT) {
                 break;
             }
         }
-        return (int)round(($sampled_bytes / $sampled) * $kept);
+        return (int)round(($sampled_size / $sampled) * $kept);
     }
     /**
      * Returns whether enough time has passed since the last idle-session
@@ -920,9 +1563,21 @@ class WebSite
      * would only ever grow. The session being served right now was just
      * stamped with the current time, so it is never near the cutoff and
      * cannot be signed out by a sweep. An idle timeout of zero or less
-     * turns the sweep off. The least-recently-used heap that backs the
-     * session cap tolerates these removals: its now-stale entries are
-     * skipped during cap eviction and cleared when that heap is rebuilt.
+     * turns the sweep off. A dropped session's file is deleted with it;
+     * before, only the session was forgotten and its file stayed in the
+     * session folder for good.
+     *
+     * The sweep then holds the sessions to MAX_SESSIONS, dropping those
+     * used longest ago. sessionStart does this too, but when requests run
+     * in worker processes a worker holds only the few sessions its request
+     * names, so it is never over the cap; this process holds them all, so
+     * the cap is kept here. Sessions are ordered by the time they were
+     * last used, since each worker counts uses on its own. The
+     * least-recently-used heap that backs sessionStart's cap tolerates
+     * these removals: its now-stale entries are skipped during cap
+     * eviction and cleared when that heap is rebuilt. A sweep that drops
+     * any session writes a line to the log saying how many it dropped and
+     * how many it kept.
      */
     protected function reapIdleSessions()
     {
@@ -933,16 +1588,115 @@ class WebSite
         $idle_timeout =
             $this->default_server_globals['SESSION_IDLE_TIMEOUT']
             ?? self::SESSION_IDLE_TIMEOUT_DEFAULT;
-        if ($idle_timeout <= 0) {
-            return;
-        }
-        $cutoff = $now - $idle_timeout;
-        foreach ($this->sessions as $reap_id => $session) {
-            $session_time = $session['TIME'] ?? $now;
-            if ($session_time < $cutoff) {
-                unset($this->sessions[$reap_id]);
+        $idle_dropped = 0;
+        if ($idle_timeout > 0) {
+            $cutoff = $now - $idle_timeout;
+            foreach ($this->sessions as $reap_id => $session) {
+                $session_time = $session['TIME'] ?? $now;
+                if ($session_time < $cutoff) {
+                    $this->forgetSession($reap_id);
+                    $idle_dropped++;
+                }
             }
         }
+        $max_sessions = $this->default_server_globals['MAX_SESSIONS'] ??
+            self::MAX_SESSIONS_DEFAULT;
+        $excess = count($this->sessions) - $max_sessions;
+        if ($excess > 0) {
+            $last_used = array_map(fn($session) => $session['TIME'] ?? $now,
+                $this->sessions);
+            asort($last_used);
+            foreach (array_slice(array_keys($last_used), 0, $excess) as
+                $drop_id) {
+                $this->forgetSession($drop_id);
+            }
+        }
+        if ($idle_dropped > 0 || $excess > 0) {
+            error_log("[website-session-sweep] dropped $idle_dropped " .
+                "idle sessions and " . max(0, $excess) . " over the cap " .
+                "of $max_sessions with their files; " .
+                count($this->sessions) . " sessions kept");
+        }
+    }
+    /**
+     * sweepSessionFiles keeps the session folder from filling up with files
+     * that belong to no session: those no kept session owns, unchanged for
+     * SESSION_FILE_ORPHAN_AGE seconds, are deleted. Such files are left
+     * when the server stops without saving its sessions, such as when it
+     * is killed or crashes, and were left by versions whose idle sweep did
+     * not delete files, so a long-running site can hold a great many of
+     * them. A walk
+     * of the folder begins when the server starts and then every
+     * SESSION_FILE_SWEEP_INTERVAL seconds. The event loop calls this on
+     * every pass, and each call looks at no more than
+     * SESSION_FILE_SWEEP_BATCH names and spends no more than
+     * SESSION_FILE_SWEEP_STEP_TIME seconds before handing back, keeping its
+     * place in the folder for the next pass. A walk done in one go held
+     * the event loop for as long as the folder took to read, and in that
+     * time the server took no connections. The folder is read one name at
+     * a time, so a folder holding a great many files costs no more memory
+     * than one holding a few.
+     *
+     * @param int $now current Unix time in seconds
+     * @return bool whether a walk of the folder is still under way
+     */
+    protected function sweepSessionFiles($now)
+    {
+        $folder = (string)($this->default_server_globals['SESSION_DIR'] ??
+            "");
+        if ($this->session_file_sweep_handle === null) {
+            if ($now - $this->last_session_file_sweep_time <
+                self::SESSION_FILE_SWEEP_INTERVAL) {
+                return false;
+            }
+            $this->last_session_file_sweep_time = $now;
+            $handle = ($folder === "") ? false : @opendir($folder);
+            if ($handle === false) {
+                error_log("[website-session-sweep] could not open the " .
+                    "session folder $folder to look for old session files");
+                return false;
+            }
+            $this->session_file_sweep_handle = $handle;
+            $this->session_file_sweep_counts = ['LOOKED' => 0,
+                'DELETED' => 0, 'BEGAN' => microtime(true)];
+            error_log("[website-session-sweep] looking in $folder for " .
+                "session files no session owns, unchanged for " .
+                self::SESSION_FILE_ORPHAN_AGE . " seconds, a few hundred " .
+                "names per pass of the event loop");
+        }
+        $prefix = self::SESSION_FILE_PREFIX;
+        $cutoff = $now - self::SESSION_FILE_ORPHAN_AGE;
+        $began = microtime(true);
+        for ($looked = 0; $looked < self::SESSION_FILE_SWEEP_BATCH;
+            $looked++) {
+            $name = readdir($this->session_file_sweep_handle);
+            if ($name === false) {
+                closedir($this->session_file_sweep_handle);
+                $this->session_file_sweep_handle = null;
+                $counts = $this->session_file_sweep_counts;
+                error_log("[website-session-sweep] done in $folder: " .
+                    "looked at {$counts['LOOKED']} names, deleted " .
+                    "{$counts['DELETED']} old session files, in " .
+                    round(microtime(true) - $counts['BEGAN'], 1) .
+                    " seconds");
+                return false;
+            }
+            $this->session_file_sweep_counts['LOOKED']++;
+            if (str_starts_with($name, $prefix) &&
+                !isset($this->sessions[substr($name, strlen($prefix))])) {
+                $path = $folder . "/" . $name;
+                $modified = @filemtime($path);
+                if ($modified !== false && $modified < $cutoff &&
+                    @unlink($path)) {
+                    $this->session_file_sweep_counts['DELETED']++;
+                }
+            }
+            if (microtime(true) - $began >
+                self::SESSION_FILE_SWEEP_STEP_TIME) {
+                break;
+            }
+        }
+        return true;
     }
     /**
      * Writes one line to the error log when a single response body is
@@ -977,6 +1731,48 @@ class WebSite
             "status={$status} {$method} {$remote} {$uri}");
     }
     /**
+     * logMemoryPerRequest writes a line every few minutes saying how
+     * much memory the server holds and how many requests it has served
+     * since the last such line. The request loop calls it after each
+     * request.
+     *
+     * A figure that climbs on its own does not say whether the climbing
+     * comes from work done or from time passing. Reporting the growth
+     * against the requests served between two lines tells those apart:
+     * a steady number of bytes per request says something is held
+     * between requests, while a falling one says the memory is claimed
+     * once and reused.
+     */
+    protected function logMemoryPerRequest()
+    {
+        $now = time();
+        $served = $this->requests_served - $this->memory_line_requests;
+        if ($this->memory_line_written_at == 0 ||
+            $now - $this->memory_line_written_at <
+            self::SECONDS_BETWEEN_MEMORY_LINES) {
+            if ($this->memory_line_written_at == 0) {
+                $this->memory_line_written_at = $now;
+                $this->memory_line_requests = $this->requests_served;
+                $this->memory_line_used = memory_get_usage(true);
+            }
+            return;
+        }
+        $used = memory_get_usage(true);
+        $grew = $used - $this->memory_line_used;
+        $each = ($served > 0) ? (int)round($grew / $served) : 0;
+        $used_megabytes = round($used / self::BYTES_PER_MEGABYTE, 1);
+        $grew_megabytes = round($grew / self::BYTES_PER_MEGABYTE, 1);
+        $peak_megabytes = round(memory_get_peak_usage(true) /
+            self::BYTES_PER_MEGABYTE, 1);
+        error_log("[website-memory-per-request] " .
+            "now={$used_megabytes}MB peak={$peak_megabytes}MB " .
+            "grew={$grew_megabytes}MB over {$served} requests, " .
+            "{$each}B each, total_served={$this->requests_served}");
+        $this->memory_line_written_at = $now;
+        $this->memory_line_requests = $this->requests_served;
+        $this->memory_line_used = $used;
+    }
+    /**
      * Records when a single request makes the server claim more memory
      * from the system than it ever had, naming the request that did it.
      * The periodic memory sample says the server is holding a lot but
@@ -1004,7 +1800,7 @@ class WebSite
         }
         $used_growth = memory_get_usage(true) - $before_used;
         $peak_growth = memory_get_peak_usage(true) - $before_peak;
-        if ($used_growth < $threshold && $peak_growth < $threshold) {
+        if ($peak_growth < $threshold) {
             return;
         }
         $method = $_SERVER['REQUEST_METHOD'] ?? "?";
@@ -1016,8 +1812,15 @@ class WebSite
             self::BYTES_PER_MEGABYTE, 1);
         $now_used = round(memory_get_usage(true) /
             self::BYTES_PER_MEGABYTE, 1);
+        /* What the request is still holding now that it is answered. A
+           request that let everything go reads near nothing here however
+           much it claimed, so a run of lines with a figure that keeps
+           climbing names the requests that keep something. */
+        $now_held = round(memory_get_usage(false) /
+            self::BYTES_PER_MEGABYTE, 1);
         error_log("[website-request-memory] grew={$used_megabytes}MB " .
             "peak_grew={$peak_megabytes}MB now={$now_used}MB " .
+            "held={$now_held}MB " .
             "{$method} {$remote} {$uri}");
     }
     /**
@@ -1228,6 +2031,10 @@ class WebSite
             $matches)) {
             return (int)$matches[1];
         }
+        if (preg_match('/^HTTP\/\S+\s+(\d+)/',
+            $this->statusLineForHeaders(), $matches)) {
+            return (int)$matches[1];
+        }
         return 200;
     }
     /**
@@ -1245,6 +2052,8 @@ class WebSite
         $this->processRequest();
         $this->in_flight_request = "";
         $this->logRequestMemoryGrowth($before_used, $before_peak);
+        $this->requests_served++;
+        $this->logMemoryPerRequest();
     }
     /**
      * Cause all the current HTTP request to be processed according to the
@@ -1259,7 +2068,14 @@ class WebSite
             $_SERVER['REQUEST_URI'] = $_SERVER['SCRIPT_NAME'];
         }
         foreach ($this->middle_wares as $middleware) {
-            $middleware();
+            /* A callback that has answered the request itself gives back
+               false, and nothing further is done with the request. That
+               is how a callback can refuse a request outright, having
+               written its own status and body, rather than having its
+               reply followed by whatever a route would have sent. */
+            if ($middleware() === false) {
+                return;
+            }
         }
         /*
             WebSocket upgrades cannot be handled in SAPI mode
@@ -1275,7 +2091,7 @@ class WebSite
             $this->header("HTTP/1.1 501 Not Implemented");
             $this->header("Content-Type: text/plain");
             echo "WebSocket upgrades require running this script "
-                . "from the command line (php index.php). The PHP "
+                . "from the command line. The PHP "
                 . "SAPI used by Apache, nginx-FPM, and CGI does not "
                 . "expose the underlying TCP socket and so cannot "
                 . "handle WebSocket frames. A typical deployment "
@@ -1303,9 +2119,9 @@ class WebSite
             raw URI, then urldecode only the path portion.
          */
         $raw_uri = $_SERVER['REQUEST_URI'];
-        $q = strpos($raw_uri, '?');
-        $raw_path = ($q === false) ? $raw_uri :
-            substr($raw_uri, 0, $q);
+        $query_start = strpos($raw_uri, '?');
+        $raw_path = ($query_start === false) ? $raw_uri :
+            substr($raw_uri, 0, $query_start);
         $decoded_path = urldecode($raw_path);
         $this->request_script = rtrim(substr($decoded_path,
             strlen($this->base_path)), "?");
@@ -1442,13 +2258,22 @@ class WebSite
             /* H1 streams incrementally: echo each chunk and flush it
                as a chunked-transfer block, stopping if the peer goes
                away (a seek aborting the request), the same contract
-               as a route that echoes and calls flush() itself */
+               as a route that echoes and calls flush() itself. Where
+               this runs inside a fiber, the loop is handed back after
+               every chunk. Without that, reading a whole large file
+               here held the one process for as long as the download
+               took, and every other request waited: a hundred megabyte
+               video stalled the site for the half minute it took to
+               go out. */
             foreach ($generator as $chunk) {
                 if ($chunk !== null && $chunk !== "") {
                     echo $chunk;
                 }
                 if (!$this->flush() && $this->streamingFailed()) {
                     break;
+                }
+                if (\Fiber::getCurrent() !== null) {
+                    \Fiber::suspend();
                 }
             }
         } else {
@@ -1599,7 +2424,7 @@ class WebSite
      * incrementally, or send headers + initial bytes before
      * computing the rest.
      *
-     * Behaviour:
+     * Behavior:
      *   First call: composes headers (using $this->header_data
      *     plus Transfer-Encoding: chunked for H1, or a HEADERS
      *     frame without END_STREAM for H2) and writes them with
@@ -1666,6 +2491,61 @@ class WebSite
     public function streamingFailed()
     {
         return $this->streaming_failed;
+    }
+    /**
+     * writeFrameWhole writes the bytes of one protocol control frame to
+     * a connection completely, looping on the partial writes a
+     * non-blocking socket gives, and waiting briefly on the socket
+     * becoming writable between attempts. The framing of a connection
+     * is a byte stream: a control frame written short leaves the next
+     * frame starting mid-frame, after which the peer reads garbage or
+     * waits on a frame that never completes. A window-credit frame cut
+     * short this way left a browser waiting for credit it never got
+     * while the server waited for data the browser was never going to
+     * send, and the two sat silent. Callers pass the serialized frame;
+     * where the write cannot complete the connection is past saving and
+     * false says so, letting the caller tear it down.
+     *
+     * @param resource $connection the socket the frame goes to
+     * @param string $bytes the whole serialized frame
+     * @return bool whether every byte was written
+     */
+    protected function writeFrameWhole($connection, $bytes)
+    {
+        $total = strlen($bytes);
+        $written = 0;
+        $stalls = 0;
+        while ($written < $total) {
+            $sent = @fwrite($connection, ($written == 0) ? $bytes :
+                substr($bytes, $written));
+            if ($sent === false || feof($connection)) {
+                return false;
+            }
+            $written += $sent;
+            if ($written >= $total) {
+                break;
+            }
+            if ($sent == 0) {
+                $stalls++;
+                if ($stalls > 1) {
+                    return false;
+                }
+                $read_streams = [];
+                $write_streams = [$connection];
+                $except_streams = [];
+                set_error_handler(null);
+                $ready = stream_select($read_streams, $write_streams,
+                    $except_streams,
+                    self::CONTROL_FRAME_WRITE_WAIT);
+                restore_error_handler();
+                if (empty($ready)) {
+                    return false;
+                }
+            } else {
+                $stalls = 0;
+            }
+        }
+        return true;
     }
     /**
      * Writes $data completely to the streaming socket, looping on
@@ -2300,6 +3180,7 @@ class WebSite
         if (empty($session_path)) {
             return;
         }
+        $this->saved_sessions_path = $session_path;
         $session_info = [];
         $session_info['SESSIONS'] = $this->sessions;
         $session_info['SESSION_SEQUENCE'] = $this->session_sequence;
@@ -2327,8 +3208,8 @@ class WebSite
      */
     protected function sessionFilePath($session_id)
     {
-        return $this->default_server_globals['SESSION_DIR'] .
-            "/atto_session_" . $session_id;
+        return $this->default_server_globals['SESSION_DIR'] . "/" .
+            self::SESSION_FILE_PREFIX . $session_id;
     }
     /**
      * Reads a session's contents back from its file. A session the server
@@ -2417,25 +3298,34 @@ class WebSite
         $_COOKIE[$this->current_session] = $session_id;
     }
     /**
-     * Reads in the file $filename and returns its contents as a string.
-     * In non-CLI mode this method maps directly to PHP's built-in function
-     * file_get_contents(). In CLI mode, it checks if the file exists in
-     * its Marker Algorithm based RAM cache (Fiat et al 1991). If so, it
+     * Reads the contents of a file, from the server's RAM cache when the
+     * file is there. In CLI mode, it checks if the file exists in its
+     * Marker Algorithm based RAM cache (Fiat et al 1991). If so, it
      * directly returns it. Otherwise, it reads it in using blocking I/O
-     * file_get_contents() and caches it before return its string contents.
-     * Note this function assumes that only the web server is performing I/O
-     * with this file. filemtime() can be used to see if a file on disk has been
-     * changed and then you can use $force_read = true below to force re-
-     * reading the file into the cache
+     * file_get_contents() and caches it before returning its string
+     * contents. Note this function assumes that only the web server is
+     * performing I/O with this file. filemtime() can be used to see if a
+     * file on disk has been changed and then you can use $force_read =
+     * true below to force re-reading the file into the cache. When
+     * $read_compress is true the gzip compressed contents are what is
+     * cached and returned, under a cache entry of their own beside the
+     * plain one, so a text file a client will accept compressed is
+     * compressed once and then served from the cache until it is
+     * evicted like any other entry.
      *
      * @param string $filename name of file to get contents of
      * @param bool $force_read whether to force the file to be read from
      *      persistent storage rather than the cache
-     * @return string contents of the file given by $filename
+     * @param bool $read_compress whether to return, and cache, the gzip
+     *      compressed contents rather than the contents as they are
+     * @return string contents of the file given by $filename, gzip
+     *      compressed if asked
      */
-    public function fileGetContents($filename, $force_read = false)
+    public function fileGetContents($filename, $force_read = false,
+        $read_compress = false)
     {
         if ($this->isCli()) {
+            $this->syncFileJournal();
             if (!empty($this->file_cache['PATH'][$filename])) {
                 /*
                     We are caching realpath which already has its own cache.
@@ -2447,25 +3337,27 @@ class WebSite
                 $path = realpath($filename);
                 $this->file_cache['PATH'][$filename] = $path;
             }
-            if (isset($this->file_cache['MARKED'][$path])) {
+            $cache_key = ($read_compress) ?
+                $path . self::COMPRESSED_CACHE_SUFFIX : $path;
+            if (isset($this->file_cache['MARKED'][$cache_key])) {
                 if ($force_read) {
-                    $this->file_cache['MARKED'][$path] =
-                        file_get_contents($path);
+                    $this->file_cache['MARKED'][$cache_key] =
+                        $this->readFileContents($path, $read_compress);
                 }
-                return $this->file_cache['MARKED'][$path];
-            } else if (isset($this->file_cache['UNMARKED'][$path])) {
+                return $this->file_cache['MARKED'][$cache_key];
+            } else if (isset($this->file_cache['UNMARKED'][$cache_key])) {
                 if ($force_read) {
-                    $this->file_cache['MARKED'][$path] =
-                        file_get_contents($path);
+                    $this->file_cache['MARKED'][$cache_key] =
+                        $this->readFileContents($path, $read_compress);
                 } else {
-                    $this->file_cache['MARKED'][$path] =
-                        $this->file_cache['UNMARKED'][$path];
+                    $this->file_cache['MARKED'][$cache_key] =
+                        $this->file_cache['UNMARKED'][$cache_key];
                 }
-                unset($this->file_cache['UNMARKED'][$path]);
-                return $this->file_cache['MARKED'][$path];
+                unset($this->file_cache['UNMARKED'][$cache_key]);
+                return $this->file_cache['MARKED'][$cache_key];
             }
-            $data = file_get_contents($path);
-            $this->file_cache['HASH'][$path] = md5($data);
+            $data = $this->readFileContents($path, $read_compress);
+            $this->file_cache['HASH'][$cache_key] = md5($data);
             if (strlen($data) < $this->default_server_globals[
                 'MAX_CACHE_FILESIZE']) {
                 if (count($this->file_cache['MARKED']) +
@@ -2477,11 +3369,13 @@ class WebSite
                     unset(
                         $this->file_cache['UNMARKED'][$unmarked_paths[$eject]]);
                 }
-                $this->file_cache['MARKED'][$path] = $data;
+                $this->file_cache['MARKED'][$cache_key] = $data;
                 if (count($this->file_cache['MARKED']) >=
                     $this->default_server_globals['MAX_CACHE_FILES']) {
                     foreach ($this->file_cache['PATH'] as $name => $path) {
-                        if (empty($this->file_cache['MARKED'][$path])) {
+                        if (empty($this->file_cache['MARKED'][$path]) &&
+                            empty($this->file_cache['MARKED'][$path .
+                            self::COMPRESSED_CACHE_SUFFIX])) {
                             unset($this->file_cache['PATH'][$name]);
                         }
                     }
@@ -2489,15 +3383,39 @@ class WebSite
                         $this->file_cache['UNMARKED'][$path] = $data;
                         unset($this->file_cache['MARKED'][$path]);
                     }
+                    /* The hashes of files no longer cached go too. Every
+                       file read or written leaves a hash, so without this
+                       they would pile up, one for each session file ever
+                       made. A file whose hash is gone is just written
+                       again the next time, even if unchanged. */
+                    $this->file_cache['HASH'] = array_intersect_key(
+                        $this->file_cache['HASH'] ?? [],
+                        $this->file_cache['UNMARKED']);
                 }
             }
             return $data;
         }
-        return file_get_contents($filename);
+        return $this->readFileContents($filename, $read_compress);
+    }
+    /**
+     * Reads a file from disk, gzip compressing what it read when asked.
+     * fileGetContents calls this wherever it reads a file rather than its
+     * cache, so the compressed and plain forms come from one place.
+     *
+     * @param string $path the file to read
+     * @param bool $compress whether to gzip compress the contents
+     * @return string the contents, compressed if asked
+     */
+    protected function readFileContents($path, $compress)
+    {
+        $data = file_get_contents($path);
+        return ($compress && $data !== false) ? gzencode($data) : $data;
     }
     /**
      * Writes $data to the persistent file with name $filename. Saves a copy
-     * in the RAM cache if there is a copy already there.
+     * in the RAM cache if there is a copy already there, and drops any gzip
+     * compressed copy of the file, which fileGetContents makes again from
+     * the new contents when it is next asked for.
      *
      * @param string $filename name of file to write to persistent storages
      * @param string $data string of data to store in file
@@ -2505,9 +3423,11 @@ class WebSite
      */
     public function filePutContents($filename, $data)
     {
-        $num_bytes = strlen($data);
+        $this->syncFileJournal();
+        $data_length = strlen($data);
         $fits_in_cache =
-            $num_bytes < $this->default_server_globals['MAX_CACHE_FILESIZE'];
+            $data_length <
+            $this->default_server_globals['MAX_CACHE_FILESIZE'];
         if ($fits_in_cache) {
             if (isset($this->file_cache['PATH'][$filename])) {
                 /*
@@ -2522,6 +3442,14 @@ class WebSite
             }
         }
         if ($this->isCli()) {
+            /* A compressed copy was made from the old contents, so it is
+               dropped and made again from the new ones on the next read. */
+            if (!empty($this->file_cache['PATH'][$filename])) {
+                $gzip_key = $this->file_cache['PATH'][$filename] .
+                    self::COMPRESSED_CACHE_SUFFIX;
+                unset($this->file_cache['MARKED'][$gzip_key],
+                    $this->file_cache['UNMARKED'][$gzip_key]);
+            }
             if ($fits_in_cache)  {
                 if (isset($this->file_cache['MARKED'][$path])) {
                     $this->file_cache['MARKED'][$path] = $data;
@@ -2544,12 +3472,1093 @@ class WebSite
         if (isset($this->file_cache['HASH'][$hash_path]) &&
             $this->file_cache['HASH'][$hash_path] === $hash &&
             file_exists($filename)) {
-            return $num_bytes;
+            return $data_length;
         }
-        $num_bytes = file_put_contents($filename, $data);
+        $written_length = file_put_contents($filename, $data);
         $this->file_cache['HASH'][$hash_path] = $hash;
         @chmod($filename, 0777);
-        return $num_bytes;
+        if ($this->file_journal !== "") {
+            clearstatcache(true, $this->file_journal);
+            if (@filesize($this->file_journal) > self::FILE_JOURNAL_MAX_BYTES) {
+                file_put_contents($this->file_journal, "", LOCK_EX);
+            }
+            file_put_contents($this->file_journal,
+                (realpath($filename) ?: $filename) . "\n",
+                FILE_APPEND | LOCK_EX);
+        }
+        return $written_length;
+    }
+    /**
+     * startWorkers starts the worker processes that run requests for this
+     * front process, and waits for each to connect back. A worker is the
+     * same site script started with WORKER_COMMAND; it builds the same
+     * routes and calls serveAsWorker, which reads requests from its link
+     * instead of listening on a port. The workers are started with
+     * proc_open and talk over loopback sockets, which PHP provides alike on
+     * Linux, macOS and Windows, with no fork. listen calls it once the
+     * ports are bound and the server has become its run-as user, so the
+     * workers run as that user.
+     *
+     * @param int $count how many worker processes to start
+     */
+    protected function startWorkers($count)
+    {
+        $this->worker_count = $count;
+        $this->worker_listener = stream_socket_server("tcp://127.0.0.1:0",
+            $errno, $errstr);
+        if ($this->worker_listener === false) {
+            error_log("Workers not started: $errstr");
+            $this->worker_listener = null;
+            return;
+        }
+        for ($i = 0; $i < $count; $i++) {
+            $this->startWorker($i);
+        }
+        /* Nothing is served yet, so the first workers are waited for, all
+           at once rather than one after another. */
+        while (!empty($this->worker_starts)) {
+            $this->finishWorkerStarts(self::WORKER_ACCEPT_WAIT);
+        }
+    }
+    /**
+     * startWorker starts worker number $i and records it in $worker_starts
+     * without waiting for it to connect back; finishWorkerStarts takes it
+     * into $workers once it has. startWorkers calls it for each worker, and
+     * leastBusyWorker calls it again for a worker that has stopped.
+     *
+     * @param int $i number of the worker to start
+     * @return bool whether the worker's process could be started
+     */
+    protected function startWorker($i)
+    {
+        $port = parse_url("tcp://" .
+            stream_socket_get_name($this->worker_listener, false),
+            PHP_URL_PORT);
+        $log = ($this->worker_log === "") ?
+            ((PHP_OS_FAMILY === "Windows") ? "NUL" : "/dev/null") :
+            $this->worker_log;
+        $environment = getenv();
+        $environment['ATTO_WORKER_LINK'] = $port;
+        /* The link is a loopback port any local program could connect to,
+           so the worker proves it was started here: it and this process
+           share a secret no other program sees, and each side shows the
+           other a hash of it before any request crosses the link. */
+        $secret = bin2hex(random_bytes(32));
+        $environment['ATTO_WORKER_SECRET'] = $secret;
+        $environment['ATTO_WORKER_JOURNAL'] = $this->file_journal;
+        $process = null;
+        if ($this->worker_start !== null) {
+            $settings = ["ATTO_WORKER_LINK", "ATTO_WORKER_SECRET",
+                "ATTO_WORKER_JOURNAL"];
+            foreach ($settings as $setting) {
+                putenv("$setting=" . $environment[$setting]);
+            }
+            ($this->worker_start)();
+            foreach ($settings as $setting) {
+                putenv($setting);
+            }
+        } else {
+            $process = proc_open($this->worker_command, [0 => ["file",
+                (PHP_OS_FAMILY === "Windows") ? "NUL" : "/dev/null", "r"],
+                1 => ["file", $log, "a"], 2 => ["file", $log, "a"]],
+                $pipes, null, $environment);
+        }
+        /* The front does not wait here for the worker to connect, which
+           took the whole front, every request it served, for as long as
+           a worker took to start. finishWorkerStarts takes the worker in
+           once it has connected and shown its hash. */
+        unset($this->workers[$i]);
+        $this->worker_starts[$i] = ["process" => $process,
+            "secret" => $secret, "proof" => hash("sha256", "worker $secret"),
+            "give_up" => time() + self::WORKER_START_SECONDS];
+        if ($process === false) {
+            $this->finishWorkerStarts();
+            return false;
+        }
+        return true;
+    }
+    /**
+     * finishWorkerStarts takes in the workers in $worker_starts that have
+     * connected back, without waiting unless asked to. Every connection on
+     * the worker link is held apart until it shows a hash; one that shows
+     * the hash of a worker being started becomes that worker's link, and
+     * one that shows a wrong hash, or none in WORKER_PROOF_SECONDS, is
+     * closed and noted. A worker whose process exits before connecting, or
+     * that has not connected within WORKER_START_SECONDS, is noted and
+     * tried again after WORKER_RETRY_SECONDS. The event loop calls it on
+     * each pass while a worker is starting, and startWorkers calls it with
+     * a wait until the first workers are in.
+     *
+     * @param float $wait seconds to wait for a connection, 0 for none
+     */
+    protected function finishWorkerStarts($wait = 0)
+    {
+        if ($this->worker_listener === null) {
+            return;
+        }
+        $accepted = @stream_socket_accept($this->worker_listener, $wait);
+        while ($accepted !== false) {
+            stream_set_blocking($accepted, false);
+            $this->worker_pending_links[] = ["link" => $accepted,
+                "said" => "", "since" => microtime(true)];
+            $accepted = @stream_socket_accept($this->worker_listener, 0);
+        }
+        foreach ($this->worker_pending_links as $k => $connection) {
+            $read = fread($connection["link"],
+                64 - strlen($connection["said"]));
+            $said = $connection["said"] . (($read === false) ? "" : $read);
+            $started = null;
+            foreach ($this->worker_starts as $i => $start) {
+                if (strlen($said) == 64 && hash_equals($start["proof"],
+                    $said)) {
+                    $started = $i;
+                }
+            }
+            if ($started !== null) {
+                unset($this->worker_pending_links[$k]);
+                $this->takeInWorker($started, $connection["link"]);
+                continue;
+            }
+            if (strlen($said) == 64 || feof($connection["link"]) ||
+                microtime(true) - $connection["since"] >
+                self::WORKER_PROOF_SECONDS) {
+                $this->refuseWorkerLink($connection["link"]);
+                unset($this->worker_pending_links[$k]);
+                continue;
+            }
+            $this->worker_pending_links[$k]["said"] = $said;
+        }
+        if ($this->worker_refusals["unnoted"] > 0) {
+            $this->noteWorker(-1, "link refused " .
+                $this->worker_refusals["unnoted"] . " more connections " .
+                "that did not prove they were workers; they were not noted " .
+                "one by one");
+            $this->worker_refusals["unnoted"] = 0;
+        }
+        foreach ($this->worker_starts as $i => $start) {
+            $process = $start["process"];
+            $status = is_resource($process) ? proc_get_status($process) :
+                ["running" => true];
+            if ($process !== false && $status['running'] &&
+                time() < $start["give_up"]) {
+                continue;
+            }
+            $this->noteWorker($i, (($process === false) ?
+                "could not be started" : (!$status['running'] ?
+                "exited before connecting, with code " . $status['exitcode'] :
+                "did not connect within " . self::WORKER_START_SECONDS .
+                " seconds")) . "; it is tried again after " .
+                self::WORKER_RETRY_SECONDS . " seconds");
+            if (is_resource($process)) {
+                /* Ended and waited for, so no finished process is left
+                   behind for each failed start. */
+                proc_terminate($process);
+                proc_close($process);
+            }
+            unset($this->worker_starts[$i]);
+            $this->worker_retry_after[$i] = time() +
+                self::WORKER_RETRY_SECONDS;
+        }
+    }
+    /**
+     * takeInWorker makes $link, a connection that showed the hash of
+     * worker $i, that worker's link: it shows the worker the front's own
+     * hash, reads the worker's process id, notes the start, and records the
+     * worker in $workers, ready for requests. finishWorkerStarts calls it.
+     *
+     * @param int $i number of the worker that connected
+     * @param resource $link the worker's connection
+     */
+    protected function takeInWorker($i, $link)
+    {
+        $start = $this->worker_starts[$i];
+        unset($this->worker_starts[$i]);
+        stream_set_blocking($link, true);
+        fwrite($link, hash("sha256", "front " . $start["secret"]));
+        $worker_id = unpack("N", (string)fread($link, 4) . "\0\0\0\0")[1];
+        $this->noteWorker($i, "started as process " . $worker_id);
+        stream_set_blocking($link, false);
+        $this->workers[$i] = ["process" => $start["process"],
+            "link" => $link, "id" => $worker_id, "busy" => 0, "parts" => [],
+            "have" => 0, "heard" => time()];
+    }
+    /**
+     * relayToWorker hands the current request to the least busy worker and
+     * lets this process serve others until the reply comes. It runs as a
+     * deferred response: the waiting happens in a fiber, and the reply is
+     * sent by the same code that sends any deferred reply, including one
+     * whose body is a file read out a piece at a time. The worker is sent
+     * the request's globals and the records of any sessions its cookies
+     * name; back come the headers, the body or the file holding it, and
+     * the session records the request made or changed, which are put back
+     * into $sessions. getResponseData calls it in place of process.
+     */
+    protected function relayToWorker()
+    {
+        $session_records = [];
+        foreach ($_COOKIE as $cookie_value) {
+            if (is_string($cookie_value) &&
+                isset($this->sessions[$cookie_value])) {
+                $session_records[$cookie_value] =
+                    $this->sessions[$cookie_value];
+            }
+        }
+        $environment = $this->captureRequestEnvironment();
+        unset($environment["STREAMING_SOCKET"],
+            $environment["STREAMING_CONTEXT"]);
+        $this->worker_request_id++;
+        $request = ["ID" => $this->worker_request_id,
+            "ENVIRONMENT" => $environment, "FILES" => $_FILES,
+            "SESSIONS" => $session_records, "BASE_PATH" => $this->base_path,
+            "SERVER_GLOBALS" => $this->default_server_globals];
+        $this->deferResponse(function () use ($request) {
+            /* A request still waiting its turn when its worker is ended
+               was never run, so it is handed to another worker rather
+               than answered with a 502. Each worker number is tried
+               once, so a worker that keeps stopping cannot hold the
+               request for good. */
+            $tries_left = max(1, $this->worker_count);
+            $growing_file = false;
+            $reserved = $this->worker_reserved !== null &&
+                ($this->worker_reserved)();
+            do {
+                $started = false;
+                $this->waitForFreeWorker($reserved);
+                $worker = $this->leastBusyWorker($reserved);
+                if ($worker === null) {
+                    $this->header(($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
+                        " 503 Service Unavailable");
+                    echo "No worker process is running.";
+                    return;
+                }
+                if (empty($this->workers[$worker]["waiting"])) {
+                    $this->workers[$worker]["heard"] = time();
+                }
+                $this->workers[$worker]["busy"]++;
+                /* Kept with the request, so the access line written when its
+                   reply is sent can say which worker ran it. */
+                $_SERVER['ATTO_WORKER'] = $worker;
+                $message = serialize($request);
+                $this->workers[$worker]["queued"][] =
+                    pack("N", strlen($message)) . $message;
+                $this->writeToWorkers();
+                $id = $request["ID"];
+                $this->workers[$worker]["waiting"][$id] =
+                    [$_SERVER['REQUEST_URI'] ?? "", time(),
+                    $_SERVER['REQUEST_METHOD'] ?? "GET", false];
+                $connection_key = $this->deferredSendContext()['key'] ?? null;
+                if ($connection_key !== null) {
+                    $this->relayed_by_connection[$connection_key][$id] =
+                        $worker;
+                }
+                /* A worker that stops is replaced under the same number,
+                   so the request waits on this worker's link, not on the
+                   number: a request queued to the stopped worker would
+                   otherwise wait on its replacement, which never got it. */
+                $link = $this->workers[$worker]["link"];
+                $same_worker = fn() =>
+                    ($this->workers[$worker]["link"] ?? null) === $link;
+                while (!isset($this->worker_replies[$id]) &&
+                    !isset($this->cancelled_requests[$id]) &&
+                    $same_worker()) {
+                    $this->readWorkerReplies($worker);
+                    $started = $started ||
+                        isset($this->worker_started[$id]);
+                    if (isset($this->worker_growing[$id])) {
+                        $growing_file = $this->startGrowingWorkerFile($id);
+                    }
+                    if (!isset($this->worker_replies[$id]) &&
+                        \Fiber::getCurrent() !== null) {
+                        \Fiber::suspend(["read" =>
+                            $this->workers[$worker]["link"] ?? null,
+                            "until" => fn() => isset($this->worker_replies[$id])
+                            || isset($this->worker_growing[$id])
+                            || isset($this->cancelled_requests[$id])
+                            || !$same_worker()]);
+                    }
+                }
+                /* The worker's word that it took the request up may come
+                   after the fiber last looked, as when the worker is ended
+                   while it runs the request. */
+                $started = $started || isset($this->worker_started[$id]);
+                unset($this->worker_started[$id]);
+                if ($same_worker()) {
+                    $this->workers[$worker]["busy"]--;
+                    unset($this->workers[$worker]["waiting"][$id]);
+                }
+                if ($connection_key !== null) {
+                    unset($this->relayed_by_connection[$connection_key][$id]);
+                    if (empty($this->relayed_by_connection[$connection_key])) {
+                        unset($this->relayed_by_connection[$connection_key]);
+                    }
+                }
+                if (isset($this->cancelled_requests[$id])) {
+                    unset($this->cancelled_requests[$id],
+                        $this->worker_replies[$id],
+                        $this->worker_growing[$id]);
+                    return;
+                }
+                $reply = $this->worker_replies[$id] ?? null;
+                unset($this->worker_replies[$id]);
+                $tries_left--;
+            } while ($reply === null && !$started && $tries_left > 0);
+            if ($reply === null && $growing_file) {
+                /* The headers and part of the file have gone out, so the
+                   reply simply ends, short, where the worker stopped. */
+                return;
+            }
+            if ($reply === null) {
+                $this->header(($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
+                    " 502 Bad Gateway");
+                echo "The worker process running this request stopped.";
+                return;
+            }
+            foreach ($request["SESSIONS"] as $session_id => $record) {
+                if (!isset($reply["SESSIONS"][$session_id])) {
+                    unset($this->sessions[$session_id]);
+                }
+            }
+            foreach ($reply["SESSIONS"] as $session_id => $record) {
+                $this->sessions[$session_id] = $record;
+            }
+            $this->header_data = $reply["HEADER"];
+            $this->content_type = $reply["CONTENT_TYPE"];
+            $this->current_session = $reply["CURRENT_SESSION"];
+            $_SESSION = $reply["SESSION"];
+            if ($reply["STOP"]) {
+                /* The worker's route asked for a stop or restart. The
+                   front holds every session, so it saves them itself,
+                   where the route saved the worker's few; and it stops
+                   only once this reply has been sent, so the page that
+                   polls for the restart reaches the browser. */
+                if ($reply["SESSION_PATH"] !== "") {
+                    $this->saveSessionsForRestart($reply["SESSION_PATH"]);
+                }
+                $this->running_task->stop_after = $reply["RESTART"];
+            }
+            if ($growing_file) {
+                return;
+            }
+            /* A growing file this front could not start early is sent
+               whole now that the worker has finished it. */
+            $reply_file = ($reply["FILE"] ?? "") !== "" ? $reply["FILE"] :
+                ($reply["GROWN_FILE"] ?? "");
+            if ($reply_file !== "" && $this->deferBodyFromFile($reply_file,
+                !empty($reply["REMOVE_FILE"]))) {
+                return;
+            }
+            echo $reply["BODY"];
+        });
+    }
+    /**
+     * startGrowingWorkerFile starts sending a file a worker is still
+     * writing, once the worker has named it. relayToWorker calls it from
+     * the fiber relaying the request, with the message readWorkerReplies
+     * kept in $worker_growing. The message carries the headers the route
+     * had set, which go out first, and then the file is sent as it grows
+     * until the worker's last reply for the request ends the fiber.
+     *
+     * @param int $id the id the front gave the relayed request
+     * @return bool whether the file is being sent; false when the
+     *      request's protocol cannot send a body of unknown length, in
+     *      which case the file is sent whole after the worker finishes
+     */
+    protected function startGrowingWorkerFile($id)
+    {
+        $growing_message = $this->worker_growing[$id];
+        unset($this->worker_growing[$id]);
+        $this->header_data = $growing_message["HEADER"];
+        $this->content_type = $growing_message["CONTENT_TYPE"];
+        $this->current_session = $growing_message["CURRENT_SESSION"];
+        $_SESSION = $growing_message["SESSION"];
+        return $this->deferBodyFromFile($growing_message["FILE"],
+            !empty($growing_message["REMOVE_FILE"]), true);
+    }
+    /**
+     * loadSavedSessions takes back the sessions saveSessionsForRestart
+     * wrote before a restart, so a signed-in user's cookie still names a
+     * session the new server knows. Without them the first request after
+     * the restart, such as the restart page's status poll, is given a new
+     * session and the user is signed out. listen calls it with the
+     * SESSION_INFO it is handed. Only well-formed session ids are taken;
+     * other keys, such as TERMINAL, are not sessions.
+     *
+     * @param array $session_info what saveSessionsForRestart wrote, with
+     *      the sessions under SESSIONS
+     */
+    public function loadSavedSessions($session_info)
+    {
+        foreach ($session_info['SESSIONS'] ?? [] as $session_id => $record) {
+            if (!is_array($record) || !preg_match('/^[a-f0-9]{' .
+                self::SESSION_ID_HEX_LEN . '}$/', (string)$session_id)) {
+                continue;
+            }
+            $sequence = (int)($record['SEQ'] ?? 0);
+            $this->sessions[$session_id] = $record;
+            $this->session_sequence = max($this->session_sequence,
+                $sequence);
+            $this->session_lru ??= new \SplMinHeap();
+            $this->session_lru->insert([$sequence, $session_id]);
+        }
+    }
+    /**
+     * refuseWorkerLink closes a connection to the worker link that did not
+     * show the hash of the secret a worker is started with, as a program
+     * other than the worker would not, and notes it in the worker log with
+     * where it came from. Only WORKER_REFUSALS_NOTED_PER_MINUTE are noted
+     * in a minute, so a flood of them cannot fill the log; the rest are
+     * counted, and the count is noted with the next note. startWorker
+     * calls it.
+     *
+     * @param resource $link the connection to refuse
+     */
+    protected function refuseWorkerLink($link)
+    {
+        $from = (string)stream_socket_get_name($link, true);
+        fclose($link);
+        $minute = intdiv(time(), 60);
+        if ($this->worker_refusals["minute"] != $minute) {
+            $this->worker_refusals["minute"] = $minute;
+            $this->worker_refusals["noted"] = 0;
+        }
+        if ($this->worker_refusals["noted"] >=
+            self::WORKER_REFUSALS_NOTED_PER_MINUTE) {
+            $this->worker_refusals["unnoted"]++;
+            return;
+        }
+        $this->worker_refusals["noted"]++;
+        $unnoted = $this->worker_refusals["unnoted"];
+        $this->worker_refusals["unnoted"] = 0;
+        $this->noteWorker(-1, "link refused a connection from $from that " .
+            "did not prove it was a worker started here" . (($unnoted > 0) ?
+            "; $unnoted more were refused but not noted" : ""));
+    }
+    /**
+     * noteWorker writes one line about a worker's life, starting, failing
+     * to start or stopping, to the WORKER_LOG file its output also goes
+     * to, or to the error log when there is none. startWorker and
+     * readWorkerReplies call it, so a server whose workers never appear
+     * says why.
+     *
+     * @param int $i number of the worker, counted from zero; -1 for a note
+     *      about the worker link rather than one worker
+     * @param string $what what happened to it
+     */
+    protected function noteWorker($i, $what)
+    {
+        $line = date("r") . " worker" . (($i >= 0) ? " " . ($i + 1) : "") .
+            " " . $what;
+        if ($this->worker_log === "" ||
+            @file_put_contents($this->worker_log, "$line\n", FILE_APPEND) ===
+            false) {
+            error_log($line);
+        }
+    }
+    /**
+     * noteFrontWork adds one request of kind $kind to $front_work, with
+     * the processor time the front used since $usage, a getrusage
+     * reading taken when the front began on it. For a relayed request the
+     * time covers handing it to a worker, not the worker's time or the
+     * writing of its reply later. The request handler calls it after each
+     * request, and sampleMemoryUsage writes and clears the totals.
+     *
+     * @param string $kind "relayed", "kept" or "served"
+     * @param array $usage getrusage() taken before the request
+     */
+    protected function noteFrontWork($kind, $usage)
+    {
+        $now = getrusage();
+        $used = ($now["ru_utime.tv_sec"] - $usage["ru_utime.tv_sec"]) +
+            ($now["ru_stime.tv_sec"] - $usage["ru_stime.tv_sec"]) +
+            (($now["ru_utime.tv_usec"] - $usage["ru_utime.tv_usec"]) +
+            ($now["ru_stime.tv_usec"] - $usage["ru_stime.tv_usec"])) /
+            self::MICROSECONDS_PER_SECOND;
+        $this->front_work[$kind]["count"] =
+            ($this->front_work[$kind]["count"] ?? 0) + 1;
+        $this->front_work[$kind]["cpu"] =
+            ($this->front_work[$kind]["cpu"] ?? 0) + $used;
+        if ($kind != "relayed") {
+            $path = strtok($_SERVER['REQUEST_URI'] ?? "", "?");
+            $this->front_work["paths"][$path] =
+                ($this->front_work["paths"][$path] ?? 0) + $used;
+        }
+    }
+    /**
+     * cancelRelayedRequests tells the workers to drop every request from
+     * the connection $key that is still at a worker, since the connection
+     * has closed and no reply can reach it. Each such request's fiber is
+     * ended through $cancelled_requests, and its worker is sent a CANCEL
+     * frame, which the worker applies when it reaches that request, so
+     * work for a client that has gone is not done. shutdownHttpStream
+     * calls it.
+     *
+     * @param int $key the connection's key
+     */
+    protected function cancelRelayedRequests($key)
+    {
+        foreach ($this->relayed_by_connection[$key] ?? [] as $id => $worker) {
+            $this->cancelled_requests[$id] = true;
+            if (!isset($this->workers[$worker])) {
+                continue;
+            }
+            $waiting = $this->workers[$worker]["waiting"] ?? [];
+            if (array_key_first($waiting) !== $id) {
+                /* A request the worker has not reached yet costs it
+                   nothing to drop; one it is already running finishes. */
+                unset($this->workers[$worker]["waiting"][$id]);
+                $this->workers[$worker]["busy"]--;
+            }
+            $message = serialize(["CANCEL" => $id]);
+            $this->workers[$worker]["queued"][] =
+                pack("N", strlen($message)) . $message;
+        }
+        unset($this->relayed_by_connection[$key]);
+    }
+    /**
+     * writeToWorkers writes each worker's queued requests to the worker's
+     * link, as much as the link takes without waiting. A request is queued
+     * to a worker when the front has received it from a browser and chosen
+     * that worker, and it leaves the queue once its last byte is written.
+     * relayToWorker queues a request and calls writeToWorkers, and the main
+     * loop calls it on every pass to write the rest. With each queue goes a
+     * count of how much of its first request has been written, so a large
+     * request is never copied whole to drop the part already written; at
+     * most WORKER_WRITE_SIZE bytes are copied for one write. Requests reach
+     * a worker whole and in order this way, and a worker that is busy and
+     * not reading, with a large upload queued for it, never holds the front
+     * up.
+     */
+    protected function writeToWorkers()
+    {
+        foreach ($this->workers as $i => $worker) {
+            while (!empty($this->workers[$i]["queued"])) {
+                $offset = $this->workers[$i]["queued_written"] ?? 0;
+                $next_request = $this->workers[$i]["queued"][0];
+                $written = @fwrite($worker["link"], $offset == 0 ?
+                    $next_request : substr($next_request, $offset,
+                    self::WORKER_WRITE_SIZE));
+                if (empty($written)) {
+                    break;
+                }
+                $offset += $written;
+                if ($offset < strlen($next_request)) {
+                    $this->workers[$i]["queued_written"] = $offset;
+                    break;
+                }
+                array_shift($this->workers[$i]["queued"]);
+                $this->workers[$i]["queued_written"] = 0;
+            }
+        }
+    }
+    /**
+     * endOverdueWorkers ends any worker whose current request, other than
+     * a POST, has run for more than WORKER_REQUEST_SECONDS by the clock, and
+     * any worker with requests queued to it that has sent the front nothing
+     * for WORKER_SILENT_SECONDS. The worker's link then closes,
+     * readWorkerReplies notes it stopped with the request it was on, and
+     * every request waiting on it gets a 502. The main loop calls it on
+     * each pass. A worker started through WORKER_START is ended by its
+     * process id, which needs posix_kill; one started with proc_open is
+     * ended through its process handle.
+     */
+    protected function endOverdueWorkers()
+    {
+        $now = time();
+        foreach ($this->workers as $i => $worker) {
+            $waiting = $worker["waiting"] ?? [];
+            $running = reset($waiting);
+            if ($running === false) {
+                continue;
+            }
+            if (!empty($worker["ended"])) {
+                /* A worker asked to stop that has not stopped within
+                   WORKER_STOP_SECONDS is killed outright. */
+                if ($now - $worker["ended"] > 2 * self::WORKER_STOP_SECONDS) {
+                    /* Killed and still not gone: its link is held open by
+                       a process it started, which inherited it. The front
+                       stops waiting on it. */
+                    $this->dropWorker($i, "dropped, its link still open");
+                    continue;
+                }
+                if ($now - $worker["ended"] > self::WORKER_STOP_SECONDS &&
+                    !empty($worker["id"])) {
+                    if ($this->worker_stop !== null) {
+                        ($this->worker_stop)($worker["id"], false);
+                    } else if (function_exists("posix_kill")) {
+                        posix_kill($worker["id"], 9);
+                    }
+                }
+                continue;
+            }
+            $overdue = $running[2] !== "POST" && !empty($running[3]) &&
+                $now - $running[1] > self::WORKER_REQUEST_SECONDS;
+            $silent = !($running[2] === "POST" && !empty($running[3])) &&
+                $now - ($worker["heard"] ?? $now) > self::WORKER_SILENT_SECONDS;
+            if (!$overdue && !$silent) {
+                continue;
+            }
+            if (is_resource($worker["process"])) {
+                proc_terminate($worker["process"], 9);
+            } else if ($this->worker_stop !== null && !empty($worker["id"])) {
+                /* Asked to stop first, so the worker can log where it was
+                   before it exits. */
+                ($this->worker_stop)($worker["id"], true);
+            } else if (function_exists("posix_kill") &&
+                !empty($worker["id"])) {
+                posix_kill($worker["id"], 15);
+            } else {
+                continue;
+            }
+            $this->workers[$i]["ended"] = $now;
+            $this->noteWorker($i, "ended after " . ($now - $running[1]) .
+                " s on " . $running[0]);
+        }
+    }
+    /**
+     * leastBusyWorker picks the worker running the fewest requests, first
+     * starting a new worker in place of any that has stopped. A worker
+     * still starting is not chosen. relayToWorker and waitForFreeWorker
+     * call it for each request.
+     *
+     * @param bool $reserved whether the request is one the reserved worker
+     *      is kept for, in which case only that worker is chosen when one
+     *      is kept
+     * @return int|null number of the chosen worker, or null if none runs
+     */
+    protected function leastBusyWorker($reserved = false)
+    {
+        /* A worker whose link closed was dropped when its end was read;
+           every number up to the count asked for that has no worker gets
+           a new one here. */
+        for ($i = 0; $i < $this->worker_count; $i++) {
+            if (!isset($this->workers[$i]) &&
+                !isset($this->worker_starts[$i]) &&
+                time() >= ($this->worker_retry_after[$i] ?? 0)) {
+                $this->startWorker($i);
+            }
+        }
+        if (!empty($this->worker_starts)) {
+            $this->finishWorkerStarts();
+        }
+        $last = $this->worker_count - 1;
+        if ($this->worker_reserved !== null && $this->worker_count > 1) {
+            if ($reserved) {
+                return isset($this->workers[$last]) ? $last : null;
+            }
+        }
+        $chosen = null;
+        foreach ($this->workers as $i => $worker) {
+            /* A worker asked to stop runs nothing more. */
+            if (!empty($worker["ended"])) {
+                continue;
+            }
+            if ($this->worker_reserved !== null && $this->worker_count > 1 &&
+                $i == $last) {
+                continue;
+            }
+            if ($chosen === null ||
+                $worker["busy"] < $this->workers[$chosen]["busy"]) {
+                $chosen = $i;
+            }
+        }
+        /* The reserved worker also takes other requests while it has
+           nothing to do and every other worker is busy, so it is never
+           idle while requests queue; a reserved request then waits behind
+           at most the one request it is running. */
+        if ($this->worker_reserved !== null && $this->worker_count > 1 &&
+            isset($this->workers[$last]) && $this->workers[$last]["busy"] == 0
+            && empty($this->workers[$last]["ended"])
+            && ($chosen === null || $this->workers[$chosen]["busy"] > 0)) {
+            $chosen = $last;
+        }
+        return $chosen;
+    }
+    /**
+     * waitForFreeWorker holds the current request in this process, rather
+     * than queue it to a worker, while every worker it may go to is
+     * running a request. A worker runs one request at a time, so a
+     * request queued to a worker running a slow search waits for the whole
+     * search, though another worker may be free in a moment; a slow
+     * search then held up every page queued behind it. A request also
+     * waits while the only workers are still starting. The wait ends when
+     * a worker the request may go to has nothing to run, or after
+     * WORKER_SILENT_SECONDS, when the request is queued to the least busy
+     * worker as before. relayToWorker calls it before choosing a worker.
+     *
+     * @param bool $reserved whether the request is one the reserved worker
+     *      is kept for, as leastBusyWorker takes it
+     */
+    protected function waitForFreeWorker($reserved)
+    {
+        if (\Fiber::getCurrent() === null) {
+            return;
+        }
+        $give_up = time() + self::WORKER_SILENT_SECONDS;
+        /* With no worker to choose, the request also waits while one is
+           starting, or while one asked to stop has not yet gone, after
+           which a new one is started in its place, rather than be
+           answered that none is running. */
+        $must_wait = fn($worker) => ($worker === null) ?
+            (!empty($this->worker_starts) || !empty(array_filter(
+            array_column($this->workers, "ended")))) :
+            $this->workers[$worker]["busy"] > 0;
+        $chosen = $this->leastBusyWorker($reserved);
+        while ($must_wait($chosen) && time() < $give_up) {
+            /* Waiting on the chosen worker's link wakes the event loop
+               when that worker answers; a reply from any other worker
+               wakes it too, through the request waiting on that one. A
+               worker starting wakes it through the worker link. */
+            \Fiber::suspend(["read" => ($chosen === null) ?
+                $this->worker_listener : $this->workers[$chosen]["link"],
+                "until" => fn() => time() >= $give_up ||
+                    !$must_wait($this->leastBusyWorker($reserved))]);
+            $chosen = $this->leastBusyWorker($reserved);
+        }
+    }
+    /**
+     * dropWorker forgets worker $i: it notes $how in the worker log with
+     * the request the worker was on and how many more were queued to it,
+     * closes the front's end of its link, and removes it, so every request
+     * waiting on it gets a 502 and the next request starts a new worker.
+     * readWorkerReplies calls it when a worker's link closes, and
+     * endOverdueWorkers when a killed worker's link stays open.
+     *
+     * @param int $i number of the worker to drop
+     * @param string $how what happened to the worker, for the log
+     */
+    protected function dropWorker($i, $how)
+    {
+        $waiting = $this->workers[$i]["waiting"] ?? [];
+        $running = reset($waiting);
+        $this->noteWorker($i, $how . (($running === false) ? "" :
+            " while running " . $running[0] . " for " .
+            (time() - $running[1]) . " s, with " . (count($waiting) - 1) .
+            " more waiting"));
+        if (is_resource($this->workers[$i]["process"])) {
+            proc_close($this->workers[$i]["process"]);
+        }
+        if (is_resource($this->workers[$i]["link"])) {
+            fclose($this->workers[$i]["link"]);
+        }
+        unset($this->workers[$i]);
+    }
+    /**
+     * readWorkerReplies reads what worker $i has sent and files each whole
+     * reply under its request id in $worker_replies. A closed link removes
+     * the worker, so a request waiting on it is answered with an error.
+     * relayToWorker calls it while it waits.
+     *
+     * @param int $i number of the worker to read from
+     */
+    protected function readWorkerReplies($i)
+    {
+        $link = $this->workers[$i]["link"];
+        $read = fread($link, self::WORKER_READ_BYTES);
+        if (($read === false || $read === "") && feof($link)) {
+            $this->dropWorker($i, "stopped");
+            return;
+        }
+        if ($read !== false && $read !== "") {
+            $this->workers[$i]["heard"] = time();
+        }
+        /* What the worker sends is kept as a list of the pieces read, and
+           joined only once a whole reply has come, so a reply of many
+           megabytes is not copied again on every read. */
+        $worker = &$this->workers[$i];
+        if ($read !== false && $read !== "") {
+            $worker["parts"][] = $read;
+            $worker["have"] += strlen($read);
+        }
+        while (true) {
+            if (!isset($worker["need"])) {
+                if ($worker["have"] < 4) {
+                    break;
+                }
+                if (strlen($worker["parts"][0]) < 4) {
+                    $worker["parts"] = [implode("", $worker["parts"])];
+                }
+                $worker["need"] = 4 + unpack("N", $worker["parts"][0])[1];
+            }
+            if ($worker["have"] < $worker["need"]) {
+                break;
+            }
+            $buffer = implode("", $worker["parts"]);
+            $reply = unserialize(substr($buffer, 4, $worker["need"] - 4));
+            $rest = substr($buffer, $worker["need"]);
+            $worker["parts"] = ($rest === "") ? [] : [$rest];
+            $worker["have"] = strlen($rest);
+            unset($worker["need"], $buffer, $rest);
+            if (is_array($reply) && isset($reply["STARTED"])) {
+                /* The worker has taken this request up, so its time on
+                   it counts from now, not from when it was queued or from
+                   when the worker was starting up. */
+                if (isset($this->workers[$i]["waiting"][$reply["STARTED"]])) {
+                    $this->workers[$i]["waiting"][$reply["STARTED"]][1] =
+                        time();
+                    $this->workers[$i]["waiting"][$reply["STARTED"]][3] =
+                        true;
+                    $this->worker_started[$reply["STARTED"]] = true;
+                }
+                continue;
+            }
+            if (is_array($reply) && isset($reply["GROWING"])) {
+                /* The request's route has started a file it is still
+                   writing. The fiber relaying the request sends it; a
+                   request whose connection has gone has no such fiber,
+                   and its last reply deletes the file below. */
+                if (!isset($this->cancelled_requests[$reply["GROWING"]])) {
+                    $this->worker_growing[$reply["GROWING"]] = $reply;
+                }
+                continue;
+            }
+            if (is_array($reply) &&
+                isset($this->cancelled_requests[$reply["ID"] ?? null])) {
+                /* The connection went while the worker ran this request,
+                   so no fiber waits for the reply. */
+                unset($this->cancelled_requests[$reply["ID"]],
+                    $this->workers[$i]["waiting"][$reply["ID"]],
+                    $this->worker_started[$reply["ID"]]);
+                $this->workers[$i]["busy"]--;
+                if (($reply["GROWN_FILE"] ?? "") !== "" &&
+                    !empty($reply["REMOVE_FILE"])) {
+                    @unlink($reply["GROWN_FILE"]);
+                }
+                continue;
+            }
+            if (is_array($reply) && isset($reply["ID"])) {
+                $this->worker_replies[$reply["ID"]] = $reply;
+            }
+        }
+        unset($worker);
+    }
+    /**
+     * serveAsWorker makes this process a worker for a front process: it
+     * connects to the link ATTO_WORKER_LINK names and runs each request
+     * sent there through the same routes and code as a normal request,
+     * then sends back the headers, the body, the file holding a streamed
+     * body, and the session records. A route that names a file it is still
+     * writing has the file's name sent at once, through deferBodyFromFile,
+     * and the last reply then says the file is done. It returns when the
+     * link closes,
+     * which is when the front process stops. A site script calls it
+     * instead of listen when started as a worker.
+     */
+    public function serveAsWorker()
+    {
+        if (function_exists("pcntl_signal")) {
+            /* When the front asks this worker to stop, it logs the code it
+               was in, so a request that ran too long names its slow step. */
+            pcntl_async_signals(true);
+            pcntl_signal(SIGTERM, function () {
+                $steps = [];
+                foreach (array_slice(debug_backtrace(), 1,
+                    self::WORKER_TRACE_STEPS) as $step) {
+                    $steps[] = basename($step["file"] ?? "?") . ":" .
+                        ($step["line"] ?? "?") . " " .
+                        ($step["function"] ?? "");
+                }
+                error_log("[website-worker] asked to stop while running " .
+                    ($_SERVER['REQUEST_URI'] ?? "") . " at " .
+                    implode(" < ", $steps));
+                exit();
+            });
+        }
+        $link = @stream_socket_client("tcp://127.0.0.1:" .
+            getenv("ATTO_WORKER_LINK"), $errno, $errstr,
+            self::WORKER_START_SECONDS);
+        if ($link === false) {
+            return;
+        }
+        /* Each side shows the other a hash of the secret the front
+           started this worker with; a program that is not the front
+           cannot answer, and nothing is read from it. */
+        $secret = (string)getenv("ATTO_WORKER_SECRET");
+        fwrite($link, hash("sha256", "worker $secret"));
+        /* The front may never answer: a front that stopped while this
+           worker started leaves its listening socket open in this worker,
+           which inherited it, so the connection is made but never taken.
+           Waiting for good would keep this worker, and every worker whose
+           link it also inherited, running after the front is gone. */
+        stream_set_timeout($link, self::WORKER_START_SECONDS);
+        $answer = "";
+        while (strlen($answer) < 64) {
+            $read = fread($link, 64 - strlen($answer));
+            if ($read === false || ($read === "" && (feof($link) ||
+                stream_get_meta_data($link)["timed_out"]))) {
+                return;
+            }
+            $answer .= $read;
+        }
+        stream_set_timeout($link, (int)ini_get("default_socket_timeout"));
+        if ($secret === "" ||
+            !hash_equals(hash("sha256", "front $secret"), $answer)) {
+            return;
+        }
+        $this->file_journal = (string)getenv("ATTO_WORKER_JOURNAL");
+        fwrite($link, pack("N", getmypid()));
+        $this->worker_link = $link;
+        $queued = [];
+        $cancelled = [];
+        while (true) {
+            /* Every frame already on the link is read before the next
+               request is taken up, so a CANCEL the front sent for a
+               request still in the queue is seen before that request
+               runs. */
+            do {
+                $header = $this->readWorkerBytes($link, 4, $queued === []);
+                if ($header === null) {
+                    return;
+                }
+                if ($header === "") {
+                    break;
+                }
+                $message = $this->readWorkerBytes($link,
+                    unpack("N", $header)[1]);
+                $frame = ($message === null) ? null : unserialize($message);
+                if (!is_array($frame)) {
+                    return;
+                }
+                if (isset($frame["CANCEL"])) {
+                    $cancelled[$frame["CANCEL"]] = true;
+                } else {
+                    $queued[] = $frame;
+                }
+            } while (true);
+            $request = array_shift($queued);
+            if (isset($cancelled[$request["ID"]])) {
+                unset($cancelled[$request["ID"]]);
+                continue;
+            }
+            /* The base path comes from how the front process was started,
+               which a worker started by another path would work out
+               differently, and it decides which route a path matches. */
+            $this->base_path = $request["BASE_PATH"];
+            /* A request the route makes to this site itself is built
+               from these settings. A worker never runs listen, so it takes
+               the front's; without them such a request lacked SCRIPT_NAME,
+               and an application routing on it showed its error page. */
+            $this->default_server_globals = $request["SERVER_GLOBALS"];
+            $this->sessions = $request["SESSIONS"];
+            $this->applyRequestEnvironment($request["ENVIRONMENT"] + [
+                "STREAMING_SOCKET" => null, "STREAMING_CONTEXT" => [],
+                "IS_STREAMING" => false, "STREAMING_FAILED" => false]);
+            $_FILES = $request["FILES"];
+            $this->stop = false;
+            $this->restart = "";
+            $this->saved_sessions_path = "";
+            set_time_limit((($_SERVER['REQUEST_METHOD'] ?? "GET") === "POST")
+                ? 0 : self::WORKER_REQUEST_SECONDS);
+            /* The front times WORKER_REQUEST_SECONDS from the word sent
+               next, not from the request's arrival, which is earlier when
+               the request waited for a free worker. A route that keeps
+               within that limit times itself from here. */
+            $_SERVER['WORKER_STARTED_FLOAT'] = microtime(true);
+            $started = serialize(["STARTED" => $request["ID"]]);
+            fwrite($link, pack("N", strlen($started)) . $started);
+            $this->worker_reply_file = "";
+            $this->worker_remove_file = false;
+            $this->worker_running_id = $request["ID"];
+            $this->worker_grown_file = "";
+            $body = $this->getResponseData(false);
+            set_time_limit(0);
+            $reply = serialize(["ID" => $request["ID"],
+                "HEADER" => (string)$this->header_data,
+                "CONTENT_TYPE" => $this->content_type,
+                "CURRENT_SESSION" => (string)$this->current_session,
+                "SESSION" => $_SESSION, "SESSIONS" => $this->sessions,
+                "BODY" => (string)$body, "STOP" => (bool)$this->stop,
+                "RESTART" => $this->restart,
+                "SESSION_PATH" => $this->saved_sessions_path,
+                "FILE" => $this->worker_reply_file,
+                "GROWN_FILE" => $this->worker_grown_file,
+                "REMOVE_FILE" => $this->worker_remove_file]);
+            $this->worker_reply_file = null;
+            fwrite($link, pack("N", strlen($reply)) . $reply);
+        }
+    }
+    /**
+     * readWorkerBytes reads exactly $length bytes from a worker's link
+     * for serveAsWorker. With $wait it waits as needed; without it, when
+     * no byte is there to read it returns "" at once, so the worker can
+     * see whether another frame has arrived before it takes up a request.
+     *
+     * @param resource $link the worker's link to the front process
+     * @param int $length how many bytes to read
+     * @param bool $wait whether to wait for bytes that are not there yet
+     * @return string|null the bytes, "" if none were waiting and $wait is
+     *      false, or null if the link closed first
+     */
+    protected function readWorkerBytes($link, $length, $wait = true)
+    {
+        $bytes = "";
+        if (!$wait) {
+            $reads = [$link];
+            $writes = null;
+            $excepts = null;
+            if (stream_select($reads, $writes, $excepts, 0) < 1) {
+                return "";
+            }
+        }
+        while (strlen($bytes) < $length) {
+            $read = fread($link, $length - strlen($bytes));
+            if ($read === false || ($read === "" && feof($link))) {
+                return null;
+            }
+            $bytes .= $read;
+        }
+        return $bytes;
+    }
+    /**
+     * syncFileJournal drops from this process's file cache every file
+     * another server process has written since this one last looked, so
+     * a cached copy is never served after the file on disk changed. It
+     * reads the new lines of the file write journal, each the path of one
+     * written file, and forgets that path's cached contents, compressed
+     * copy and hash; the hash matters too, since filePutContents skips a
+     * write whose data matches the hash. A journal shorter than the part
+     * already read was started again empty, so everything is dropped.
+     * fileGetContents and filePutContents call it before using the cache.
+     * It does nothing when the server runs alone. Appending with LOCK_EX
+     * and reading under a shared lock work the same on Linux, macOS and
+     * Windows.
+     */
+    protected function syncFileJournal()
+    {
+        if ($this->file_journal === "") {
+            return;
+        }
+        clearstatcache(true, $this->file_journal);
+        $size = @filesize($this->file_journal);
+        if ($size === false || $size == $this->file_journal_offset) {
+            return;
+        }
+        if ($size < $this->file_journal_offset) {
+            $this->clearFileCache();
+            $this->file_journal_offset = $size;
+            return;
+        }
+        $journal = @fopen($this->file_journal, "rb");
+        if ($journal === false) {
+            return;
+        }
+        flock($journal, LOCK_SH);
+        fseek($journal, $this->file_journal_offset);
+        $added = stream_get_contents($journal);
+        flock($journal, LOCK_UN);
+        fclose($journal);
+        $last_newline = strrpos($added, "\n");
+        if ($last_newline === false) {
+            return;
+        }
+        $this->file_journal_offset += $last_newline + 1;
+        foreach (explode("\n", substr($added, 0, $last_newline)) as $path) {
+            $compressed = $path . self::COMPRESSED_CACHE_SUFFIX;
+            unset($this->file_cache['MARKED'][$path],
+                $this->file_cache['UNMARKED'][$path],
+                $this->file_cache['MARKED'][$compressed],
+                $this->file_cache['UNMARKED'][$compressed],
+                $this->file_cache['HASH'][$path]);
+        }
     }
     /**
      * Deletes the files stored in the RAM FileCache
@@ -2587,7 +4596,6 @@ class WebSite
      * Returns the mime type of the provided file name if it can be
      * determined from the file's name. The type is read from the name's
      * extension rather than the file's bytes, so it costs no file read.
-     * (This function is from the seekquarry/yioop project)
      *
      * @param string $file_name name of file, including path, to figure out
      *      the mime type for
@@ -2616,6 +4624,7 @@ class WebSite
             ".ico" => "image/x-icon",
             ".css" => "text/css",
             ".csv" => "text/csv",
+            ".diff" => "text/plain",
             ".epub" => "application/epub+zip",
             ".gif" => "image/gif",
             ".gz" => "application/gzip",
@@ -2626,6 +4635,7 @@ class WebSite
             ".oga" => "audio/ogg",
             ".ogg" => "audio/ogg",
             ".opus" => "audio/opus",
+            ".patch" => "text/plain",
             ".mov" => "video/quicktime",
             ".mp3" => "audio/mpeg",
             ".mp4" => "video/mp4",
@@ -2670,14 +4680,12 @@ class WebSite
         }
         $next_time = microtime(true) + $time;
         /*
-            Use a string key for the timers map. PHP array keys are
-            always ints or strings, so a float key like
-            1777158012.190742 would be implicitly truncated to int
-            (and emit a deprecation notice on PHP 8.1+). Storing
-            the key as a string preserves the full microsecond
-            precision and lets processTimers look it up reliably.
+            Each timer has an id of its own, kept for as long as it
+            repeats, so timers due at the same moment each run, and
+            clearTimer stops a repeating timer by the id setTimer gave.
          */
-        $key = (string) $next_time;
+        $this->timers_made++;
+        $key = "timer" . $this->timers_made;
         $this->timers[$key] = [$repeating, $time, $callback];
         $this->timer_alarms->insert([$next_time, $key]);
         return $key;
@@ -2814,6 +4822,7 @@ class WebSite
     {
         $default_server_globals = self::defaultServerGlobals();
         $original_address = is_array($address) ? "multi" : $address;
+        $this->listen_address = $original_address;
         $shared_context = [];
         $shared_globals = [];
         if (is_array($config_array_or_ini_filename)) {
@@ -2852,6 +4861,25 @@ class WebSite
            zero or absent leaves the sampling off. It is taken out of
            the globals so it does not leak into $_SERVER as a stray CGI
            variable. */
+        $this->file_journal = (string)($shared_globals['FILE_JOURNAL'] ??
+            ($shared_context['FILE_JOURNAL'] ?? ""));
+        unset($shared_globals['FILE_JOURNAL'],
+            $shared_context['FILE_JOURNAL']);
+        $this->loadSavedSessions($shared_globals['SESSION_INFO'] ?? []);
+        unset($shared_globals['SESSION_INFO']);
+        $worker_count = (int)($shared_globals['WORKERS'] ?? 0);
+        $this->worker_command = (array)($shared_globals['WORKER_COMMAND'] ??
+            []);
+        $this->worker_start = $shared_globals['WORKER_START'] ?? null;
+        $this->worker_reserved = $shared_globals['WORKER_RESERVED'] ?? null;
+        $this->worker_stop = $shared_globals['WORKER_STOP'] ?? null;
+        $this->worker_log = (string)($shared_globals['WORKER_LOG'] ?? "");
+        $this->front_only = $shared_globals['FRONT_ONLY'] ?? null;
+        unset($shared_globals['WORKERS'], $shared_globals['WORKER_COMMAND'],
+            $shared_globals['WORKER_START'],
+            $shared_globals['WORKER_RESERVED'],
+            $shared_globals['WORKER_STOP'],
+            $shared_globals['WORKER_LOG'], $shared_globals['FRONT_ONLY']);
         $this->memory_sample_period = (int)($shared_globals[
             'WEBSITE_MEMORY_SAMPLE_PERIOD'] ??
             ($shared_context['WEBSITE_MEMORY_SAMPLE_PERIOD'] ?? 0));
@@ -2987,6 +5015,15 @@ class WebSite
                 }
             }
         }
+        if ($worker_count > 0 && (!empty($this->worker_command) ||
+            $this->worker_start !== null)) {
+            /* Workers start after the server has become its run-as
+               user, so they run as that user too. They inherit the
+               listening sockets, but each exits when its link to this
+               process closes, so none outlives the server holding a
+               port. */
+            $this->startWorkers($worker_count);
+        }
         $this->in_streams = [self::CONNECTION => [], self::DATA => [""]];
         $this->out_streams = [self::CONNECTION => [], self::DATA => [],
             self::DATA_OFFSET => []];
@@ -3029,13 +5066,26 @@ class WebSite
         $num_selected = 1;
         while (!$this->stop || $num_selected > 0) {
             $this->sampleMemoryUsage();
+            $this->endOverdueWorkers();
+            $this->writeToWorkers();
             $this->reapIdleSessions();
+            $this->sweepSessionFiles(time());
             if ($this->stop) {
+                if ($this->stop_started == 0) {
+                    $this->stop_started = microtime(true);
+                }
                 $in_streams_with_data = $this->in_streams[self::CONNECTION];
                 foreach ($this->listeners as $key => $entry) {
                     unset($in_streams_with_data[$key]);
                 }
                 if (count($in_streams_with_data) == 0) {
+                    break;
+                }
+                if (microtime(true) - $this->stop_started >
+                    $this->stop_drain_limit) {
+                    foreach ($in_streams_with_data as $key => $stream) {
+                        $this->shutdownHttpStream($key);
+                    }
                     break;
                 }
             } else {
@@ -3086,7 +5136,7 @@ class WebSite
                 its value wins. The clamp is a no-op on servers
                 without an H3 listener.
              */
-            $h3_min_ms = null;
+            $h3_soonest = null;
             foreach ($this->listeners as $listener_entry) {
                 /*
                     Duck-type any UDP-driven listener that
@@ -3098,19 +5148,19 @@ class WebSite
                         'nextTimeoutMillis')) {
                     $candidate = $listener_entry->nextTimeoutMillis();
                     if ($candidate !== null
-                        && ($h3_min_ms === null
-                            || $candidate < $h3_min_ms)) {
-                        $h3_min_ms = $candidate;
+                        && ($h3_soonest === null
+                            || $candidate < $h3_soonest)) {
+                        $h3_soonest = $candidate;
                     }
                 }
             }
-            if ($h3_min_ms !== null) {
-                $h3_secs = $h3_min_ms / 1000.0;
+            if ($h3_soonest !== null) {
+                $h3_wait = $h3_soonest / 1000.0;
                 if ($timeout === null
-                    || $h3_secs < $timeout +
+                    || $h3_wait < $timeout +
                         $micro_timeout / self::MICROSECONDS_PER_SECOND) {
-                    $timeout = (int) floor($h3_secs);
-                    $micro_timeout = (int) (($h3_secs - $timeout)
+                    $timeout = (int) floor($h3_wait);
+                    $micro_timeout = (int) (($h3_wait - $timeout)
                         * self::MICROSECONDS_PER_SECOND);
                 }
             }
@@ -3142,8 +5192,62 @@ class WebSite
                     }
                 }
             }
+            /* While a walk of the session folder is under way, sleep at
+               most SESSION_FILE_SWEEP_PAUSE between its steps, so a quiet
+               server still gets through a folder of a great many files
+               in reasonable time. While stopping, sleep at most
+               STOP_PASS_PAUSE, so the stop is over as soon as its
+               connections are, or as soon as its time to drain them is
+               up. */
+            $most_pause = null;
+            if ($this->session_file_sweep_handle !== null) {
+                $most_pause = self::SESSION_FILE_SWEEP_PAUSE;
+            }
+            if ($this->stop) {
+                $most_pause = self::STOP_PASS_PAUSE;
+            }
+            if ($most_pause !== null) {
+                $wanted = ($timeout === null) ? $most_pause + 1 :
+                    $timeout * self::MICROSECONDS_PER_SECOND +
+                    $micro_timeout;
+                if ($wanted > $most_pause) {
+                    $timeout = 0;
+                    $micro_timeout = $most_pause;
+                }
+            }
+            /* A worker's reply wakes the loop like any readable stream,
+               so the request waiting for it resumes at once rather than
+               at the next timer or client event. */
+            foreach ($this->workers as $i => $worker) {
+                $in_streams_with_data["worker $i"] = $worker["link"];
+            }
+            /* While a worker starts, its connecting back, and its showing
+               its hash, wake the loop too. */
+            if (!empty($this->worker_starts)) {
+                $in_streams_with_data["starting workers"] =
+                    $this->worker_listener;
+                foreach ($this->worker_pending_links as $k => $connection) {
+                    $in_streams_with_data["starting link $k"] =
+                        $connection["link"];
+                }
+            }
             $num_selected = stream_select($in_streams_with_data,
                 $out_streams_with_data, $excepts, $timeout, $micro_timeout);
+            foreach (array_keys($in_streams_with_data) as $key) {
+                if (is_string($key) && str_starts_with($key, "starting ")) {
+                    unset($in_streams_with_data[$key]);
+                } else if (is_string($key) &&
+                    str_starts_with($key, "worker ")) {
+                    unset($in_streams_with_data[$key]);
+                    $i = (int)substr($key, strlen("worker "));
+                    if (isset($this->workers[$i])) {
+                        $this->readWorkerReplies($i);
+                    }
+                }
+            }
+            if (!empty($this->worker_starts)) {
+                $this->finishWorkerStarts();
+            }
             $this->processTimers();
             /*
                 Drive H3 listener internal timers regardless of
@@ -3195,6 +5299,13 @@ class WebSite
             }
             $this->cullDeadStreams();
         }
+        /* A worker still starting has no link yet to see this process
+           end by, so it is ended here. */
+        foreach ($this->worker_starts as $start) {
+            if (is_resource($start["process"])) {
+                proc_terminate($start["process"], 9);
+            }
+        }
         if ($this->restart && !empty($_SERVER['SCRIPT_NAME'])) {
             $session_path = substr($this->restart, strlen('restart') + 1);
             $php_path = $this->default_server_globals["PHP_PATH"] ?? "";
@@ -3210,7 +5321,7 @@ class WebSite
             /* a launcher can name the address the re-spawned
                process should be started with (for instance a marker
                that selects a multi-port bind), supplied as a server
-               global so this Yioop-agnostic server need not know
+               global so this server need not know
                what the marker means; fall back to the address this
                process was launched with otherwise */
             $restart_arg = $this->default_server_globals[
@@ -3243,6 +5354,22 @@ class WebSite
                 : "$script < /dev/null > /dev/null &";
             pclose(popen($job, "r"));
         }
+    }
+    /**
+     * restartAddress gives the address a replacement for this server
+     * should be started on. Where whatever launched this server named
+     * an address for a restart, that is the one, since a launcher may
+     * bind several ports from one word it alone understands; otherwise
+     * it is the address this server was told to listen on. A caller
+     * that starts a replacement reads this rather than working the
+     * address out again.
+     *
+     * @return string the address a replacement server is started with
+     */
+    public function restartAddress()
+    {
+        $named = $this->default_server_globals["RESTART_ADDRESS"] ?? "";
+        return ($named === "") ? $this->listen_address : $named;
     }
     /**
      * Opens a single server listener at $address with the given
@@ -3402,6 +5529,10 @@ class WebSite
                 $this->content_type,
             "CURRENT_SESSION" => empty($this->current_session) ? "" :
                 $this->current_session,
+            "STREAMING_SOCKET" => $this->streaming_socket,
+            "STREAMING_CONTEXT" => $this->streaming_context,
+            "IS_STREAMING" => $this->is_streaming,
+            "STREAMING_FAILED" => $this->streaming_failed,
         ];
     }
     /**
@@ -3425,14 +5556,20 @@ class WebSite
         $this->header_data = $environment["HEADER"];
         $this->content_type = $environment["CONTENT_TYPE"];
         $this->current_session = $environment["CURRENT_SESSION"];
+        if (array_key_exists("STREAMING_CONTEXT", $environment)) {
+            $this->streaming_socket = $environment["STREAMING_SOCKET"];
+            $this->streaming_context = $environment["STREAMING_CONTEXT"];
+            $this->is_streaming = $environment["IS_STREAMING"];
+            $this->streaming_failed = $environment["STREAMING_FAILED"];
+        }
     }
     /**
      * Handles a local HTTP request from inside a running WebSite
      * route back to itself. The single-threaded event loop makes
      * a real curl/socket loopback deadlock; this short-circuits
-     * by invoking the route handler in-process. Routes that need
-     * loopback (yioop's FetchUrl) should detect "local" URLs and
-     * call this instead of curl.
+     * by invoking the route handler in-process. A route that fetches
+     * pages of its own site should detect "local" URLs and call this
+     * instead of curl.
      *
      * @param string $url local page url requested
      * @param bool $include_headers include HTTP response headers
@@ -3502,17 +5639,96 @@ class WebSite
                 $this->current_session];
         $this->setGlobals($context);
         $out_data = $this->getResponseData($include_headers);
-        $r = array_pop($request_context);
-        $_SERVER = $r["SERVER"];
-        $_GET = $r["GET"];
-        $_POST = $r["POST"];
-        $_REQUEST = $r["REQUEST"];
-        $_COOKIE = $r["COOKIE"];
-        $_SESSION = $r["SESSION"];
-        $this->header_data = $r["HEADER"];
-        $this->content_type = $r["CONTENT_TYPE"];
-        $this->current_session = $r["CURRENT_SESSION"];
+        $saved = array_pop($request_context);
+        $_SERVER = $saved["SERVER"];
+        $_GET = $saved["GET"];
+        $_POST = $saved["POST"];
+        $_REQUEST = $saved["REQUEST"];
+        $_COOKIE = $saved["COOKIE"];
+        $_SESSION = $saved["SESSION"];
+        $this->header_data = $saved["HEADER"];
+        $this->content_type = $saved["CONTENT_TYPE"];
+        $this->current_session = $saved["CURRENT_SESSION"];
         return $out_data;
+    }
+    /**
+     * Says that a deferred reply's body is the given file rather than
+     * whatever the handler prints. The file is drained to the client a
+     * piece at a time, so a reply far larger than the server's memory can
+     * be sent without being held. A handler that has built a file -- the
+     * pack a git pull asks for, say -- names it here instead of printing
+     * it, which would gather the whole reply in memory.
+     *
+     * A handler may also name a file it has only begun to write, with
+     * $growing. The headers then go out at once, without a length, and the
+     * file is sent as it grows: in chunks under HTTP/1.1 and in DATA
+     * frames under HTTP/2 and HTTP/3. The reply ends when the handler
+     * returns. A git
+     * clone of a long history starts arriving this way while its pack is
+     * still being made, rather than after the whole pack is built.
+     *
+     * @param string $path the file holding the body
+     * @param bool $remove_after whether to delete the file once it has all
+     *      gone out, for a file made only to be sent
+     * @param bool $growing whether the handler is still writing the file
+     *      and goes on writing it after this call
+     * @return bool whether the file was taken; false when this request is
+     *      not deferred, in which case the caller sends the file itself,
+     *      and false for a growing file on HTTP/1.0, which has no way to
+     *      send a body of unknown length and keep the connection
+     */
+    public function deferBodyFromFile($path, $remove_after = false,
+        $growing = false)
+    {
+        $task = $this->running_task ?? $this->deferred_request;
+        if ($growing && !in_array($_SERVER['SERVER_PROTOCOL'] ?? "",
+            ["HTTP/1.1", "HTTP/2.0", "HTTP/3"])) {
+            return false;
+        }
+        if ($growing && $task === null && $this->worker_link !== null) {
+            /* The front starts sending the file as soon as it hears its
+               name, while this worker goes on writing it; the request's
+               last reply, sent when the route returns, says the file is
+               finished. */
+            $growing_reply = serialize(["GROWING" => $this->worker_running_id,
+                "HEADER" => (string)$this->header_data,
+                "CONTENT_TYPE" => $this->content_type,
+                "CURRENT_SESSION" => (string)$this->current_session,
+                "SESSION" => $_SESSION ?? [], "FILE" => $path,
+                "REMOVE_FILE" => $remove_after]);
+            fwrite($this->worker_link, pack("N", strlen($growing_reply)) .
+                $growing_reply);
+            $this->worker_grown_file = $path;
+            $this->worker_remove_file = $remove_after;
+            return true;
+        }
+        if ($growing && $task !== null) {
+            $task->file = $path;
+            $task->remove_file = $remove_after;
+            $task->growing = true;
+            $task->growing_done = false;
+            $this->completeDeferredFile($task);
+            return true;
+        }
+        if ($task === null && $this->worker_reply_file !== null) {
+            /* A worker hands the file's name back to the front, which
+               sends the file from disk. Sent as the reply's body it
+               would be held whole by both processes, and a large git
+               pack ran the front out of memory. */
+            $this->worker_reply_file = $path;
+            $this->worker_remove_file = $remove_after;
+            return true;
+        }
+        if ($task === null) {
+            /* This request is not being run as a deferred task -- under
+               another web server, or where no send context was made -- so
+               there is nothing to hand the file to and the caller has to
+               send it itself. */
+            return false;
+        }
+        $task->file = $path;
+        $task->remove_file = $remove_after;
+        return true;
     }
     /**
      * Lets a route finish later instead of right now, so a slow request
@@ -3534,10 +5750,12 @@ class WebSite
      *
      * @param callable $handler does the request's real work and prints
      *      its response; may call Fiber::suspend() at its wait points
+     * @param float|null $budget largest total running time this request may
+     *      use, in seconds; the scheduler's own limit when not given
      * @return bool true, so a route may `return $site->deferResponse(...)`
      *      and count the request as handled
      */
-    public function deferResponse(callable $handler)
+    public function deferResponse(callable $handler, $budget = null)
     {
         $send = $this->deferredSendContext();
         if (!$this->isCli() || $send === null) {
@@ -3546,21 +5764,55 @@ class WebSite
         }
         $task = new \stdClass();
         $task->body = "";
+        $task->file = "";
+        $task->remove_file = false;
         $task->environment = $this->captureRequestEnvironment();
         $task->send = $send;
         $task->saved = null;
+        $task->outer_task = null;
+        $task->producer = null;
+        $task->outer_producer = null;
         $on_enter = function () use ($task) {
             $task->saved = $this->captureRequestEnvironment();
             $this->applyRequestEnvironment($task->environment);
+            $task->outer_task = $this->running_task;
+            $this->running_task = $task;
+            $task->outer_producer = $this->streaming_producer;
+            $this->streaming_producer = null;
             ob_start();
         };
+        /* A body the handler gave to stream() belongs to this request, so
+           it is kept with the task rather than left on the server, where
+           the next ordinary HTTP/2 or HTTP/3 request would send it under
+           its own headers. */
         $on_leave = function () use ($task) {
             $task->body .= ob_get_clean();
+            if ($this->streaming_producer !== null) {
+                $task->producer = $this->streaming_producer;
+            }
+            $this->streaming_producer = $task->outer_producer;
             $task->environment = $this->captureRequestEnvironment();
             $this->applyRequestEnvironment($task->saved);
+            $this->running_task = $task->outer_task;
         };
-        $on_complete = function ($result, $error) use ($task) {
+        /* An HTTP/3 reply is sent over the QUIC listener rather than a
+           connection of its own, so it has no connection key to keep. */
+        $key = $send['key'] ?? null;
+        if ($key !== null) {
+            $this->deferred_running[$key] =
+                ($this->deferred_running[$key] ?? 0) + 1;
+        }
+        $on_complete = function ($result, $error) use ($task, $key) {
+            if ($key !== null && --$this->deferred_running[$key] <= 0) {
+                unset($this->deferred_running[$key]);
+            }
             $this->completeDeferredResponse($task, $error);
+            if (isset($task->stop_after)) {
+                /* A relayed request asked for a stop or restart, which
+                   waits until its reply has been queued for sending. */
+                $this->stop = true;
+                $this->restart = $task->stop_after;
+            }
         };
         $guarded = function () use ($handler) {
             try {
@@ -3591,7 +5843,7 @@ class WebSite
             $this->cooperative_scheduler = new CooperativeScheduler();
         }
         $this->cooperative_scheduler->add(new \Fiber($guarded),
-            $on_complete, $on_enter, $on_leave);
+            $on_complete, $on_enter, $on_leave, $budget);
         $this->deferred_request = $task;
         return true;
     }
@@ -3649,6 +5901,138 @@ class WebSite
             "Please try again.</p></body></html>\n";
     }
     /**
+     * Sends a deferred reply whose body is a file. The headers go out
+     * first, then the file is drained to the client a piece at a time by
+     * the same loop that drains any other reply, so nothing larger than
+     * one piece is ever held. HTTP/1.1 drains it through sendRestFromFile;
+     * HTTP/2 and HTTP/3 draw on a generator that reads the file, through
+     * emitDeferredH2 and the HTTP/3 transport's emitDeferredPieces.
+     *
+     * @param object $task the deferred request, carrying where to send and
+     *      which file holds the body
+     * @return void
+     */
+    protected function completeDeferredFile($task)
+    {
+        $key = $task->send['key'] ?? null;
+        $growing = !empty($task->growing);
+        $size = $growing ? null : filesize($task->file);
+        /* The headers the handler set are left as they are: overwriting
+           them threw away the kind of reply it said this was, which for a
+           git service is what tells the client it is talking to git at
+           all. */
+        if ($task->send['protocol'] === 'h1') {
+            $head = $this->finalizeDeferredResponse("", true, $size,
+                $growing);
+            $this->emitDeferredH1($task->send, $head);
+            $this->sendRestFromFile($key, $task->file,
+                !empty($task->remove_file), $growing ? $task : null);
+            return;
+        }
+        $is_h3 = ($task->send['protocol'] === 'h3');
+        if ($is_h3) {
+            /* HTTP/3 reads the status line from the header buffer, which
+               this adds where the handler set none. */
+            $this->finalizeDeferredResponse("", false);
+        }
+        $reading = fopen($task->file, "rb");
+        if ($reading === false) {
+            if ($is_h3) {
+                $task->send['listener']->emitDeferredResponse(
+                    $task->send['connection'], $task->send['stream_id'], "");
+            } else {
+                $this->emitDeferredH2($task->send, "");
+            }
+            return;
+        }
+        $file = $task->file;
+        $remove = !empty($task->remove_file);
+        $pieces = (function () use ($reading, $file, $remove, $task,
+            $growing) {
+            try {
+                while (true) {
+                    $piece = fread($reading, self::OUT_FILE_STEP);
+                    if ($piece !== false && $piece !== "") {
+                        yield $piece;
+                        continue;
+                    }
+                    /* A file still being written has no more bytes yet;
+                       false tells the loop to come back on a later pass
+                       rather than end the stream. */
+                    if (!$growing || !empty($task->growing_done)) {
+                        break;
+                    }
+                    yield false;
+                }
+            } finally {
+                fclose($reading);
+                $task->file_released = true;
+                /* the file is let go once sent, as the HTTP/1.1 path does
+                   in sendRestFromFile */
+                if ($remove) {
+                    @unlink($file);
+                }
+            }
+        })();
+        if ($is_h3) {
+            $task->send['listener']->emitDeferredPieces(
+                $task->send['connection'], $task->send['stream_id'],
+                $pieces, $size);
+            return;
+        }
+        $this->emitDeferredH2($task->send, "", $pieces, $size);
+    }
+    /**
+     * finishGrowingFile marks a growing file's writer as finished, once
+     * the deferred task that started sending the file has ended:
+     * the route itself, or the fiber relaying it to a worker, which ends
+     * on the worker's last reply. completeDeferredResponse calls it in
+     * place of sending a reply, since the headers and most of the file
+     * have gone already. The parked HTTP/1.1 connection or HTTP/2 stream
+     * is then given its last bytes and its end on this pass, rather than
+     * waiting for other traffic to wake the loop. A task that failed
+     * after the headers went cannot be given an error page, so the
+     * failure is logged and the reply ends where the file ends.
+     *
+     * @param object $task the deferred request that named the growing
+     *      file
+     * @param \Throwable|null $error why the task failed, or null if it
+     *      finished cleanly
+     * @return void
+     */
+    protected function finishGrowingFile($task, $error)
+    {
+        $task->growing_done = true;
+        clearstatcache(true, $task->file);
+        $size = is_file($task->file) ? filesize($task->file) : 0;
+        /* A client that left before the file was sent had the file let
+           go while it was still open for writing, which Windows does not
+           allow to be deleted, so it is deleted now that it is closed. */
+        $key = $task->send['key'] ?? null;
+        $released = !empty($task->file_released) ||
+            ($task->send['protocol'] === 'h1' &&
+            ($this->out_streams[self::DATA_FILE][$key]["path"] ?? "") !==
+            $task->file);
+        if ($released && !empty($task->remove_file) &&
+            is_file($task->file)) {
+            @unlink($task->file);
+        }
+        if ($error !== null) {
+            error_log("Deferred request failed after its reply began: " .
+                ($_SERVER['REQUEST_METHOD'] ?? "") . " " .
+                ($_SERVER['REQUEST_URI'] ?? "") . ": " .
+                $error->getMessage());
+        }
+        foreach ($this->response_loggers as $response_logger) {
+            $response_logger($this->responseStatusCode(), $size);
+        }
+        $this->refillStreamingGenerators();
+        if ($task->send['protocol'] === 'h3') {
+            $task->send['listener']->advanceH3StreamingGenerator(
+                $task->send['connection'], $task->send['stream_id']);
+        }
+    }
+    /**
      * Sends a deferred request's response once its fiber has finished,
      * over the same connection the request arrived on. On success the
      * accumulated page is finished off (status line, content type, length)
@@ -3664,6 +6048,10 @@ class WebSite
     protected function completeDeferredResponse($task, $error)
     {
         $this->applyRequestEnvironment($task->environment);
+        if (!empty($task->growing)) {
+            $this->finishGrowingFile($task, $error);
+            return;
+        }
         if ($error !== null) {
             if ($error instanceof TaskBudgetExceededException) {
                 /* The request ran longer than a request is allowed to,
@@ -3671,6 +6059,8 @@ class WebSite
                    request timeout with a short page a person can read,
                    not a bare server error. */
                 error_log("Deferred request timed out: " .
+                    ($_SERVER['REQUEST_METHOD'] ?? "") . " " .
+                    ($_SERVER['REQUEST_URI'] ?? "") . ": " .
                     $error->getMessage());
                 $body = $this->requestTimeoutPage();
                 $this->header_data =
@@ -3678,8 +6068,23 @@ class WebSite
                     " 408 Request Timeout\x0D\x0A";
                 $this->content_type = "text/html";
             } else {
+                /* Where the failure happened is what a person needs
+                   to act on it; the message alone leaves them reading
+                   the whole site for a call that takes a word and was
+                   given a list. The first few steps of the way in are
+                   logged with it, since the failing line is often
+                   reached from somewhere unexpected. */
+                $way_in = [];
+                foreach (array_slice($error->getTrace(), 0, 4) as $step) {
+                    $way_in[] = ($step['class'] ?? "") .
+                        ($step['type'] ?? "") . ($step['function'] ?? "") .
+                        " at " . basename($step['file'] ?? "?") . ":" .
+                        ($step['line'] ?? "?");
+                }
                 error_log("Deferred request failed: " .
-                    $error->getMessage());
+                    $error->getMessage() . " in " .
+                    basename($error->getFile()) . ":" .
+                    $error->getLine() . " via " . implode(" <- ", $way_in));
                 $body = "Internal Server Error";
                 $this->header_data =
                     ($_SERVER['SERVER_PROTOCOL'] ?? 'HTTP/1.1') .
@@ -3688,6 +6093,25 @@ class WebSite
             }
         } else {
             $body = $task->body;
+        }
+        if ($error === null && $task->producer !== null &&
+            $task->send['protocol'] !== 'h1') {
+            $this->completeDeferredProducer($task);
+            return;
+        }
+        $from_file = ($error === null && !empty($task->file) &&
+            is_file($task->file));
+        $status = $this->responseStatusCode();
+        foreach ($this->response_loggers as $response_logger) {
+            $response_logger($status, $from_file ? filesize($task->file) :
+                strlen($body));
+        }
+        /* A reply whose body is a file is sent from the file rather than
+           from a string, so its size costs a fixed amount of memory
+           instead of its own length. */
+        if ($from_file) {
+            $this->completeDeferredFile($task);
+            return;
         }
         if ($task->send['protocol'] === 'h1') {
             $out_data = $this->finalizeDeferredResponse($body, true);
@@ -3705,6 +6129,31 @@ class WebSite
                 $task->send['connection'], $task->send['stream_id'],
                 $body);
         }
+    }
+    /**
+     * completeDeferredProducer finishes a deferred request whose route
+     * handed its body to stream() rather than printing it.
+     * completeDeferredResponse calls this method once the route's fiber
+     * has ended. The method first sends the headers the route set. It
+     * then gives the route's generator to the HTTP/2 or HTTP/3 sender,
+     * which draws each piece of the body when the client is ready for it,
+     * on the request's own stream. stream() wrote the access log line
+     * when the route called it.
+     *
+     * @param object $task the deferred request, carrying where to send and
+     *      the generator that yields its body
+     * @return void
+     */
+    protected function completeDeferredProducer($task)
+    {
+        $this->finalizeDeferredResponse("", false);
+        if ($task->send['protocol'] === 'h3') {
+            $task->send['listener']->emitDeferredPieces(
+                $task->send['connection'], $task->send['stream_id'],
+                $task->producer, null);
+            return;
+        }
+        $this->emitDeferredH2($task->send, "", $task->producer);
     }
     /**
      * Marks the current request, which is being served over HTTP/3, as
@@ -3754,7 +6203,16 @@ class WebSite
     {
         $protocol = $_SERVER['SERVER_PROTOCOL'] ?? "HTTP/1.1";
         if (preg_match('/^Location:/mi', $this->header_data)) {
-            return $protocol . " 301 Moved Permanently\x0D\x0A";
+            /* Sent on after doing something, not moved for good. A
+               permanent move is one a browser may remember and act on
+               without asking again, which is right for an address that
+               has changed for ever and wrong for a page that sends the
+               reader on after handling what they asked. Signing out is
+               the plain case: told the address had moved for good, a
+               browser stopped asking for it and went straight to where
+               it had been sent last time, so signing out never happened
+               again. */
+            return $protocol . " 302 Found\x0D\x0A";
         }
         if (preg_match('/^Refresh:/mi', $this->header_data)) {
             return $protocol . " 302 Found\x0D\x0A";
@@ -3770,12 +6228,21 @@ class WebSite
      * the ordinary request path is left exactly as it was.
      *
      * @param string $body the page the deferred handler printed
+     * @param int|null $body_length how long the body is, for a
+     *      body that travels from a file rather than as the
+     *      string given here; the string's own length when not
+     *      given
      * @param bool $include_headers true to return headers plus body (the
      *      HTTP/1.1 wire form), false to return just the body with the
      *      header buffer filled in (what the HTTP/2 framer wants)
+     * @param bool $chunked true for a body whose length is not known yet,
+     *      which HTTP/1.1 then sends in chunks, each with its own length:
+     *      the headers say Transfer-Encoding: chunked in place of a
+     *      Content-Length
      * @return string the finished response, or just its body
      */
-    protected function finalizeDeferredResponse($body, $include_headers)
+    protected function finalizeDeferredResponse($body, $include_headers,
+        $body_length = null, $chunked = false)
     {
         if ($this->current_session != "" &&
             !empty($_COOKIE[$this->current_session])) {
@@ -3801,8 +6268,13 @@ class WebSite
             $this->header_data = preg_replace(
                 '/^Content-Length:[^\r\n]*\r\n/im', '',
                 $this->header_data);
+            if ($chunked) {
+                return $this->header_data .
+                    "Transfer-Encoding: chunked\x0D\x0A\x0D\x0A" . $body;
+            }
             return $this->header_data . "Content-Length: " .
-                strlen($body) . "\x0D\x0A\x0D\x0A" . $body;
+                (($body_length === null) ? strlen($body) : $body_length) .
+                "\x0D\x0A\x0D\x0A" . $body;
         }
         return $body;
     }
@@ -3837,9 +6309,16 @@ class WebSite
      * @param array $send the request's send details (stream key,
      *      connection, stream id, and HPACK encoder)
      * @param string $body the response body
+     * @param \Generator|null $pieces yields the body a piece at a
+     *      time, for a body too large to hold as one string; the
+     *      $body argument is ignored when this is given
+     * @param int|null $size how long the body is, needed when it
+     *      arrives in pieces rather than as one string; null with pieces
+     *      for a body still being made, which is sent with no length
      * @return void
      */
-    protected function emitDeferredH2($send, $body)
+    protected function emitDeferredH2($send, $body, $pieces = null,
+        $size = null)
     {
         $key = $send['key'];
         $connection = $send['connection'];
@@ -3891,16 +6370,19 @@ class WebSite
             $resp_headers_data[] =
                 ["content-type", "text/html; charset=utf-8"];
         }
-        if (!$has_content_length) {
-            $resp_headers_data[] =
-                ["content-length", (string) strlen($body)];
+        /* A body given in pieces with no size is still being made, so
+           its length is not known and the stream's end marks where it
+           stops. */
+        if (!$has_content_length && ($pieces === null || $size !== null)) {
+            $resp_headers_data[] = ["content-length",
+                (string)(($size === null) ? strlen($body) : $size)];
         }
         $resp_headers = new HeaderFrame($stream_id, $resp_headers_data);
         $resp_headers->flags->add("END_HEADERS");
         $out = $resp_headers->serialize($hpack_encode);
         $this->queueResponseData($key, $connection, $out);
         $this->sendH2BodyPaced($key, $connection, $conn, $stream_id,
-            $body);
+            $body, $pieces);
     }
     /**
      * Used to export info (but not change) about running sessions
@@ -3932,7 +6414,27 @@ class WebSite
         $this->streaming_response_logged = false;
         ob_start();
         try {
-            $this->process();
+            /* A WebSocket upgrade stays in this process, since its frames
+               arrive here for as long as the connection lasts, and so do a
+               request with nowhere to send a deferred reply, such as an
+               internal request, and one the site's FRONT_ONLY check says
+               streams its reply. */
+            if ($this->worker_count > 0 && $this->worker_listener !== null &&
+                strtolower($_SERVER['HTTP_UPGRADE'] ?? '') !== 'websocket' &&
+                $this->deferredSendContext() !== null &&
+                ($this->front_only === null || !($this->front_only)())) {
+                $usage = getrusage();
+                $this->relayToWorker();
+                $this->noteFrontWork("relayed", $usage);
+            } else {
+                $usage = getrusage();
+                try {
+                    $this->process();
+                } finally {
+                    $this->noteFrontWork($this->worker_count > 0 ? "kept" :
+                        "served", $usage);
+                }
+            }
         } catch (WebException $we) {
             $msg = $we->getMessage();
             $cmd = substr($msg, 0, strlen('restart'));
@@ -4011,18 +6513,18 @@ class WebSite
         }
         $body_size = strlen($out_data);
         $this->logLargeResponse($body_size);
-        if ($include_headers) {
-            /* this header-composing pass runs once for a response, so
-               tell any registered response loggers how it turned out,
-               unless a streamed body already logged its own access line
-               (getResponseData sees an empty body for a streamed reply,
-               so its length here would be zero) */
-            if (!$this->streaming_response_logged) {
-                $status = $this->responseStatusCode();
-                foreach ($this->response_loggers as $response_logger) {
-                    $response_logger($status, $body_size);
-                }
+        /* every reply passes here once, whichever protocol sends it, so
+           this is where the response loggers are told how it turned out,
+           unless a streamed body already logged its own access line
+           (getResponseData sees an empty body for a streamed reply, so
+           its length here would be zero) */
+        if (!$this->streaming_response_logged) {
+            $status = $this->responseStatusCode();
+            foreach ($this->response_loggers as $response_logger) {
+                $response_logger($status, $body_size);
             }
+        }
+        if ($include_headers) {
             /* the computed length is authoritative; drop any
                Content-Length the route set itself (resource range
                replies do) so the response carries exactly one */
@@ -4069,8 +6571,8 @@ class WebSite
             $matches) > 0) {
             $route_regex = preg_replace_callback(
                 '/\*|\{[a-zA-Z][a-zA-Z0-9_]*\}/',
-                function ($m) use ($var_magic, $star_magic) {
-                    return ($m[0] === '*') ? $star_magic : $var_magic;
+                function ($match) use ($var_magic, $star_magic) {
+                    return ($match[0] === '*') ? $star_magic : $var_magic;
                 },
                 $route);
             $route_regex = preg_quote($route_regex, "#");
@@ -4113,15 +6615,21 @@ class WebSite
             if (!empty($this->timers[$key])) {
                 list($repeating, $time, $callback) =
                     $this->timers[$key];
+                $started = microtime(true);
                 $callback();
+                $ran = microtime(true) - $started;
+                if ($ran > self::SLOW_TIMER) {
+                    $where = new \ReflectionFunction($callback);
+                    error_log("[website-slow-timer] " .
+                        round($ran * self::MILLISECONDS_PER_SECOND) .
+                        "ms in the timer set at " . $where->getFileName() .
+                        ":" . $where->getStartLine());
+                }
                 if ($repeating) {
-                    $next_time = $now + $time;
-                    $new_key = (string) $next_time;
-                    $this->timers[$new_key] =
-                        [$repeating, $time, $callback];
-                    unset($this->timers[$key]);
-                    $this->timer_alarms->insert(
-                        [$next_time, $new_key]);
+                    /* the callback may have cleared its own timer */
+                    if (isset($this->timers[$key])) {
+                        $this->timer_alarms->insert([$now + $time, $key]);
+                    }
                 } else {
                     unset($this->timers[$key]);
                 }
@@ -4169,6 +6677,20 @@ class WebSite
             $too_long = $len >= $max_len;
             if (!empty(
                 $this->in_streams[self::CONTEXT][$key]['BAD_RESPONSE'])) {
+                /* The connection was answered with an error such as 413,
+                   so what comes now is the rest of the refused request.
+                   It is read and thrown away, which also keeps select
+                   from finding the socket readable on every pass, and
+                   the connection is closed once the client closes its
+                   side. */
+                stream_set_blocking($in_stream, false);
+                $discarded = @fread($in_stream,
+                    $this->default_server_globals['MAX_IO_LEN']);
+                if ($discarded === false || feof($in_stream)) {
+                    $this->shutdownHttpStream($key);
+                } else if ($discarded !== "") {
+                    $this->in_streams[self::MODIFIED_TIME][$key] = time();
+                }
                 continue;
             }
             /*
@@ -4184,6 +6706,16 @@ class WebSite
             $proto = $conn?->protocol ?? 'h1';
             if (!isset($this->transports[$proto])) {
                 $proto = 'h1';
+            }
+            if ($this->no_wrap_requests) {
+                /* Asked to let a failure out. What goes wrong while a
+                   request is handled then ends the server, which is
+                   what someone tracking such a failure down wants to
+                   see. */
+                $this->read_made_progress = true;
+                $this->transports[$proto]->onReadable($key, $conn,
+                    $in_stream, $too_long);
+                continue;
             }
             try {
                 $this->read_made_progress = true;
@@ -4243,11 +6775,36 @@ class WebSite
             set_error_handler(function ($error_number, $error_text) {
                 return stripos($error_text, "reset by peer") !== false
                     || stripos($error_text, "SSL operation failed")
-                    !== false;
+                    !== false
+                    || stripos($error_text, "SSL: Success") !== false;
             });
-            $data = stream_get_contents($in_stream, min(
+            /* Over an encrypted stream a read hands back at most one
+               decrypted record, and bytes already decrypted past it sit
+               in the crypto layer's own buffer where select cannot see
+               them. So the read loops until a pass comes back empty or
+               the bound is met, the same way the frame path below does;
+               a single read left the tail of a larger body stranded and
+               the request never finished. */
+            $data = "";
+            $sought = min(
                 $this->default_server_globals['MAX_IO_LEN'],
-                $max_len - $len));
+                $max_len - $len);
+            while ($sought > 0) {
+                $piece = stream_get_contents($in_stream, $sought);
+                if ($piece === false) {
+                    if ($data === "") {
+                        $data = false;
+                    }
+                    break;
+                }
+                if ($piece === "") {
+                    break;
+                }
+                $data .= $piece;
+                $sought = min(
+                    $this->default_server_globals['MAX_IO_LEN'],
+                    $max_len - $len - strlen($data));
+            }
             restore_error_handler();
             /* select reported this socket readable, so a read that
                comes back with no bytes means the peer has closed
@@ -4275,7 +6832,8 @@ class WebSite
             }
         } else {
             $data = "";
-            $this->initializeBadRequestResponse($key);
+            $this->initializeBadRequestResponse($key,
+                self::PAYLOAD_TOO_LARGE);
         }
         if (!$too_long && !$this->parseRequest($key, $data)) {
             return;
@@ -4608,6 +7166,19 @@ class WebSite
             $peek = @stream_socket_recvfrom($conn->resource(), 1,
                 STREAM_PEEK);
             if ($peek === false || $peek === '') {
+                /*
+                    A peer that closed before sending a byte leaves the
+                    socket readable at every select, and peeking does
+                    not mark the stream at its end, so it is closed
+                    here rather than stepped again until the handshake
+                    deadline with the loop never sleeping.
+                 */
+                if (feof($conn->resource())) {
+                    $this->front_work["closed_before_first_byte"] =
+                        ($this->front_work["closed_before_first_byte"] ??
+                        0) + 1;
+                    $this->shutdownHttpStream($key);
+                }
                 return;
             }
             $conn->protocol_state['handshake_peeked'] = true;
@@ -4745,8 +7316,9 @@ class WebSite
     protected function checkHttpType($stream_start)
     {
         /*
-            Cleartext HTTP/2 upgrade starts with the client connection
-            preface magic string
+            A request over HTTP/2 without TLS opens with the fixed
+            preface that RFC 9113 names, so seeing it settles which
+            protocol the connection speaks.
          */
         if (str_starts_with($stream_start, self::H2_CLIENT_MAGIC)) {
             return ["CLIENT_HTTP" => "h2c"];
@@ -4804,7 +7376,8 @@ class WebSite
         }
         if (!($client_settings instanceof SettingsFrame)) {
             throw new \Exception("Expected SETTINGS frame, got "
-                . get_class($client_settings));
+                . (is_object($client_settings) ?
+                get_class($client_settings) : "a frame of unknown type"));
         }
         $client_settings->parseBody(
             $this->readExactly($connection, $settings_len));
@@ -4826,11 +7399,13 @@ class WebSite
             0x03 => self::H2_MAX_CONCURRENT_STREAMS,
             0x04 => self::H2_ADVERTISED_WINDOW,
             0x05 => self::H2_MAX_FRAME_SIZE,
+            0x08 => 1,
         ]);
-        @fwrite($connection, $server_settings->serialize());
+        $this->writeFrameWhole($connection,
+            $server_settings->serialize());
         $ack = new SettingsFrame(0, []);
         $ack->flags->add('ACK');
-        @fwrite($connection, $ack->serialize());
+        $this->writeFrameWhole($connection, $ack->serialize());
         /*
             The larger upload window advertised above only applies to
             individual streams. The whole connection has its own
@@ -4846,7 +7421,7 @@ class WebSite
         if ($connection_window_growth > 0) {
             $connection_window_update = new WindowUpdateFrame(0,
                 $connection_window_growth);
-            @fwrite($connection,
+            $this->writeFrameWhole($connection,
                 $connection_window_update->serialize());
         }
         stream_set_blocking($connection, false);
@@ -4918,6 +7493,7 @@ class WebSite
         if ($read_error ||
             ($chunk === "" && feof($connection)
             && empty($this->out_streams[self::DATA][$key])
+            && empty($this->out_streams[self::DATA_FILE][$key])
             && empty($state['pending_send'])
             && empty($state['streaming_gen']))) {
             $this->shutdownHttpStream($key);
@@ -4951,7 +7527,7 @@ class WebSite
                     drained because the connection is being closed.
                  */
                 $goaway = new GoAwayFrame(0, 0, 0x6, "");
-                @fwrite($connection, $goaway->serialize());
+                $this->writeFrameWhole($connection, $goaway->serialize());
                 $this->shutdownHttpStream($key);
                 return false;
             }
@@ -4964,6 +7540,9 @@ class WebSite
                     $payload_len)
                 : "";
             $state['input_buffer'] = substr($buffer, $frame_len);
+            if ($frame === null) {
+                continue;
+            }
             $this->processH2Frame($key, $connection,
                 $conn, $frame, $payload, $payload_len);
             /*
@@ -5007,13 +7586,19 @@ class WebSite
     {
         $state = &$conn->protocol_state;
         if ($frame instanceof GoAwayFrame) {
+            $code = (strlen($payload) >= 8) ?
+                unpack('N', substr($payload, 4, 4))[1] : 0;
+            if ($code != 0) {
+                error_log("[website-h2] connection $key closed by the " .
+                    "client, error code $code");
+            }
             $this->shutdownHttpStream($key);
             return false;
         }
         if ($frame instanceof PingFrame) {
             $pong = new PingFrame(0, $payload);
             $pong->flags->add('ACK');
-            @fwrite($connection, $pong->serialize());
+            $this->writeFrameWhole($connection, $pong->serialize());
             return false;
         }
         if ($frame instanceof SettingsFrame
@@ -5066,7 +7651,7 @@ class WebSite
             }
             $ack = new SettingsFrame(0, []);
             $ack->flags->add('ACK');
-            @fwrite($connection, $ack->serialize());
+            $this->writeFrameWhole($connection, $ack->serialize());
             return false;
         }
         if ($frame instanceof DataFrame) {
@@ -5080,8 +7665,29 @@ class WebSite
              */
             $frame->parseBody($payload);
             $stream_id = $frame->stream_id;
-            $pending = $state['pending_streams'][$stream_id] ?? null;
-            if ($pending === null) {
+            if (isset($state['ws_carrier_streams'][$stream_id])) {
+                /* This stream carries a WebSocket opened by an
+                   extended CONNECT. Its DATA frames are WebSocket
+                   frame bytes, not a request body, so they go to the
+                   WebSocket parser. The client credits are replenished
+                   so a long-lived socket does not stall its window. */
+                $consumed = strlen($frame->data);
+                if ($consumed > 0) {
+                    $stream_update = new WindowUpdateFrame(
+                        $stream_id, $consumed);
+                    $conn_update = new WindowUpdateFrame(0, $consumed);
+                    if (!$this->writeFrameWhole($connection,
+                        $stream_update->serialize()
+                        . $conn_update->serialize())) {
+                        $this->shutdownHttpStream($key);
+                        return false;
+                    }
+                }
+                $this->feedH2WebSocket($key, $stream_id, $frame->data,
+                    $frame->flags->contains('END_STREAM'));
+                return false;
+            }
+            if (!isset($state['pending_streams'][$stream_id])) {
                 /*
                     DATA on a stream we never saw HEADERS on, or
                     one already dispatched. RFC 7540 sec 5.1: DATA
@@ -5093,11 +7699,15 @@ class WebSite
                  */
                 $goaway = new GoAwayFrame(0,
                     $state['last_stream_id'] ?? 0, 0x1, "");
-                @fwrite($connection, $goaway->serialize());
+                $this->writeFrameWhole($connection, $goaway->serialize());
                 $this->shutdownHttpStream($key);
                 return false;
             }
-            $pending['body'] .= $frame->data;
+            /* The body grows in place in the connection's state. Taking
+               a copy of the stream's entry, adding to it and storing it
+               back copies the whole body on every frame, so the time to
+               take a body grows with the square of its size. */
+            $state['pending_streams'][$stream_id]['body'] .= $frame->data;
             /*
                 RFC 7540 sec 6.9: replenish the per-stream and
                 connection-level receive windows after each DATA
@@ -5108,8 +7718,8 @@ class WebSite
                 we credit immediately for the consumed bytes:
                 stream-level update for the stream-id, connection-
                 level update for stream-id 0. Without this, H2
-                POSTs >65535 bytes (yioop Fetcher crawl uploads,
-                multipart file uploads) stall until client timeout.
+                POSTs >65535 bytes (large form posts, multipart file
+                uploads) stall until client timeout.
              */
             $consumed = strlen($frame->data);
             if ($consumed > 0) {
@@ -5117,10 +7727,14 @@ class WebSite
                     $stream_id, $consumed);
                 $conn_update = new WindowUpdateFrame(
                     0, $consumed);
-                @fwrite($connection, $stream_update->serialize()
-                    . $conn_update->serialize());
+                if (!$this->writeFrameWhole($connection,
+                    $stream_update->serialize()
+                    . $conn_update->serialize())) {
+                    $this->shutdownHttpStream($key);
+                    return false;
+                }
             }
-            if (strlen($pending['body'])
+            if (strlen($state['pending_streams'][$stream_id]['body'])
                     > $this->default_server_globals[
                         'MAX_REQUEST_LEN']) {
                 /*
@@ -5129,18 +7743,18 @@ class WebSite
                  */
                 $goaway = new GoAwayFrame(0,
                     $state['last_stream_id'] ?? 0, 0xb, "");
-                @fwrite($connection, $goaway->serialize());
+                $this->writeFrameWhole($connection, $goaway->serialize());
                 $this->shutdownHttpStream($key);
                 return false;
             }
             if ($frame->flags->contains('END_STREAM')) {
-                $context = $pending['context'];
-                $context['CONTENT'] = $pending['body'];
+                $context = $state['pending_streams'][$stream_id]['context'];
+                $context['CONTENT'] =
+                    $state['pending_streams'][$stream_id]['body'];
                 unset($state['pending_streams'][$stream_id]);
                 return $this->dispatchH2Request($key, $connection,
                     $stream_id, $context);
             }
-            $state['pending_streams'][$stream_id] = $pending;
             return false;
         }
         if ($frame instanceof WindowUpdateFrame) {
@@ -5216,7 +7830,7 @@ class WebSite
                     $goaway = new GoAwayFrame(0,
                         $state['last_stream_id'] ?? 0,
                         self::H2_ERROR_PROTOCOL, "");
-                    @fwrite($connection, $goaway->serialize());
+                    $this->writeFrameWhole($connection, $goaway->serialize());
                     $this->shutdownHttpStream($key);
                     return false;
                 }
@@ -5228,6 +7842,12 @@ class WebSite
             return false;
         }
         if ($frame instanceof RstStreamFrame) {
+            $code = (strlen($payload) == 4) ? unpack('N', $payload)[1] :
+                -1;
+            error_log("[website-h2] connection $key stream " .
+                "{$frame->stream_id} reset by the client, error code " .
+                "$code" . (isset($state['pending_send'][$frame->stream_id]) ?
+                ", response not fully sent" : ""));
             /*
                 RFC 7540 sec 6.4: the client no longer wants this
                 stream; drop any response bytes still waiting on
@@ -5262,7 +7882,7 @@ class WebSite
         $high_water = $state['last_stream_id'] ?? 0;
         if ($client_stream_id <= $high_water) {
             $goaway = new GoAwayFrame(0, $high_water, 0x1, "");
-            @fwrite($connection, $goaway->serialize());
+            $this->writeFrameWhole($connection, $goaway->serialize());
             $this->shutdownHttpStream($key);
             return false;
         }
@@ -5296,6 +7916,16 @@ class WebSite
             $propagate['HTTPS'] = $conn->https;
         }
         $context = array_merge($propagate, $context);
+        if (($context['REQUEST_METHOD'] ?? '') === 'CONNECT'
+            && ($context['REQUEST_PROTOCOL'] ?? '') === 'websocket') {
+            /* RFC 8441: a WebSocket rides an extended CONNECT stream
+               rather than its own connection. The handshake runs
+               against this stream and, when a route matches, the
+               stream stays open to carry WebSocket frames inside h2
+               DATA frames both ways. */
+            return $this->handleH2WebSocketConnect($key, $connection,
+                $conn, $client_stream_id, $context);
+        }
         /*
             Refuse the stream if this connection is already at its
             stream count or its buffered-byte ceiling. The header
@@ -5309,6 +7939,17 @@ class WebSite
             REFUSED_STREAM tells the client the request was not acted
             on so it may retry once the connection drains.
          */
+        /* A stream whose producer has nothing left to give is finished,
+           whatever the client did with it. A media player that asks for
+           a range and then stops reading leaves one of these behind, and
+           counting those toward the ceiling meant a page holding a few
+           recordings had no room left to send anything. */
+        foreach (($state['streaming_gen'] ?? []) as $done_id => $producer) {
+            if (!($producer instanceof \Generator) ||
+                !$producer->valid()) {
+                unset($state['streaming_gen'][$done_id]);
+            }
+        }
         $open_streams = count($state['pending_streams'] ?? []) +
             count($state['pending_send'] ?? []) +
             count($state['streaming_gen'] ?? []);
@@ -5509,9 +8150,11 @@ class WebSite
      * @param object $conn Connection holding protocol_state
      * @param int $stream_id stream the response belongs to
      * @param string $body the complete response body
+     * @param \Generator|null $pieces yields the body a piece at
+     *      a time; used instead of slicing $body when given
      */
     protected function sendH2BodyPaced($key, $connection, $conn,
-        $stream_id, $body)
+        $stream_id, $body, $pieces = null)
     {
         if ($conn === null) {
             return;
@@ -5522,12 +8165,13 @@ class WebSite
         $stream_window =
             $conn->protocol_state['peer_initial_window']
             ?? self::H2_DEFAULT_WINDOW;
-        if (strlen($body) <= $stream_window) {
+        if ($pieces === null && strlen($body) <= $stream_window) {
             $this->sendH2Body($key, $connection, $conn, $stream_id,
                 $body);
             return;
         }
-        $producer = (function () use ($body) {
+        $producer = ($pieces !== null) ? $pieces :
+            (function () use ($body) {
             $body_len = strlen($body);
             for ($pos = 0; $pos < $body_len;
                 $pos += self::H2_MAX_FRAME_SIZE) {
@@ -5605,10 +8249,13 @@ class WebSite
      * connection keep being served (the generator is parked between
      * iterations rather than blocking the route). A generator that
      * has finished is removed and its stream's final chunk marked,
-     * letting pumpH2PendingSend close the stream once it drains.
+     * letting pumpH2PendingSend close the stream once it drains. It
+     * first has unparkGrowingFiles put back any HTTP/1.1 connection
+     * whose growing file has more to send.
      */
     protected function refillStreamingGenerators()
     {
+        $this->unparkGrowingFiles();
         foreach ($this->connections as $key => $conn) {
             if (empty($conn->protocol_state['streaming_gen'])) {
                 continue;
@@ -5676,7 +8323,9 @@ class WebSite
      * it; when the generator is exhausted, appends a final empty
      * chunk marking the body complete and unparks it. Keeping the
      * refill bounded by one slice caps the memory a streamed
-     * response holds and lets the loop move on to other work.
+     * response holds and lets the loop move on to other work. A
+     * generator that yields false has nothing to give yet and is left
+     * parked until the next pass.
      *
      * @param int $key connection identifier
      * @param resource $connection socket the frames go out on
@@ -5714,7 +8363,13 @@ class WebSite
             $chunk = $generator->current();
             $generator->next();
             $last = !$generator->valid();
-            if ($chunk === null) {
+            if ($chunk === false && !$last &&
+                $generator->current() === false) {
+                /* The producer has nothing yet, as a file still being
+                   written may not; it is asked again on a later pass. */
+                return;
+            }
+            if ($chunk === null || $chunk === false) {
                 $chunk = "";
             }
             $this->appendH2Body($key, $connection, $conn, $stream_id,
@@ -6166,11 +8821,11 @@ class WebSite
             wsKeepalivePass, parseWsRequest, the response-drain
             path, and cullDeadStreams all read these here.
          */
-        $conn_obj = $this->connection($key);
-        if ($conn_obj !== null) {
-            $conn_obj->protocol = 'ws';
-            $conn_obj->is_websocket = true;
-            $conn_obj->ws = $ws;
+        $open_connection = $this->connection($key);
+        if ($open_connection !== null) {
+            $open_connection->protocol = 'ws';
+            $open_connection->is_websocket = true;
+            $open_connection->ws = $ws;
         }
         $this->wsEnqueueWrite($key, $response);
         if (!$this->ws_keepalive_registered
@@ -6178,25 +8833,23 @@ class WebSite
             $this->registerWsKeepalive();
         }
         /*
-            Give the route the request that opened the socket the same way
-            an ordinary route sees it: through the request superglobals.
-            The upgrade is handled before the normal request path fills
-            them, so a route otherwise has no way to read the path and
-            query it was reached on or the cookies the client sent. Server
-            variables, the parsed query string, and the cookies are set
-            from the handshake context so a route can identify and
-            authenticate the connection with the usual PHP request array.
+            What opened the socket is handed to the route on the socket
+            itself rather than through the arrays an ordinary request
+            uses. A socket outlives the request that opened it, and a
+            finished response writes the session named by the cookie in
+            those arrays, so a socket's cookie left sitting in them
+            reaches into work that has nothing to do with it. The route
+            reads the query and the cookies it was opened with from
+            here, and nothing else of the request is touched.
          */
-        $_SERVER = array_merge($this->default_server_globals, $context);
-        $_GET = [];
-        parse_str($context['QUERY_STRING'] ?? '', $_GET);
-        $_REQUEST = array_merge($_REQUEST, $_GET);
-        $_COOKIE = [];
+        $ws->query = [];
+        parse_str($context['QUERY_STRING'] ?? '', $ws->query);
+        $ws->cookies = [];
         if (!empty($context['HTTP_COOKIE'])) {
             foreach (explode(";", $context['HTTP_COOKIE']) as $sent_cookie) {
                 $cookie_parts = explode("=", $sent_cookie, 2);
                 if (count($cookie_parts) == 2) {
-                    $_COOKIE[trim($cookie_parts[0])] =
+                    $ws->cookies[trim($cookie_parts[0])] =
                         trim($cookie_parts[1]);
                 }
             }
@@ -6234,6 +8887,231 @@ class WebSite
             $this->ws_allowed_origins, true);
     }
     /**
+     * Completes a WebSocket opened by an HTTP/2 extended CONNECT. The
+     * handshake happens in the header block rather than a 101 response:
+     * a 200 on the connect stream accepts the tunnel, after which the
+     * stream carries WebSocket frames inside DATA frames both ways. A
+     * matching ws() route is required; without one the stream is
+     * refused so the browser can fall back.
+     *
+     * @param int $key connection key in in_streams
+     * @param resource $connection client socket
+     * @param object $conn the Connection for this socket
+     * @param int $stream_id the extended CONNECT stream's id
+     * @param array $context request context from the CONNECT headers
+     * @return bool false, matching the frame handler's contract that a
+     *      handled frame wrote no ordinary response
+     */
+    protected function handleH2WebSocketConnect($key, $connection, $conn,
+        $stream_id, $context)
+    {
+        if (!$this->checkWebSocketOrigin($context)) {
+            $refusal = new RstStreamFrame($stream_id,
+                self::H2_ERROR_REFUSED_STREAM);
+            $this->writeFrameWhole($connection,
+                $refusal->serialize());
+            return false;
+        }
+        $uri = $context['REQUEST_URI'] ?? '/';
+        $question_pos = strpos($uri, '?');
+        $path = ($question_pos === false) ? $uri
+            : substr($uri, 0, $question_pos);
+        if (!empty($this->base_path)
+            && strpos($path, $this->base_path) === 0) {
+            $path = substr($path, strlen($this->base_path));
+        }
+        if ($path === '') {
+            $path = '/';
+        }
+        $callback = $this->findWsRoute($path);
+        if ($callback === null) {
+            $refusal = new RstStreamFrame($stream_id,
+                self::H2_ERROR_REFUSED_STREAM);
+            $this->writeFrameWhole($connection,
+                $refusal->serialize());
+            return false;
+        }
+        $state = &$conn->protocol_state;
+        $state['ws_carrier_streams'][$stream_id] = true;
+        /*
+            RFC 8441 sec 5: a 200 (no END_STREAM) on the connect
+            stream accepts the tunnel. HPACK-encode the single
+            :status header and send it as a HEADERS frame; the stream
+            stays open for the DATA frames that follow.
+         */
+        $hpack_encode = $state['hpack_encode'] ?? new HPack();
+        $state['hpack_encode'] = $hpack_encode;
+        $headers = new HeaderFrame($stream_id, [[':status', '200']]);
+        $headers->flags->add('END_HEADERS');
+        $this->writeFrameWhole($connection,
+            $headers->serialize($hpack_encode));
+        $ws = new WebSocket($connection, $key, $this);
+        $ws->h2_stream_id = $stream_id;
+        $conn->is_websocket = true;
+        if (!isset($conn->h2_websockets)
+            || !is_array($conn->h2_websockets)) {
+            $conn->h2_websockets = [];
+        }
+        $conn->h2_websockets[$stream_id] = $ws;
+        if (!$this->ws_keepalive_registered
+            && $this->ws_keepalive_interval > 0) {
+            $this->registerWsKeepalive();
+        }
+        /* What opened the socket is handed to the socket itself, never
+           through the arrays an ordinary request uses, for the reason
+           given where a socket is upgraded from HTTP/1.1: a socket
+           outlives its request, and a cookie left in those arrays
+           reaches into work that has nothing to do with it. */
+        $ws->query = [];
+        parse_str($context['QUERY_STRING'] ?? '', $ws->query);
+        $ws->cookies = [];
+        if (!empty($context['HTTP_COOKIE'])) {
+            foreach (explode(";", $context['HTTP_COOKIE'])
+                as $sent_cookie) {
+                $cookie_parts = explode("=", $sent_cookie, 2);
+                if (count($cookie_parts) == 2) {
+                    $ws->cookies[trim($cookie_parts[0])] =
+                        trim($cookie_parts[1]);
+                }
+            }
+        }
+        try {
+            $callback($ws);
+        } catch (\Exception $problem) {
+            if ($ws->on_error !== null) {
+                ($ws->on_error)($problem->getMessage(), $ws);
+            }
+        }
+        return false;
+    }
+    /**
+     * Feeds inbound bytes from a WebSocket-carrier stream's DATA
+     * frames to the WebSocket frame parser for that stream, and
+     * dispatches whole frames. A DATA frame that ends the stream is
+     * treated as the client closing the socket.
+     *
+     * @param int $key connection key in in_streams
+     * @param int $stream_id the carrier stream's id
+     * @param string $data raw WebSocket bytes from the DATA frame
+     * @param bool $ended whether the DATA frame carried END_STREAM
+     */
+    protected function feedH2WebSocket($key, $stream_id, $data, $ended)
+    {
+        $conn = $this->connection($key);
+        $ws = $conn?->h2_websockets[$stream_id] ?? null;
+        if ($ws === null) {
+            return;
+        }
+        $ws->input_buffer .= $data;
+        $ws->last_pong_time = time();
+        $keep_open = true;
+        while ($keep_open) {
+            $parsed = WebSocketFrame::parseBuffer($ws->input_buffer);
+            if ($parsed === null) {
+                break;
+            }
+            $ws->input_buffer = substr($ws->input_buffer,
+                $parsed['consumed']);
+            $keep_open = $this->dispatchWsFrame($key, $ws,
+                $parsed['frame']);
+        }
+        /* A browser leaving a page closes the WebSocket with a close
+           frame, which carries no HTTP/2 end-of-stream flag, so the
+           carrier has to be let go when the socket itself closes as
+           well as when the stream ends. Without this the stream, the
+           socket and its push timer stayed behind, and the timer went
+           on writing to a connection that was gone. */
+        if ($ended || !$keep_open || $ws->closed) {
+            /* A close frame has already run the socket's close callback
+               in dispatchWsFrame, so it is only run here for the other
+               ways a carrier ends. */
+            if ($ws->on_close !== null && !$ws->closed) {
+                ($ws->on_close)($ws);
+            }
+            unset($conn->protocol_state['ws_carrier_streams'][$stream_id]);
+            unset($conn->h2_websockets[$stream_id]);
+            /* The ending frame joins the same queue the close echo went
+               into, so it leaves after that echo rather than ahead of
+               it, which would end the stream under a frame still to
+               come. */
+            $end_frame = new DataFrame($stream_id, "");
+            $end_frame->flags->add('END_STREAM');
+            $this->wsEnqueueWrite($key, $end_frame->serialize());
+        }
+    }
+    /**
+     * Queues WebSocket frame bytes to be sent inside an HTTP/2 DATA
+     * frame on a carrier stream. The DATA frame is built now and
+     * handed to the same out_streams buffer the rest of the h2 write
+     * path drains, so ordering with any other bytes on the connection
+     * is preserved.
+     *
+     * @param int $key connection key in in_streams
+     * @param int $stream_id the carrier stream's id
+     * @param string $ws_frame the built WebSocket frame
+     */
+    public function wsEnqueueH2Write($key, $stream_id, $ws_frame)
+    {
+        /* A DATA frame's payload may not exceed the peer's maximum
+           frame size, so a WebSocket frame larger than that is sent
+           as several DATA frames on the same stream. The WebSocket
+           frame itself is unbroken; only its carriage is split. */
+        $offset = 0;
+        $total = strlen($ws_frame);
+        do {
+            $piece = substr($ws_frame, $offset,
+                self::H2_MAX_FRAME_SIZE);
+            $data_frame = new DataFrame($stream_id, $piece);
+            $this->wsEnqueueWrite($key, $data_frame->serialize());
+            $offset += self::H2_MAX_FRAME_SIZE;
+        } while ($offset < $total);
+    }
+
+    /**
+     * Sends already-built WebSocket frame bytes to a socket by whichever
+     * way that socket runs: wrapped in HTTP/2 data frames when it rides
+     * an extended CONNECT stream, or straight to the connection when it
+     * is an HTTP/1.1 upgrade. Control frames answered deep in the frame
+     * dispatch go through here, since writing them raw onto an HTTP/2
+     * connection corrupts its framing.
+     *
+     * @param int $key connection key in in_streams
+     * @param object $ws the socket the frame belongs to
+     * @param string $ws_frame the built WebSocket frame
+     */
+    protected function wsSendFrame($key, $ws, $ws_frame)
+    {
+        if ($ws->h2_stream_id !== 0) {
+            $this->wsEnqueueH2Write($key, $ws->h2_stream_id, $ws_frame);
+            return;
+        }
+        $this->wsEnqueueWrite($key, $ws_frame);
+    }
+    /**
+     * Says whether a drained connection is one that carries nothing but
+     * a WebSocket, so its finished write needs no further work beyond
+     * clearing the entry. Only a connection upgraded from HTTP/1.1 is
+     * such a one. An HTTP/2 connection can carry sockets and ordinary
+     * replies at the same time, and both are frames in one buffer, so it
+     * keeps to the HTTP/2 path where the rest of a large reply is sent.
+     * Treating it as a socket left a big reply unsent after its first
+     * slice and the reader waited on it forever.
+     *
+     * @param object $conn the connection whose write just drained, or
+     *      null when it has already been taken down
+     * @return bool true when the socket path is the right one
+     */
+    protected function usesSocketDrain($conn)
+    {
+        if ($conn === null) {
+            return false;
+        }
+        if ($conn->protocol === 'h2') {
+            return false;
+        }
+        return (bool)$conn->is_websocket;
+    }
+    /**
      * Appends a binary blob (already-built WebSocket frame, or
      * the 101 handshake response) to the out_streams buffer for
      * a connection. The event loop drains the buffer to the
@@ -6246,6 +9124,14 @@ class WebSite
      */
     public function wsEnqueueWrite($key, $data)
     {
+        if (empty($this->in_streams[self::CONNECTION][$key])) {
+            /* The connection was torn down before this write. A push
+               that fires in the gap between a socket closing and its
+               timer being cleared lands here; there is nothing to
+               write to, so the write is dropped rather than reaching
+               into a connection array that no longer holds the key. */
+            return;
+        }
         if (empty($this->out_streams[self::CONNECTION][$key])) {
             $this->out_streams[self::CONNECTION][$key] =
                 $this->in_streams[self::CONNECTION][$key];
@@ -6290,27 +9176,38 @@ class WebSite
     {
         $now = time();
         foreach ($this->connections as $key => $conn) {
-            if (!$conn->is_websocket || $conn->ws === null) {
+            if (!$conn->is_websocket) {
                 continue;
             }
-            $ws = $conn->ws;
-            if ($ws->closed) {
-                continue;
+            /* A connection holds either one socket from an HTTP/1.1
+               upgrade or any number carried on HTTP/2 connect streams,
+               and both kinds want the same keepalive. */
+            $sockets = [];
+            if ($conn->ws !== null) {
+                $sockets[] = $conn->ws;
             }
-            if ($now - $ws->last_pong_time
-                > $this->ws_keepalive_timeout) {
-                $this->shutdownHttpStream($key);
-                if ($ws->on_close !== null) {
-                    ($ws->on_close)($ws);
+            foreach (($conn->h2_websockets ?? []) as $carried) {
+                $sockets[] = $carried;
+            }
+            foreach ($sockets as $ws) {
+                if ($ws->closed) {
+                    continue;
                 }
-                continue;
-            }
-            if ($now - $ws->last_pong_time
-                >= $this->ws_keepalive_interval) {
-                $ws->last_ping_time = $now;
-                $this->wsEnqueueWrite($key,
-                    WebSocketFrame::build(self::WS_OPCODE_PING,
-                        ""));
+                if ($now - $ws->last_pong_time
+                    > $this->ws_keepalive_timeout) {
+                    $this->shutdownHttpStream($key);
+                    if ($ws->on_close !== null) {
+                        ($ws->on_close)($ws);
+                    }
+                    continue;
+                }
+                if ($now - $ws->last_pong_time
+                    >= $this->ws_keepalive_interval) {
+                    $ws->last_ping_time = $now;
+                    $this->wsSendFrame($key, $ws,
+                        WebSocketFrame::build(self::WS_OPCODE_PING,
+                            ""));
+                }
             }
         }
     }
@@ -6446,7 +9343,7 @@ class WebSite
         if ($opcode === self::WS_OPCODE_CLOSE) {
             if (!$ws->closed) {
                 $ws->closed = true;
-                $this->wsEnqueueWrite($key,
+                $this->wsSendFrame($key, $ws,
                     WebSocketFrame::build(self::WS_OPCODE_CLOSE,
                         $frame['payload']));
             }
@@ -6456,7 +9353,7 @@ class WebSite
             return false;
         }
         if ($opcode === self::WS_OPCODE_PING) {
-            $this->wsEnqueueWrite($key,
+            $this->wsSendFrame($key, $ws,
                 WebSocketFrame::build(self::WS_OPCODE_PONG,
                     $frame['payload']));
             return true;
@@ -6489,9 +9386,9 @@ class WebSite
             if ($ws->on_message !== null) {
                 try {
                     ($ws->on_message)($message, $ws);
-                } catch (\Exception $e) {
+                } catch (\Exception $error) {
                     if ($ws->on_error !== null) {
-                        ($ws->on_error)($e->getMessage(), $ws);
+                        ($ws->on_error)($error->getMessage(), $ws);
                     }
                 }
             }
@@ -6585,6 +9482,232 @@ class WebSite
             substr($name, $colon + 1)];
     }
     /**
+     * Reads the next piece of a file-backed reply into the send buffer,
+     * and lets the file go once every byte of it has been read. A reply
+     * that is a file on disk is sent this way rather than read into a
+     * string, so its size costs the server a fixed amount of memory
+     * rather than its own length.
+     *
+     * @param string $key which connection is being sent to
+     * @return void
+     */
+    protected function refillFromFile($key)
+    {
+        $backing = $this->out_streams[self::DATA_FILE][$key] ?? null;
+        if (empty($backing)) {
+            return;
+        }
+        $context = $this->out_streams[self::CONTEXT][$key] ?? [];
+        $read_this_pass = self::OUT_FILE_STEP;
+        if (empty($context['MACHINE_REQUEST'])) {
+            /* Every file being sent takes a turn of this loop, so one
+               block of IP addresses opening several at once would take
+               several turns and leave less of the link for every other
+               reader. An IP block keeps one turn however many files it
+               opens, and those files divide that turn between them. A
+               file the request marks as MACHINE_REQUEST, one going to
+               another machine of the same site, keeps a whole turn. */
+            $receiving_ip_block = self::ipBlock(
+                $context['REMOTE_ADDR'] ?? "");
+            $files_this_ip_block = $this->ipBlockFileSends(
+                $receiving_ip_block);
+            if ($files_this_ip_block > 1) {
+                $read_this_pass = max((int)($read_this_pass /
+                    $files_this_ip_block), 1);
+            }
+        }
+        $piece = fread($backing["handle"], $read_this_pass);
+        $writer = $backing["growing"] ?? null;
+        if ($writer !== null) {
+            $this->refillFromGrowingFile($key, $backing, $piece);
+            return;
+        }
+        if ($piece === false || $piece === "") {
+            $this->letGoOfSendFile($key, $backing);
+            return;
+        }
+        $this->out_streams[self::DATA][$key] = $piece;
+        $this->out_streams[self::DATA_OFFSET][$key] = 0;
+        if (feof($backing["handle"])) {
+            $this->letGoOfSendFile($key, $backing);
+        }
+    }
+    /**
+     * refillFromGrowingFile puts the next piece of a file that is still
+     * being written into an HTTP/1.1 send buffer, as one chunk of a
+     * chunked reply: the piece's length in hexadecimal, a line end, the
+     * piece and a line end. refillFromFile calls it with the piece it
+     * read. When the writer has finished and nothing is left, the empty
+     * last chunk ends the reply and the file is let go. When the writer
+     * has not finished and nothing new is there, the connection is
+     * parked in $parked_files, out of the write set, so the loop does not
+     * go round with nothing to write.
+     *
+     * @param string $key which connection is being sent to
+     * @param array $backing what was recorded about the file, whose
+     *      growing entry is the deferred task writing it
+     * @param string|bool $piece what was just read from the file
+     * @return void
+     */
+    protected function refillFromGrowingFile($key, $backing, $piece)
+    {
+        if ($piece !== false && $piece !== "") {
+            $this->out_streams[self::DATA][$key] = dechex(strlen($piece)) .
+                "\x0D\x0A" . $piece . "\x0D\x0A";
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
+            $this->out_streams[self::MODIFIED_TIME][$key] = time();
+            return;
+        }
+        if (!empty($backing["growing"]->growing_done)) {
+            $this->out_streams[self::DATA][$key] = "0\x0D\x0A\x0D\x0A";
+            $this->out_streams[self::DATA_OFFSET][$key] = 0;
+            $this->letGoOfSendFile($key, $backing);
+            return;
+        }
+        $this->out_streams[self::DATA][$key] = "";
+        $this->out_streams[self::DATA_OFFSET][$key] = 0;
+        $this->parked_files[$key] =
+            $this->out_streams[self::CONNECTION][$key];
+        unset($this->out_streams[self::CONNECTION][$key]);
+    }
+    /**
+     * unparkGrowingFiles puts back into the write set each HTTP/1.1
+     * connection refillFromGrowingFile parked, once its file has bytes
+     * not yet sent or its writer has finished, so the next pass sends
+     * them or ends the reply. A connection that has closed meanwhile has
+     * its file let go. refillStreamingGenerators calls it on each pass
+     * of the loop.
+     *
+     * @return void
+     */
+    protected function unparkGrowingFiles()
+    {
+        foreach ($this->parked_files as $key => $socket) {
+            $backing = $this->out_streams[self::DATA_FILE][$key] ?? null;
+            if (empty($backing)) {
+                unset($this->parked_files[$key]);
+                continue;
+            }
+            if (!isset($this->in_streams[self::CONNECTION][$key])) {
+                unset($this->parked_files[$key]);
+                $this->letGoOfSendFile($key, $backing);
+                continue;
+            }
+            $stat = fstat($backing["handle"]);
+            $sent_up_to = ftell($backing["handle"]);
+            if (empty($backing["growing"]->growing_done) &&
+                ($stat === false || $stat["size"] <= $sent_up_to)) {
+                continue;
+            }
+            unset($this->parked_files[$key]);
+            $this->out_streams[self::CONNECTION][$key] = $socket;
+        }
+    }
+    /**
+     * Closes a file that has been sent and, where it was made only to be
+     * sent, deletes it. A pack built for a git pull is such a file: once
+     * the client has it there is nothing left to keep.
+     *
+     * @param string $key which connection was being sent to
+     * @param array $backing what was recorded about the file
+     * @return void
+     */
+    protected function letGoOfSendFile($key, $backing)
+    {
+        fclose($backing["handle"]);
+        unset($this->out_streams[self::DATA_FILE][$key]);
+        if (!empty($backing["remove_after"]) && is_file($backing["path"])) {
+            unlink($backing["path"]);
+        }
+    }
+    /**
+     * Says that the rest of a reply is the given file, so it is drained
+     * from disk a piece at a time rather than held in memory. Used for a
+     * reply built as a file, such as the pack a git pull asks for.
+     *
+     * @param string $key which connection is being sent to
+     * @param string $path the file holding the rest of the reply
+     * @param bool $remove_after whether to delete the file once every byte
+     *      of it has gone out, for a file made only to be sent
+     * @param object|null $writer the deferred task still writing the file,
+     *      whose growing_done field says when it has finished; the file is
+     *      then sent in chunks as it grows. null for a finished file.
+     * @return bool whether the file could be opened
+     */
+    protected function sendRestFromFile($key, $path, $remove_after = false,
+        $writer = null)
+    {
+        $handle = fopen($path, "rb");
+        if ($handle === false) {
+            return false;
+        }
+        $this->out_streams[self::DATA_FILE][$key] = ["path" => $path,
+            "handle" => $handle, "remove_after" => $remove_after,
+            "growing" => $writer];
+        return true;
+    }
+    /**
+     * ipBlockFileSends counts the files this server is part way
+     * through sending to one block of IP addresses.
+     *
+     * A file being sent takes a turn of the write loop each pass, so
+     * several files going to the same place at once take several turns
+     * and leave less of the link for every other reader. refillFromFile
+     * asks this so it can divide one block's turn among the files that
+     * block is being sent. A whole IP block is counted rather than a
+     * single IP address because one client can make its requests from
+     * many IP addresses in the same block. Files a request marks as
+     * MACHINE_REQUEST, sent to another machine of the same site, are not
+     * counted, since they are not what this limits.
+     *
+     * @param string $ip_block the leading bytes of an IP address, as
+     *      ipBlock gives them
+     * @return int how many file sends to that IP block are in progress
+     */
+    public function ipBlockFileSends($ip_block)
+    {
+        $found = 0;
+        foreach ($this->out_streams[self::DATA_FILE] as $key => $backing) {
+            $context = $this->out_streams[self::CONTEXT][$key] ?? [];
+            if (!empty($context['MACHINE_REQUEST'])) {
+                continue;
+            }
+            $receiving_ip_address = $context['REMOTE_ADDR'] ?? "";
+            if ($receiving_ip_address !== "" &&
+                self::ipBlock($receiving_ip_address) === $ip_block) {
+                $found++;
+            }
+        }
+        return $found;
+    }
+    /**
+     * ipBlock gives the part of an IP address that says which block of
+     * IP addresses it belongs to.
+     *
+     * An internet provider hands out IP addresses in blocks, so one
+     * client can make its requests from many IP addresses that differ
+     * only in their last part. Keeping the leading bytes puts all of
+     * those under one count. Three bytes are kept of an IPv4 address,
+     * which is four bytes long, and eight of an IPv6 address, which is
+     * sixteen: those are the smallest blocks a provider hands out as a
+     * unit.
+     *
+     * @param string $ip_address the IP address a request came from,
+     *      written the way a person writes one
+     * @return string the leading bytes of that IP address, or the
+     *      string given where it cannot be read as an IP address
+     */
+    public static function ipBlock($ip_address)
+    {
+        $bytes = @inet_pton($ip_address);
+        if ($bytes === false) {
+            return $ip_address;
+        }
+        $keep = (strlen($bytes) == self::IPV4_ADDRESS_BYTES) ?
+            self::IPV4_BLOCK_BYTES : self::IPV6_BLOCK_BYTES;
+        return substr($bytes, 0, $keep);
+    }
+    /**
      * Used to send response data to out stream for which responses have not
      * been written.
      *
@@ -6610,6 +9733,18 @@ class WebSite
             $offset =
                 $this->out_streams[self::DATA_OFFSET][$key] ?? 0;
             $unsent = strlen($data) - $offset;
+            if ($unsent <= 0 &&
+                !empty($this->out_streams[self::DATA_FILE][$key])) {
+                /* The rest of this reply is a file, so the next piece of
+                   it is read in only once what came before has gone out.
+                   A reply larger than the server's memory travels this
+                   way a piece at a time. */
+                $this->refillFromFile($key);
+                $data = $this->out_streams[self::DATA][$key];
+                $offset =
+                    $this->out_streams[self::DATA_OFFSET][$key] ?? 0;
+                $unsent = strlen($data) - $offset;
+            }
             //suppress connection reset notices
             set_error_handler(null);
             /*
@@ -6630,12 +9765,17 @@ class WebSite
             $chunk_len = min($unsent,
                 $this->default_server_globals['MAX_IO_LEN']);
             $tail = substr($data, $offset, $chunk_len);
-            $num_bytes = @fwrite($out_stream, $tail);
+            $written = @fwrite($out_stream, $tail);
             restore_error_handler();
-            $remaining_bytes = ($num_bytes === false) ? 0
-                : max(0, $unsent - $num_bytes);
-            if ($num_bytes > 0) {
-                $offset += $num_bytes;
+            $remaining = ($written === false) ? 0
+                : max(0, $unsent - $written);
+            // a reply whose rest is still in a file is not finished
+            if ($written !== false && $remaining == 0 &&
+                !empty($this->out_streams[self::DATA_FILE][$key])) {
+                $remaining = 1;
+            }
+            if ($written > 0) {
+                $offset += $written;
                 $this->out_streams[self::DATA_OFFSET][$key] =
                     $offset;
                 /*
@@ -6656,12 +9796,12 @@ class WebSite
                 }
                 $this->out_streams[self::MODIFIED_TIME][$key] = time();
             }
-            if ($remaining_bytes == 0) {
+            if ($remaining == 0) {
                 $context = $this->out_streams[self::CONTEXT][$key]
                     ?? [];
-                $conn_obj = $this->connection($key);
-                $is_ws = $conn_obj?->is_websocket;
-                $is_h2 = $conn_obj?->protocol === 'h2';
+                $connection = $this->connection($key);
+                $is_h2 = $connection?->protocol === 'h2';
+                $is_ws = $this->usesSocketDrain($connection);
                 if ($is_ws) {
                     /*
                         WebSocket: drain complete, but the
@@ -6673,10 +9813,11 @@ class WebSite
                         outbound CLOSE frame, so now it is safe
                         to tear down the connection.
                      */
-                    $ws = $conn_obj->ws;
+                    $ws = $connection->ws;
                     unset($this->out_streams[self::CONNECTION][$key],
                         $this->out_streams[self::DATA][$key],
                         $this->out_streams[self::DATA_OFFSET][$key],
+                        $this->out_streams[self::DATA_FILE][$key],
                         $this->out_streams[self::CONTEXT][$key],
                         $this->out_streams[self::MODIFIED_TIME][$key]);
                     if ($ws?->closed) {
@@ -6698,7 +9839,7 @@ class WebSite
                         way.
                      */
                     $this->pumpH2AllPendingSend($key, $out_stream,
-                        $conn_obj);
+                        $connection);
                     if ((strlen($this->out_streams[self::DATA][$key]
                         ?? "") - ($this->out_streams[
                         self::DATA_OFFSET][$key] ?? 0)) <= 0) {
@@ -6720,6 +9861,17 @@ class WebSite
                     $context['SERVER_PROTOCOL'] == 'HTTP/1.0') {
                     if (empty($context["PRE_BAD_RESPONSE"])) {
                         $this->shutdownHttpStream($key);
+                    } else {
+                        /* An error response is sent in full before the
+                           client stops sending, so only this side is
+                           closed: the client reads the response, then
+                           closes, and processRequestStreams closes the
+                           rest. Closing both sides with request bytes
+                           still arriving would reset the connection,
+                           and the client could lose the response. */
+                        @stream_socket_shutdown($out_stream,
+                            STREAM_SHUT_WR);
+                        $this->shutdownHttpWriteStream($key);
                     }
                 } else {
                     $this->shutdownHttpWriteStream($key);
@@ -6819,25 +9971,98 @@ class WebSite
             }
 
             $this->in_streams[self::CONTEXT][$key] = $context;
-            if (empty($context['CONTENT_LENGTH'])) {
+            if (empty($context['CONTENT_LENGTH']) &&
+                !$this->isChunkedRequest($context)) {
                 $context['CONTENT'] = "";
                 $this->setGlobals($context, $this->connection($key));
                 return true;
-            } else if ($context['CONTENT_LENGTH'] >
+            } else if (($context['CONTENT_LENGTH'] ?? 0) >
                 $this->default_server_globals['MAX_REQUEST_LEN'] -
                 $end_head_pos) {
-                $this->initializeBadRequestResponse($key);
+                $this->initializeBadRequestResponse($key,
+                    self::PAYLOAD_TOO_LARGE);
                 return true;
             }
         }
         $data = $this->in_streams[self::DATA][$key];
         $content_pos = strpos($data, "$eol$eol") + strlen("$eol$eol");
+        if ($this->isChunkedRequest($context)) {
+            $content = $this->decodeChunkedBody(substr($data, $content_pos));
+            if ($content === false) {
+                return false;
+            }
+            if ($content === null) {
+                $this->initializeBadRequestResponse($key);
+                return true;
+            }
+            $context['CONTENT'] = $content;
+            $context['CONTENT_LENGTH'] = strlen($content);
+            $this->setGlobals($context, $this->connection($key));
+            return true;
+        }
         if (strlen($data) - $content_pos < $context['CONTENT_LENGTH']) {
             return false;
         }
         $context['CONTENT'] = substr($data, $content_pos);
         $this->setGlobals($context, $this->connection($key));
         return true;
+    }
+    /**
+     * isChunkedRequest says whether an HTTP/1.1 request sends its body in
+     * chunks, as its Transfer-Encoding header names chunked. A client
+     * sends a body this way when it does not know the length in advance;
+     * git does so for a push larger than its one megabyte post buffer.
+     *
+     * @param array $context the request's headers, as parseH1Request
+     *      reads them
+     * @return bool whether the body is chunked
+     */
+    protected function isChunkedRequest($context)
+    {
+        return stripos($context['HTTP_TRANSFER_ENCODING'] ?? "",
+            "chunked") !== false;
+    }
+    /**
+     * decodeChunkedBody joins the chunks of a request body sent with
+     * Transfer-Encoding: chunked (RFC 9112, the HTTP/1.1 specification,
+     * section 7.1). Each chunk is its length in hexadecimal on a line of
+     * its own, then that many bytes and a line end; a chunk of length 0
+     * ends the body, followed by any trailer lines and an empty line.
+     *
+     * @param string $raw the bytes received after the request's headers
+     * @return string|bool|null the joined body; false when the body has
+     *      not all arrived yet; null when the bytes are not chunks
+     */
+    protected function decodeChunkedBody($raw)
+    {
+        $body = "";
+        $pos = 0;
+        $total = strlen($raw);
+        while (true) {
+            $line_end = strpos($raw, "\x0D\x0A", $pos);
+            if ($line_end === false) {
+                return false;
+            }
+            $size_text = trim(explode(";", substr($raw, $pos,
+                $line_end - $pos), 2)[0]);
+            if ($size_text === "" || !ctype_xdigit($size_text)) {
+                return null;
+            }
+            $size = hexdec($size_text);
+            $pos = $line_end + 2;
+            if ($size == 0) {
+                if (substr($raw, $pos, 2) === "\x0D\x0A") {
+                    return $body;
+                }
+                return (strpos($raw, "\x0D\x0A\x0D\x0A", $pos) === false) ?
+                    false : $body;
+            }
+            if ($pos + $size + 2 > $total) {
+                return false;
+            }
+            $body .= substr($raw, $pos, $size);
+            $pos += $size + 2;
+        }
     }
     /**
      * Initializes superglobals before process() in CLI mode.
@@ -6895,6 +10120,11 @@ class WebSite
             }
         }
         $_SERVER = array_merge($this->default_server_globals, $context);
+        /* The stream's context is made once per connection, so the
+           arrival time it holds is the connection's; each request gets
+           its own. */
+        $_SERVER['REQUEST_TIME_FLOAT'] = microtime(true);
+        $_SERVER['REQUEST_TIME'] = (int)$_SERVER['REQUEST_TIME_FLOAT'];
         parse_str($context['QUERY_STRING'], $_GET);
         $_POST = [];
         /*
@@ -6957,16 +10187,21 @@ class WebSite
                     continue;
                 }
                 if (empty($file_name)) {
-                    //we support up to 3D arrays in form variables
-                    if (preg_match("/^(\w+)\[(\w+)\]\[(\w+)\]\[(\w+)\]$/",
+                    /* We support up to 3D arrays in form variables. A key
+                       may hold more than letters, digits and underscores:
+                       a hyphen is ordinary in a name a page makes up for
+                       itself, and matching only word characters dropped
+                       every such field silently. */
+                    if (preg_match("/^(\w+)\[([^\]]+)\]\[([^\]]+)\]" .
+                        "\[([^\]]+)\]$/",
                         $name, $matches)) {
                         $_POST[$matches[1]][$matches[2]][$matches[3]][
                             $matches[4]] = $content;
-                    } else if (preg_match("/^(\w+)\[(\w+)\]\[(\w+)\]$/", $name,
-                        $matches)) {
+                    } else if (preg_match("/^(\w+)\[([^\]]+)\]" .
+                        "\[([^\]]+)\]$/", $name, $matches)) {
                         $_POST[$matches[1]][$matches[2]][$matches[3]] =
                             $content;
-                    } else if (preg_match("/^(\w+)\[(\w+)\]$/", $name,
+                    } else if (preg_match("/^(\w+)\[([^\]]+)\]$/", $name,
                         $matches)) {
                         $_POST[$matches[1]][$matches[2]] = $content;
                     } else {
@@ -6985,6 +10220,19 @@ class WebSite
                  */
                 $tmp_token = "atto-mem-upload-"
                     . bin2hex(random_bytes(8));
+                /*
+                    The line ending before a boundary belongs to the
+                    boundary, not to the part above it, so it is taken
+                    off here. Left on, every uploaded file arrived two
+                    bytes longer than it was sent, which a picture or
+                    any other file read by its bytes will not survive.
+                    Exactly one ending is removed, since a file whose
+                    own last bytes are a line ending is entitled to
+                    keep them.
+                 */
+                if (substr($content, -2) === "\x0D\x0A") {
+                    $content = substr($content, 0, -2);
+                }
                 /*
                     full_path mirrors the key mod_php has set on
                     every $_FILES entry since PHP 8.1: for a normal
@@ -7005,26 +10253,31 @@ class WebSite
                     'data', 'size', 'full_path'];
                 /*
                     A multi-file upload arrives as separate parts named
-                    field[0], field[1], and so on. PHP under Apache or
-                    Nginx turns those into a single $_FILES['field']
-                    whose 'name', 'tmp_name', etc. are arrays indexed by
-                    the bracket number, and the resource upload handler
-                    reads that shape. Reproduce it here: peel off the
-                    bracket index and store each file's parts at that
-                    index under the base field name. A plain field name
-                    with no brackets keeps the simple single-file shape,
-                    and two parts that really do share one name still
-                    collect into arrays as before.
+                    field[0], field[1], and so on, or as repeated parts
+                    all named field[] where the form left the brackets
+                    empty, which is what a plain HTML multiple file
+                    input sends. PHP under Apache or Nginx turns either
+                    into a single $_FILES['field'] whose 'name',
+                    'tmp_name', etc. are arrays indexed by position, and
+                    the upload handlers read that shape. Reproduce it
+                    here: peel off the bracket index, counting from the
+                    files already gathered where the brackets are empty,
+                    and store each file's parts at that index under the
+                    base field name. A plain field name with no brackets
+                    keeps the simple single-file shape, and two parts
+                    that really do share one name still collect into
+                    arrays as before.
                  */
-                if (preg_match('/^(\w+)\[(\w+)\]$/', $name, $matches)) {
+                if (preg_match('/^(\w+)\[(\w*)\]$/', $name, $matches)) {
                     $base_name = $matches[1];
-                    $file_index = $matches[2];
                     if (empty($_FILES[$base_name])) {
                         $_FILES[$base_name] = [];
                         foreach ($file_fields as $field) {
                             $_FILES[$base_name][$field] = [];
                         }
                     }
+                    $file_index = ($matches[2] === "") ?
+                        count($_FILES[$base_name]['name']) : $matches[2];
                     foreach ($file_fields as $field) {
                         if (!is_array($_FILES[$base_name][$field])) {
                             $_FILES[$base_name][$field] =
@@ -7048,6 +10301,8 @@ class WebSite
             parse_str($context['CONTENT'], $_POST);
         }
         $_SERVER = array_merge($this->default_server_globals, $context);
+        $_SERVER['REQUEST_TIME_FLOAT'] = microtime(true);
+        $_SERVER['REQUEST_TIME'] = (int)$_SERVER['REQUEST_TIME_FLOAT'];
         $_COOKIE = [];
         if (!empty($_SERVER['HTTP_COOKIE'])) {
             $sent_cookies = explode(";", $_SERVER['HTTP_COOKIE']);
@@ -7139,12 +10394,23 @@ class WebSite
     }
     /**
      * Used to set up PHP superglobals, $_GET, $_POST, etc in the case that
-     * a 400 BAD REQUEST response occurs.
+     * a 400 BAD REQUEST response occurs, or a 413 PAYLOAD TOO LARGE one
+     * for a request longer than MAX_REQUEST_LEN. The connection's own
+     * context is marked too, so parseH1Request does not reset the
+     * connection for a next request: what the client goes on sending is
+     * the rest of the request just refused, which processRequestStreams
+     * reads and throws away until the client closes.
      *
      * @param int $key id of stream that bad request came from
+     * @param int $status the response code, 400 unless the request was too
+     *      long
      */
-    protected function initializeBadRequestResponse($key)
+    protected function initializeBadRequestResponse($key, $status = 400)
     {
+        if (isset($this->in_streams[self::CONTEXT][$key])) {
+            $this->in_streams[self::CONTEXT][$key]['PRE_BAD_RESPONSE'] =
+                true;
+        }
         $_COOKIE = [];
         $_SESSION = [];
         $_FILES = [];
@@ -7153,7 +10419,7 @@ class WebSite
         $_REQUEST = [];
         $_SERVER = array_merge($this->default_server_globals,
             $this->in_streams[self::CONTEXT][$key],
-            ['REQUEST_METHOD' => 'ERROR', 'REQUEST_URI' => '/400',
+            ['REQUEST_METHOD' => 'ERROR', 'REQUEST_URI' => '/' . $status,
              'SERVER_PROTOCOL' => 'HTTP/1.0',
              'PRE_BAD_RESPONSE' => true]);
     }
@@ -7203,8 +10469,8 @@ class WebSite
             }
             $meta = stream_get_meta_data(
                 $this->in_streams[self::CONNECTION][$key]);
-            $conn_obj = $this->connection($key);
-            if ($conn_obj?->is_websocket) {
+            $connection = $this->connection($key);
+            if ($connection?->is_websocket) {
                 /*
                     WebSockets have their own keepalive timer in
                     wsKeepalivePass; do not close them based on
@@ -7216,7 +10482,7 @@ class WebSite
                 }
                 continue;
             }
-            if ($conn_obj?->protocol === 'handshake') {
+            if ($connection?->protocol === 'handshake') {
                 /*
                     A connection still completing its TLS handshake
                     has no request modified-time yet, so the generic
@@ -7225,7 +10491,7 @@ class WebSite
                     passed, matching stepHandshake.
                  */
                 $deadline =
-                    $conn_obj->protocol_state['handshake_deadline']
+                    $connection->protocol_state['handshake_deadline']
                     ?? 0;
                 if ($meta['eof'] ||
                     ($deadline > 0 && microtime(true) > $deadline)) {
@@ -7250,17 +10516,18 @@ class WebSite
                  */
                 $modified_time = time();
             }
-            if ($meta['eof'] ||
+            if ($meta['eof'] || (empty($this->relayed_by_connection[$key]) &&
                 time() - $modified_time > $this->default_server_globals[
-                'CONNECTION_TIMEOUT']) {
+                'CONNECTION_TIMEOUT'])) {
                 $this->shutdownHttpStream($key);
             }
         }
     }
     /**
      * Reports whether a reply is still on its way out on this connection,
-     * either because a streamed body has more to produce or because bytes
-     * already produced have not all been sent. Used so the sweep for idle
+     * either because a streamed body has more to produce, because bytes
+     * already produced have not all been sent, or because a deferred
+     * request on it is still doing its work. Used so the sweep for idle
      * connections leaves a download alone: the peer sends nothing while it
      * reads, so by the usual measure such a connection looks silent.
      *
@@ -7271,7 +10538,7 @@ class WebSite
     {
         $unsent = strlen($this->out_streams[self::DATA][$key] ?? "") -
             ($this->out_streams[self::DATA_OFFSET][$key] ?? 0);
-        if ($unsent > 0) {
+        if ($unsent > 0 || !empty($this->deferred_running[$key])) {
             return true;
         }
         $conn = $this->connection($key);
@@ -7314,11 +10581,21 @@ class WebSite
      */
     public function shutdownHttpStream($key)
     {
+        $this->cancelRelayedRequests($key);
         if (!empty($this->in_streams[self::CONNECTION][$key])) {
             set_error_handler(null);
             @stream_socket_shutdown($this->in_streams[self::CONNECTION][$key],
                 STREAM_SHUT_RDWR);
             restore_error_handler();
+        }
+        /* A file still being sent has a handle open on it. Dropping
+           the record of that send without closing the handle left one
+           open for every connection that went away mid-file, and a
+           server that ran long enough could open no more. */
+        if (!empty($this->out_streams[self::DATA_FILE][$key]["handle"]) &&
+            is_resource($this->out_streams[self::DATA_FILE][$key][
+            "handle"])) {
+            fclose($this->out_streams[self::DATA_FILE][$key]["handle"]);
         }
         unset($this->in_streams[self::CONNECTION][$key],
             $this->in_streams[self::CONTEXT][$key],
@@ -7328,6 +10605,7 @@ class WebSite
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::DATA][$key],
             $this->out_streams[self::DATA_OFFSET][$key],
+            $this->out_streams[self::DATA_FILE][$key],
             $this->out_streams[self::MODIFIED_TIME][$key],
             $this->connections[$key]
         );
@@ -7342,10 +10620,20 @@ class WebSite
      */
     protected function shutdownHttpWriteStream($key)
     {
+        /* A file still being sent has a handle open on it. Dropping
+           the record of that send without closing the handle left one
+           open for every connection that went away mid-file, and a
+           server that ran long enough could open no more. */
+        if (!empty($this->out_streams[self::DATA_FILE][$key]["handle"]) &&
+            is_resource($this->out_streams[self::DATA_FILE][$key][
+            "handle"])) {
+            fclose($this->out_streams[self::DATA_FILE][$key]["handle"]);
+        }
         unset($this->out_streams[self::CONNECTION][$key],
             $this->out_streams[self::CONTEXT][$key],
             $this->out_streams[self::DATA][$key],
             $this->out_streams[self::DATA_OFFSET][$key],
+            $this->out_streams[self::DATA_FILE][$key],
             $this->out_streams[self::MODIFIED_TIME][$key]
         );
     }
@@ -7475,6 +10763,14 @@ class Connection
      */
     public $ws = null;
     /**
+     * WebSocket handles opened over HTTP/2 extended CONNECT streams
+     * on this connection, indexed by carrier stream id. A single h2
+     * connection can carry more than one, unlike the one-per-
+     * connection $ws of an HTTP/1.1 upgrade.
+     * @var array
+     */
+    public $h2_websockets = [];
+    /**
      * Protocol-specific state, indexed by short keys whose
      * meaning depends on protocol. For 'h2' this currently holds:
      *
@@ -7530,17 +10826,17 @@ class Connection
         return 0;
     }
     /**
-     * Reads up to $max_bytes from the connection. Honors the
+     * Reads up to $length bytes from the connection. Honors the
      * current blocking mode of the underlying stream.
      *
-     * @param int $max_bytes maximum bytes to read
+     * @param int $length the most bytes to read
      * @return string|false bytes read, empty string at EOF or
      *      when no data is available in non-blocking mode, or
      *      false on error
      */
-    public function read($max_bytes)
+    public function read($length)
     {
-        return @fread($this->resource, $max_bytes);
+        return @fread($this->resource, $length);
     }
     /**
      * Writes $data to the connection.
@@ -8271,6 +11567,28 @@ class WebSocket
         $this->last_pong_time = time();
     }
     /**
+     * When this WebSocket rides an HTTP/2 extended CONNECT stream
+     * rather than a connection of its own, this holds that stream's
+     * id so outbound frames are wrapped in HTTP/2 DATA frames on it.
+     * Zero means the socket is a plain HTTP/1.1 upgrade written
+     * straight to the connection.
+     * @var int
+     */
+    public $h2_stream_id = 0;
+    /**
+     * What was asked for in the address the socket was opened with,
+     * read from the handshake rather than from the arrays an ordinary
+     * request uses, since a socket outlives that request.
+     * @var array
+     */
+    public $query = [];
+    /**
+     * The cookies the client sent when opening the socket, kept here
+     * for the same reason as the query above.
+     * @var array
+     */
+    public $cookies = [];
+    /**
      * Registers a callback invoked once for each complete inbound
      * text or binary message. The callback receives the message
      * payload as its first argument and this WebSocket as the
@@ -8377,6 +11695,11 @@ class WebSocket
             return false;
         }
         $frame = WebSocketFrame::build($opcode, $payload);
+        if ($this->h2_stream_id !== 0) {
+            $this->site->wsEnqueueH2Write($this->key,
+                $this->h2_stream_id, $frame);
+            return true;
+        }
         $this->site->wsEnqueueWrite($this->key, $frame);
         return true;
     }
@@ -8529,7 +11852,10 @@ class Frame
      *      freshly-instantiated Frame subclass (resolved via
      *      FrameFactory::$frames) with payload_length and flags
      *      populated, plus the payload length the caller must
-     *      consume before calling parseBody
+     *      consume before calling parseBody. The frame is null for a
+     *      type this server does not know, such as the PRIORITY_UPDATE
+     *      frame (type 0x10) a browser sends to change how soon it wants
+     *      a response; RFC 9113 sec 5.5 has such a frame skipped
      */
     public static function parseFrameHeader($data)
     {
@@ -8544,7 +11870,7 @@ class Frame
         $flag_byte = ord($data[4]);
         $stream_id = unpack('N', substr($data, 5, 4))[1] & 0x7FFFFFFF;
         if (!isset(FrameFactory::$frames[$type])) {
-            throw new \Exception("Unknown frame type: " . $type);
+            return [null, $length];
         }
         $frame = new FrameFactory::$frames[$type]($stream_id);
         $frame->payload_length = $length;
@@ -8821,6 +12147,13 @@ class HeaderFrame extends Frame
                 foreach ($header as $key => $value) {
                     if ($key === ':method') {
                         $method = strtoupper($value);
+                    } else if ($key === ':protocol') {
+                        /* RFC 8441: an extended CONNECT names the
+                           protocol to tunnel, such as websocket, in
+                           this pseudo-header. It is kept so the h2
+                           dispatch can recognize a WebSocket that
+                           rides the connect stream. */
+                        $context['REQUEST_PROTOCOL'] = strtolower($value);
                     } else if ($key === ':path') {
                         $path = ($value !== ''
                             && $value[0] === '/') ? $value : '/';
@@ -8887,8 +12220,8 @@ class HeaderFrame extends Frame
             connection context populated by initRequestStream. Do
             NOT set it here: the array_merge in parseH2Request
             prefers fresh keys, which would clobber the real IP
-            with a placeholder and break apps like yioop that
-            verify $_SESSION['REMOTE_ADDR'].
+            with a placeholder and break an application that
+            verifies $_SESSION['REMOTE_ADDR'].
          */
         $context['SCRIPT_FILENAME']  = '';
         return $context;
@@ -9741,12 +13074,12 @@ class HPack
      */
     private static $static_name_index = null;
     /**
-     * List of header names that have been encoded as
+     * never_indexed holds the header names that have been encoded as
      * "Literal Never Indexed" and so must not be added to the
      * dynamic table by intermediaries (RFC 7541 sec 6.2.3).
      * @var array<string,bool>
      */
-    private $never_index_list = [];
+    private $never_indexed = [];
     /**
      * Maximum dynamic table size in octets. The RFC 7541 default
      * is 4096; the peer can change this via SETTINGS_HEADER_TABLE_SIZE.
@@ -9776,7 +13109,7 @@ class HPack
         if (self::$static_name_value_index === null) {
             self::$static_name_value_index = [];
             self::$static_name_index = [];
-            foreach (self::STATIC_TABLE as $index => [$n, $v]) {
+            foreach (self::STATIC_TABLE as $index => [$name, $value]) {
                 /*
                     Static table contains duplicates by name
                     (e.g. multiple :method, :status, :path
@@ -9785,12 +13118,12 @@ class HPack
                     form (smaller index = fewer continuation
                     bytes).
                  */
-                $key = $n . "\0" . $v;
+                $key = $name . "\0" . $value;
                 if (!isset(self::$static_name_value_index[$key])) {
                     self::$static_name_value_index[$key] = $index;
                 }
-                if (!isset(self::$static_name_index[$n])) {
-                    self::$static_name_index[$n] = $index;
+                if (!isset(self::$static_name_index[$name])) {
+                    self::$static_name_index[$name] = $index;
                 }
             }
         }
@@ -9894,7 +13227,9 @@ class HPack
         $offset = 0;
         $headers = [];
         $input_length = strlen($input);
-        if ($input_length <= 0) return null;
+        if ($input_length <= 0) {
+            return null;
+        }
         while ($offset < $input_length) {
             $first_byte = ord($input[$offset]);
             if (($first_byte & 0x80) === 0x80) {
@@ -10069,7 +13404,7 @@ class HPack
     }
     /**
      * Decodes a literal never indexed (RFC 7541 sec 6.2.3)
-     * starting at $offset. Records the name in never_index_list
+     * starting at $offset. Records the name in never_indexed
      * so future encodes will respect the directive.
      *
      * @param string $input raw byte buffer
@@ -10081,7 +13416,7 @@ class HPack
     {
         /*
             Literal never indexed: 0001xxxx with a 4-bit name
-            index prefix. Caches name in never_index_list so it
+            index prefix. Caches name in never_indexed so it
             won't be inserted into the dynamic table on later
             sees. RFC 7541 sec 6.2.3.
          */
@@ -10097,7 +13432,7 @@ class HPack
         }
         [$value, $offset] = $this->decodeStringLiteral(
             $input, $offset);
-        $this->never_index_list[$name] = true;
+        $this->never_indexed[$name] = true;
         return [
             'decoded' => [$name => $value],
             'next' => $offset
@@ -10191,7 +13526,7 @@ class HPack
         foreach ($headers as [$name, $value]) {
             $name = (string) $name;
             $value = (string) $value;
-            if (isset($this->never_index_list[$name])) {
+            if (isset($this->never_indexed[$name])) {
                 $encoded .= chr(0x10);
                 $encoded .= $this->encodeString($name);
                 $encoded .= $this->encodeString($value);
@@ -10205,9 +13540,9 @@ class HPack
                     >= 127. RFC 7541 sec 6.1.
                  */
                 $idx = $static_nv[$key];
-                $int_bytes = $this->encodeInteger($idx, 7);
-                $encoded .= chr(ord($int_bytes[0]) | 0x80)
-                    . substr($int_bytes, 1);
+                $index_code = $this->encodeInteger($idx, 7);
+                $encoded .= chr(ord($index_code[0]) | 0x80)
+                    . substr($index_code, 1);
                 continue;
             }
             if (isset($static_n[$name])) {
@@ -10222,9 +13557,9 @@ class HPack
                     the decoder's.
                  */
                 $idx = $static_n[$name];
-                $int_bytes = $this->encodeInteger($idx, 6);
-                $encoded .= chr(ord($int_bytes[0]) | 0x40)
-                    . substr($int_bytes, 1);
+                $index_code = $this->encodeInteger($idx, 6);
+                $encoded .= chr(ord($index_code[0]) | 0x40)
+                    . substr($index_code, 1);
                 $encoded .= $this->encodeString($value);
                 $this->addHeader($name, $value);
                 continue;
@@ -10263,12 +13598,12 @@ class HPack
                 "Huffman" bit (0x80) set. Multi-byte if length
                 >= 127. RFC 7541 sec 5.2.
              */
-            $int_bytes = $this->encodeInteger(strlen($huffman), 7);
-            $first = ord($int_bytes[0]) | 0x80;
-            return chr($first) . substr($int_bytes, 1) . $huffman;
+            $index_code = $this->encodeInteger(strlen($huffman), 7);
+            $first = ord($index_code[0]) | 0x80;
+            return chr($first) . substr($index_code, 1) . $huffman;
         } else {
-            $int_bytes = $this->encodeInteger(strlen($str), 7);
-            return $int_bytes . $str;
+            $index_code = $this->encodeInteger(strlen($str), 7);
+            return $index_code . $str;
         }
     }
     /**
@@ -10324,8 +13659,8 @@ class HPack
                    5.2 always permits */
                 return false;
             }
-            [$code_int, $code_len] = $codes[$ascii];
-            $cur = ($cur << $code_len) | $code_int;
+            [$code_bits, $code_len] = $codes[$ascii];
+            $cur = ($cur << $code_len) | $code_bits;
             $cur_bits += $code_len;
             /*
                 Flush 4 bytes when we have at least 32 bits. We
@@ -10456,7 +13791,7 @@ class HPack
  * having to be rewritten to pass a yield along. WebSite::listen() calls
  * step() once each time around the loop; each call resumes every waiting
  * fiber once and then serves the ready sockets, so the slow work and the
- * rest of the site make progress together. (When Yioop runs under another
+ * rest of the site make progress together. (When the site runs under another
  * web server such as Apache there is no atto loop and each request is its
  * own process, so WebSite::deferTask() runs the work straight through,
  * outside any fiber, and this scheduler is never used.)
@@ -10486,7 +13821,7 @@ class CooperativeScheduler
      * the fiber has used so far. Empty whenever no long work is in flight.
      * @var array
      */
-    protected $tasks = [];
+    public $tasks = [];
     /**
      * Largest total running time, in seconds, any one task is allowed
      * before it is stopped with a budget error.
@@ -10520,10 +13855,15 @@ class CooperativeScheduler
      *      each resume returns or suspends (even if it threw); the partner
      *      of $on_enter, used to capture what the slice produced and put
      *      the previous context back
+     * @param float|null $budget largest total running time this one task
+     *      may use, in seconds; the scheduler's own limit when not given.
+     *      Work that legitimately takes longer than a page render, such as
+     *      building a pack for a git pull, asks for more here rather than
+     *      the whole server being given a looser limit
      * @return void
      */
     public function add(\Fiber $fiber, $on_complete = null,
-        $on_enter = null, $on_leave = null)
+        $on_enter = null, $on_leave = null, $budget = null)
     {
         $this->tasks[] = [
             'fiber' => $fiber,
@@ -10532,6 +13872,7 @@ class CooperativeScheduler
             'on_leave' => $on_leave,
             'work_time' => 0.0,
             'wait' => null,
+            'budget' => ($budget === null) ? $this->budget : (float)$budget,
         ];
     }
     /**
@@ -10601,6 +13942,11 @@ class CooperativeScheduler
             $finished = false;
             $error = null;
             $result = null;
+            if ($task['fiber']->isSuspended() && is_array($task['wait']) &&
+                isset($task['wait']['until']) && !($task['wait']['until'])()) {
+                $still_running[] = $task;
+                continue;
+            }
             $slice_start = microtime(true);
             try {
                 if ($task['on_enter'] !== null) {
@@ -10626,10 +13972,13 @@ class CooperativeScheduler
                 $error = $throwable;
             }
             $task['work_time'] += microtime(true) - $slice_start;
-            if (!$finished && $task['work_time'] > $this->budget) {
+            $task['slices'] = ($task['slices'] ?? 0) + 1;
+            if (!$finished && $task['work_time'] > $task['budget']) {
                 $finished = true;
-                $error = new TaskBudgetExceededException(
-                    'cooperative task exceeded its work-time budget');
+                $error = new TaskBudgetExceededException(sprintf(
+                    'cooperative task exceeded its work-time budget, ' .
+                    '%.1f s of work in %d slices against %.1f s',
+                    $task['work_time'], $task['slices'], $task['budget']));
             }
             if ($finished) {
                 if (is_callable($task['on_complete'])) {
